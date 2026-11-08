@@ -97,7 +97,7 @@ Re-breaking an epic later only adds new `proposed` tasks. It never edits approve
 ```
 ergon dispatch --dry-run               # what would run
 ergon dispatch                         # up to 6 tasks, 3 at a time
-ergon dispatch --epic E-012 --tier sonnet --jobs 2 --budget 5
+ergon dispatch --epic E-012 --tier sonnet --jobs 2 --budget 5 --budget-total 20 --budget-pct 80   # $5/worker, stop launching at 80% of $20
 ergon dispatch --ids T-202,T-188
 ```
 

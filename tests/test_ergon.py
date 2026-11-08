@@ -322,6 +322,20 @@ class TestDispatch(Project):
         runs = list((self.root / "tasks" / "runs").glob("*.json"))
         self.assertEqual(len(runs), 2)
 
+    def test_budget_total_stops_launches(self):
+        for n in "ABC":
+            self.ergon("new", "task", f"Job {n}", "--tier", "sonnet")
+        for t in ("T-001", "T-002", "T-003"):
+            stamp(self.task_file(t))
+        dry = self.ergon("dispatch", "--dry-run", "--budget-total", "0.025", "--budget-pct", "80", "--budget", "1").stdout
+        self.assertIn("cap        $0.02", dry)
+        out = self.ergon("dispatch", "--jobs", "1", "--budget-total", "0.025", "--budget-pct", "80").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.status("T-002"), "done", out)
+        self.assertEqual(self.status("T-003"), "ready", out)
+        self.assertIn("budget cap $0.02 reached", out)
+        self.assertIn("Not launched: T-003", out)
+
     def test_overlapping_touches_run_in_sequence(self):
         for touches in ("shared.py", "a.py"):
             with self.subTest(touches):

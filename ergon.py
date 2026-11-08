@@ -34,7 +34,8 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon check                  lint; non-zero exit on any violation
   ergon tidy                   move every task and epic file to where it belongs: an epic's tasks
                                in epics/<epic>/, the rest in items/ (idempotent)
-  ergon dispatch [--tier T] [--epic E] [--ids T-1,T-2] [--max N] [--jobs J] [--dry-run]
+  ergon dispatch [--tier T] [--epic E] [--ids T-1,T-2] [--max N] [--jobs J]
+                      [--budget-total USD [--budget-pct P]] [--dry-run]
                                run ready tasks headless, one worktree + task/<ID> branch each,
                                merge each finished branch into its epic branch (and, for a task
                                touching a companion repo, that repo's local trunk)
@@ -1574,6 +1575,11 @@ def dispatch(args):
     ids = set(args.ids.split(",")) if args.ids else None
     agents, settings = worker_agents(), worker_settings()
     tried, skipped, results = set(), {}, []
+    cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
+    capped = False
+
+    def spent():
+        return sum(r[3].get("cost", 0) for r in results)
     every_touch = {k for c in COMPANIONS for k in c["touches"]}
 
     def eligible(tasks):
@@ -1657,6 +1663,12 @@ def dispatch(args):
                   + also(t) + f"  {t['title']}")
         if not plan:
             print("nothing to dispatch")
+        if cap is not None:
+            n = min(len(plan), args.max)
+            print(f"  cap        ${cap:.2f} total ({args.budget_pct:g}% of ${args.budget_total:.2f}): "
+                  "no new task launches once finished workers' cost reaches it"
+                  + (f"; estimated at most ${n * args.budget:.2f} for {n} task(s) at --budget ${args.budget:g}"
+                     if args.budget else "; no --budget, so no estimate"))
         # Shared touches: whichever lands second (task into epic, or epic into trunk) may conflict,
         # so a task sharing a path with an earlier one is held until that one lands.
         for i, a in enumerate(plan):
@@ -1673,7 +1685,9 @@ def dispatch(args):
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
             while True:
                 with state_lock():
-                    queue = [] if launched >= args.max else list(eligible(load(ITEMS)))
+                    if cap is not None and spent() >= cap:
+                        capped = True
+                    queue = [] if launched >= args.max or capped else list(eligible(load(ITEMS)))
                     while queue and len(running) < args.jobs and launched < args.max:
                         t = queue.pop(0)
                         if any(shared(t, o) for o in active.values()):
@@ -1705,6 +1719,12 @@ def dispatch(args):
         filed = [f for r in results for f in r[3].get("filed", [])]
         if filed:
             print(f"{len(filed)} proposed from workers' FOUND lines: {', '.join(filed)}")
+    if capped:
+        left = [t["id"] for t in eligible(load(ITEMS))]
+        mean = spent() / len(results) if results else 0
+        print(f"\nbudget cap ${cap:.2f} reached (spent ${spent():.2f}): stopped launching. "
+              f"Not launched: {', '.join(left) or 'none'}"
+              + (f". Estimated ~${mean * len(left):.2f} more to run them (mean ${mean:.2f}/task)" if left else ""))
     tasks = load(ITEMS)
     yours = [t for t in tasks.values() if t["tier"] == "human" and t["status"] == "ready" and deps_done(t, tasks)]
     if yours:
@@ -1884,6 +1904,10 @@ def main():
                    choices=["auto", "acceptEdits", "dontAsk", "bypassPermissions"])
     d.add_argument("--timeout", type=int, default=60, help="minutes per worker (default 60)")
     d.add_argument("--budget", type=float, help="max USD per worker (--max-budget-usd)")
+    d.add_argument("--budget-total", type=float,
+                   help="max USD for the whole run: stop launching once finished workers' cost reaches it")
+    d.add_argument("--budget-pct", type=float, default=100,
+                   help="use only this %% of --budget-total as the cap (default 100)")
     d.add_argument("--escalate", action="store_true",
                    help="when a worker reports blocked, retry once one tier up (haiku→sonnet→opus)")
     d.add_argument("--dry-run", action="store_true")
