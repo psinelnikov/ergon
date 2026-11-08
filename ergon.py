@@ -1396,6 +1396,7 @@ def run_worker(t, base, wt, branch, pubs, args, agents, settings):
     if not found:
         return "blocked", "worker ended without a RESULT line", info
     verdict, why = found[-1]
+    info["asked"] = verdict == "blocked"  # the worker itself says what a human must do
     return verdict, why.strip(" *`") or "(no reason given)", info
 
 
@@ -1414,6 +1415,23 @@ def file_found(t, found, epics):
         dump(meta, TASK_KEYS)
         made.append((tid, title))
     return made
+
+
+def file_human(t, why, epics):
+    """A worker reported `RESULT: blocked`: file a proposed human-tier task for what it asked
+    for and make the blocked task depend on it. Caller holds the state lock."""
+    tid = next_id(ITEMS, "T")
+    title = why if len(why) <= 100 else why[:97].rstrip() + "..."
+    body = TASK_BODY.replace("## What\n", f"## What\n{why}\n", 1)
+    meta = {"id": tid, "title": title, "tier": "human", "status": "proposed",
+            "epic": t.get("epic") or "", "depends": [], "touches": [],
+            "source": t["id"], "created": today(), "approved": "", "tier_why": "",
+            "_path": task_home(t, epics) / f"{tid}-{slug(title)}.md", "_body": body}
+    dump(meta, TASK_KEYS)
+    cur = load(ITEMS)[t["id"]]
+    cur["depends"] = list(cur.get("depends") or []) + [tid]
+    dump(cur, TASK_KEYS)
+    return tid, title
 
 
 def drop_worktree(wt, branch, repo=None):
@@ -1537,6 +1555,9 @@ def dispatch(args):
             for fid, title in file_found(t, info.get("found") or [], epics):
                 print(f"  proposed {fid}  (found by {t['id']})  {title}")
                 info.setdefault("filed", []).append(fid)
+            if verdict == "blocked" and info.get("asked"):
+                hid, title = file_human(t, why, epics)
+                print(f"  proposed {hid}  (human, {t['id']} now depends on it)  {title}")
         return t, verdict, why, info
 
     def also(t):

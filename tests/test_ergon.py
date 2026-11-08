@@ -31,6 +31,8 @@ commit(".", f"Do the thing ({tid})")
 pub = os.path.join("pub", "src")
 if os.path.isdir(pub):
     commit(pub, os.environ.get("FAKE_PUB_MSG", "Do the public thing").replace("{id}", tid))
+if os.environ.get("FAKE_DIRTY"):
+    open(f"{tid}.txt", "a").write("more\n")
 found = "".join(f"FOUND: {x}\n" for x in os.environ.get("FAKE_FOUND", "").split("|") if x)
 print(json.dumps({"result": "did it\n" + found + os.environ.get("FAKE_RESULT", "RESULT: done"), "session_id": "s-1", "total_cost_usd": 0.01}))
 '''
@@ -310,6 +312,31 @@ class TestDispatch(Project):
                     self.assertIn("tier: sonnet", text)
                     self.assertIn(f"title: {title}", text)
                 self.assertIn("2 proposed", out)
+
+    def test_worker_block_files_human_task(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_RESULT="RESULT: blocked \u2014 rotate the API key")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        text = self.task_file("T-002").read_text()
+        self.assertIn("tier: human", text)
+        self.assertIn("status: proposed", text)
+        self.assertIn("source: T-001", text)
+        self.assertIn("title: rotate the API key", text)
+        self.assertIn("depends: [T-002]", self.task_file("T-001").read_text())
+        self.assertFalse(list(self.root.glob("tasks/**/T-003*")))
+        stamp(self.task_file("T-002"))
+        self.assertIn("T-002", self.ergon("next", "--tier", "human").stdout)
+
+    def test_land_block_files_no_human_task(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_DIRTY="1")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("uncommitted", self.task_file("T-001").read_text())
+        self.assertFalse(list(self.root.glob("tasks/**/T-002*")))
 
     def test_dry_run_from_a_worktree(self):
         self.ergon("new", "task", "Private only", "--tier", "haiku")
