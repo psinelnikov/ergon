@@ -22,7 +22,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon finish E-ID            close the epic and merge its branch into the trunk (also happens
                                when its last task goes done); no checkout needs switching
   ergon approve ID [ID ...]    HUMAN ONLY, real terminal. An epic ID approves its proposed tasks
-  ergon reject ID [--reason R] HUMAN ONLY. proposed -> dropped
+  ergon reject ID [--reason R] HUMAN ONLY. proposed -> dropped; review -> ready (needs --reason,
+                               which the next worker is shown; branch and worktree are kept)
+  ergon accept ID [ID ...]     HUMAN ONLY, real terminal. Land a task dispatch held at `review`
+                               (merge its branch like dispatch would, close the epic if last).
+                               An epic ID accepts its tasks in review
   ergon close ID [ID ...] --as done|dropped --reason R
                                HUMAN ONLY. An approved task whose work landed elsewhere, or that
                                no longer applies; skips the epic-branch check, closes the epic
@@ -88,6 +92,13 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # review = ["haiku", "sonnet"]  # worker tiers whose branches a reviewer one tier up must pass before
 #                               # landing (opus reviews opus); a fail blocks the task
 
+# Tasks whose finished branch waits at status `review` for a human `ergon accept` instead of landing.
+# A task matches a rule if its tier is in tiers (when given) and a touches: entry matches (when
+# given). A task's own `accept: yes` opts it in too. Nothing opts a task out.
+# [[accept]]
+# tiers = ["opus"]
+# touches = ["server/**"]       # fnmatch patterns, like [[protect]]
+
 # A separate repo checked out inside this one that tasks may change, e.g. a public product
 # repo next to a private install. Each dispatched task touching it gets its own worktree of it.
 # [[companion]]
@@ -106,6 +117,7 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 
 
 PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
+ACCEPT = []  # [[accept]] rules: {tiers, touches}
 
 
 def protect_hit(touch, pattern):
@@ -187,7 +199,7 @@ def configure(start=None, need_config=True):
     the main checkout: task state, worktrees, run logs and companion checkouts live there, so
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
-        RETIRED_FILE, WORKER_RULES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, REVIEW
+        RETIRED_FILE, WORKER_RULES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, REVIEW, ACCEPT
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -236,17 +248,26 @@ def configure(start=None, need_config=True):
             raise NotConfigured(f"{CONFIG_FILE}: [[protect]] #{n} needs touches and a min_tier in {TIERS}")
         PROTECT.append({"touches": [str(x).strip("/") for x in pr["touches"]],
                         "min_tier": pr["min_tier"], "note": pr.get("note", "")})
+    ACCEPT = []
+    for n, ac in enumerate(CFG.get("accept") or [], 1):
+        tiers, touches = ac.get("tiers") or [], ac.get("touches") or []
+        tiers = [tiers] if isinstance(tiers, str) else tiers
+        touches = [touches] if isinstance(touches, str) else touches
+        if not (tiers or touches) or any(x not in WORKER_TIERS for x in tiers):
+            raise NotConfigured(f"{CONFIG_FILE}: [[accept]] #{n} needs tiers (from {WORKER_TIERS}) and/or touches")
+        ACCEPT.append({"tiers": list(tiers), "touches": [str(x).strip("/") for x in touches]})
     state_rel = re.escape(STATE.relative_to(HOME).as_posix())
     TASK_FILE = re.compile(rf"(?:^|/){state_rel}/(items/[^/\s]+|epics/[^/\s]+/(EPIC|T-[^/\s]+))\.md$")
     TASK_DIR_IN_CMD = re.compile(rf"(?:^|[\s/\"'=]){state_rel}/(items|epics)\b")
 
 
 TIERS = ["haiku", "sonnet", "opus", "human"]
-TASK_STATUSES = ["proposed", "ready", "doing", "blocked", "done", "dropped"]
+TASK_STATUSES = ["proposed", "ready", "doing", "review", "blocked", "done", "dropped"]
 EPIC_STATUSES = ["open", "done", "dropped"]
 # Statuses a task can only reach after a human approved it.
-NEEDS_APPROVAL = {"ready", "doing", "blocked", "done"}
-# Transitions `set` allows. proposed -> ready is approve's job, not set's.
+NEEDS_APPROVAL = {"ready", "doing", "review", "blocked", "done"}
+# Transitions `set` allows. proposed -> ready is approve's job, not set's. Only dispatch moves a
+# task into `review`, and only a human moves it out: `accept` (-> done) or `reject` (-> ready).
 AGENT_MOVES = {
     "ready": {"doing", "blocked"},
     "doing": {"done", "blocked", "ready"},
@@ -338,6 +359,26 @@ def line(t, tasks):
     return f"  {t['id']}  {t['tier']:<6}  {t['title']}{tail}"
 
 
+YES = ("yes", "true", "1")
+
+
+def needs_accept(t, *tiers):
+    """Does a finished branch of t wait at `review` for a human `accept`? Its own `accept: yes`, or
+    an [[accept]] rule its tier (or any of `tiers`, e.g. the one an --escalate finished at) and
+    touches: match."""
+    if str(t.get("accept", "")).lower() in YES:
+        return True
+    have = {t.get("tier"), *tiers}
+    for rule in ACCEPT:
+        if rule["tiers"] and not have & set(rule["tiers"]):
+            continue
+        if rule["touches"] and not any(protect_hit(str(x), p) for x in t.get("touches") or []
+                                       for p in rule["touches"]):
+            continue
+        return True
+    return False
+
+
 def board(args):
     tasks, epics = load(ITEMS), load(EPICS)
     shown = [t for t in tasks.values()
@@ -396,6 +437,12 @@ def review(args):
         print("nothing awaiting approval")
     else:
         print("\napprove from your own terminal:  ergon approve <ID|E-ID> ...")
+    held = sorted((t for t in tasks.values() if t["status"] == "review"), key=lambda t: t["id"])
+    if held:
+        print(f"\nAWAITING ACCEPTANCE ({len(held)}): finished branches, not merged")
+        for t in held:
+            print(line(t, tasks) + f"  [{TASK_BRANCH}{t['id']}]")
+        print("\nfrom your own terminal:  ergon accept <ID|E-ID> ...   or   ergon reject <ID> --reason R")
 
 
 def show(args):
@@ -685,10 +732,13 @@ def setf(args):
         key, _, val = kv.partition("=")
         if key == "approved":
             raise SystemExit("approval is human-only: use `approve` from a real terminal")
+        if is_task and key == "accept" and val.lower() not in YES:
+            raise SystemExit("set can only turn `accept:` on (accept=yes); a human clears it by editing the file")
         if is_task and key == "status":
             if val not in AGENT_MOVES.get(item["status"], set()):
                 raise SystemExit(f"{args.id}: {item['status']} -> {val} not allowed via set"
-                                 + (" (needs human approve)" if item["status"] == "proposed" else ""))
+                                 + (" (needs human approve)" if item["status"] == "proposed" else "")
+                                 + (" (a human accepts or rejects it)" if item["status"] == "review" else ""))
         if is_task and key == "tier" and val not in TIERS:
             raise SystemExit(f"tier must be one of {TIERS}")
         if not is_task and key == "status" and val not in EPIC_STATUSES:
@@ -742,11 +792,12 @@ def approver():
     return name or os.environ.get("USER", "human")
 
 
-def targets(ids, tasks, epics):
+def targets(ids, tasks, epics, status="proposed"):
+    """The tasks ids name; an epic ID names its tasks in `status`."""
     out = []
     for i in ids:
         if i in epics:
-            out += [t for t in tasks.values() if t.get("epic") == i and t["status"] == "proposed"]
+            out += [t for t in tasks.values() if t.get("epic") == i and t["status"] == status]
         elif i in tasks:
             out.append(tasks[i])
         else:
@@ -826,20 +877,103 @@ def review_interactive(args):
 
 
 def reject(args):
+    """HUMAN ONLY. A proposed task is dropped. A task in `review` goes back to `ready` with the
+    reason in its Notes; its branch and worktree stay, so the next dispatch picks up from them
+    and its worker is told why."""
     tasks, epics = load(ITEMS), load(EPICS)
-    todo = [t for t in targets(args.ids, tasks, epics) if t["status"] == "proposed"]
-    if not todo:
-        raise SystemExit("nothing in `proposed` among those ids")
-    for t in todo:
-        print(line(t, tasks))
-    if not human_gate(f"Drop these {len(todo)} task(s)?"):
+    named = targets(args.ids, tasks, epics)
+    todo = [t for t in named if t["status"] == "proposed"]
+    back = [t for t in named if t["status"] == "review"]
+    if not todo and not back:
+        raise SystemExit("nothing in `proposed` or `review` among those ids")
+    if back and not args.reason:
+        raise SystemExit("rejecting work in `review` needs --reason: it's what the next worker is told to fix")
+    for t in todo + back:
+        print(line(t, tasks) + ("  (review -> ready)" if t in back else ""))
+    what = " and ".join(x for x in (f"drop {len(todo)} proposed" if todo else "",
+                                    f"send {len(back)} in review back to ready" if back else "") if x)
+    if not human_gate(f"{what[0].upper() + what[1:]}?"):
         raise SystemExit("aborted")
     for t in todo:
         t["status"] = "dropped"
         if args.reason:
             t["_body"] = t["_body"].rstrip() + f"\n\nRejected {today()}: {args.reason}\n"
         dump(t, TASK_KEYS)
-    print(f"dropped {len(todo)}")
+    for t in back:
+        t["status"] = "ready"
+        add_note(t, f"rejected by {approver()}: {args.reason}", who="review")
+        dump(t, TASK_KEYS)
+    print(", ".join(x for x in (f"dropped {len(todo)}" if todo else "",
+                                f"sent {len(back)} back to ready" if back else "") if x))
+
+
+def held_branch(t, epics):
+    """(base, worktree, branch, companion worktrees) of a task dispatch held at `review`, as
+    land() takes them. Raises GitError if its branch is gone."""
+    branch = TASK_BRANCH + t["id"]
+    if not branch_exists(branch):
+        raise GitError(f"{t['id']}: no branch {branch} to land; `ergon reject {t['id']} --reason R` "
+                       f"sends it back to ready")
+    base = base_branch(t, epics)
+    wt = Path(worktrees().get(branch) or WORKTREES / t["id"])
+    pubs = []
+    for c in COMPANIONS:
+        if not companion_touch(t, c):
+            continue
+        if not branch_exists(branch, c["path"]):
+            raise GitError(f"{t['id']}: no {c['name']} branch {branch}, though its touches: names {c['name']}")
+        pubs.append((c, Path(worktrees(c["path"]).get(branch) or wt / c["rel"])))
+    return base, wt, branch, pubs
+
+
+def accept(args):
+    """HUMAN ONLY: land tasks that dispatch held at `review` the way dispatch would have (companions
+    first, then the task branch into its epic branch or the trunk), mark them done, and close an
+    epic whose last task this was. A landing that fails marks the task blocked, as in dispatch."""
+    tasks, epics = load(ITEMS), load(EPICS)
+    todo = [t for t in targets(args.ids, tasks, epics, "review") if t["status"] == "review"]
+    if not todo:
+        raise SystemExit("nothing in `review` among those ids")
+    for t in todo:
+        print(line(t, tasks) + f"  [{TASK_BRANCH}{t['id']}]")
+    if not human_gate(f"Accept and land these {len(todo)} task(s) as {approver()}?"):
+        raise SystemExit("aborted")
+    who, failed = f"{approver()} {today()}", 0
+    for tid in [t["id"] for t in todo]:
+        with state_lock():  # land() and finish_epic() expect it; also keeps dispatch off the trunk
+            t, epics = load(ITEMS)[tid], load(EPICS)
+            if t["status"] != "review":
+                print(f"skip {tid}: now {t['status']}")
+                continue
+            try:
+                base, wt, branch, pubs = held_branch(t, epics)
+                stray = [f"{tree}: {p}" for tree in [wt] + [pub for _, pub in pubs]
+                         if tree.exists() for p in dirty_paths(tree)]
+            except GitError as err:
+                print(f"{tid} not landed, still in review: {err}")
+                failed += 1
+                continue
+            if stray:
+                print(f"{tid} not landed, still in review: uncommitted changes would miss the merge; "
+                      "commit or discard them, then accept again:\n  " + "\n  ".join(stray))
+                failed += 1
+                continue
+            verdict, why = land(t, base, wt, branch, pubs, accepted=who)
+            if verdict != "done":
+                put_status(tid, "blocked", f"couldn't land it for {who}: {why}", who="accept")
+                print(f"  blocked  {tid}  {why}")
+                failed += 1
+                continue
+            put_status(tid, "done", f"accepted by {who}: {why}", who="accept")
+            print(f"  done     {tid}  {why}")
+            e = epics.get(t.get("epic"))
+            if e and e["status"] == "open" and epic_complete(e["id"], load(ITEMS)):
+                try:
+                    finish_epic(e["id"])
+                except GitError as err:
+                    print(f"  {e['id']} is complete but not merged: {err}")
+    if failed:
+        sys.exit(1)
 
 
 def close(args):
@@ -1101,6 +1235,12 @@ def lint():
             errs.append(f"{where}: status {t.get('status')!r} not in {TASK_STATUSES}")
         if t.get("status") in NEEDS_APPROVAL and not t.get("approved"):
             errs.append(f"{where}: status {t['status']} without a human `approved:` stamp")
+        if t.get("status") == "review" and not branch_exists(TASK_BRANCH + t["id"]):
+            errs.append(f"{where}: in review but branch {TASK_BRANCH}{t['id']} is gone, so there's nothing "
+                        f"to accept; a human rejects it back to ready or closes it")
+        if t.get("accept") and str(t["accept"]).lower() not in YES:
+            errs.append(f"{where}: accept: {t['accept']!r} isn't `yes` (leave it out for no; config "
+                        f"[[accept]] rules can't be opted out of)")
         if t.get("epic") and t["epic"] not in epics:
             errs.append(f"{where}: epic {t['epic']} doesn't exist")
         for d in t.get("depends") or []:
@@ -1146,7 +1286,7 @@ def check(args):
 # Shell writes: in-place editors, redirects (not to /dev/null or another fd), tee, mv/cp/rm.
 SHELL_WRITE = re.compile(r"\bsed\s+(-\w+\s+)*-i|\bperl\s+-\w*i|(?<![0-9&>])>(?!\s*/dev/null|&)|"
                          r"\btee\b|\b(mv|cp|rm|truncate|install)\s|python[0-9.]*\s+-c|<<")
-HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close)\b|\breview\s+(-i|--interactive)\b")
+HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept)\b|\breview\s+(-i|--interactive)\b")
 GUARD_TOOLS = "Edit|Write|MultiEdit|Bash"
 GIT_WRITE = re.compile(r"\bgit\b[^;&|]*\s(add|commit|checkout|switch|reset|restore|merge|rebase|"
                        r"cherry-pick|revert|stash|apply|am|pull|push|fetch|branch|tag|worktree|"
@@ -1195,7 +1335,8 @@ def guard_reason(tool, inp, worker=False):
     if tool == "Bash":
         cmd = inp.get("command", "")
         if HUMAN_CMD.search(cmd):
-            return "approve / reject / close / review -i are human-only; ask the user to run them in their own terminal"
+            return ("approve / reject / close / accept / review -i are human-only; ask the user to run them "
+                    "in their own terminal")
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
                      r"\b(CLAUDECODE|AI_AGENT)=", cmd):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
@@ -1219,7 +1360,11 @@ def guard_reason(tool, inp, worker=False):
     if fb.get("approved", "") != fa.get("approved", ""):
         return "`approved:` is written by a human only (the one rule: `ergon guide`)"
     if fb.get("status", "") != fa.get("status", "") and not (not before and fa.get("status") in ("proposed", "open")):
+        if fb.get("status") == "review":
+            return "a task in review leaves it only by a human's `ergon accept` or `ergon reject`, run in their own terminal"
         return "change status with `ergon set ID status=…` (it enforces the allowed moves), not by editing the file"
+    if fb.get("accept", "").lower() in YES and fa.get("accept", "").lower() not in YES:
+        return "only a human takes `accept:` off a task (it holds the task's landing for their review)"
     return None
 
 
@@ -1308,16 +1453,16 @@ def has_checkout(c):
     return (c["path"] / ".git").exists()
 
 
-def add_note(t, note):
+def add_note(t, note, who="dispatch"):
     body = t["_body"].rstrip()
-    t["_body"] = (body if "## Notes" in body else body + "\n\n## Notes") + f"\n- {today()} dispatch: {note}\n"
+    t["_body"] = (body if "## Notes" in body else body + "\n\n## Notes") + f"\n- {today()} {who}: {note}\n"
 
 
-def put_status(tid, status, note=None):
+def put_status(tid, status, note=None, who="dispatch"):
     t = load(ITEMS)[tid]
     t["status"] = status
     if note:
-        add_note(t, note)
+        add_note(t, note, who)
     dump(t, TASK_KEYS)
 
 
@@ -1668,8 +1813,14 @@ def run_review(t, tier, base, wt, branch, pubs, args, agent, settings):
 
 
 def review_retry(t):
-    """Retry-prompt lines for a task whose last attempt the reviewer vetoed, or ''."""
-    m = re.search(r"\bdispatch: (review \(\w+\) failed: .*)", last_note(t))
+    """Retry-prompt lines for a task whose last attempt the reviewer vetoed or a human rejected
+    in review, or ''."""
+    note = last_note(t)
+    human = re.search(r"\breview: rejected by (.*)", note)
+    if human:
+        return (f"A human reviewed the last attempt's branch and sent it back, not merged: rejected by {human[1]}\n"
+                "Fix what they raised on this branch; it waits for their acceptance again before it lands.\n")
+    m = re.search(r"\bdispatch: (review \(\w+\) failed: .*)", note)
     if not m:
         return ""
     log = re.search(r"\(review log (\S+?\.json)\)", m[1])
@@ -1706,9 +1857,11 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings):
     return (f"{failed}. {kept}" if failed else None), cost
 
 
-def land(t, base, wt, branch, pubs=()):
+def land(t, base, wt, branch, pubs=(), accepted=None):
     """After gate() passes: merge (companions first), clean up. Returns (verdict, reason).
-    Nothing merges unless every merge would go through cleanly. Caller holds the state lock."""
+    Nothing merges unless every merge would go through cleanly. Caller holds the state lock.
+    `accepted` ("<name> <date>", from `accept`) forces a merge commit into base that records
+    who accepted it: task files are local, so history is the only lasting record."""
     kept = kept_note(wt, branch, pubs)
     for c, pub in pubs:
         if c["forbid_ids"]:
@@ -1736,7 +1889,8 @@ def land(t, base, wt, branch, pubs=()):
                                + (f". Already landed: {', '.join(landed)}" if landed else ""))
         landed.append(f"{c['name']} {c['trunk']}")
     try:
-        merge_into(base, branch, f"Merge {t['id']}: {t['title']}")
+        merge_into(base, branch, f"Merge {t['id']}: {t['title']}"
+                   + (f"\n\nAccepted by {accepted}" if accepted else ""), no_ff=bool(accepted))
     except GitError as err:
         return "blocked", (f"{err}. {kept}: merge by hand"
                            + (f". Already landed: {', '.join(landed)}" if landed else ""))
@@ -1825,17 +1979,23 @@ def dispatch(args):
             if failed:
                 verdict, why = "blocked", failed
         with state_lock():  # also serializes every merge into a companion's trunk
-            if verdict == "done":
+            # `t` is the task as it was at launch, so nothing the worker did to its file since
+            # (dropping `accept:`, retiering) lets the branch skip a human's acceptance.
+            if verdict == "done" and needs_accept(t, *([up] if up else [])):
+                verdict, why = "review", (f"waits for a human: `ergon accept {t['id']}` lands it, `ergon reject "
+                                          f"{t['id']} --reason R` sends it back. {kept_note(wt, branch, pubs)}")
+            elif verdict == "done":
                 verdict, why = land(t, base, wt, branch, pubs)
-            if verdict == "done":
-                put_status(t["id"], "done", f"escalated {first}→{up}: {why1}" if up else None)
+            if verdict in ("done", "review"):
+                put_status(t["id"], verdict, "; ".join(x for x in (
+                    f"escalated {first}→{up}: {why1}" if up else "", why if verdict == "review" else "") if x) or None)
                 if up:
                     t2 = load(ITEMS)[t["id"]]
                     t2["tier"] = up
                     dump(t2, TASK_KEYS)
-                print(f"  done     {t['id']}  {why}")
+                print(f"  {verdict:<8} {t['id']}  {why}")
                 e = epics.get(t.get("epic"))
-                if e and epic_complete(e["id"], load(ITEMS)):
+                if verdict == "done" and e and epic_complete(e["id"], load(ITEMS)):
                     try:
                         finish_epic(e["id"])
                     except GitError as err:
@@ -1867,7 +2027,7 @@ def dispatch(args):
             e = epics.get(t.get("epic"))
             print(f"  would run  {t['id']}  {t['tier']:<6}  on {epic_branch(e) if e else MAIN}"
                   + also(t) + (f", reviewed by {reviewer_tier(t['tier'])}" if t["tier"] in REVIEW else "")
-                  + f"  {t['title']}")
+                  + (", held for your accept" if needs_accept(t) else "") + f"  {t['title']}")
         if not plan:
             print("nothing to dispatch")
         if cap is not None:
@@ -1884,9 +2044,9 @@ def dispatch(args):
                     print(f"  held       {a['id']} behind {b['id']}: both touch {', '.join(shared(a, b))}")
                     break
         for a in plan:
-            for b in (t for t in tasks.values() if t["status"] == "doing"):
+            for b in (t for t in tasks.values() if t["status"] in ("doing", "review")):
                 if shared(a, b):
-                    print(f"  overlap    {a['id']} and {b['id']} (doing) both touch {', '.join(shared(a, b))}")
+                    print(f"  overlap    {a['id']} and {b['id']} ({b['status']}) both touch {', '.join(shared(a, b))}")
     else:
         running, launched, active = {}, 0, {}  # active: running task id -> task
         stops, tick = [], 0.25
@@ -1954,7 +2114,9 @@ def dispatch(args):
         cost = sum(r[3].get("cost", 0) for r in results)
         done = sum(r[1] == "done" for r in results)
         rcost = sum(r[3].get("review_cost", 0) for r in results)
-        print(f"\n{done}/{len(results)} done, ${cost:.2f}" + (f" (reviews ${rcost:.2f} of it)" if rcost else "")
+        held = sum(r[1] == "review" for r in results)
+        print(f"\n{done}/{len(results)} done" + (f", {held} awaiting your accept" if held else "")
+              + f", ${cost:.2f}" + (f" (reviews ${rcost:.2f} of it)" if rcost else "")
               + f". Logs in {RUNS.relative_to(HOME)}/")
         filed = [f for r in results for f in r[3].get("filed", [])]
         if filed:
@@ -1972,6 +2134,12 @@ def dispatch(args):
     if yours:
         print(f"\nREADY FOR YOU ({len(yours)} human-tier)")
         for t in sorted(yours, key=lambda t: t["id"]):
+            print(line(t, tasks))
+    held = [t for t in tasks.values() if t["status"] == "review"]
+    if held:
+        print(f"\nAWAITING YOUR ACCEPT ({len(held)}): `ergon accept <ID>` lands one, "
+              "`ergon reject <ID> --reason R` sends it back")
+        for t in sorted(held, key=lambda t: t["id"]):
             print(line(t, tasks))
 
 
@@ -2128,6 +2296,8 @@ def report(args):
     section("Landed", landed)
     section("Blocked", [f"  {i}  {t['title']}" + (f"\n      {last_note(t)}" if last_note(t) else "")
                         for i, t in sorted(tasks.items()) if t["status"] == "blocked"])
+    section("Awaiting acceptance", [f"  {i}  {t['title']}  (`ergon accept {i}` or `ergon reject {i} --reason R`)"
+                                    for i, t in sorted(tasks.items()) if t["status"] == "review"])
     out[:] = [l for x in out for l in x.split("\n")]
     groups = {}
     for t in tasks.values():
@@ -2189,6 +2359,7 @@ def main():
         sub.add_parser(name).add_argument("id")
     a = sub.add_parser("approve")
     a.add_argument("ids", nargs="+")
+    sub.add_parser("accept").add_argument("ids", nargs="+")
     r = sub.add_parser("reject")
     r.add_argument("ids", nargs="+")
     r.add_argument("--reason")
@@ -2252,7 +2423,7 @@ def main():
             {"new": new, "set": setf, "start": start, "finish": finish, "close": close,
              "tidy": tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours)
-        {"next": nxt, "review": review, "show": show, "approve": approve, "reject": reject,
+        {"next": nxt, "review": review, "show": show, "approve": approve, "reject": reject, "accept": accept,
          "audit": audit, "stats": stats, "report": report, "check": check, "dispatch": dispatch, "rules": rules}[args.cmd](args)
 
 

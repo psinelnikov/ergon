@@ -63,6 +63,9 @@ touches = ["org/product", ".product/src"]  # default: [name, path]
 forbid_tracker_ids = true
 policy = "docs/public-boundary.md" # cited to workers as the reason
 
+[[accept]]                         # repeatable; matching tasks stop at `review` until a human runs `ergon accept`
+tiers = ["opus"]                   # and/or touches = ["server/**"]; a task's own `accept: yes` also opts in
+
 [[protect]]                        # repeatable; `check` fails an open task below min_tier that touches these
 touches = ["server/auth/**", "prod-db"]  # fnmatch patterns against a task's touches:
 min_tier = "opus"                  # or "human"

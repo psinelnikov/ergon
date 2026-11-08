@@ -17,7 +17,8 @@ The project's own rules (tier signals that are specific to it, hosts that need a
 
 - Every task an agent creates starts `status: proposed`. That includes tasks from breaking down an epic.
 - Only a human moves a task to `ready`: either `ergon approve <ID|E-ID>` from their own terminal (it refuses inside agent shells and asks for confirmation), or by hand-editing `status: ready` + `approved: <name> <date>`.
-- **Agents never write `approved:`, never set `status: ready` on a proposed task, and never work a task that isn't `ready`.** `ergon set` enforces this, and `ergon check` fails on any task past `proposed` that has no stamp. The plugin's PreToolUse hook (`ergon hook guard`) also refuses agent edits that change a task file's `status:` or `approved:`, shell writes to task files, `approve`/`reject`/`close`/`review -i`, and touching `CLAUDECODE`/`AI_AGENT`. Its Stop hook runs `check` once before a session ends. All of it is a speed bump, not security. Bypassing it breaks this rule.
+- **Agents never write `approved:`, never set `status: ready` on a proposed task, and never work a task that isn't `ready`.** `ergon set` enforces this, and `ergon check` fails on any task past `proposed` that has no stamp. The plugin's PreToolUse hook (`ergon hook guard`) also refuses agent edits that change a task file's `status:` or `approved:`, shell writes to task files, `approve`/`reject`/`close`/`accept`/`review -i`, and touching `CLAUDECODE`/`AI_AGENT`. Its Stop hook runs `check` once before a session ends. All of it is a speed bump, not security. Bypassing it breaks this rule.
+- **Humans accept output too, where the project asks for it.** A task marked for acceptance (its own `accept: yes`, or an `[[accept]]` rule in `.ergon.toml` matching its tier or `touches:`) stops at `status: review` when dispatch would land it: verify and any reviewer agent have passed, the branch and worktree are kept, nothing is merged. Only a human moves it on: `ergon accept <ID|E-ID>` lands it (the merge dispatch would have done, then the epic closes if that was its last task), and `ergon reject <ID> --reason R` sends it back to `ready` with the reason in its Notes. Both refuse inside agent shells and ask for confirmation, like `approve`. **Agents never move a task out of `review`, never take `accept:` off a task, and never run `accept`.** `set` refuses the move, and the guard refuses the file edits and the command.
 - Reviewing a long queue: `ergon review -i [--epic E-00N] [--tier T]` walks it one task at a time (approve / reject / change tier / open in `$EDITOR` / skip). Human only, like `approve`.
 - Pick work with `ergon next --tier <your tier>`. Take only tasks at your tier or below. To run many at once, see Dispatch below.
 
@@ -37,11 +38,13 @@ When in doubt, go one tier up. Put the reason in `tier_why:` in one line. If a t
 ## Lifecycle
 
 ```
-proposed --(human approve)--> ready --> doing --> done
-    \--(human reject)--> dropped     \-> blocked -/
+proposed --(human approve)--> ready --> doing ------> done <--(human accept)--.
+    \--(human reject)--> dropped ^       |  \-> blocked -/                    |
+                                 |       \--(dispatch, if marked)--------> review
+                                 \----------(human reject --reason)----------/
 ```
 
-Agents move tasks through `ready → doing → done|blocked` with `ergon set T-012 status=doing`. When you finish one, the commit message says what changed and cites the task ID. `## Notes` is local scratch. For a `human` task with no code change, record the evidence in the epic's next commit or in the project's log.
+Agents move tasks through `ready → doing → done|blocked` with `ergon set T-012 status=doing`. Only dispatch moves a task into `review`, and only a human's `accept` or `reject` moves it out; `ergon review` lists those tasks under AWAITING ACCEPTANCE. When you finish one, the commit message says what changed and cites the task ID. `## Notes` is local scratch. For a `human` task with no code change, record the evidence in the epic's next commit or in the project's log.
 
 `ergon close ID --as done|dropped --reason R` (human only) closes an approved task whose work landed elsewhere or that no longer applies.
 
@@ -56,7 +59,7 @@ If `.ergon.toml` sets `map`, cards under it can link a known gap to the task tha
 id: T-012
 title: Imperative, ≤70 chars
 tier: sonnet            # haiku | sonnet | opus | human
-status: proposed        # proposed | ready | doing | blocked | done | dropped
+status: proposed        # proposed | ready | doing | review | blocked | done | dropped
 epic: E-002             # optional
 depends: [T-010]        # must be done before this is pickable
 touches: [server/auth, prod-db]   # paths, hosts, nouns, companion repo names
@@ -64,6 +67,7 @@ source: TODO.md:1425    # where it came from (the `log` file, an issue, a doc)
 created: 2026-10-04
 approved:               # "<name> <date>", written by a human only
 tier_why: one line
+accept: yes             # optional: dispatch holds the finished branch at `review` for a human
 ---
 ## What
 ## Done when
@@ -113,7 +117,8 @@ ergon dispatch --watch --budget-total 20 --interval 30   # keep running; pick up
   - Each review counts toward `--budget` (per call), `--budget-total`, the run summary (`$X (reviews $Y of it)`) and the spend in `stats` and `report`, under the task's tier. It isn't counted as a run.
   - The reviewer is a second opinion, not a security boundary: it reads text the worker wrote, so a worker can try to talk it into a pass. Verify is the mechanical check.
   - The done checks, verify and review touch only the task's own worktree and branch, so they run outside the state lock. A slow one doesn't hold up other tasks landing.
-- **Done** means the worker said so, left no uncommitted changes (in any tree), a commit on `task/<ID>` cites the ID, and verify and review (where set) passed. Companion branches are checked first (no tracker ID if forbidden, clean merges everywhere), then merged into each companion's local trunk, then the task branch into its base. Then the worktrees and branches are deleted (companions first), the task goes `done`, and if it was the epic's last task the epic closes. Nothing is pushed.
+- **Accept.** Opt-in: a task with `accept: yes`, or one matching an `[[accept]]` rule in `.ergon.toml` (`tiers = ["opus"]` and/or `touches = ["server/**"]`, fnmatch like `[[protect]]`; a rule with both needs both), doesn't land when its gate passes. Dispatch sets it `review` instead, notes how to accept or reject it, keeps the worktrees and branches, and lists it at the end of the run. `--dry-run` marks it `held for your accept`. Dispatch decides from the task as it was at launch, so a worker that edits its own task file can't skip the hold. After `--escalate`, the tier that finished counts too. `ergon accept` lands it later as dispatch would have (refusing while a worktree has uncommitted changes), always with a merge commit, `Merge T-NNN: <title>` plus `Accepted by <name> <date>`, so history keeps who accepted it. If that merge fails the task goes `blocked` with the reason. A rejected task's next worker is shown the human's reason and picks up the same branch. Nothing opts a task out of a matching rule, and `ergon check` fails a task in `review` whose `task/<ID>` branch is gone.
+- **Done** means the worker said so, left no uncommitted changes (in any tree), a commit on `task/<ID>` cites the ID, and verify and review (where set) passed, and no human acceptance is required (see Accept). Companion branches are checked first (no tracker ID if forbidden, clean merges everywhere), then merged into each companion's local trunk, then the task branch into its base. Then the worktrees and branches are deleted (companions first), the task goes `done`, and if it was the epic's last task the epic closes. Nothing is pushed.
 - **Anything else is `blocked`,** with a line in `## Notes` giving the reason, the log in `<state>/runs/`, and the `claude --resume <session>` to inspect it. The worktrees and branches stay. Fix it (or merge by hand and set it `done`), or move it back to `ready`; the next dispatch reuses the branches and tells the worker an earlier attempt exists. If a companion merge landed but a later merge failed, the note says which landed.
 - **Skipped:** `human` tasks (listed at the end as yours), and tasks whose `touches:` include a nested repo, which a worktree doesn't contain. Work those interactively.
 - **Overlap.** A task whose `touches:` share a path with a running one (companion names themselves don't count) is held, not started, until that one lands or blocks, so the second never conflicts with the first. `--dry-run` prints `held  T-2 behind T-1` for these, and `overlap` for a shared path with a task already `doing` elsewhere.

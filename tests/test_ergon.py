@@ -675,6 +675,155 @@ class TestReview(DispatchProject):
         self.assertIn("review lists worker tiers", r.stderr)
 
 
+class TestAccept(DispatchProject):
+    """Human acceptance of output: dispatch holds a marked task at `review` instead of landing it."""
+    config = DispatchProject.config + '''
+        [[accept]]
+        tiers = ["opus"]
+
+        [[accept]]
+        touches = ["server/**"]
+    '''
+
+    def human(self, *args, answer="y"):
+        """Run ergon the way a human does: on a terminal of its own, answering the [y/N] prompt."""
+        import pty
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.chdir(self.root)
+                env = {k: v for k, v in self.env.items() if k not in ("CLAUDECODE", "AI_AGENT")}
+                os.execve(sys.executable, [sys.executable, str(ERGON), *args], env)
+            finally:
+                os._exit(127)
+        os.write(fd, (answer + "\n").encode())
+        out = b""
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        _, status = os.waitpid(pid, 0)
+        return os.waitstatus_to_exitcode(status), out.decode(errors="replace")
+
+    def has_branch(self, name):
+        return bool(sh("git", "branch", "--list", name, cwd=self.root).stdout.strip())
+
+    def on(self, branch, path):
+        return sh("git", "cat-file", "-e", f"{branch}:{path}", cwd=self.root, check=False).returncode == 0
+
+    def test_review_holds_then_accept_lands_and_closes_epic(self):
+        self.ergon("new", "epic", "Big thing")
+        self.ergon("new", "task", "Risky", "--tier", "opus", "--epic", "E-001")
+        self.ergon("new", "task", "Routine", "--tier", "sonnet", "--epic", "E-001")
+        for t in ("T-001", "T-002"):
+            stamp(self.task_file(t))
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertIn("held for your accept", [l for l in dry.splitlines() if "T-001" in l][0])
+        self.assertNotIn("held for your accept", [l for l in dry.splitlines() if "T-002" in l][0])
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-002"), "done", out)
+        self.assertEqual(self.status("T-001"), "review", out)
+        self.assertIn("1 awaiting your accept", out)
+        self.assertIn("AWAITING YOUR ACCEPT (1)", out)
+        epic = next((self.root / "tasks/epics").glob("E-001-*"))
+        self.assertIn("status: open", (epic / "EPIC.md").read_text())  # not complete: T-001 isn't done
+        branch = f"epic/{epic.name}"
+        self.assertTrue(self.on(branch, "T-002.txt"))
+        self.assertFalse(self.on(branch, "T-001.txt"))  # nothing of T-001 merged
+        self.assertTrue(self.has_branch("task/T-001"))
+        self.assertTrue((self.root / ".claude" / "worktrees" / "T-001").is_dir())
+        self.assertIn("ergon accept T-001", self.task_file("T-001").read_text())
+        self.ergon("check")
+        self.assertIn("AWAITING ACCEPTANCE (1)", self.ergon("review").stdout)
+
+        # Agents can't get it out of review: not by set, not by editing the file, not by accept.
+        r = self.ergon("set", "T-001", "status=done", check=False)
+        self.assertIn("review -> done not allowed", r.stderr)
+        f = str(self.task_file("T-001"))
+        self.assertIn("ergon accept", self.guard("Edit", {"file_path": f, "old_string": "status: review",
+                                                         "new_string": "status: done"}))
+        self.assertIn("human-only", self.guard("Bash", {"command": "ergon accept T-001"}))
+        self.assertIn("human-only", self.guard("Bash", {"command": "python3 ergon.py accept E-001"}))
+        r = self.ergon("accept", "T-001", check=False, env=clean_env(CLAUDECODE="1"))
+        self.assertIn("agent shell", r.stderr)
+        self.assertEqual(self.status("T-001"), "review")
+
+        code, out = self.human("accept", "T-001", answer="n")
+        self.assertIn("aborted", out)
+        self.assertEqual(self.status("T-001"), "review")
+        code, out = self.human("accept", "E-001")  # an epic ID accepts its tasks in review
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("accepted by Tester", self.task_file("T-001").read_text())
+        self.assertIn("status: done", (epic / "EPIC.md").read_text())  # its last task: the epic closed
+        self.assertTrue((self.root / "T-001.txt").exists())  # in the checked-out trunk
+        self.assertTrue((self.root / "T-002.txt").exists())
+        self.assertIn("Merge E-001: Big thing", sh("git", "log", "-1", "--format=%B", "main", cwd=self.root).stdout)
+        self.assertRegex(sh("git", "log", "--format=%B", "main", cwd=self.root).stdout,
+                         r"Merge T-001: Risky\n\nAccepted by Tester \d{4}-")  # history records who accepted
+        self.assertFalse(self.has_branch("task/T-001"))
+        self.assertFalse(self.has_branch(branch))
+        self.assertFalse((self.root / ".claude" / "worktrees" / "T-001").exists())
+
+    def test_reject_sends_review_back_to_ready(self):
+        self.ergon("new", "task", "Api", "--tier", "haiku", "--touches", "server/api.py")
+        self.ergon("new", "task", "Opted in", "--tier", "sonnet")
+        self.ergon("new", "task", "Plain", "--tier", "sonnet")
+        for t in ("T-001", "T-002", "T-003"):
+            stamp(self.task_file(t))
+        f2 = self.task_file("T-002")
+        f2.write_text(f2.read_text().replace("\ntier:", "\naccept: yes\ntier:", 1))
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "review", out)  # an [[accept]] touches rule
+        self.assertEqual(self.status("T-002"), "review", out)  # its own accept: yes
+        self.assertEqual(self.status("T-003"), "done", out)
+
+        # An agent can't take the mark off.
+        self.assertIn("only a human", self.guard("Edit", {"file_path": str(f2), "old_string": "accept: yes\n",
+                                                         "new_string": ""}))
+        r = self.ergon("set", "T-003", "accept=no", check=False)
+        self.assertIn("only turn `accept:` on", r.stderr)
+
+        code, out = self.human("reject", "T-001")
+        self.assertNotEqual(code, 0)
+        self.assertIn("needs --reason", out)
+        code, out = self.human("reject", "T-001", "--reason", "no test for the 404 path")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.status("T-001"), "ready")
+        self.assertIn("review: rejected by Tester: no test for the 404 path", self.task_file("T-001").read_text())
+        self.assertTrue(self.has_branch("task/T-001"))  # kept for the next attempt
+        self.assertFalse((self.root / "T-001.txt").exists())
+
+        seen = Path(self.tmp.name) / "seen.jsonl"
+        self.env["FAKE_SEEN"] = str(seen)
+        time.sleep(1.1)  # run logs are named to the second
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "review", out)  # held again
+        prompt = json.loads(seen.read_text().splitlines()[0])["prompt"]
+        self.assertIn("rejected by Tester: no test for the 404 path", prompt)
+        self.assertIn("An earlier attempt left commits", prompt)
+
+        # A review task whose branch is gone has nothing to accept: check says so.
+        self.ergon("check")
+        sh("git", "worktree", "remove", "--force", str(self.root / ".claude" / "worktrees" / "T-002"), cwd=self.root)
+        sh("git", "branch", "-D", "task/T-002", cwd=self.root)
+        r = self.ergon("check", check=False)
+        self.assertIn("T-002: in review but branch task/T-002 is gone", r.stdout)
+        code, out = self.human("accept", "T-002")
+        self.assertNotEqual(code, 0)
+        self.assertIn("no branch task/T-002", out)
+        self.assertEqual(self.status("T-002"), "review")
+
+    def test_bad_accept_config(self):
+        (self.root / ".ergon.toml").write_text('[[accept]]\ntiers = ["human"]\n')
+        r = self.ergon("board", check=False)
+        self.assertIn("[[accept]] #1 needs tiers", r.stderr)
+
+
 class TestStats(Project):
     def test_stats_per_tier(self):
         self.ergon("new", "task", "A", "--tier", "sonnet")
