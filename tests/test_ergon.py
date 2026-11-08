@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import textwrap
 import unittest
 from pathlib import Path
@@ -565,6 +566,29 @@ class TestStats(Project):
         self.assertEqual(rows["haiku"], ["haiku", "2", "1", "1", "50%", "$0.25", "$0.12", "1"])
         self.assertIn("T-001 x2", out)
         self.assertIn("skipped 2", out)
+
+
+class TestReport(Project):
+    def test_report_sections(self):
+        for n in "ABCD":
+            self.ergon("new", "task", f"Task {n}", "--tier", "sonnet")
+        for tid, st in (("T-001", "done"), ("T-002", "blocked")):
+            f = self.task_file(tid)
+            f.write_text(re.sub(r"^status: \w+$", f"status: {st}", f.read_text(), flags=re.M))
+        f = self.task_file("T-002")
+        f.write_text(f.read_text().rstrip() + "\n- 2026-11-08 dispatch: needs a decision\n")
+        (self.root / "x.txt").write_text("x")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "Land it (T-001)"], check=True)
+        time.sleep(1.1)  # git --since has one-second resolution
+        out = self.ergon("report").stdout
+        self.assertRegex(out, r"Landed\n  T-001  Task A\n      \w+ Land it \(T-001\)")
+        self.assertRegex(out, r"Blocked\n  T-002  Task B\n      .*needs a decision")
+        self.assertRegex(out, r"Awaiting approval\n  2 proposed\n    -\s+sonnet\s+2")
+        self.assertNotIn("Human tasks", out)
+        self.assertNotIn("Spend", out)
+        self.assertTrue((self.root / "tasks" / ".report-last").exists())
+        self.assertNotIn("Landed", self.ergon("report", "--since", "last").stdout)
 
 
 if __name__ == "__main__":

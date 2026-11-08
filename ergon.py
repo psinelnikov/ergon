@@ -1922,6 +1922,64 @@ def stats(args):
         print(f"\nskipped {r['skipped']} unreadable or unmatched log(s)")
 
 
+def last_note(t):
+    """The last bullet under the task's ## Notes, or ''."""
+    _, _, notes = t["_body"].partition("## Notes")
+    bullets = [l[2:].strip() for l in notes.splitlines() if l.startswith("- ")]
+    return bullets[-1] if bullets else ""
+
+
+def report(args):
+    tasks = load(ITEMS)
+    mark = STATE / ".report-last"
+    since = args.since
+    if since == "last":
+        since = mark.read_text().strip() if mark.exists() else None
+    cited = {}
+    try:
+        rows = git("log", "--all", "--format=%h %s", *([f"--since={since}"] if since else []), raw=True)
+    except GitError:
+        rows = ""
+    for row in rows.splitlines():
+        for tid in dict.fromkeys(re.findall(r"\bT-\d{3,}\b", row)):
+            cited.setdefault(tid, []).append(row)
+    width = min(shutil.get_terminal_size((80, 24)).columns, 100)
+    clip = lambda text: text if len(text) <= width else text[:width - 1] + "…"
+    out = []
+
+    def section(title, lines):
+        if lines:
+            out.append(f"{title}{' (since ' + since + ')' if since and title == 'Landed' else ''}")
+            out.extend(clip(l) for l in lines)
+            out.append("")
+
+    landed = []
+    for i, t in sorted(tasks.items()):
+        if t["status"] == "done" and (not since or i in cited):
+            landed.append(f"  {i}  {t['title']}")
+            landed.extend(f"      {c}" for c in cited.get(i, [])[:3])
+    section("Landed", landed)
+    section("Blocked", [f"  {i}  {t['title']}" + (f"\n      {last_note(t)}" if last_note(t) else "")
+                        for i, t in sorted(tasks.items()) if t["status"] == "blocked"])
+    out[:] = [l for x in out for l in x.split("\n")]
+    groups = {}
+    for t in tasks.values():
+        if t["status"] == "proposed":
+            key = (t.get("epic") or "-", t.get("tier") or "?")
+            groups[key] = groups.get(key, 0) + 1
+    section("Awaiting approval", [f"  {sum(groups.values())} proposed"]
+            + [f"    {e:<8} {tier:<7} {n}" for (e, tier), n in sorted(groups.items())] if groups else [])
+    section("Human tasks ready", [f"  {line(t, tasks).strip()}" for t in tasks.values()
+                                  if t["status"] == "ready" and t.get("tier") == "human"])
+    r = aggregate_stats(RUNS, tasks, since=since[:10] if since else None)
+    runs = sum(v["runs"] for v in r["tiers"].values())
+    if runs:
+        section("Spend", [f"  ${sum(v['cost'] for v in r['tiers'].values()):.2f} over {runs} run(s)"]
+                + [f"    {k:<7} ${v['cost']:.2f}  {v['runs']} run(s)" for k, v in r["tiers"].items()])
+    print("\n".join(out).rstrip() or "(nothing to report)")
+    mark.write_text(datetime.datetime.now().isoformat(timespec="seconds") + "\n")
+
+
 def guide(args):
     text = GUIDE.read_text()
     print(re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.S).strip())
@@ -1976,6 +2034,8 @@ def main():
     ss = sub.add_parser("stats")
     ss.add_argument("--since", metavar="DATE", help="YYYY-MM-DD: runs started that day or later")
     ss.add_argument("--epic")
+    rp = sub.add_parser("report")
+    rp.add_argument("--since", metavar="DATE|last", help="YYYY-MM-DD, or `last` for the previous report")
     sub.add_parser("check")
     sub.add_parser("tidy")
     d = sub.add_parser("dispatch")
@@ -2026,7 +2086,7 @@ def main():
              "tidy": tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours)
         {"next": nxt, "review": review, "show": show, "approve": approve, "reject": reject,
-         "audit": audit, "stats": stats, "check": check, "dispatch": dispatch, "rules": rules}[args.cmd](args)
+         "audit": audit, "stats": stats, "report": report, "check": check, "dispatch": dispatch, "rules": rules}[args.cmd](args)
 
 
 if __name__ == "__main__":
