@@ -28,10 +28,10 @@ The only requirements are Python 3.9+ (standard library only) and git. Dispatch 
 ```bash
 # 1. The plugin: hooks, agents, skills
 claude plugin marketplace add ~/code/ergon        # or the git URL
-claude plugin install ergon@ergon --scope project # run in each project that uses it
+claude plugin install ergon@ergon                 # user scope; hooks stay silent in repos without .ergon.toml
 
 # 2. The CLI on your PATH (humans and agents both call `ergon`)
-pipx install -e ~/code/ergon                      # or: uv tool install -e ~/code/ergon
+uv tool install -e ~/code/ergon                   # or: pipx install -e ~/code/ergon
 ```
 
 Then, in a project:
