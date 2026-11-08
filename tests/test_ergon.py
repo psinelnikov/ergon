@@ -19,11 +19,22 @@ import ergon  # noqa: E402
 
 FAKE_CLAUDE = r'''#!/usr/bin/env python3
 """Stands in for `claude -p`: commits a change citing the task, in the task worktree and in
-any companion worktree inside it, then reports RESULT: done."""
+any companion worktree inside it, then reports RESULT: done. As the task-review agent it
+reports $FAKE_REVIEW (default REVIEW: pass) and appends its model and prompt to $FAKE_SEEN."""
 import json, os, re, subprocess, sys, time
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 prompt = sys.argv[-1]
 tier = sys.argv[sys.argv.index("--agent") + 1].replace("task-", "").upper()
+if os.environ.get("FAKE_SEEN"):
+    agents = json.loads(sys.argv[sys.argv.index("--agents") + 1])
+    with open(os.environ["FAKE_SEEN"], "a") as f:
+        f.write(json.dumps({"agent": tier, "model": agents["task-" + tier.lower()]["model"], "prompt": prompt}) + "\n")
+if tier == "REVIEW":
+    if os.environ.get("FAKE_REVIEW_COMMIT"):
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "sneaky"], check=True)
+    print(json.dumps({"result": "looked\n" + os.environ.get("FAKE_REVIEW", "REVIEW: pass"),
+                      "session_id": "r-1", "total_cost_usd": 0.02}))
+    sys.exit()
 tid = re.search(r"dispatched on (T-\d+)", prompt).group(1)
 def commit(where, msg):
     with open(os.path.join(where, f"{tid}.txt"), "a") as f:
@@ -279,7 +290,8 @@ class TestEpicBranch(Project):
         self.assertEqual(branches.strip(), "")
 
 
-class TestDispatch(Project):
+class DispatchProject(Project):
+    """A project with a companion checkout, worker rules and the fake `claude` on PATH."""
     config = '''
         trunk = "main"
         worker_rules = "WORKER.md"
@@ -305,6 +317,8 @@ class TestDispatch(Project):
         (bindir / "claude").chmod(0o755)
         self.env = clean_env(PATH=f"{bindir}:{os.environ['PATH']}")
 
+
+class TestDispatch(DispatchProject):
     def test_dispatch_lands_on_both_sides(self):
         self.ergon("new", "task", "Private only", "--tier", "haiku")
         self.ergon("new", "task", "Touch public", "--tier", "sonnet", "--touches", "acme/public")
@@ -540,6 +554,125 @@ class TestDispatch(Project):
         self.assertIn("Never touch prod.", prompt)
         self.assertIn("doesn't name acme/public", prompt)
         self.assertEqual(self.status("T-001"), "blocked")
+
+
+class TestReview(DispatchProject):
+    config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n        review = ["haiku", "opus"]')
+
+    def setUp(self):
+        super().setUp()
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        self.env["FAKE_SEEN"] = str(self.seen)
+
+    def calls(self):
+        return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+
+    def test_review_gates_landing(self):
+        cases = [("pass", "REVIEW: pass", None, "done", None),
+                 ("fail", "REVIEW: fail \u2014 skipped the Done when tests", None, "blocked",
+                  "review (sonnet) failed: skipped the Done when tests"),
+                 ("no line", "Looks fine to me.", None, "blocked", "didn't end with a `REVIEW: pass`"),
+                 ("pass not last", "REVIEW: pass\nbut wait, one more thing", None, "blocked", "didn't end with"),
+                 ("misspelt", "REVIEW: passed", None, "blocked", "didn't end with"),
+                 ("not json", None, None, "blocked", "wasn't JSON"),
+                 ("changed branch", "REVIEW: pass", "1", "blocked", "changed the branch or worktree")]
+        for name, review, sneak, want, why in cases:
+            with self.subTest(name):
+                self.setUp()
+                self.ergon("new", "task", "Reviewed", "--tier", "haiku")
+                stamp(self.task_file("T-001"))
+                if review is None:  # a reviewer that prints garbage instead of JSON
+                    bindir = Path(self.tmp.name) / "bin"
+                    fake = (bindir / "claude").read_text()
+                    (bindir / "claude").write_text(fake.replace('if tier == "REVIEW":', 'if tier == "REVIEW":\n    print("oops"); sys.exit()', 1))
+                else:
+                    self.env["FAKE_REVIEW"] = review
+                if sneak:
+                    self.env["FAKE_REVIEW_COMMIT"] = sneak
+                out = self.ergon("dispatch").stdout
+                self.assertEqual(self.status("T-001"), want, out)
+                calls = self.calls()
+                self.assertEqual([c["agent"] for c in calls], ["HAIKU", "REVIEW"])
+                self.assertEqual(calls[1]["model"], "sonnet")  # one tier above the worker
+                prompt = calls[1]["prompt"]
+                self.assertIn("You are reviewing T-001", prompt)
+                self.assertIn("title: Reviewed", prompt)
+                self.assertIn("git diff main...task/T-001", prompt)
+                self.assertIn("+work", prompt)
+                self.assertIn("Never touch prod.", prompt)
+                reviews = list((self.root / "tasks" / "runs").glob("T-001-*-review.json"))
+                self.assertEqual(len(reviews), 1)
+                cost = "$0.03 (reviews $0.02 of it)" if review is not None else "$0.01"
+                self.assertIn(f"1 done, " if want == "done" else "0/1 done, ", out)
+                self.assertIn(cost, out)
+                if want == "done":
+                    self.assertTrue((self.root / "T-001.txt").exists())
+                    self.assertIn("review   T-001  sonnet: pass", out)
+                else:
+                    text = self.task_file("T-001").read_text()
+                    self.assertIn(why, text)
+                    self.assertIn("review log tasks/runs/T-001-", text)
+                    self.assertIn("Branch task/T-001 and worktree", text)
+                    self.assertFalse((self.root / "T-001.txt").exists())  # nothing merged
+                    self.assertIn("task/T-001", sh("git", "branch", "--list", "task/T-001", cwd=self.root).stdout)
+                    self.assertFalse(list(self.root.glob("tasks/**/T-002*")))  # no human task filed
+
+    def test_review_tiers_and_retry_prompt(self):
+        self.ergon("new", "task", "Unreviewed", "--tier", "sonnet")
+        self.ergon("new", "task", "Top", "--tier", "opus")
+        for t in ("T-001", "T-002"):
+            stamp(self.task_file(t))
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertRegex(dry, r"T-002  opus .*, reviewed by opus")
+        self.assertNotIn("reviewed by", [l for l in dry.splitlines() if "T-001" in l][0])
+        self.env["FAKE_REVIEW"] = "REVIEW: fail \u2014 no test for the edge case"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)  # sonnet isn't in review: no reviewer
+        self.assertEqual(self.status("T-002"), "blocked", out)
+        reviews = [c for c in self.calls() if c["agent"] == "REVIEW"]
+        self.assertEqual([c["model"] for c in reviews], ["opus"])  # capped: opus reviews opus
+        # A human moves it back to ready; the retry is told what the reviewer said.
+        f = self.task_file("T-002")
+        f.write_text(re.sub(r"^status: blocked$", "status: ready", f.read_text(), flags=re.M))
+        self.env["FAKE_REVIEW"] = "REVIEW: pass"
+        self.seen.unlink()
+        time.sleep(1.1)  # run logs are named to the second
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-002"), "done", out)
+        worker = [c for c in self.calls() if c["agent"] == "OPUS"][0]["prompt"]
+        self.assertIn("The reviewer vetoed the last attempt: review (opus) failed: no test for the edge case", worker)
+        self.assertRegex(worker, r"Its full review is in /\S+/tasks/runs/T-002-\d+-\d+-review\.json\.")
+        self.assertIn("An earlier attempt left commits", worker)
+        stats = self.ergon("stats").stdout
+        opus = [l.split() for l in stats.splitlines() if l.startswith("opus")][0]
+        self.assertEqual(opus[:4], ["opus", "2", "2", "0"])  # reviews aren't runs
+        self.assertEqual(opus[5], "$0.06")  # two worker runs + two reviews
+
+    def test_review_sees_companion_diff(self):
+        self.ergon("new", "task", "Touch public", "--tier", "haiku", "--touches", "acme/public")
+        stamp(self.task_file("T-001"))
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertTrue((self.root / "pub" / "src" / "T-001.txt").exists())
+        prompt = [c for c in self.calls() if c["agent"] == "REVIEW"][0]["prompt"]
+        self.assertIn("Companion repo acme/public", prompt)
+        self.assertIn("diff main...task/T-001`:", prompt)
+        self.assertEqual(prompt.count("+work"), 2)  # the task's diff and the companion's
+
+    def test_escalated_task_is_reviewed_from_the_tier_that_finished(self):
+        self.ergon("new", "task", "Hard", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+        self.env["FAKE_RESULT_HAIKU"] = "RESULT: blocked \u2014 too hard"
+        out = self.ergon("dispatch", "--escalate").stdout
+        self.assertEqual(self.status("T-001"), "done", out)  # sonnet isn't listed, haiku is
+        self.assertEqual([(c["agent"], c["model"]) for c in self.calls()],
+                         [("HAIKU", "haiku"), ("SONNET", "sonnet"), ("REVIEW", "opus")])
+        self.assertIn("A sonnet-tier worker says", self.calls()[2]["prompt"])
+
+    def test_bad_review_config(self):
+        (self.root / ".ergon.toml").write_text('review = ["human"]\n')
+        r = self.ergon("board", check=False)
+        self.assertIn("review lists worker tiers", r.stderr)
 
 
 class TestStats(Project):

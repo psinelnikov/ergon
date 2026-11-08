@@ -85,6 +85,8 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # worker_rules = "tasks/WORKER.md"      # inlined into every dispatched worker's prompt
 # verify = "make test"          # run in the task worktree before landing; non-zero exit blocks the task
 #                               # (a task's `verify:` frontmatter overrides it)
+# review = ["haiku", "sonnet"]  # worker tiers whose branches a reviewer one tier up must pass before
+#                               # landing (opus reviews opus); a fail blocks the task
 
 # A separate repo checked out inside this one that tasks may change, e.g. a public product
 # repo next to a private install. Each dispatched task touching it gets its own worktree of it.
@@ -185,7 +187,7 @@ def configure(start=None, need_config=True):
     the main checkout: task state, worktrees, run logs and companion checkouts live there, so
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
-        RETIRED_FILE, WORKER_RULES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD
+        RETIRED_FILE, WORKER_RULES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, REVIEW
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -212,6 +214,12 @@ def configure(start=None, need_config=True):
     LOG = opt("log")  # a path relative to the repo, e.g. TODO.md
     RETIRED_FILE = REPO / opt("retired") if opt("retired") else None
     WORKER_RULES = REPO / opt("worker_rules") if opt("worker_rules") else None
+    # Worker tiers whose finished branches a reviewer must pass before they land. Opt-in: none
+    # by default. After --escalate, either the task's own tier or the one that finished counts.
+    REVIEW = CFG.get("review") or []
+    REVIEW = [REVIEW] if isinstance(REVIEW, str) else REVIEW
+    if not isinstance(REVIEW, list) or any(x not in WORKER_TIERS for x in REVIEW):
+        raise NotConfigured(f"{CONFIG_FILE}: review lists worker tiers to review, from {WORKER_TIERS}")
     COMPANIONS = []
     for c in CFG.get("companion") or []:
         if not c.get("path"):
@@ -1433,6 +1441,7 @@ def run_worker(t, base, wt, branch, pubs, args, agents, settings):
                           f"{c['trunk']}..HEAD`).\n")
     except GitError:
         pass
+    retry += review_retry(t)
     links = gitlinks()
     nested = (f"Nested repos ({', '.join(links)}) are empty in this worktree: if the task needs one, "
               "stop blocked.\n") if links else ""
@@ -1552,19 +1561,155 @@ def run_verify(t, wt):
     return f"verify `{cmd}` {how}: {tail} (full output {log.relative_to(HOME)})"
 
 
-def land(t, base, wt, branch, pubs=()):
-    """After a worker says done: verify, merge (companions first), clean up. Returns
-    (verdict, reason). Nothing merges unless every merge would go through cleanly."""
+REVIEW_PROMPT = """You are reviewing {id} before it lands.
+
+Working tree: {wt}, on branch {branch}, cut from {base}. A {tier}-tier worker says the task is done.
+{companions}{rules}
+The task file:
+
+{text}
+
+The diff, `git diff {base}...{branch}`{size}:
+
+{diff}
+"""
+REVIEW_DIFF_MAX = 100_000  # characters inlined per diff; past that the reviewer runs git diff itself
+REVIEW_LINE = re.compile(r"^\W*REVIEW:\s*(pass|fail)\b[\s—:–-]*(.*)$")
+
+
+def reviewer_tier(tier):
+    """Who reviews a tier's work: one tier above, capped at opus (opus reviews opus)."""
+    return WORKER_TIERS[min(WORKER_TIERS.index(tier) + 1, len(WORKER_TIERS) - 1)]
+
+
+def review_agent():
+    """The task-review definition (a project's .claude/agents/task-review.md wins over the
+    plugin's), minus a model: run_review sets that from reviewer_tier()."""
+    path = next(p for p in (AGENTS / "task-review.md", PLUGIN_AGENTS / "task-review.md") if p.exists())
+    m = parse(path)
+    agent = {"description": m["description"], "prompt": m["_body"].strip()}
+    tools = m.get("tools")
+    if tools:
+        agent["tools"] = tools if isinstance(tools, list) else [x.strip() for x in tools.split(",") if x.strip()]
+    return agent
+
+
+def review_diff(base, branch, repo=None):
+    """(diff text for the prompt, size note). Past REVIEW_DIFF_MAX the prompt gets the stat only."""
+    diff = git("diff", f"{base}...{branch}", raw=True, cwd=repo)
+    if len(diff) <= REVIEW_DIFF_MAX:
+        return diff or "(empty)", ""
+    stat = git("diff", "--stat", f"{base}...{branch}", raw=True, cwd=repo)
+    return stat, f" (too long to inline at {len(diff)} characters: its --stat follows; run it yourself)"
+
+
+def tree_state(trees, branch, repos):
+    """What a read-only reviewer must leave as it found it: each tree's HEAD and tracked changes,
+    and where `branch` points in each repo."""
+    return ([(git("rev-parse", "HEAD", cwd=x), dirty_paths(x)) for x in trees]
+            + [git("rev-parse", branch, cwd=r) for r in repos])
+
+
+def run_review(t, tier, base, wt, branch, pubs, args, agent, settings):
+    """Run the reviewer on a finished task branch. Returns (failure reason or None, cost,
+    reviewer tier). Only a last line of `REVIEW: pass` passes: no such line, a fail, output that
+    isn't JSON, an error, a kill, a timeout, or a reviewer that changed the branch or worktree
+    all block the landing."""
+    who = reviewer_tier(tier)
+    trees, repos = [wt] + [pub for _, pub in pubs], [None] + [c["path"] for c, _ in pubs]
+    before = tree_state(trees, branch, repos)
+    diff, size = review_diff(base, branch)
+    companions = ""
+    for c, pub in pubs:
+        cdiff, csize = review_diff(c["trunk"], branch, c["path"])
+        companions += (f"\nCompanion repo {c['name']}: worktree {pub}, branch {branch} cut from its "
+                       f"{c['trunk']}. Its diff, `git -C {pub} diff {c['trunk']}...{branch}`{csize}:\n\n{cdiff}\n")
+    rules = worker_rules()
+    prompt = REVIEW_PROMPT.format(id=t["id"], wt=wt, branch=branch, base=base, tier=tier, companions=companions,
+                                  rules=f"\nThe worker followed these project rules:\n\n{rules}\n" if rules else "",
+                                  text=t["_path"].read_text(), diff=diff, size=size)
+    cmd = ["claude", "-p", "--agents", json.dumps({"task-review": dict(agent, model=who)}),
+           "--agent", "task-review", "--permission-mode", args.permission_mode, "--settings", settings,
+           "--output-format", "json"]
+    if args.budget:
+        cmd += ["--max-budget-usd", str(args.budget)]
+    stem = f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-review"
+    log = RUNS / f"{stem}.json"
+    out, err = run_proc(cmd + [prompt], wt, args.timeout * 60)
+    log.write_text(out)
+    if err.strip():
+        (RUNS / f"{stem}.err").write_text(err)
+    fail = lambda why, cost=0: (f"review ({who}) failed: {why} (review log {log.relative_to(HOME)})", cost, who)
+    if err.startswith(KILLED):
+        return fail("killed by a second Ctrl-C")
+    try:
+        d = json.loads(out)
+        if not isinstance(d, dict):
+            raise ValueError
+    except ValueError:
+        return fail("reviewer output wasn't JSON" + (f" ({err.strip().splitlines()[0]})" if err.strip() else ""))
+    cost = d.get("total_cost_usd") or 0
+    try:
+        changed = tree_state(trees, branch, repos) != before
+    except GitError:
+        changed = True
+    if changed:
+        return fail("the reviewer changed the branch or worktree; it must stay read-only", cost)
+    text = d.get("result") or ""
+    if d.get("is_error"):
+        return fail(f"reviewer errored ({d.get('subtype') or d.get('terminal_reason')}): {text[:200]}", cost)
+    last = next((l for l in reversed(text.strip().splitlines()) if l.strip()), "")
+    m = REVIEW_LINE.match(last.strip(" *`"))
+    if not m:
+        return fail("reviewer didn't end with a `REVIEW: pass` or `REVIEW: fail` line", cost)
+    if m[1] == "pass":
+        return None, cost, who
+    return fail(m[2].strip(" *`") or "(no reason given)", cost)
+
+
+def review_retry(t):
+    """Retry-prompt lines for a task whose last attempt the reviewer vetoed, or ''."""
+    m = re.search(r"\bdispatch: (review \(\w+\) failed: .*)", last_note(t))
+    if not m:
+        return ""
+    log = re.search(r"\(review log (\S+?\.json)\)", m[1])
+    return (f"The reviewer vetoed the last attempt: {m[1]}\n"
+            + (f"Its full review is in {HOME / log[1]}.\n" if log else "")
+            + "Fix what it raised on this branch; it reviews again before this lands.\n")
+
+
+def kept_note(wt, branch, pubs):
+    return f"Branch {branch} and worktree {wt} kept" + "".join(f" ({c['name']} worktree {pub})" for c, pub in pubs)
+
+
+def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings):
+    """After a worker says done, before the merge lock: its done claim holds, verify passes,
+    then the reviewer passes if `review` names the task's tier or `tier`, the one that finished
+    (after --escalate the lower tier's commits are on the branch too). The reviewer is one tier
+    above `tier`. Touches
+    only the task's own worktrees and branch, so a long verify or review doesn't hold the state
+    lock. Returns (failure reason or None, review cost)."""
     for tree in [wt] + [pub for _, pub in pubs]:
         if dirty_paths(tree):
-            return "blocked", f"worker said done but left uncommitted changes in {tree}"
+            return f"worker said done but left uncommitted changes in {tree}", 0
     msgs = git("log", "--format=%B%x1e", f"{base}..{branch}", raw=True)
     if not re.search(rf"\b{t['id']}\b", msgs):
-        return "blocked", f"worker said done but no commit on {branch} cites {t['id']}"
-    kept = f"Branch {branch} and worktree {wt} kept" + "".join(f" ({c['name']} worktree {pub})" for c, pub in pubs)
+        return f"worker said done but no commit on {branch} cites {t['id']}", 0
+    kept = kept_note(wt, branch, pubs)
     failed = run_verify(t, wt)
     if failed:
-        return "blocked", f"{failed}. {kept}"
+        return f"{failed}. {kept}", 0
+    if t["tier"] not in REVIEW and tier not in REVIEW:
+        return None, 0
+    failed, cost, who = run_review(t, tier, base, wt, branch, pubs, args, reviewer, settings)
+    print(f"  review   {t['id']}  {who}: " + ("pass" if not failed else "fail"), flush=True)
+    return (f"{failed}. {kept}" if failed else None), cost
+
+
+def land(t, base, wt, branch, pubs=()):
+    """After gate() passes: merge (companions first), clean up. Returns (verdict, reason).
+    Nothing merges unless every merge would go through cleanly. Caller holds the state lock."""
+    kept = kept_note(wt, branch, pubs)
     for c, pub in pubs:
         if c["forbid_ids"]:
             leak = TRACKER_ID.search(git("log", "--format=%B", f"{c['trunk']}..{branch}", raw=True, cwd=c["path"]))
@@ -1625,6 +1770,7 @@ def dispatch(args):
     links, epics = gitlinks(), load(EPICS)
     ids = set(args.ids.split(",")) if args.ids else None
     agents, settings = worker_agents(), worker_settings()
+    reviewer = review_agent() if REVIEW else None
     tried, skipped, results = set(), {}, []
     cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
     capped = stopped = False
@@ -1669,6 +1815,15 @@ def dispatch(args):
             info2["cost"] = info.get("cost", 0) + info2.get("cost", 0)
             info2["found"] = (info.get("found") or []) + (info2.get("found") or [])
             verdict, info = v2, info2
+        if verdict == "done":
+            try:
+                failed, rcost = gate(t, up or t["tier"], base, wt, branch, pubs, args, reviewer, settings)
+            except GitError as err:
+                failed, rcost = f"{err}. {kept_note(wt, branch, pubs)}", 0
+            info["cost"] = info.get("cost", 0) + rcost
+            info["review_cost"] = rcost
+            if failed:
+                verdict, why = "blocked", failed
         with state_lock():  # also serializes every merge into a companion's trunk
             if verdict == "done":
                 verdict, why = land(t, base, wt, branch, pubs)
@@ -1711,7 +1866,8 @@ def dispatch(args):
         for t in plan:
             e = epics.get(t.get("epic"))
             print(f"  would run  {t['id']}  {t['tier']:<6}  on {epic_branch(e) if e else MAIN}"
-                  + also(t) + f"  {t['title']}")
+                  + also(t) + (f", reviewed by {reviewer_tier(t['tier'])}" if t["tier"] in REVIEW else "")
+                  + f"  {t['title']}")
         if not plan:
             print("nothing to dispatch")
         if cap is not None:
@@ -1797,7 +1953,9 @@ def dispatch(args):
     if results:
         cost = sum(r[3].get("cost", 0) for r in results)
         done = sum(r[1] == "done" for r in results)
-        print(f"\n{done}/{len(results)} done, ${cost:.2f}. Logs in {RUNS.relative_to(HOME)}/")
+        rcost = sum(r[3].get("review_cost", 0) for r in results)
+        print(f"\n{done}/{len(results)} done, ${cost:.2f}" + (f" (reviews ${rcost:.2f} of it)" if rcost else "")
+              + f". Logs in {RUNS.relative_to(HOME)}/")
         filed = [f for r in results for f in r[3].get("filed", [])]
         if filed:
             print(f"{len(filed)} proposed from workers' FOUND lines: {', '.join(filed)}")
@@ -1857,7 +2015,8 @@ def aggregate_stats(runs_dir, tasks, since=None, epic=None):
     since: 'YYYY-MM-DD' (runs started that day or later); epic: only that epic's tasks.
     Returns {"tiers": {tier: {runs, done, blocked, timeouts, cost}}, "repeat": {id: blocked
     count} for tasks blocked more than once, "skipped": logs that were unreadable, not JSON
-    (and not a timeout) or whose task is gone}. Never raises on a bad log."""
+    (and not a timeout) or whose task is gone}. A reviewer's log (<ID>-<time>-review.json) adds
+    its cost to the task's tier but isn't a run. Never raises on a bad log."""
     tiers, per_task, skipped = {}, {}, 0
     for log in sorted(Path(runs_dir).glob("*.json")):
         m = RUN_LOG.match(log.name)
@@ -1871,6 +2030,15 @@ def aggregate_stats(runs_dir, tasks, since=None, epic=None):
         if epic and t.get("epic") != epic:
             continue
         if since and f"{m['date']}-{m['m']}-{m['d']}" < since:
+            continue
+        tier_row = lambda: tiers.setdefault(t.get("tier") or "?", {"runs": 0, "done": 0, "blocked": 0,
+                                                                "timeouts": 0, "cost": 0.0})
+        if log.stem.endswith("-review"):
+            try:
+                d = json.loads(log.read_text())
+                tier_row()["cost"] += float(d.get("total_cost_usd") or 0) if isinstance(d, dict) else 0
+            except (OSError, ValueError, TypeError):
+                pass
             continue
         err = log.with_suffix(".err")
         try:
@@ -1889,8 +2057,7 @@ def aggregate_stats(runs_dir, tasks, since=None, epic=None):
         text = d.get("result") or ""
         found = re.findall(r"^\W*RESULT:\s*(done|blocked)\b", text, re.M)
         verdict = "blocked" if d.get("is_error") or not found else found[-1]
-        row = tiers.setdefault(t.get("tier") or "?", {"runs": 0, "done": 0, "blocked": 0,
-                                                        "timeouts": 0, "cost": 0.0})
+        row = tier_row()
         row["runs"] += 1
         row[verdict] += 1
         row["timeouts"] += timed_out
@@ -1909,8 +2076,8 @@ def stats(args):
         row = r["tiers"].get(tier)
         if not row:
             continue
-        n = row["runs"]
-        print(f"{tier:<8}{n:>5}{row['done']:>6}{row['blocked']:>8}{100 * row['blocked'] / n:>7.0f}%"
+        n = row["runs"] or 1  # only reviews: their worker run fell outside --since
+        print(f"{tier:<8}{row['runs']:>5}{row['done']:>6}{row['blocked']:>8}{100 * row['blocked'] / n:>7.0f}%"
               f"{'$%.2f' % row['cost']:>10}{'$%.2f' % (row['cost'] / n):>9}{row['timeouts']:>9}")
     if not r["tiers"]:
         print("(no runs)")
