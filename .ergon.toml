@@ -1,0 +1,17 @@
+# ergon: https://github.com/<you>/ergon. Paths are relative to this file (the main checkout).
+trunk = "main"                  # epics branch from and merge back into this
+state = "tasks"                 # task files: <state>/items, <state>/epics, dispatch logs <state>/runs
+worktrees = ".claude/worktrees" # one per started epic and per dispatched task
+# map = "map"                   # cards whose "-> task T-NNN" links `check` keeps honest
+# log = "TODO.md"               # the log a task's `source: TODO.md:<line>` cites
+# retired = "tasks/audit-retired.txt"   # `term | gate | note` rows for `audit`
+# worker_rules = "tasks/WORKER.md"      # inlined into every dispatched worker's prompt
+
+# A separate repo checked out inside this one that tasks may change, e.g. a public product
+# repo next to a private install. Each dispatched task touching it gets its own worktree of it.
+# [[companion]]
+# name = "org/product"          # how tasks name it in touches:
+# path = ".product/src"         # its checkout, relative to this file
+# trunk = "main"
+# forbid_tracker_ids = true     # refuse to land commits there that cite T-/E- IDs
+# policy = "docs/boundary.md"   # cited to workers as the reason
