@@ -945,5 +945,81 @@ class TestReport(Project):
         self.assertNotIn("Landed", self.ergon("report", "--since", "last").stdout)
 
 
+
+class TestCommitHook(DispatchProject):
+    """`ergon init --hooks`: git refuses commits citing a task no human approved, whatever agent
+    (or human) makes them."""
+
+    def setUp(self):
+        super().setUp()
+        self.hook = self.root / ".git" / "hooks" / "commit-msg"
+        self.ergon("new", "task", "Proposed", "--tier", "sonnet")
+        self.ergon("new", "task", "Approved", "--tier", "haiku")
+        stamp(self.task_file("T-002"))
+
+    def commit(self, msg, cwd=None):
+        return sh("git", "commit", "--allow-empty", "-m", msg, cwd=cwd or self.root, check=False, env=self.env)
+
+    def test_off_by_default(self):
+        self.assertFalse(self.hook.exists())
+        self.assertEqual(self.commit("Work (T-001)").returncode, 0)
+
+    def test_refuses_unapproved_passes_approved(self):
+        out = self.ergon("init", "--hooks").stdout
+        self.assertIn("installed", out)
+        self.assertTrue(os.access(self.hook, os.X_OK))
+        r = self.commit("Do the proposed thing (T-001)")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("T-001: proposed, and no human has approved it", r.stderr)
+        r = self.commit("Invent a task (T-099)")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("T-099: no such task", r.stderr)
+        self.assertEqual(self.commit("Do the approved thing (T-002)").returncode, 0)
+        self.assertEqual(self.commit("Cites nothing, or an epic E-001").returncode, 0)
+        r = self.commit("Mixed (T-002, T-001)")
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("T-002", r.stderr)
+        # Comment lines git strips don't count ("# On branch task/T-001" in the editor template).
+        (Path(self.tmp.name) / "msg").write_text("Approved work (T-002)\n\n# On branch task/T-001\n")
+        self.assertEqual(sh("git", "commit", "--allow-empty", "--cleanup=strip", "-F",
+                            str(Path(self.tmp.name) / "msg"), cwd=self.root, check=False).returncode, 0)
+        # Hand-editing a task to ready without a stamp isn't approval.
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("status: proposed", "status: ready"))
+        self.assertEqual(self.commit("Sneak (T-001)").returncode, 1)
+
+    def test_worktree_and_merge(self):
+        self.ergon("init", "--hooks")
+        self.ergon("init", "--hooks")  # idempotent: rewrites its own hook
+        wt = Path(self.tmp.name) / "wt"
+        sh("git", "worktree", "add", "-q", "-b", "side", str(wt), cwd=self.root)
+        self.assertEqual(self.commit("From a worktree (T-001)", cwd=wt).returncode, 1)
+        self.assertEqual(self.commit("From a worktree (T-002)", cwd=wt).returncode, 0)
+        # A merge commit only brings in checked commits; epic merges list dropped tasks, say.
+        r = sh("git", "merge", "--no-ff", "-m", "Merge side: T-001 (dropped), T-002", "side",
+               cwd=self.root, check=False, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_dispatch_lands_with_hook(self):
+        self.ergon("init", "--hooks")
+        out = self.ergon("dispatch", "--ids", "T-002").stdout
+        self.assertEqual(self.status("T-002"), "done", out)
+
+    def test_leaves_foreign_hooks_and_non_ergon_repos(self):
+        self.hook.write_text("#!/bin/sh\nexit 0\n")
+        r = self.ergon("init", "--hooks", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("isn't ergon's", r.stderr)
+        self.assertEqual(self.hook.read_text(), "#!/bin/sh\nexit 0\n")
+        self.hook.unlink()
+        sh("git", "config", "core.hooksPath", ".husky", cwd=self.root)
+        r = self.ergon("init", "--hooks", check=False)
+        self.assertIn("core.hooksPath", r.stderr)
+        self.assertFalse(self.hook.exists())
+        sh("git", "config", "--unset", "core.hooksPath", cwd=self.root)
+        self.ergon("init", "--hooks")
+        (self.root / ".ergon.toml").unlink()  # no config: the hook does nothing
+        self.assertEqual(self.commit("Work (T-001)").returncode, 0)
+
 if __name__ == "__main__":
     unittest.main()

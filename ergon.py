@@ -7,7 +7,9 @@ workflow and the approval rule: `ergon guide`. Per-project settings: .ergon.toml
 repo's main checkout (`ergon init` writes one). No dependencies beyond the standard library.
 
   ergon                        board: open work grouped by status, then tier
-  ergon init                   write .ergon.toml, the state folders and .gitignore lines here
+  ergon init [--hooks]         write .ergon.toml, the state folders and .gitignore lines here.
+                               --hooks also installs a git commit-msg hook that refuses commits
+                               citing a task no human approved (covers agents other than Claude Code)
   ergon guide                  print the workflow guide (also the plugin's `ergon` skill)
   ergon rules                  print this project's worker rules (worker_rules in .ergon.toml)
   ergon next [--tier T]        approved, unblocked tasks an agent of tier T may take
@@ -56,6 +58,7 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                read-only: per tier, runs / done / blocked / block rate / cost /
                                timeouts from <state>/runs/*.json, and tasks that blocked twice+
   ergon hook guard|stop        Claude Code hooks (the plugin wires them); not for humans
+  ergon hook commit-msg FILE   the git hook `init --hooks` installs; not for humans
 """
 import argparse
 import datetime
@@ -1489,6 +1492,8 @@ def guard_reason(tool, inp, worker=False):
 
 
 def hook(args):
+    if args.event == "commit-msg":
+        return commit_msg_hook(args)
     try:
         event = json.load(sys.stdin)
         try:
@@ -1511,6 +1516,100 @@ def hook(args):
     except Exception as err:  # fail open
         print(f"ergon hook error (ignored): {err}", file=sys.stderr)
     sys.exit(0)
+
+
+# ---------- git commit-msg hook ----------
+# The Claude Code guard only reaches Claude Code. Agents that read AGENTS.md (Codex, Cursor, ...)
+# meet only the CLI's checks, so `ergon init --hooks` adds the cheapest bump every agent hits:
+# git itself refuses a commit whose message cites a task no human approved. Opt-in, per clone.
+# Like the guard, a speed bump: `git commit --no-verify` skips it, and it fails open on a crash.
+
+COMMIT_HOOK_MARK = "# ergon commit-msg hook"
+COMMIT_HOOK = """#!/bin/sh
+{mark}, written by `ergon init --hooks`. Delete this file to turn it off.
+# Refuses a commit whose message cites a task (T-NNN) no human has approved. A speed bump, not
+# a security boundary: it does nothing in a checkout without .ergon.toml.
+py={python}
+ergon_py={script}
+[ -x "$py" ] || py=python3
+if [ -f "$ergon_py" ]; then exec "$py" "$ergon_py" hook commit-msg "$1"; fi
+if command -v ergon >/dev/null 2>&1; then exec ergon hook commit-msg "$1"; fi
+echo "ergon commit-msg hook: ergon not found, so this commit's task IDs weren't checked" >&2
+"""
+SCISSORS = re.compile(r"^#\s*-+ >8 -+$")
+
+
+def cited_tasks(msg):
+    """Task IDs a commit message cites, ignoring the comment lines git strips (the editor
+    template's "# On branch task/T-012", say) and everything below a `commit -v` scissors line."""
+    kept = []
+    for l in msg.splitlines():
+        if SCISSORS.match(l):
+            break
+        if not l.startswith("#"):
+            kept.append(l)
+    return sorted(set(re.findall(r"\bT-\d{3,}\b", "\n".join(kept))))
+
+
+def commit_msg_reason(msg, tasks):
+    """Why a commit with this message must not land, or None. Each task it cites must exist and
+    carry a human's `approved:` stamp: a proposed task, one rejected to dropped, one hand-edited
+    to ready, or an ID nobody filed are all refused. Epic IDs aren't approved, so aren't checked."""
+    bad = []
+    for tid in cited_tasks(msg):
+        t = tasks.get(tid)
+        if not t:
+            bad.append(f"{tid}: no such task in this tracker")
+        elif not t.get("approved"):
+            bad.append(f"{tid}: {t.get('status') or 'no status'}, and no human has approved it")
+    if not bad:
+        return None
+    return ("ergon: commit refused. It cites tasks no human has approved:\n  " + "\n  ".join(bad) +
+            "\nOnly a human approves a task (`ergon approve`, in their own terminal). Work only `ready` "
+            "tasks (`ergon next`); file new work with `ergon new task` and ask the user to approve it.")
+
+
+def commit_msg_hook(args):
+    """git runs this from the checkout's top level with the message file's path. Exit 1 refuses."""
+    try:
+        try:
+            configure(args.project)
+        except NotConfigured:
+            sys.exit(0)  # not an ergon project: behave as if there were no hook
+        try:
+            git("rev-parse", "-q", "--verify", "MERGE_HEAD")
+            sys.exit(0)  # a merge only brings in commits that were checked when they were made
+        except GitError:
+            pass
+        if not args.msgfile:
+            raise ValueError("no message file given")
+        why = commit_msg_reason(Path(args.msgfile).read_text(errors="replace"), load(ITEMS))
+    except Exception as err:  # fail open, like the Claude Code hooks
+        print(f"ergon commit-msg hook error (ignored): {err}", file=sys.stderr)
+        sys.exit(0)
+    if why:
+        print(why, file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+
+def install_commit_hook():
+    """Write the commit-msg hook into this repo's hooks folder (shared by every worktree). Never
+    overwrites a hook that isn't ergon's, or one managed through core.hooksPath."""
+    line = 'ergon hook commit-msg "$1" || exit 1'
+    managed = subprocess.run(["git", "-C", str(HOME), "config", "core.hooksPath"],
+                             capture_output=True, text=True).stdout.strip()
+    if managed:
+        raise SystemExit(f"core.hooksPath is {managed}, so something else manages this repo's git hooks; "
+                         f"ergon installed none. Add this line to that commit-msg hook:\n  {line}")
+    dest = (HOME / git("rev-parse", "--git-path", "hooks", cwd=HOME)).resolve() / "commit-msg"
+    if dest.exists() and COMMIT_HOOK_MARK not in dest.read_text(errors="replace"):
+        raise SystemExit(f"{dest} exists and isn't ergon's; left it alone. Add this line to it:\n  {line}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(COMMIT_HOOK.format(mark=COMMIT_HOOK_MARK, python=shlex.quote(sys.executable),
+                                       script=shlex.quote(str(HERE / "ergon.py"))))
+    dest.chmod(0o755)
+    print(f"installed {dest}: git now refuses commits citing a task no human has approved")
 
 
 # ---------- dispatch ----------
@@ -2292,6 +2391,8 @@ def init(args):
                     + "# ergon: task state is local; commits that cite task IDs are the record\n"
                     + "\n".join(add) + "\n")
         print(f"added to .gitignore: {' '.join(add)}")
+    if args.hooks:
+        install_commit_hook()
     print("next: enable the ergon plugin for this project (README), then `ergon new epic \"...\"`")
 
 
@@ -2451,8 +2552,11 @@ def main():
     ap = argparse.ArgumentParser(prog="ergon", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
-    for name in ("init", "guide", "rules"):
+    for name in ("guide", "rules"):
         sub.add_parser(name)
+    sub.add_parser("init").add_argument(
+        "--hooks", action="store_true",
+        help="also install a git commit-msg hook refusing commits that cite an unapproved task")
     b = sub.add_parser("board")
     b.add_argument("--tier", choices=TIERS)
     b.add_argument("--epic")
@@ -2522,7 +2626,8 @@ def main():
                    help="when a worker reports blocked, retry once one tier up (haiku→sonnet→opus)")
     d.add_argument("--dry-run", action="store_true")
     hk = sub.add_parser("hook")
-    hk.add_argument("event", choices=["guard", "stop"])
+    hk.add_argument("event", choices=["guard", "stop", "commit-msg"])
+    hk.add_argument("msgfile", nargs="?", help="commit-msg: the file git passes")
     hk.add_argument("--worker", action="store_true", help="dispatch sets this: guard companion checkouts too")
     hk.add_argument("--project", help="the project to guard (default: $CLAUDE_PROJECT_DIR, then the event's cwd)")
     args = ap.parse_args()

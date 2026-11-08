@@ -4,7 +4,7 @@ A task tracker for repos where AI agents do much of the work. **Humans approve, 
 
 - One markdown file per task and per epic. Frontmatter is the state; the body is the brief. The files are local and gitignored, and the commits that cite task IDs are the permanent record.
 - Every task is sized by the cheapest model tier that can do it: `haiku`, `sonnet`, `opus` or `human`.
-- Agents can propose tasks, but only a human can approve one. This is enforced by the CLI, by a lint, and by a Claude Code hook. It's a speed bump, not a security boundary.
+- Agents can propose tasks, but only a human can approve one. This is enforced by the CLI, by a lint, by a Claude Code hook and, if you opt in, by a git hook that covers every other agent too (see [Agents other than Claude Code](#agents-other-than-claude-code)). It's a speed bump, not a security boundary.
 - Each epic gets its own branch, worked in its own git worktree. When its last task closes, the branch merges back with a message listing every task and the commits that cite it.
 - `ergon dispatch` runs approved tasks headless, in parallel: one worktree, one `task/<ID>` branch and one `claude -p` worker per task. Finished branches merge into their epic. Nothing is ever pushed. `ergon dispatch --watch --budget-total USD [--interval SEC]` keeps running and picks up tasks you approve meanwhile, until the cap is reached or Ctrl-C (running workers finish; a second Ctrl-C kills them and marks them blocked).
 - `ergon import gh#123` turns a GitHub issue into a `proposed` task (see [Importing issues](#importing-issues)). When its epic merges, ergon prints the `gh issue comment` / `gh issue close` commands for you to run after you push. It never runs them.
@@ -39,8 +39,25 @@ Then, in a project:
 
 ```bash
 ergon init            # writes .ergon.toml, tasks/items, tasks/epics and the .gitignore lines
+ergon init --hooks    # optional, any time: also the git commit-msg hook (next section)
 ergon new epic "Ship the thing"
 ```
+
+## Agents other than Claude Code
+
+The PreToolUse guard (`ergon hook guard`) only runs inside Claude Code. Codex, Cursor and other agents that read `AGENTS.md` meet only the CLI's own checks. `ergon init --hooks` adds a git `commit-msg` hook. From then on, git refuses any commit whose message cites a task (`T-NNN`) that has no human `approved:` stamp: a `proposed` task, one rejected to `dropped`, one hand-edited to `ready`, or an ID nobody filed. Commits citing approved tasks, epic IDs or nothing at all go through as before.
+
+- **Opt-in, per clone.** Without `--hooks` nothing changes. The hook lives in `.git/hooks/`, so every worktree of that clone shares it, and it isn't committed. It does nothing in a checkout without `.ergon.toml`. To turn it off, delete `.git/hooks/commit-msg`. Ergon never overwrites a `commit-msg` hook it didn't write, and never installs one when `core.hooksPath` is set (husky and the like). It prints the line to add to that hook instead: `ergon hook commit-msg "$1" || exit 1`.
+- **Merges aren't checked.** A merge only brings in commits that were checked when they were made, and an epic's merge message lists its dropped tasks too.
+- **A speed bump.** `git commit --no-verify` skips it, as does deleting the hook. The hook fails open if ergon crashes. It catches an agent that drifts into working an unapproved task and cites it the way the workflow asks. It doesn't stop one that is set on getting around it, and it doesn't catch work that cites no task at all.
+
+Why a git hook and not an MCP server exposing `next`/`show`/`set`/`new` without `approve`:
+
+- **An MCP server only binds agents that choose to use it.** These agents still have a shell, so the CLI would be just as reachable as before. Every agent's work lands through git, so a git hook is on the one path all of it takes, whichever tool made it.
+- **It costs less.** A small shell script plus under a hundred lines of ergon.py, still standard library only. An MCP server is a long-running process with a protocol to keep up with, and every agent tool needs its own setup for it.
+- **It checks the outcome, not the request.** The hook doesn't care how a task got to look approved, only whether the commit cites one that is. Its weakness is the same: it only sees commits.
+
+It deliberately doesn't run the full `ergon check`. A problem in some unrelated task file would then block every commit, humans' included. The Claude Code Stop hook keeps running `check` as before.
 
 ## Configure: `.ergon.toml`
 
