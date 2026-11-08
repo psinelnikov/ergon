@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ergon"
+version = "0.1.0"
+description = "Task tracker for AI-assisted repos: humans approve, agents execute"
+requires-python = ">=3.9"
+
+[project.scripts]
+ergon = "ergon:main"
+
+[tool.setuptools]
+py-modules = ["ergon"]

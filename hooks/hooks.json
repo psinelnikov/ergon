@@ -1,0 +1,20 @@
+{
+  "description": "ergon: refuse agent edits that approve tasks or change their status by hand, and run `ergon check` before a session ends. Does nothing in a repo without .ergon.toml.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/ergon.py\" hook guard", "timeout": 10 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/ergon.py\" hook stop", "timeout": 30 }
+        ]
+      }
+    ]
+  }
+}

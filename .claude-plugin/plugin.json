@@ -1,0 +1,9 @@
+{
+  "name": "ergon",
+  "displayName": "Ergon",
+  "version": "0.1.0",
+  "description": "Task tracker for AI-assisted repos: humans approve, agents execute. Markdown task files sized by model tier, an approval guard hook, one branch per epic, and headless dispatch of approved tasks into their own worktrees.",
+  "author": { "name": "Pavel Sinelnikov" },
+  "keywords": ["tasks", "epics", "approval", "worktrees", "dispatch", "subagents"],
+  "skills": "./skills/"
+}

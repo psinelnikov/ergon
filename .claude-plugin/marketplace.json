@@ -1,0 +1,14 @@
+{
+  "name": "ergon",
+  "owner": { "name": "Pavel Sinelnikov" },
+  "description": "Ergon: humans approve, agents execute.",
+  "plugins": [
+    {
+      "name": "ergon",
+      "source": "./",
+      "displayName": "Ergon",
+      "description": "Task tracker for AI-assisted repos: humans approve, agents execute.",
+      "keywords": ["tasks", "approval", "dispatch"]
+    }
+  ]
+}
