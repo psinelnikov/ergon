@@ -35,10 +35,14 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon tidy                   move every task and epic file to where it belongs: an epic's tasks
                                in epics/<epic>/, the rest in items/ (idempotent)
   ergon dispatch [--tier T] [--epic E] [--ids T-1,T-2] [--max N] [--jobs J]
-                      [--budget-total USD [--budget-pct P]] [--dry-run]
+                      [--budget-total USD [--budget-pct P]] [--watch [--interval SEC]]
+                      [--dry-run]
                                run ready tasks headless, one worktree + task/<ID> branch each,
                                merge each finished branch into its epic branch (and, for a task
-                               touching a companion repo, that repo's local trunk)
+                               touching a companion repo, that repo's local trunk).
+                               --watch (needs --budget-total) keeps rescanning for newly ready
+                               tasks every --interval seconds (default 30) until the cap is hit
+                               or Ctrl-C (stop launching, let workers finish; a second kills them)
   ergon stats [--since DATE] [--epic E]
                                read-only: per tier, runs / done / blocked / block rate / cost /
                                timeouts from <state>/runs/*.json, and tasks that blocked twice+
@@ -52,8 +56,11 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
@@ -1371,6 +1378,48 @@ def prepare(t, epics):
     return base, wt, branch, pubs
 
 
+KILLED = "ergon: killed"
+PROCS, PROCS_LOCK, KILL_ALL = set(), threading.Lock(), threading.Event()
+
+
+def kill_workers():
+    """Second Ctrl-C: kill every running worker (and its process group) and refuse new ones."""
+    KILL_ALL.set()
+    with PROCS_LOCK:
+        for p in list(PROCS):
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def run_proc(cmd, cwd, timeout):
+    """Run a worker in its own session (a terminal Ctrl-C doesn't reach it) so the dispatcher
+    decides what an interrupt means. Returns (stdout, stderr); stderr starts with KILLED if
+    kill_workers() ended it."""
+    with PROCS_LOCK:
+        if KILL_ALL.is_set():
+            return "", KILLED
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
+        PROCS.add(p)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        out, err = p.communicate()
+        err = f"timed out after {timeout // 60} min\n{err or ''}"
+    finally:
+        with PROCS_LOCK:
+            PROCS.discard(p)
+    if KILL_ALL.is_set() and p.returncode == -signal.SIGKILL and not err.startswith("timed out"):
+        return out or "", KILLED
+    return out or "", err or ""
+
+
 def run_worker(t, base, wt, branch, pubs, args, agents, settings):
     """Run one headless worker. Returns (verdict, reason, run info); never raises."""
     retry = ""
@@ -1409,17 +1458,13 @@ def run_worker(t, base, wt, branch, pubs, args, agents, settings):
         cmd += ["--max-budget-usd", str(args.budget)]
     stem = f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}" + ("-" + t["tier"] if t.get("escalated") else "")
     log = RUNS / f"{stem}.json"
-    try:
-        r = subprocess.run(cmd + [prompt], cwd=wt, capture_output=True, text=True,
-                           timeout=args.timeout * 60)
-        out, err = r.stdout, r.stderr
-    except subprocess.TimeoutExpired as e:
-        text_of = lambda b: (b.decode(errors="replace") if isinstance(b, bytes) else b) or ""
-        out, err = text_of(e.stdout), f"timed out after {args.timeout} min\n{text_of(e.stderr)}"
+    out, err = run_proc(cmd + [prompt], wt, args.timeout * 60)
     log.write_text(out)
     if err.strip():
         (RUNS / f"{stem}.err").write_text(err)
     info = {"log": log.relative_to(HOME)}
+    if err.startswith(KILLED):
+        return "blocked", "killed by a second Ctrl-C", info
     try:
         d = json.loads(out)
     except ValueError:
@@ -1560,6 +1605,12 @@ def land(t, base, wt, branch, pubs=()):
 
 
 def dispatch(args):
+    if args.watch and not args.budget_total:
+        raise SystemExit("--watch needs --budget-total (a cap on spend, so an unattended watch can't run away)")
+    if args.watch and args.dry_run:
+        raise SystemExit("--watch and --dry-run don't combine")
+    if args.max is None:
+        args.max = float("inf") if args.watch else 6
     if REPO != HOME and not args.dry_run:  # a dry run only reads, so any checkout will do
         raise SystemExit(f"run dispatch from the main checkout ({HOME})")
     if not shutil.which("claude") and not args.dry_run:
@@ -1576,7 +1627,7 @@ def dispatch(args):
     agents, settings = worker_agents(), worker_settings()
     tried, skipped, results = set(), {}, []
     cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
-    capped = False
+    capped = stopped = False
 
     def spent():
         return sum(r[3].get("cost", 0) for r in results)
@@ -1682,34 +1733,65 @@ def dispatch(args):
                     print(f"  overlap    {a['id']} and {b['id']} (doing) both touch {', '.join(shared(a, b))}")
     else:
         running, launched, active = {}, 0, {}  # active: running task id -> task
-        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            while True:
-                with state_lock():
-                    if cap is not None and spent() >= cap:
-                        capped = True
-                    queue = [] if launched >= args.max or capped else list(eligible(load(ITEMS)))
-                    while queue and len(running) < args.jobs and launched < args.max:
-                        t = queue.pop(0)
-                        if any(shared(t, o) for o in active.values()):
-                            continue  # held: stays eligible, retried when a running task lands
-                        tried.add(t["id"])
-                        try:
-                            base, wt, branch, pubs = prepare(t, epics)
-                        except GitError as err:
-                            skipped[t["id"]] = f"couldn't make a worktree: {err}"
-                            continue
-                        put_status(t["id"], "doing")
-                        print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
-                              + also(t) + f"  {t['title']}")
-                        running[pool.submit(one, t, base, wt, branch, pubs)] = t["id"]
-                        active[t["id"]] = t
-                        launched += 1
-                if not running:
-                    break
-                finished, _ = wait(running, return_when=FIRST_COMPLETED)
-                for f in finished:
-                    active.pop(running.pop(f), None)
-                    results.append(f.result())
+        stops, tick = [], 0.25
+        stop_evt = threading.Event()
+
+        def on_sigint(signum, frame):
+            stops.append(1)
+            if len(stops) == 1:
+                print("\n  interrupt: no new launches; waiting for running workers "
+                      "(Ctrl-C again kills them and marks them blocked)", flush=True)
+            else:
+                print("\n  interrupt: killing running workers", flush=True)
+                kill_workers()
+            stop_evt.set()
+        old_handler = signal.signal(signal.SIGINT, on_sigint)
+        next_scan, scan = 0.0, True
+        try:
+            with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                while True:
+                    stopping = bool(stops)
+                    if scan and not stopping:
+                        # the lock is held only for the scan, so `approve` works between scans
+                        with state_lock():
+                            if cap is not None and spent() >= cap:
+                                capped = True
+                            queue = [] if launched >= args.max or capped else list(eligible(load(ITEMS)))
+                            while queue and len(running) < args.jobs and launched < args.max:
+                                t = queue.pop(0)
+                                if any(shared(t, o) for o in active.values()):
+                                    continue  # held: stays eligible, retried when a running task lands
+                                tried.add(t["id"])
+                                try:
+                                    base, wt, branch, pubs = prepare(t, epics)
+                                except GitError as err:
+                                    skipped[t["id"]] = f"couldn't make a worktree: {err}"
+                                    continue
+                                put_status(t["id"], "doing")
+                                print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
+                                      + also(t) + f"  {t['title']}")
+                                running[pool.submit(one, t, base, wt, branch, pubs)] = t["id"]
+                                active[t["id"]] = t
+                                launched += 1
+                        next_scan = time.monotonic() + args.interval
+                    scan = False
+                    over = stopping or capped or launched >= args.max
+                    if not running and (not args.watch or over):
+                        break
+                    if running:
+                        finished, _ = wait(running, timeout=tick, return_when=FIRST_COMPLETED)
+                    else:
+                        stop_evt.wait(tick)
+                        finished = ()
+                    for f in finished:
+                        active.pop(running.pop(f), None)
+                        results.append(f.result())
+                        scan = True
+                    if args.watch and time.monotonic() >= next_scan:
+                        scan = True
+        finally:
+            signal.signal(signal.SIGINT, old_handler)
+        stopped = bool(stops)
     for tid, why in sorted(skipped.items()):
         print(f"  skipped  {tid}  {why}")
     if results:
@@ -1719,6 +1801,8 @@ def dispatch(args):
         filed = [f for r in results for f in r[3].get("filed", [])]
         if filed:
             print(f"{len(filed)} proposed from workers' FOUND lines: {', '.join(filed)}")
+    if stopped:
+        print("\ninterrupted: stopped launching" + ("; killed running workers" if KILL_ALL.is_set() else ""))
     if capped:
         left = [t["id"] for t in eligible(load(ITEMS))]
         mean = spent() / len(results) if results else 0
@@ -1898,7 +1982,7 @@ def main():
     d.add_argument("--tier", choices=WORKER_TIERS)
     d.add_argument("--epic")
     d.add_argument("--ids", help="comma-separated task IDs (still only ready ones)")
-    d.add_argument("--max", type=int, default=6, help="tasks to launch this run (default 6)")
+    d.add_argument("--max", type=int, help="tasks to launch this run (default 6; no limit with --watch)")
     d.add_argument("--jobs", type=int, default=3, help="workers at once (default 3)")
     d.add_argument("--permission-mode", default="auto",
                    choices=["auto", "acceptEdits", "dontAsk", "bypassPermissions"])
@@ -1908,6 +1992,9 @@ def main():
                    help="max USD for the whole run: stop launching once finished workers' cost reaches it")
     d.add_argument("--budget-pct", type=float, default=100,
                    help="use only this %% of --budget-total as the cap (default 100)")
+    d.add_argument("--watch", action="store_true",
+                   help="keep running: rescan for newly ready tasks until Ctrl-C or --budget-total is reached")
+    d.add_argument("--interval", type=float, default=30, help="seconds between rescans with --watch (default 30)")
     d.add_argument("--escalate", action="store_true",
                    help="when a worker reports blocked, retry once one tier up (haiku→sonnet→opus)")
     d.add_argument("--dry-run", action="store_true")

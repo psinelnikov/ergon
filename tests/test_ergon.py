@@ -19,7 +19,8 @@ import ergon  # noqa: E402
 FAKE_CLAUDE = r'''#!/usr/bin/env python3
 """Stands in for `claude -p`: commits a change citing the task, in the task worktree and in
 any companion worktree inside it, then reports RESULT: done."""
-import json, os, re, subprocess, sys
+import json, os, re, subprocess, sys, time
+time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 prompt = sys.argv[-1]
 tier = sys.argv[sys.argv.index("--agent") + 1].replace("task-", "").upper()
 tid = re.search(r"dispatched on (T-\d+)", prompt).group(1)
@@ -335,6 +336,65 @@ class TestDispatch(Project):
         self.assertEqual(self.status("T-003"), "ready", out)
         self.assertIn("budget cap $0.02 reached", out)
         self.assertIn("Not launched: T-003", out)
+
+    def watch(self, *extra):
+        return subprocess.Popen([sys.executable, str(ERGON), "dispatch", "--watch", "--interval", "0.2", *extra],
+                                cwd=self.root, env=self.env, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+
+    def wait_status(self, tid, want, proc, secs=30):
+        import time
+        end = time.time() + secs
+        while time.time() < end:
+            if self.status(tid) == want:
+                return
+            time.sleep(0.1)
+        proc.kill()
+        self.fail(f"{tid} never became {want}: {proc.communicate()[0]}")
+
+    def test_watch_needs_budget_total(self):
+        r = self.ergon("dispatch", "--watch", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--budget-total", r.stdout + r.stderr)
+
+    def test_watch_picks_up_tasks_approved_mid_run_and_ends_at_cap(self):
+        for n in "ABC":
+            self.ergon("new", "task", f"Job {n}", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        p = self.watch("--budget-total", "0.025")
+        self.wait_status("T-001", "done", p)
+        stamp(self.task_file("T-002"))  # approved while the watch runs
+        self.wait_status("T-002", "done", p)
+        stamp(self.task_file("T-003"))
+        out = p.communicate(timeout=30)[0]  # 3 x $0.01 reaches the cap: the watch ends by itself
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(self.status("T-003"), "done", out)
+        self.assertIn("budget cap", out)
+
+    def test_watch_ctrl_c_lets_workers_finish_and_second_kills(self):
+        import signal, time
+        for n in "AB":
+            self.ergon("new", "task", f"Job {n}", "--tier", "sonnet")
+            stamp(self.task_file("T-001" if n == "A" else "T-002"))
+        self.env["FAKE_SLEEP"] = "3"
+        p = self.watch("--budget-total", "5", "--jobs", "1")
+        self.wait_status("T-001", "doing", p)
+        p.send_signal(signal.SIGINT)
+        out = p.communicate(timeout=30)[0]
+        self.assertEqual(self.status("T-001"), "done", out)  # finished despite the interrupt
+        self.assertEqual(self.status("T-002"), "ready", out)  # never launched
+        self.setUp()
+        self.ergon("new", "task", "Job A", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env["FAKE_SLEEP"] = "20"
+        p = self.watch("--budget-total", "5")
+        self.wait_status("T-001", "doing", p)
+        time.sleep(0.5)
+        p.send_signal(signal.SIGINT)
+        time.sleep(0.5)
+        p.send_signal(signal.SIGINT)
+        out = p.communicate(timeout=30)[0]
+        self.assertEqual(self.status("T-001"), "blocked", out)
 
     def test_overlapping_touches_run_in_sequence(self):
         for touches in ("shared.py", "a.py"):
