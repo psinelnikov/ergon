@@ -31,7 +31,8 @@ commit(".", f"Do the thing ({tid})")
 pub = os.path.join("pub", "src")
 if os.path.isdir(pub):
     commit(pub, os.environ.get("FAKE_PUB_MSG", "Do the public thing").replace("{id}", tid))
-print(json.dumps({"result": "did it\nRESULT: done", "session_id": "s-1", "total_cost_usd": 0.01}))
+found = "".join(f"FOUND: {x}\n" for x in os.environ.get("FAKE_FOUND", "").split("|") if x)
+print(json.dumps({"result": "did it\n" + found + os.environ.get("FAKE_RESULT", "RESULT: done"), "session_id": "s-1", "total_cost_usd": 0.01}))
 '''
 
 
@@ -292,6 +293,23 @@ class TestDispatch(Project):
         self.assertEqual(sh("git", "worktree", "list", cwd=self.root / "pub" / "src").stdout.count("\n"), 1)
         runs = list((self.root / "tasks" / "runs").glob("*.json"))
         self.assertEqual(len(runs), 2)
+
+    def test_found_lines_become_proposed_tasks(self):
+        for res, want in (("RESULT: done", "done"), ("RESULT: blocked — nope", "blocked")):
+            with self.subTest(res):
+                self.setUp()
+                self.ergon("new", "task", "Source", "--tier", "sonnet")
+                stamp(self.task_file("T-001"))
+                self.env.update(FAKE_FOUND="Fix alpha — it breaks|Fix beta — also", FAKE_RESULT=res)
+                out = self.ergon("dispatch").stdout
+                self.assertEqual(self.status("T-001"), want, out)
+                for tid, title in (("T-002", "Fix alpha"), ("T-003", "Fix beta")):
+                    text = self.task_file(tid).read_text()
+                    self.assertEqual(self.status(tid), "proposed")
+                    self.assertIn("source: T-001", text)
+                    self.assertIn("tier: sonnet", text)
+                    self.assertIn(f"title: {title}", text)
+                self.assertIn("2 proposed", out)
 
     def test_dry_run_from_a_worktree(self):
         self.ergon("new", "task", "Private only", "--tier", "haiku")

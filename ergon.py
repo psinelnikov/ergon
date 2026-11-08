@@ -1209,6 +1209,9 @@ WORKER_PROMPT = """You are dispatched on {id}.
 
 Working tree: {wt} (a git worktree of this repo), on branch {branch}, cut from {base}.
 {retry}{nested}{companions}{rules}
+Work you find but don't do: end your final message with one line per item, before the RESULT line,
+`FOUND: <title> — <why>`. The dispatcher files each as a proposed task.
+
 The task file, read-only to you (it lives in the main checkout):
 
 {text}
@@ -1387,11 +1390,30 @@ def run_worker(t, base, wt, branch, pubs, args, agents, settings):
     text = d.get("result") or ""
     if d.get("is_error"):
         return "blocked", f"worker errored ({d.get('subtype') or d.get('terminal_reason')}): {text[:200]}", info
+    info["found"] = [(m[0].strip(" *`"), m[1].strip(" *`")) for m in
+                     re.findall(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if m[0].strip(" *`")]
     found = re.findall(r"^\W*RESULT:\s*(done|blocked)\b[\s—:–-]*(.*)$", text, re.M)
     if not found:
         return "blocked", "worker ended without a RESULT line", info
     verdict, why = found[-1]
     return verdict, why.strip(" *`") or "(no reason given)", info
+
+
+def file_found(t, found, epics):
+    """Create each FOUND line a worker emitted as a `proposed` task: same tier, epic and a
+    source: of the task that found it. Never ready. Caller holds the state lock."""
+    made = []
+    for title, why in found:
+        tid = next_id(ITEMS, "T")
+        e = epics.get(t.get("epic"))
+        body = TASK_BODY.replace("## What\n", f"## What\n{why or title}\n", 1)
+        meta = {"id": tid, "title": title, "tier": t["tier"], "status": "proposed",
+                "epic": t.get("epic") or "", "depends": [], "touches": [],
+                "source": t["id"], "created": today(), "approved": "", "tier_why": "",
+                "_path": task_home(t, epics) / f"{tid}-{slug(title)}.md", "_body": body}
+        dump(meta, TASK_KEYS)
+        made.append((tid, title))
+    return made
 
 
 def drop_worktree(wt, branch, repo=None):
@@ -1512,6 +1534,9 @@ def dispatch(args):
                 put_status(t["id"], "blocked", f"{why} (log {info['log']}"
                            + (f", `claude --resume {info['session']}` in {wt}" if info.get("session") else "") + ")")
                 print(f"  blocked  {t['id']}  {why}")
+            for fid, title in file_found(t, info.get("found") or [], epics):
+                print(f"  proposed {fid}  (found by {t['id']})  {title}")
+                info.setdefault("filed", []).append(fid)
         return t, verdict, why, info
 
     def also(t):
@@ -1568,6 +1593,9 @@ def dispatch(args):
         cost = sum(r[3].get("cost", 0) for r in results)
         done = sum(r[1] == "done" for r in results)
         print(f"\n{done}/{len(results)} done, ${cost:.2f}. Logs in {RUNS.relative_to(HOME)}/")
+        filed = [f for r in results for f in r[3].get("filed", [])]
+        if filed:
+            print(f"{len(filed)} proposed from workers' FOUND lines: {', '.join(filed)}")
     tasks = load(ITEMS)
     yours = [t for t in tasks.values() if t["tier"] == "human" and t["status"] == "ready" and deps_done(t, tasks)]
     if yours:
