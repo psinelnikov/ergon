@@ -186,6 +186,23 @@ class TestBasics(Project):
         self.assertIn("wizard", out["reason"])
 
 
+class TestConfigOnABranch(unittest.TestCase):
+    def test_worktree_config_before_it_merges(self):
+        """Adopting ergon on a branch: the config exists only in that worktree, state is shared."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve() / "proj"
+            git_init(root)
+            wt = Path(d).resolve() / "wt"
+            sh("git", "worktree", "add", "-q", "-b", "adopt", str(wt), cwd=root)
+            (wt / ".ergon.toml").write_text('state = "work"\n')
+            env = clean_env()
+            r = sh(sys.executable, str(ERGON), "new", "task", "Hi", "--tier", "haiku", cwd=wt, env=env)
+            self.assertIn("work/items/T-001", r.stdout)
+            self.assertTrue((root / "work" / "items").is_dir())  # state lives in the main checkout
+            r = sh(sys.executable, str(ERGON), "check", cwd=root, env=env, check=False)
+            self.assertIn("ergon init", r.stderr)  # main checkout has no config yet
+
+
 class TestMapAndAudit(Project):
     config = '''
         trunk = "main"

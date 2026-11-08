@@ -151,11 +151,14 @@ def configure(start=None, need_config=True):
     REPO is the checkout we're in (an epic or task worktree, possibly): repo content (map
     cards, the log, worker rules) is read there, and its branch is what `set` checks. HOME is
     the main checkout: task state, worktrees, run logs and companion checkouts live there, so
-    every worktree shares one set of task files."""
+    every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
-    path = HOME / CONFIG_FILE
+    # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
+    # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
+    # the config falls back to the main checkout's.
+    path = next((p for p in (REPO / CONFIG_FILE, HOME / CONFIG_FILE) if p.exists()), HOME / CONFIG_FILE)
     if not path.exists():
         if need_config:
             raise NotConfigured(f"no {CONFIG_FILE} in {HOME}: run `ergon init` there")
