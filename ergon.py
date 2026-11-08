@@ -16,6 +16,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon show ID
   ergon new task "Title" --tier sonnet [--epic E-001] [--touches a,b] [--source LOG.md:42]
   ergon new epic "Title"
+  ergon import gh#123 [--tier T] [--epic E] [--touches a,b]
+                               a GitHub issue (or gh:OWNER/REPO#123) as a proposed task, via the
+                               `gh` CLI: title, quoted body as What, source: gh#123. Tier is
+                               human until you size it. When its epic merges, ergon prints (never
+                               runs) the `gh issue comment/close` commands
   ergon set ID status=doing    agents: ready -> doing -> done | blocked (never approval)
   ergon start E-ID             branch epic/<folder> off the trunk and check it out in its own
                                worktree, <worktrees>/E-ID (also happens on an epic's first `doing`)
@@ -59,6 +64,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -501,6 +507,118 @@ def new(args):
     print(meta["_path"].relative_to(HOME))
 
 
+# ---------- issue import ----------
+# `ergon import gh#123` turns a GitHub issue into a proposed task. It shells out to the `gh` CLI
+# rather than calling the API with urllib: gh already holds the user's login (ergon never sees a
+# token), knows GHES hosts and which repo this checkout's remote is, and is a tool on PATH like
+# git and claude, not a Python dependency. Only GitHub for now: Linear has no official CLI, so it
+# would mean handling an API key here. The tier isn't guessed. An imported task is `human` until
+# someone sizes it, so an issue body written outside the repo can't reach a dispatched worker
+# without a human reading it first. Closing the issue is never done here (nothing is pushed, so
+# the fix isn't public yet): finish_epic prints the `gh issue comment/close` commands instead.
+
+GH_REF = re.compile(r"^gh(?::(?P<repo>\w[\w.-]*/\w[\w.-]*))?#(?P<num>\d+)$")
+IMPORT_BODY_MAX = 4000  # characters of the issue body quoted into What
+
+
+def gh_ref(source):
+    """(number, repo or None) for a `gh#N` / `gh:OWNER/REPO#N` source, else None."""
+    m = GH_REF.match(str(source or "").strip())
+    return (m.group("num"), m.group("repo")) if m else None
+
+
+def fetch_issue(ref):
+    num, repo = gh_ref(ref)
+    if not shutil.which("gh"):
+        raise SystemExit("import needs the GitHub CLI `gh` on PATH, logged in (`gh auth login`): https://cli.github.com")
+    r = subprocess.run(["gh", "issue", "view", num, *(["-R", repo] if repo else []),
+                        "--json", "number,title,body,url,state,labels"],
+                       cwd=REPO, capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit(f"gh issue view {num} failed: {(r.stderr or r.stdout).strip()[:300]}")
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        raise SystemExit(f"gh issue view {num} didn't return JSON: {r.stdout[:200]}")
+
+
+def import_body(ref, issue):
+    body = (issue.get("body") or "").strip().replace("\r\n", "\n")
+    if len(body) > IMPORT_BODY_MAX:
+        body = body[:IMPORT_BODY_MAX] + f"\n… (cut at {IMPORT_BODY_MAX} characters; the rest is on the issue)"
+    # Quoted, so its own `## ` headings can't pass for this file's sections.
+    quoted = "\n".join(f"> {l}".rstrip() for l in body.splitlines()) or "> (no description)"
+    labels = ", ".join(l.get("name", "") for l in issue.get("labels") or [] if isinstance(l, dict))
+    return (f"\n## What\nImported from {ref} ({issue.get('url', '')}). Its text was written outside this repo: "
+            f"rewrite it as a brief, size it and fill in Done when before approving.\n\n{quoted}\n"
+            f"\n## Done when\n\n## Notes\n" + (f"Issue labels: {labels}\n" if labels else ""))
+
+
+def import_issue(args):
+    ref = args.ref.strip()
+    if ref.startswith("linear:"):
+        raise SystemExit("Linear isn't supported yet (no official CLI to shell out to); create the task "
+                         "with `ergon new task ... --source linear:ABC-12`")
+    if not gh_ref(ref):
+        raise SystemExit(f"expected gh#123 or gh:OWNER/REPO#123, got {ref!r}")
+    if args.tier and args.tier not in TIERS:
+        raise SystemExit(f"--tier must be one of {TIERS}")
+    def duplicate(tasks):
+        dup = next((t["id"] for t in tasks.values() if t.get("source") == ref), None)
+        if dup:
+            raise SystemExit(f"{ref} is already {dup}")
+    duplicate(load(ITEMS))
+    issue = fetch_issue(ref)  # outside the lock: the network can be slow
+    if str(issue.get("state", "")).upper() == "CLOSED":
+        print(f"note: {ref} is closed on GitHub")
+    title = re.sub(r"\s+", " ", issue.get("title") or f"Issue {ref}").strip()
+    title = re.sub(r"(?<=\s)#", "", title)  # ` #` starts a comment in frontmatter
+    if title.startswith("[") and title.endswith("]"):  # would parse as a list
+        title = title[1:-1].strip()
+    if len(title) > 70:
+        title = title[:69].rstrip() + "…"
+    with state_lock():
+        tasks, epics = load(ITEMS), load(EPICS)
+        duplicate(tasks)  # again: another import may have landed while gh ran
+        if args.epic and args.epic not in epics:
+            raise SystemExit(f"no such epic: {args.epic}")
+        tid = next_id(ITEMS, "T")
+        home = epics[args.epic]["_path"].parent if args.epic else ITEMS
+        meta = {"id": tid, "title": title, "tier": args.tier or "human", "status": "proposed",
+                "epic": args.epic or "", "depends": [], "touches": args.touches.split(",") if args.touches else [],
+                "source": ref, "created": today(), "approved": "",
+                "tier_why": "" if args.tier else "imported, not sized: pick the tier before approving",
+                "_path": home / f"{tid}-{slug(title)}.md", "_body": import_body(ref, issue)}
+        dump(meta, TASK_KEYS)
+    print(f"{meta['_path'].relative_to(HOME)}  ({tid}, proposed, tier {meta['tier']})")
+
+
+def issue_commands(eid, tasks, merge=None):
+    """The gh commands that report an epic's finished tasks on the issues they came from. Printed,
+    never run: the merge is local until a human pushes it."""
+    by_issue = {}
+    for t in sorted((t for t in tasks.values() if t.get("epic") == eid and t["status"] == "done"),
+                    key=lambda t: t["id"]):
+        if gh_ref(t.get("source")):
+            by_issue.setdefault(t["source"], []).append(t)
+    cmds = []
+    for ref, ts in by_issue.items():
+        num, repo = gh_ref(ref)
+        r = ["-R", repo] if repo else []
+        done = "; ".join(f"{t['id']} {t['title']}" for t in ts)
+        body = f"Done in {eid}" + (f" (merge {merge})" if merge else "") + f": {done}"
+        cmds.append(shlex.join(["gh", "issue", "comment", num, *r, "--body", body]))
+        cmds.append(shlex.join(["gh", "issue", "close", num, *r]))
+    return cmds
+
+
+def print_issue_commands(eid, tasks, merge=None):
+    cmds = issue_commands(eid, tasks, merge)
+    if cmds:
+        print(f"{eid} finished issues it was imported from. After you push, report it (ergon never does):")
+        print("\n".join("  " + c for c in cmds))
+
+
 # ---------- epic branches ----------
 # An epic's work lives on epic/<epic folder name>, cut from main when the epic starts and checked
 # out in its own worktree (.claude/worktrees/E-NNN), so several epics can be worked at once.
@@ -687,6 +805,7 @@ def finish_epic(eid):
         e["status"] = "done"
         dump(e, EPIC_KEYS)
         print(f"{eid} done (never started on a branch, nothing to merge)")
+        print_issue_commands(eid, tasks)
         return
     where = worktrees().get(branch)
     stray = dirty_paths(where) if where else []
@@ -704,6 +823,7 @@ def finish_epic(eid):
     e["status"] = "done"
     dump(e, EPIC_KEYS)
     print(f"{eid} done: merged {branch} into {MAIN} (not pushed) and deleted the branch{note}")
+    print_issue_commands(eid, tasks, git("rev-parse", "--short", MAIN))
 
 
 def finish(args):
@@ -2352,6 +2472,11 @@ def main():
     nw.add_argument("--epic")
     nw.add_argument("--touches")
     nw.add_argument("--source")
+    im = sub.add_parser("import", help="a GitHub issue as a proposed task: gh#123 or gh:OWNER/REPO#123")
+    im.add_argument("ref", metavar="gh#N")
+    im.add_argument("--tier", help="default: human, until someone sizes it")
+    im.add_argument("--epic")
+    im.add_argument("--touches")
     st = sub.add_parser("set")
     st.add_argument("id")
     st.add_argument("pairs", nargs="+", metavar="key=value")
@@ -2424,7 +2549,8 @@ def main():
              "tidy": tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours)
         {"next": nxt, "review": review, "show": show, "approve": approve, "reject": reject, "accept": accept,
-         "audit": audit, "stats": stats, "report": report, "check": check, "dispatch": dispatch, "rules": rules}[args.cmd](args)
+         "audit": audit, "stats": stats, "report": report, "check": check, "dispatch": dispatch, "rules": rules,
+         "import": import_issue}[args.cmd](args)
 
 
 if __name__ == "__main__":

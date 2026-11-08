@@ -290,6 +290,78 @@ class TestEpicBranch(Project):
         self.assertEqual(branches.strip(), "")
 
 
+
+FAKE_GH = r"""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["FAKE_GH_LOG"], "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+if sys.argv[1:3] != ["issue", "view"]:
+    sys.exit("fake gh: only issue view")
+num = int(sys.argv[3])
+if num == 404:
+    sys.exit("GraphQL: Could not resolve to an issue")
+print(json.dumps({"number": num, "title": f"Widget #{num} crashes on save", "state": "OPEN",
+                  "url": f"https://github.com/acme/app/issues/{num}", "labels": [{"name": "bug"}],
+                  "body": "Steps:\n## Repro\nclick save"}))
+"""
+
+
+class TestImport(Project):
+    def setUp(self):
+        super().setUp()
+        bindir = Path(self.tmp.name) / "bin"
+        bindir.mkdir()
+        (bindir / "gh").write_text(FAKE_GH.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
+        (bindir / "gh").chmod(0o755)
+        self.gh_log = Path(self.tmp.name) / "gh.log"
+        self.env = clean_env(PATH=f"{bindir}:{os.environ['PATH']}", FAKE_GH_LOG=str(self.gh_log))
+
+    def gh_calls(self):
+        return [json.loads(l) for l in self.gh_log.read_text().splitlines()]
+
+    def test_import_then_epic_finish_prints_never_runs_close(self):
+        self.ergon("new", "epic", "Fix widgets")
+        out = self.ergon("import", "gh#123", "--epic", "E-001").stdout
+        self.assertIn("T-001, proposed, tier human", out)
+        text = self.task_file("T-001").read_text()
+        self.assertIn("title: Widget 123 crashes on save", text)  # ` #` would start a comment
+        self.assertIn("source: gh#123", text)
+        self.assertIn("status: proposed", text)
+        self.assertRegex(text, r"(?m)^approved:$")
+        self.assertIn("> ## Repro", text)  # quoted: not a section of the task file
+        self.assertIn("Issue labels: bug", text)
+        self.ergon("check")
+        self.assertIn("already T-001", self.ergon("import", "gh#123", check=False).stderr)
+        self.ergon("import", "gh:acme/other#7", "--tier", "haiku", "--epic", "E-001")
+        self.assertIn("could not resolve", self.ergon("import", "gh#404", check=False).stderr.lower())
+        self.assertIn("Linear", self.ergon("import", "linear:ABC-12", check=False).stderr)
+        self.assertEqual(self.gh_calls()[0][:5], ["issue", "view", "123", "--json", "number,title,body,url,state,labels"])
+        self.assertEqual(self.gh_calls()[1][:5], ["issue", "view", "7", "-R", "acme/other"])
+
+        self.ergon("set", "T-001", "tier=sonnet")
+        for tid in ("T-001", "T-002"):
+            stamp(self.task_file(tid))
+        self.ergon("set", "T-001", "status=doing", check=False)  # opens the epic worktree
+        wt = self.root / ".claude" / "worktrees" / "E-001"
+        for tid in ("T-001", "T-002"):
+            self.ergon("set", tid, "status=doing", cwd=wt)
+            (wt / f"{tid}.txt").write_text("x\n")
+            sh("git", "add", "-A", cwd=wt)
+            sh("git", "commit", "-qm", f"Fix it ({tid})", cwd=wt)
+        self.assertNotIn("gh issue", self.ergon("set", "T-001", "status=done", cwd=wt).stdout)
+        out = self.ergon("set", "T-002", "status=done", cwd=wt).stdout
+        self.assertIn("E-001 done: merged", out)
+        merge = sh("git", "rev-parse", "--short", "main", cwd=self.root).stdout.strip()
+        self.assertIn(f"gh issue comment 123 --body 'Done in E-001 (merge {merge}): T-001 Widget 123 crashes on save'", out)
+        self.assertIn("gh issue close 123\n", out)
+        self.assertIn("gh issue close 7 -R acme/other", out)
+        self.assertTrue(all(c[:2] == ["issue", "view"] for c in self.gh_calls()))  # printed, never run
+
+    def test_import_without_gh(self):
+        env = clean_env(PATH="/usr/bin:/bin")
+        r = self.ergon("import", "gh#1", check=False, env=env)
+        self.assertIn("needs the GitHub CLI", r.stderr)
+
 class DispatchProject(Project):
     """A project with a companion checkout, worker rules and the fake `claude` on PATH."""
     config = '''
