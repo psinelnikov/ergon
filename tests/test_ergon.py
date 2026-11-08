@@ -124,6 +124,31 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(mini, tomllib.loads(text))
 
 
+class TestProtect(Project):
+    config = """
+        [[protect]]
+        touches = ["server/auth/**", "prod-db"]
+        min_tier = "opus"
+        note = "keys"
+    """
+
+    def test_protect(self):
+        self.ergon("new", "task", "A", "--tier", "sonnet", "--touches", "server/auth/login.py")
+        self.ergon("new", "task", "B", "--tier", "opus", "--touches", "server/auth")
+        self.ergon("new", "task", "C", "--tier", "haiku", "--touches", "prod-db")
+        self.ergon("new", "task", "D", "--tier", "sonnet", "--touches", "web/app.py")
+        r = self.ergon("check", check=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("T-001: touches server/auth/login.py (protect server/auth/**) needs tier opus+", r.stdout)
+        self.assertIn("T-003", r.stdout)
+        self.assertNotIn("T-002", r.stdout)
+        self.assertNotIn("T-004", r.stdout)
+        for tid in ("T-001", "T-003"):
+            f = self.task_file(tid)
+            f.write_text(f.read_text().replace("status: proposed", "status: dropped"))
+        self.ergon("check")
+
+
 class TestBasics(Project):
     def test_init_writes_config_and_gitignore(self):
         self.assertTrue((self.root / ".ergon.toml").exists())

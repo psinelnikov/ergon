@@ -62,6 +62,11 @@ trunk = "main"
 touches = ["org/product", ".product/src"]  # default: [name, path]
 forbid_tracker_ids = true
 policy = "docs/public-boundary.md" # cited to workers as the reason
+
+[[protect]]                        # repeatable; `check` fails an open task below min_tier that touches these
+touches = ["server/auth/**", "prod-db"]  # fnmatch patterns against a task's touches:
+min_tier = "opus"                  # or "human"
+note = "signing keys live here"    # optional, shown in the error
 ```
 
 To override a worker agent for one project, put your own `.claude/agents/task-<tier>.md` in the main checkout. Dispatch uses it instead of the plugin's.

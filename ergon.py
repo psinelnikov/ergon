@@ -46,6 +46,7 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
 import argparse
 import datetime
 import fcntl
+import fnmatch
 import json
 import os
 import re
@@ -85,7 +86,25 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # trunk = "main"
 # forbid_tracker_ids = true     # refuse to land commits there that cite T-/E- IDs
 # policy = "docs/boundary.md"   # cited to workers as the reason
+
+# Paths or nouns no task below a tier may touch; `check` fails an open task that does.
+# [[protect]]
+# touches = ["server/auth/**", "prod-db"]   # fnmatch patterns against a task's touches:
+# min_tier = "opus"             # or "human"
+# note = "signing keys live here"
 """
+
+
+PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
+
+
+def protect_hit(touch, pattern):
+    """Does a task's touches: entry fall under a protect pattern? fnmatch on the entry, on each
+    of its leading directories, and on the entry as a directory."""
+    touch = touch.strip("/")
+    parts = touch.split("/")
+    cands = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)] + [touch + "/"]
+    return any(fnmatch.fnmatchcase(c, pattern) for c in cands)
 
 
 class NotConfigured(Exception):
@@ -195,6 +214,12 @@ def configure(start=None, need_config=True):
             "trunk": c.get("trunk", "main"),
             "touches": tuple(t.strip("/") for t in c.get("touches") or [name, c["path"]]),
             "forbid_ids": bool(c.get("forbid_tracker_ids", False)), "policy": c.get("policy", "")})
+    PROTECT.clear()
+    for n, pr in enumerate(CFG.get("protect") or [], 1):
+        if pr.get("min_tier") not in TIERS or not pr.get("touches"):
+            raise NotConfigured(f"{CONFIG_FILE}: [[protect]] #{n} needs touches and a min_tier in {TIERS}")
+        PROTECT.append({"touches": [str(x).strip("/") for x in pr["touches"]],
+                        "min_tier": pr["min_tier"], "note": pr.get("note", "")})
     state_rel = re.escape(STATE.relative_to(HOME).as_posix())
     TASK_FILE = re.compile(rf"(?:^|/){state_rel}/(items/[^/\s]+|epics/[^/\s]+/(EPIC|T-[^/\s]+))\.md$")
     TASK_DIR_IN_CMD = re.compile(rf"(?:^|[\s/\"'=]){state_rel}/(items|epics)\b")
@@ -1065,6 +1090,13 @@ def lint():
         for d in t.get("depends") or []:
             if d not in tasks:
                 errs.append(f"{where}: depends on missing {d}")
+        if t.get("status") not in ("done", "dropped") and t.get("tier") in TIERS:
+            for pr in PROTECT:
+                hit = next(((x, p) for x in t.get("touches") or [] for p in pr["touches"]
+                            if protect_hit(str(x), p)), None)
+                if hit and TIERS.index(t["tier"]) < TIERS.index(pr["min_tier"]):
+                    errs.append(f"{where}: touches {hit[0]} (protect {hit[1]}) needs tier "
+                                f"{pr['min_tier']}+, is {t['tier']}" + (f": {pr['note']}" if pr["note"] else ""))
     for e in epics.values():
         if e.get("status") not in EPIC_STATUSES:
             errs.append(f"{e['id']}: status {e.get('status')!r} not in {EPIC_STATUSES}")

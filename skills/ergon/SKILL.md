@@ -30,6 +30,8 @@ The project's own rules (tier signals that are specific to it, hosts that need a
 | `opus` | Cross-cutting, ambiguous, or security-sensitive | Spans subsystems or repos. Touches auth, signing, secrets or a stated invariant. Root cause unknown. Needs a design decision first |
 | `human` | Things no model should or can do | Live production changes, third-party consoles, credentials, on-chain or legal actions, risk or policy calls |
 
+A project can pin minimums with `[[protect]]` in `.ergon.toml` (`touches = ["server/auth/**", "prod-db"]`, `min_tier = "opus"` or `"human"`, optional `note`). `ergon check` fails any open task whose `touches:` match a pattern (fnmatch, also against parent directories) but whose tier is below the minimum. Done and dropped tasks are ignored.
+
 When in doubt, go one tier up. Put the reason in `tier_why:` in one line. If a task has a human step and a code step, split it into two tasks and link them with `depends:`.
 
 ## Lifecycle
