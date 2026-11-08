@@ -296,6 +296,25 @@ class TestDispatch(Project):
         runs = list((self.root / "tasks" / "runs").glob("*.json"))
         self.assertEqual(len(runs), 2)
 
+    def test_overlapping_touches_run_in_sequence(self):
+        for touches in ("shared.py", "a.py"):
+            with self.subTest(touches):
+                self.setUp()
+                self.ergon("new", "task", "One", "--tier", "sonnet", "--touches", "shared.py")
+                self.ergon("new", "task", "Two", "--tier", "sonnet", "--touches", touches + ",x" if touches == "a.py" else touches)
+                for t in ("T-001", "T-002"):
+                    stamp(self.task_file(t))
+                dry = self.ergon("dispatch", "--dry-run").stdout
+                held = "held       T-002 behind T-001" in dry
+                self.assertEqual(held, touches == "shared.py", dry)
+                out = self.ergon("dispatch", "--jobs", "2").stdout
+                self.assertEqual(self.status("T-002"), "done", out)
+                order = [l.split()[0] + l.split()[1] for l in out.splitlines() if l.split()[:1] in (["doing"], ["done"])]
+                if touches == "shared.py":
+                    self.assertEqual(order, ["doingT-001", "doneT-001", "doingT-002", "doneT-002"], out)
+                else:
+                    self.assertEqual(order[:2], ["doingT-001", "doingT-002"], out)
+
     def test_found_lines_become_proposed_tasks(self):
         for res, want in (("RESULT: done", "done"), ("RESULT: blocked — nope", "blocked")):
             with self.subTest(res):

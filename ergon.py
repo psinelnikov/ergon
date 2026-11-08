@@ -1560,6 +1560,11 @@ def dispatch(args):
                 print(f"  proposed {hid}  (human, {t['id']} now depends on it)  {title}")
         return t, verdict, why, info
 
+    def shared(a, b):
+        """Paths both tasks name. A companion itself isn't shared: each task gets its own
+        worktree of it, so only paths inside it that both name count."""
+        return sorted((set(a.get("touches") or []) & set(b.get("touches") or [])) - every_touch)
+
     def also(t):
         return "".join(f" + {c['name']} {c['trunk']}" for c in COMPANIONS if companion_touch(t, c))
 
@@ -1572,25 +1577,27 @@ def dispatch(args):
                   + also(t) + f"  {t['title']}")
         if not plan:
             print("nothing to dispatch")
-        # Shared touches: whichever lands second (task into epic, or epic into trunk) may conflict.
-        # A companion itself isn't a shared touch: each task gets its own worktree of it, so
-        # only paths inside it that both tasks name count.
-        doing = [t for t in tasks.values() if t["status"] == "doing"]
-        named = {t["id"]: set(t.get("touches") or []) - every_touch for t in plan + doing}
+        # Shared touches: whichever lands second (task into epic, or epic into trunk) may conflict,
+        # so a task sharing a path with an earlier one is held until that one lands.
         for i, a in enumerate(plan):
-            for b in plan[i + 1:] + doing:
-                shared = sorted(named[a["id"]] & named[b["id"]])
-                if shared:
-                    print(f"  overlap    {a['id']} and {b['id']}{' (doing)' if b in doing else ''} "
-                          f"both touch {', '.join(shared)}")
+            for b in plan[:i]:
+                if shared(a, b):
+                    print(f"  held       {a['id']} behind {b['id']}: both touch {', '.join(shared(a, b))}")
+                    break
+        for a in plan:
+            for b in (t for t in tasks.values() if t["status"] == "doing"):
+                if shared(a, b):
+                    print(f"  overlap    {a['id']} and {b['id']} (doing) both touch {', '.join(shared(a, b))}")
     else:
-        running, launched = {}, 0
+        running, launched, active = {}, 0, {}  # active: running task id -> task
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
             while True:
                 with state_lock():
                     queue = [] if launched >= args.max else list(eligible(load(ITEMS)))
                     while queue and len(running) < args.jobs and launched < args.max:
                         t = queue.pop(0)
+                        if any(shared(t, o) for o in active.values()):
+                            continue  # held: stays eligible, retried when a running task lands
                         tried.add(t["id"])
                         try:
                             base, wt, branch, pubs = prepare(t, epics)
@@ -1601,12 +1608,13 @@ def dispatch(args):
                         print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
                               + also(t) + f"  {t['title']}")
                         running[pool.submit(one, t, base, wt, branch, pubs)] = t["id"]
+                        active[t["id"]] = t
                         launched += 1
                 if not running:
                     break
                 finished, _ = wait(running, return_when=FIRST_COMPLETED)
                 for f in finished:
-                    running.pop(f)
+                    active.pop(running.pop(f), None)
                     results.append(f.result())
     for tid, why in sorted(skipped.items()):
         print(f"  skipped  {tid}  {why}")
