@@ -38,6 +38,9 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                run ready tasks headless, one worktree + task/<ID> branch each,
                                merge each finished branch into its epic branch (and, for a task
                                touching a companion repo, that repo's local trunk)
+  ergon stats [--since DATE] [--epic E]
+                               read-only: per tier, runs / done / blocked / block rate / cost /
+                               timeouts from <state>/runs/*.json, and tasks that blocked twice+
   ergon hook guard|stop        Claude Code hooks (the plugin wires them); not for humans
 """
 import argparse
@@ -1695,6 +1698,79 @@ def init(args):
     print("next: enable the ergon plugin for this project (README), then `ergon new epic \"...\"`")
 
 
+RUN_LOG = re.compile(r"^(?P<id>[A-Z]+-\d+)-(?P<date>\d{4})(?P<m>\d{2})(?P<d>\d{2})-\d{6}\.json$")
+
+
+def aggregate_stats(runs_dir, tasks, since=None, epic=None):
+    """Per-tier numbers from the dispatch logs in runs_dir, joined with tasks (id -> meta).
+    since: 'YYYY-MM-DD' (runs started that day or later); epic: only that epic's tasks.
+    Returns {"tiers": {tier: {runs, done, blocked, timeouts, cost}}, "repeat": {id: blocked
+    count} for tasks blocked more than once, "skipped": logs that were unreadable, not JSON
+    (and not a timeout) or whose task is gone}. Never raises on a bad log."""
+    tiers, per_task, skipped = {}, {}, 0
+    for log in sorted(Path(runs_dir).glob("*.json")):
+        m = RUN_LOG.match(log.name)
+        if not m:
+            skipped += 1
+            continue
+        t = tasks.get(m["id"])
+        if t is None:
+            skipped += 1
+            continue
+        if epic and t.get("epic") != epic:
+            continue
+        if since and f"{m['date']}-{m['m']}-{m['d']}" < since:
+            continue
+        err = log.with_suffix(".err")
+        try:
+            timed_out = err.exists() and "timed out after" in err.read_text(errors="replace")
+        except OSError:
+            timed_out = False
+        try:
+            d = json.loads(log.read_text())
+            if not isinstance(d, dict):
+                raise ValueError
+        except (OSError, ValueError):
+            if not timed_out:
+                skipped += 1
+                continue
+            d = {}
+        text = d.get("result") or ""
+        found = re.findall(r"^\W*RESULT:\s*(done|blocked)\b", text, re.M)
+        verdict = "blocked" if d.get("is_error") or not found else found[-1]
+        row = tiers.setdefault(t.get("tier") or "?", {"runs": 0, "done": 0, "blocked": 0,
+                                                        "timeouts": 0, "cost": 0.0})
+        row["runs"] += 1
+        row[verdict] += 1
+        row["timeouts"] += timed_out
+        row["cost"] += float(d.get("total_cost_usd") or 0)
+        if verdict == "blocked":
+            per_task[t["id"]] = per_task.get(t["id"], 0) + 1
+    return {"tiers": tiers, "skipped": skipped,
+            "repeat": {k: v for k, v in sorted(per_task.items()) if v > 1}}
+
+
+def stats(args):
+    tasks = load(ITEMS)
+    r = aggregate_stats(RUNS, tasks, since=args.since, epic=args.epic)
+    print(f"{'tier':<8}{'runs':>5}{'done':>6}{'blocked':>8}{'block%':>8}{'cost':>10}{'mean':>9}{'timeouts':>9}")
+    for tier in [*TIERS, *(k for k in r["tiers"] if k not in TIERS)]:
+        row = r["tiers"].get(tier)
+        if not row:
+            continue
+        n = row["runs"]
+        print(f"{tier:<8}{n:>5}{row['done']:>6}{row['blocked']:>8}{100 * row['blocked'] / n:>7.0f}%"
+              f"{'$%.2f' % row['cost']:>10}{'$%.2f' % (row['cost'] / n):>9}{row['timeouts']:>9}")
+    if not r["tiers"]:
+        print("(no runs)")
+    if r["repeat"]:
+        print("\nblocked more than once:")
+        for tid, n in r["repeat"].items():
+            print(f"  {tid} x{n}  {tasks[tid].get('title', '')}")
+    if r["skipped"]:
+        print(f"\nskipped {r['skipped']} unreadable or unmatched log(s)")
+
+
 def guide(args):
     text = GUIDE.read_text()
     print(re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.S).strip())
@@ -1746,6 +1822,9 @@ def main():
     c.add_argument("--reason", required=True, help="the evidence: a commit, a log line, or why it's moot")
     au = sub.add_parser("audit")
     au.add_argument("--epic")
+    ss = sub.add_parser("stats")
+    ss.add_argument("--since", metavar="DATE", help="YYYY-MM-DD: runs started that day or later")
+    ss.add_argument("--epic")
     sub.add_parser("check")
     sub.add_parser("tidy")
     d = sub.add_parser("dispatch")
@@ -1787,7 +1866,7 @@ def main():
              "tidy": tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours)
         {"next": nxt, "review": review, "show": show, "approve": approve, "reject": reject,
-         "audit": audit, "check": check, "dispatch": dispatch, "rules": rules}[args.cmd](args)
+         "audit": audit, "stats": stats, "check": check, "dispatch": dispatch, "rules": rules}[args.cmd](args)
 
 
 if __name__ == "__main__":

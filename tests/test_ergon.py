@@ -422,5 +422,31 @@ class TestDispatch(Project):
         self.assertEqual(self.status("T-001"), "blocked")
 
 
+class TestStats(Project):
+    def test_stats_per_tier(self):
+        self.ergon("new", "task", "A", "--tier", "sonnet")
+        self.ergon("new", "task", "B", "--tier", "haiku")
+        runs = self.root / "tasks" / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+
+        def log(name, result, cost, **kw):
+            (runs / name).write_text(json.dumps({"result": result, "total_cost_usd": cost, **kw}))
+        log("T-001-20261101-100000.json", "RESULT: done", 1.0)
+        log("T-001-20261102-100000.json", "RESULT: blocked — x", 0.5)
+        log("T-001-20261103-100000.json", "RESULT: blocked — y", 0.5)
+        log("T-002-20261103-100000.json", "RESULT: done", 0.25)
+        log("T-002-20261001-100000.json", "RESULT: done", 9)  # before --since
+        (runs / "T-002-20261104-100000.json").write_text("")  # timed out
+        (runs / "T-002-20261104-100000.err").write_text("timed out after 60 min\n")
+        (runs / "T-001-20261105-100000.json").write_text("not json")
+        (runs / "junk.json").write_text("{}")
+        out = self.ergon("stats", "--since", "2026-11-01").stdout
+        rows = {l.split()[0]: l.split() for l in out.splitlines() if l.split()[:1] in (["sonnet"], ["haiku"])}
+        self.assertEqual(rows["sonnet"], ["sonnet", "3", "1", "2", "67%", "$2.00", "$0.67", "0"])
+        self.assertEqual(rows["haiku"], ["haiku", "2", "1", "1", "50%", "$0.25", "$0.12", "1"])
+        self.assertIn("T-001 x2", out)
+        self.assertIn("skipped 2", out)
+
+
 if __name__ == "__main__":
     unittest.main()
