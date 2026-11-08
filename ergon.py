@@ -1454,16 +1454,17 @@ def land(t, base, wt, branch, pubs=()):
 
 
 def dispatch(args):
-    if REPO != HOME:
+    if REPO != HOME and not args.dry_run:  # a dry run only reads, so any checkout will do
         raise SystemExit(f"run dispatch from the main checkout ({HOME})")
-    if not shutil.which("claude"):
+    if not shutil.which("claude") and not args.dry_run:
         raise SystemExit("no `claude` on PATH")
-    RUNS.mkdir(exist_ok=True)
-    WORKTREES.mkdir(parents=True, exist_ok=True)
-    git("worktree", "prune")
-    for c in COMPANIONS:  # forget companion worktrees whose directory is gone (a removed task worktree)
-        if has_checkout(c):
-            git("worktree", "prune", cwd=c["path"])
+    if not args.dry_run:
+        RUNS.mkdir(exist_ok=True)
+        WORKTREES.mkdir(parents=True, exist_ok=True)
+        git("worktree", "prune")
+        for c in COMPANIONS:  # forget companion worktrees whose directory is gone (a removed task worktree)
+            if has_checkout(c):
+                git("worktree", "prune", cwd=c["path"])
     links, epics = gitlinks(), load(EPICS)
     ids = set(args.ids.split(",")) if args.ids else None
     agents, settings = worker_agents(), worker_settings()

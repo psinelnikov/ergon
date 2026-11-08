@@ -293,6 +293,16 @@ class TestDispatch(Project):
         runs = list((self.root / "tasks" / "runs").glob("*.json"))
         self.assertEqual(len(runs), 2)
 
+    def test_dry_run_from_a_worktree(self):
+        self.ergon("new", "task", "Private only", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+        wt = Path(self.tmp.name).resolve() / "side"
+        sh("git", "worktree", "add", "-q", "-b", "side", str(wt), cwd=self.root)
+        self.assertIn("would run  T-001", self.ergon("dispatch", "--dry-run", cwd=wt).stdout)
+        r = self.ergon("dispatch", cwd=wt, check=False)
+        self.assertIn("main checkout", r.stderr)
+        self.assertEqual(self.status("T-001"), "ready")
+
     def test_tracker_id_in_public_commit_blocks(self):
         self.ergon("new", "task", "Touch public", "--tier", "sonnet", "--touches", "acme/public")
         stamp(self.task_file("T-001"))
