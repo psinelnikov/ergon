@@ -21,9 +21,10 @@ FAKE_CLAUDE = r'''#!/usr/bin/env python3
 any companion worktree inside it, then reports RESULT: done."""
 import json, os, re, subprocess, sys
 prompt = sys.argv[-1]
+tier = sys.argv[sys.argv.index("--agent") + 1].replace("task-", "").upper()
 tid = re.search(r"dispatched on (T-\d+)", prompt).group(1)
 def commit(where, msg):
-    with open(os.path.join(where, f"{tid}.txt"), "w") as f:
+    with open(os.path.join(where, f"{tid}.txt"), "a") as f:
         f.write("work\n")
     subprocess.run(["git", "-C", where, "add", "-A"], check=True)
     subprocess.run(["git", "-C", where, "commit", "-qm", msg], check=True)
@@ -34,7 +35,7 @@ if os.path.isdir(pub):
 if os.environ.get("FAKE_DIRTY"):
     open(f"{tid}.txt", "a").write("more\n")
 found = "".join(f"FOUND: {x}\n" for x in os.environ.get("FAKE_FOUND", "").split("|") if x)
-print(json.dumps({"result": "did it\n" + found + os.environ.get("FAKE_RESULT", "RESULT: done"), "session_id": "s-1", "total_cost_usd": 0.01}))
+print(json.dumps({"result": "did it\n" + found + os.environ.get("FAKE_RESULT_" + tier, os.environ.get("FAKE_RESULT", "RESULT: done")), "session_id": "s-1", "total_cost_usd": 0.01}))
 '''
 
 
@@ -331,6 +332,25 @@ class TestDispatch(Project):
                     self.assertIn("tier: sonnet", text)
                     self.assertIn(f"title: {title}", text)
                 self.assertIn("2 proposed", out)
+
+    def test_escalate_retries_one_tier_up(self):
+        blocked = "RESULT: blocked \u2014 too hard"
+        cases = [("haiku", "--escalate", {"FAKE_RESULT_HAIKU": blocked}, "done", "sonnet", 2),
+                 ("haiku", None, {"FAKE_RESULT_HAIKU": blocked}, "blocked", "haiku", 1),
+                 ("opus", "--escalate", {"FAKE_RESULT_OPUS": blocked}, "blocked", "opus", 1),
+                 ("haiku", "--escalate", {"FAKE_DIRTY": "1"}, "blocked", "haiku", 1)]
+        for tier, flag, env, want, want_tier, runs in cases:
+            with self.subTest(tier=tier, flag=flag, env=env):
+                self.setUp()
+                self.ergon("new", "task", "Hard", "--tier", tier)
+                stamp(self.task_file("T-001"))
+                self.env.update(env)
+                out = self.ergon("dispatch", *([flag] if flag else [])).stdout
+                self.assertEqual(self.status("T-001"), want, out)
+                text = self.task_file("T-001").read_text()
+                self.assertIn(f"tier: {want_tier}", text)
+                self.assertEqual(len(list((self.root / "tasks" / "runs").glob("*.json"))), runs, out)
+                self.assertEqual("escalated haiku\u2192sonnet: too hard" in text, want_tier == "sonnet")
 
     def test_worker_block_files_human_task(self):
         self.ergon("new", "task", "Source", "--tier", "sonnet")

@@ -1374,7 +1374,7 @@ def run_worker(t, base, wt, branch, pubs, args, agents, settings):
            "--output-format", "json"]
     if args.budget:
         cmd += ["--max-budget-usd", str(args.budget)]
-    stem = f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}"
+    stem = f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}" + ("-" + t["tier"] if t.get("escalated") else "")
     log = RUNS / f"{stem}.json"
     try:
         r = subprocess.run(cmd + [prompt], cwd=wt, capture_output=True, text=True,
@@ -1569,11 +1569,26 @@ def dispatch(args):
 
     def one(t, base, wt, branch, pubs):
         verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings)
+        up = None
+        if (args.escalate and verdict == "blocked" and info.get("asked")
+                and t["tier"] in WORKER_TIERS[:-1]):
+            # the worker itself reported blocked: retry once a tier up on the same branch
+            up = WORKER_TIERS[WORKER_TIERS.index(t["tier"]) + 1]
+            print(f"  escalate {t['id']}  {t['tier']}→{up}: {why}")
+            first, why1 = t["tier"], why
+            v2, why, info2 = run_worker(dict(t, tier=up, escalated=True), base, wt, branch, pubs, args, agents, settings)
+            info2["cost"] = info.get("cost", 0) + info2.get("cost", 0)
+            info2["found"] = (info.get("found") or []) + (info2.get("found") or [])
+            verdict, info = v2, info2
         with state_lock():  # also serializes every merge into a companion's trunk
             if verdict == "done":
                 verdict, why = land(t, base, wt, branch, pubs)
             if verdict == "done":
-                put_status(t["id"], "done")
+                put_status(t["id"], "done", f"escalated {first}→{up}: {why1}" if up else None)
+                if up:
+                    t2 = load(ITEMS)[t["id"]]
+                    t2["tier"] = up
+                    dump(t2, TASK_KEYS)
                 print(f"  done     {t['id']}  {why}")
                 e = epics.get(t.get("epic"))
                 if e and epic_complete(e["id"], load(ITEMS)):
@@ -1698,7 +1713,7 @@ def init(args):
     print("next: enable the ergon plugin for this project (README), then `ergon new epic \"...\"`")
 
 
-RUN_LOG = re.compile(r"^(?P<id>[A-Z]+-\d+)-(?P<date>\d{4})(?P<m>\d{2})(?P<d>\d{2})-\d{6}\.json$")
+RUN_LOG = re.compile(r"^(?P<id>[A-Z]+-\d+)-(?P<date>\d{4})(?P<m>\d{2})(?P<d>\d{2})-\d{6}(?:-\w+)?\.json$")
 
 
 def aggregate_stats(runs_dir, tasks, since=None, epic=None):
@@ -1837,6 +1852,8 @@ def main():
                    choices=["auto", "acceptEdits", "dontAsk", "bypassPermissions"])
     d.add_argument("--timeout", type=int, default=60, help="minutes per worker (default 60)")
     d.add_argument("--budget", type=float, help="max USD per worker (--max-budget-usd)")
+    d.add_argument("--escalate", action="store_true",
+                   help="when a worker reports blocked, retry once one tier up (haiku→sonnet→opus)")
     d.add_argument("--dry-run", action="store_true")
     hk = sub.add_parser("hook")
     hk.add_argument("event", choices=["guard", "stop"])
