@@ -53,6 +53,7 @@ map = "map"                        # cards whose "→ task T-NNN" links `check` 
 log = "TODO.md"                    # the log that `source: TODO.md:<line>` cites (audit checks the line)
 retired = "tasks/audit-retired.txt"  # `term | gate | note` rows: nouns that make a task stale
 worker_rules = "tasks/WORKER.md"   # inlined into every dispatched prompt; `ergon rules` prints it
+verify = "make test"               # run in the task worktree before landing; non-zero exit blocks (a task's `verify:` field overrides)
 
 [[companion]]                      # repeatable
 name = "org/product"               # how tasks name it in touches:

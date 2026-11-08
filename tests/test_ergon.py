@@ -357,6 +357,29 @@ class TestDispatch(Project):
         self.assertIn("uncommitted", self.task_file("T-001").read_text())
         self.assertFalse(list(self.root.glob("tasks/**/T-002*")))
 
+    def test_verify_gates_landing(self):
+        for cmd, want in (("true", "done"), ("echo boom-line; exit 3", "blocked")):
+            with self.subTest(cmd):
+                self.setUp()
+                self.ergon("new", "task", "Gated", "--tier", "sonnet")
+                f = self.task_file("T-001")
+                stamp(f)
+                f.write_text(f.read_text().replace("\ntier:", f"\nverify: {cmd}\ntier:", 1))
+                out = self.ergon("dispatch").stdout
+                self.assertEqual(self.status("T-001"), want, out)
+                wt = self.root / ".claude" / "worktrees" / "T-001"
+                branches = sh("git", "branch", "--list", "task/T-001", cwd=self.root).stdout
+                if want == "done":
+                    self.assertTrue((self.root / "T-001.txt").exists())
+                else:
+                    self.assertIn("boom-line", self.task_file("T-001").read_text())
+                    self.assertTrue(wt.exists())
+                    self.assertIn("task/T-001", branches)
+                    self.assertFalse((self.root / "T-001.txt").exists())  # nothing merged
+                    logs = list((self.root / "tasks" / "runs").glob("T-001-*-verify.log"))
+                    self.assertEqual(len(logs), 1)
+                    self.assertIn("boom-line", logs[0].read_text())
+
     def test_dry_run_from_a_worktree(self):
         self.ergon("new", "task", "Private only", "--tier", "haiku")
         stamp(self.task_file("T-001"))

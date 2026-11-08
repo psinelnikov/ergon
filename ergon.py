@@ -71,6 +71,8 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # log = "TODO.md"               # the log a task's `source: TODO.md:<line>` cites
 # retired = "tasks/audit-retired.txt"   # `term | gate | note` rows for `audit`
 # worker_rules = "tasks/WORKER.md"      # inlined into every dispatched worker's prompt
+# verify = "make test"          # run in the task worktree before landing; non-zero exit blocks the task
+#                               # (a task's `verify:` frontmatter overrides it)
 
 # A separate repo checked out inside this one that tasks may change, e.g. a public product
 # repo next to a private install. Each dispatched task touching it gets its own worktree of it.
@@ -1444,6 +1446,31 @@ def drop_worktree(wt, branch, repo=None):
         return f"; left {wt} on {branch} for you to remove ({str(err)[:200]})"
 
 
+VERIFY_TIMEOUT = 15 * 60  # seconds
+
+
+def run_verify(t, wt):
+    """Run the verify command (task `verify:` over config `verify`) in the task worktree.
+    Returns None if it passes or none is set, else a reason; full output goes to <state>/runs/."""
+    cmd = t.get("verify") or CFG.get("verify")
+    if not cmd:
+        return None
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True, timeout=VERIFY_TIMEOUT)
+        out, code = r.stdout + r.stderr, r.returncode
+    except subprocess.TimeoutExpired as e:
+        text_of = lambda b: (b.decode(errors="replace") if isinstance(b, bytes) else b) or ""
+        out, code = f"{text_of(e.stdout)}{text_of(e.stderr)}\ntimed out after {VERIFY_TIMEOUT // 60} min\n", None
+    if code == 0:
+        return None
+    RUNS.mkdir(parents=True, exist_ok=True)
+    log = RUNS / f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-verify.log"
+    log.write_text(out)
+    tail = " | ".join(l.strip() for l in out.strip().splitlines()[-5:])[-400:]
+    how = "timed out" if code is None else f"failed (exit {code})"
+    return f"verify `{cmd}` {how}: {tail} (full output {log.relative_to(HOME)})"
+
+
 def land(t, base, wt, branch, pubs=()):
     """After a worker says done: verify, merge (companions first), clean up. Returns
     (verdict, reason). Nothing merges unless every merge would go through cleanly."""
@@ -1454,6 +1481,9 @@ def land(t, base, wt, branch, pubs=()):
     if not re.search(rf"\b{t['id']}\b", msgs):
         return "blocked", f"worker said done but no commit on {branch} cites {t['id']}"
     kept = f"Branch {branch} and worktree {wt} kept" + "".join(f" ({c['name']} worktree {pub})" for c, pub in pubs)
+    failed = run_verify(t, wt)
+    if failed:
+        return "blocked", f"{failed}. {kept}"
     for c, pub in pubs:
         if c["forbid_ids"]:
             leak = TRACKER_ID.search(git("log", "--format=%B", f"{c['trunk']}..{branch}", raw=True, cwd=c["path"]))
