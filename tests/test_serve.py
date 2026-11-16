@@ -8,8 +8,10 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -261,6 +263,116 @@ class TestServeUnits(unittest.TestCase):
         self.assertNotRegex(out, r"<(?!/?(h2|pre|code|ul|ol|li|p|strong|br)\b)")
         self.assertIn("&lt;script&gt;", out)
         self.assertIn("<strong>&lt;i&gt;z&lt;/i&gt;</strong>", out)
+
+
+class TestEpicTimeline(ServeFixture):
+    """/e/E-001 from a fixture journal: T-001 reviewed with a fix round then landed, T-002 blocked
+    then retried then landed, T-003 asked, was answered, and waited to be accepted."""
+
+    def at(self, hm):
+        return f"2026-11-16T{hm}:00+00:00"
+
+    def journal(self):
+        a = self.at
+        rows = [
+            row(a("10:00"), "T-001", "created"), row(a("10:00"), "T-002", "created"), row(a("10:00"), "T-003", "created"),
+            row(a("11:00"), "T-001", "approved"), row(a("10:30"), "T-002", "approved"), row(a("10:30"), "T-003", "approved"),
+            row(a("11:30"), "T-001", "dispatched", tier="sonnet", worktree=".claude/worktrees/T-001"),
+            row(a("11:40"), "T-001", "worker_end", tier="sonnet", verdict="done", cost=0.5, seconds=600, session="s-1"),
+            row(a("11:41"), "T-001", "verify", ok=True, seconds=30),
+            row(a("11:42"), "T-001", "review", verdict="fail", reviewer="opus", reason="no <tests>", cost=0.25, seconds=60),
+            row(a("11:45"), "T-001", "resumed", session="s-1", round=2, tier="sonnet"),
+            row(a("11:50"), "T-001", "worker_end", tier="sonnet", verdict="done", cost=0.125, seconds=300, round=2),
+            row(a("11:52"), "T-001", "review", verdict="pass", reviewer="opus", cost=0.125, seconds=60, round=2),
+            row(a("11:53"), "T-001", "landed", base="epic/E-001"),
+            row(a("11:00"), "T-002", "dispatched", tier="haiku"),
+            row(a("11:10"), "T-002", "worker_end", tier="haiku", verdict="blocked", reason="needs the schema", cost=0.25, seconds=600),
+            row(a("11:10"), "T-002", "blocked", reason="needs the schema"),
+            row(a("12:00"), "T-002", "status", to="ready"),
+            row(a("12:05"), "T-002", "dispatched", tier="haiku"),
+            row(a("12:15"), "T-002", "worker_end", tier="haiku", verdict="done", cost=0.5, seconds=600),
+            row(a("12:16"), "T-002", "landed", base="epic/E-001"),
+            row(a("11:00"), "T-003", "dispatched", tier="opus"),
+            row(a("11:05"), "T-003", "worker_end", tier="opus", verdict="asking", cost=1.0, seconds=300),
+            row(a("11:05"), "T-003", "question", questions=[{"text": "which db?", "options": []}]),
+            row(a("11:30"), "T-003", "answered", by="p"),
+            row(a("11:31"), "T-003", "resumed", session="s", tier="opus", after="answer"),
+            row(a("11:40"), "T-003", "worker_end", tier="opus", verdict="done", cost=1.0, seconds=540),
+            row(a("11:41"), "T-003", "review_hold"),
+            row(a("12:30"), "T-003", "accepted", by="p"),
+            row(a("12:31"), "T-003", "landed", base="epic/E-001"),
+        ]
+        (self.runs / "history.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return rows
+
+    def test_phases_and_boundaries(self):
+        from ergon import timeline as TL
+        rows = self.journal()
+        tl = TL.build(rows, {}, "E-001", TL.ts_of(self.at("13:00")))
+        self.assertEqual([ln["id"] for ln in tl["lanes"]], ["T-001", "T-002", "T-003"])
+        got = {ln["id"]: [(p["kind"], p["label"], p["outcome"], p["human"],
+                           (p["start"] - tl["t0"]) / 60, (p["end"] - tl["t0"]) / 60) for p in ln["phases"]]
+               for ln in tl["lanes"]}
+        # minutes from 10:00
+        self.assertEqual(got["T-001"], [
+            ("approval", "waiting for approval", "ok", True, 0, 60),
+            ("queued", "queued", "ok", False, 60, 90),
+            ("worker", "worker", "ok", False, 90, 100),
+            ("verify", "verify", "ok", False, 100.5, 101),
+            ("review", "review", "fail", False, 101, 102),
+            ("worker", "fix round 2", "ok", False, 105, 110),
+            ("review", "review 2", "ok", False, 111, 112),
+            ("landed", "landed", "ok", False, 113, 113)])
+        # blocked then retried: the wait for a human ends when the task was set ready
+        self.assertEqual([x[:5] for x in got["T-002"] if x[0] in ("worker", "blocked")], [
+            ("worker", "worker", "fail", False, 60), ("blocked", "blocked", "ok", True, 70),
+            ("worker", "worker", "ok", False, 125)])
+        self.assertEqual([x[5] for x in got["T-002"] if x[0] == "blocked"], [120])
+        kinds3 = [(x[0], x[3], x[4], x[5]) for x in got["T-003"]]
+        self.assertIn(("asking", True, 65, 90), kinds3)
+        self.assertIn(("hold", True, 101, 150), kinds3)
+        self.assertEqual(kinds3[-1][0], "landed")
+        self.assertEqual([c[3] for c in tl["costs"]], sorted(c[3] for c in tl["costs"]))
+        self.assertAlmostEqual(tl["costs"][-1][3], 3.75)
+
+    def test_page(self):
+        self.journal()
+        code, headers, page = self.req("GET", "/e/E-001")
+        self.assertEqual(code, 200)
+        self.assertEqual(page.count('class="lane'), 3)  # one lane per task
+        self.assertEqual(len(re.findall(r'<a href="/t/T-00\d"><text', page)), 3)
+        self.assertEqual(len(re.findall(r'<rect class="seg k-worker', page)), 6)
+        self.assertEqual(len(re.findall(r'<rect class="seg [^"]* human', page)), 6)  # approvals x3, asking, hold, blocked
+        self.assertIn("waiting on a human", page)
+        self.assertIn("no &lt;tests&gt;", page)
+        self.assertIn("which db?", page)
+        self.assertIn('id=play', page)
+        self.assertIn('<option value=16>', page)
+        nonce = re.search(r"script-src 'nonce-([\w-]+)'", headers["Content-Security-Policy"])[1]
+        self.assertEqual(re.findall(r"<script[^>]*>", page), [f'<script nonce="{nonce}">'])
+        self.assertEqual(self.req("GET", "/e/E-009")[0], 404)
+        self.assertIn('href="/e/E-001"', self.req("GET", "/")[2])
+        self.assertEqual(self.snapshot().keys() - self.before.keys(), set())
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_replay_reaches_the_final_state(self):
+        self.journal()
+        page = self.req("GET", "/e/E-001")[2]
+        span = float(re.search(r'data-span="([\d.]+)"', page)[1])
+        segs = [(float(a), float(b), float(c)) for a, b, c in
+                re.findall(r'class="seg[^>]*data-s="([\d.]+)" data-e="([\d.]+)" data-w="([\d.]+)"', page)]
+        self.assertGreater(len(segs), 10)
+        js = (Path(S.__file__).parent / "epic.js").read_text()
+        prog = ("const {reveal}=require(process.argv[1]);const segs=JSON.parse(process.argv[2]);const span=+process.argv[3];"
+                "let ok=true;for(const [s,e,w] of segs){ if(reveal(s,e,w,span)!==w) ok=false;"
+                " if(reveal(s,e,w,-1)!==null) ok=false;"
+                " if(e>s){const m=reveal(s,e,w,(s+e)/2); if(!(m>0&&m<w)) ok=false;}}"
+                "console.log(ok?'final':'broken')")
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "epic.js").write_text(js)
+            out = subprocess.run(["node", "-e", prog, str(Path(d) / "epic.js"), json.dumps(segs), str(span)],
+                                 capture_output=True, text=True, cwd=d)
+        self.assertEqual(out.stdout.strip(), "final", out.stderr)
 
 
 if __name__ == "__main__":
