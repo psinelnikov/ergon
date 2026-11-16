@@ -21,6 +21,7 @@ from . import config as _config
 from . import dispatch as _dispatch
 from . import gitops as _gitops
 from . import history as _history
+from . import report as _report
 from . import tasks as _tasks
 
 
@@ -83,6 +84,10 @@ def ask(prompt):
     """Speed bump, not security: refuse inside agent shells, ask on the controlling tty."""
     if os.environ.get("CLAUDECODE") or os.environ.get("AI_AGENT"):
         raise SystemExit("refused: running inside an agent shell. A human approves from their own terminal.")
+    if os.environ.get("ERGON_ASK_STDIN"):  # scripted answers (tests); the agent-shell refusal above still holds
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        return sys.stdin.readline().strip()
     try:
         with open("/dev/tty", "r") as tin, open("/dev/tty", "w") as tout:
             tout.write(prompt)
@@ -131,18 +136,63 @@ def approve(args):
     print(f"approved {len(todo)}")
 
 
+POLICY_HEAD = "# Policies\n\nSettled review findings, written by a human (`ergon review -i`, p). Workers and reviewers read them.\n\n## Stances\n"
+
+
+def vetoed(t):
+    """A task whose findings a human may settle as a policy: held in `review`, or blocked on a review veto."""
+    return t["status"] == "review" or (
+        t["status"] == "blocked" and re.search(r"\breview \(\w+\) failed:", _report.last_note(t)))
+
+
+def write_policy(t):
+    """Prompt for a policy from t's last review finding and append it to the policies file."""
+    finding = _report.last_note(t)
+    print(f"\nfinding: {finding or '(the task is held in review)'}")
+    title = ask("policy title: ")
+    why = ask("why: ") if title else ""
+    applies = ask("applies to: ") if title else ""
+    if not title:
+        print("no title; nothing written")
+        return False
+    path = _config.POLICIES
+    text = path.read_text() if path.exists() else POLICY_HEAD
+    n = max([int(m) for m in re.findall(r"^### P-(\d+)\b", text, re.M)] or [0]) + 1
+    entry = (f"\n### P-{n} {title}\n- **Why:** {why}\n- **Applies to:** {applies}\n"
+             f"- **Examples:** {t['id']}: {finding}\n- **Decided:** {approver()} {_tasks.today()}\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.rstrip("\n") + "\n" + entry)
+    if ask(f"P-{n} written to {path.relative_to(_config.HOME)}. open $EDITOR to refine it? [y/N] ").lower() == "y":
+        subprocess.run([os.environ.get("EDITOR", "vi"), str(path)])
+    return True
+
+
 def review_interactive(args):
-    """HUMAN ONLY: walk the proposed queue one task at a time. Every answer lands immediately."""
+    """HUMAN ONLY: walk the proposed queue one task at a time, then tasks whose review vetoed
+    them (offering `p`: save the finding as a policy). Every answer lands immediately."""
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
-    queue = sorted((t for t in tasks.values() if t["status"] == "proposed"
-                    and (not args.epic or t.get("epic") == args.epic)
-                    and (not args.tier or t["tier"] == args.tier)),
-                   key=lambda t: (t.get("epic") or "~", t["id"]))
+    pick = lambda t: ((not args.epic or t.get("epic") == args.epic) and (not args.tier or t["tier"] == args.tier))
+    order = lambda t: (t.get("epic") or "~", t["id"])
+    queue = sorted((t for t in tasks.values() if t["status"] == "proposed" and pick(t)), key=order)
+    queue += sorted((t for t in tasks.values() if vetoed(t) and pick(t)), key=order)
     if not queue:
         raise SystemExit("nothing awaiting approval")
-    stamp, tally = f"{approver()} {_tasks.today()}", {"approved": 0, "dropped": 0, "skipped": 0}
+    stamp, tally = f"{approver()} {_tasks.today()}", {"approved": 0, "dropped": 0, "skipped": 0, "policies": 0}
     for i, t in enumerate(queue, 1):
-        while True:
+        while t["status"] != "proposed":
+            print(f"\n{'=' * 78}\n[{i}/{len(queue)}]  {t['id']}  {t['title']}  ({t['status']})\n")
+            print(_report.last_note(t) or "(held in review)")
+            choice = ask(f"\n{t['id']}  [p]olicy from this finding  [s]kip  [q]uit > ").lower()
+            if choice == "p":
+                tally["policies"] += write_policy(t)
+                break
+            if choice == "s":
+                tally["skipped"] += 1
+                break
+            if choice == "q":
+                print("  ".join(f"{k} {v}" for k, v in tally.items()))
+                return
+        while t["status"] == "proposed":
             epic = epics.get(t.get("epic"))
             print(f"\n{'=' * 78}\n[{i}/{len(queue)}]  {epic['id'] + '  ' + epic['title'] if epic else '(no epic)'}\n")
             print(t["_path"].read_text().rstrip())
@@ -378,6 +428,16 @@ def shared_companion_reason(tool, inp):
     return None
 
 
+POLICY_MSG = "the policies file is written by a human only (the p answer of the interactive review); propose one with a `POLICY: <title> — <why>` line"
+
+
+def is_policies(path):
+    """Whether path is the policies file, or its copy in a task worktree."""
+    rel = _config.POLICIES.relative_to(_config.HOME).as_posix()
+    return bool(path) and (str(Path(path).resolve()) == str(_config.POLICIES.resolve())
+                           or Path(path).as_posix().endswith("/" + rel))
+
+
 def guard_reason(tool, inp, worker=False):
     """Why this tool call must not run, or None."""
     if worker:
@@ -392,11 +452,15 @@ def guard_reason(tool, inp, worker=False):
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
                      r"\b(CLAUDECODE|AI_AGENT)=", cmd):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
+        if _config.POLICIES.name in cmd and SHELL_WRITE.search(cmd):
+            return POLICY_MSG
         if _config.TASK_DIR_IN_CMD.search(cmd) and SHELL_WRITE.search(cmd):
             return ("don't write task files from the shell: use `ergon new` / `ergon set` for state, "
                     "Edit for a task's body")
         return None
     path = inp.get("file_path", "")
+    if is_policies(path):
+        return POLICY_MSG
     if not _config.TASK_FILE.search(path):
         return None
     p = Path(path)

@@ -1447,5 +1447,62 @@ class TestCommitHook(DispatchProject):
         (self.root / ".ergon.toml").unlink()  # no config: the hook does nothing
         self.assertEqual(self.commit("Work (T-001)").returncode, 0)
 
+class TestPolicies(TestReview):
+    """T-029: a policies file reaches worker and reviewer prompts; only a human writes it."""
+    test_review_gates_landing = None
+
+    def blocked_by_veto(self):
+        self.ergon("new", "task", "Reviewed", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+        self.env["FAKE_REVIEW"] = "REVIEW: fail \u2014 no shims for old callers"
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "blocked")
+
+    def test_policies_in_prompts(self):
+        (self.root / "tasks" / "policies.md").write_text("## Stances\n\n### P-1 No shims\n- **Why:** pre-1.0\n")
+        self.ergon("new", "task", "Reviewed", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+        self.ergon("dispatch")
+        worker, review = self.calls()
+        self.assertIn("### P-1 No shims", worker["prompt"])
+        self.assertIn("POLICY: <title>", worker["prompt"])
+        self.assertLess(worker["prompt"].index("Never touch prod."), worker["prompt"].index("P-1 No shims"))
+        self.assertIn("### P-1 No shims", review["prompt"])
+        self.assertIn("Do not raise a finding one of them settles", review["prompt"])
+
+    def test_guard_refuses_agent_writes(self):
+        pol = str(self.root / "tasks" / "policies.md")
+        for tool, inp in (("Write", {"file_path": pol, "content": "x"}),
+                          ("Edit", {"file_path": pol, "old_string": "a", "new_string": "b"}),
+                          ("Write", {"file_path": str(self.root / ".claude/worktrees/T-001/tasks/policies.md"), "content": "x"}),
+                          ("Bash", {"command": "echo x >> tasks/policies.md"})):
+            self.assertIn("policies file", self.guard(tool, inp, "--worker") or "", (tool, inp))
+        self.assertIsNone(self.guard("Write", {"file_path": str(self.root / "other.md"), "content": "x"}, "--worker"))
+
+    def test_worker_policy_line_becomes_note(self):
+        self.ergon("new", "task", "Reviewed", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+        self.env["FAKE_FOUND"] = "x"
+        bindir = Path(self.tmp.name) / "bin"
+        fake = (bindir / "claude").read_text()
+        (bindir / "claude").write_text(fake.replace('found = "".join(', 'found = "POLICY: Skip changelog \u2014 internal only\\n" + "".join(', 1))
+        self.ergon("dispatch")
+        self.assertIn("policy proposed: Skip changelog", self.task_file("T-001").read_text())
+        self.assertFalse((self.root / "tasks" / "policies.md").exists())
+
+    def test_review_interactive_p_writes_entry(self):
+        self.blocked_by_veto()
+        env = dict(self.env, ERGON_ASK_STDIN="1", EDITOR="true")
+        for n in (1, 2):
+            r = self.ergon("review", "-i", env=env, inp="p\nNo shims\npre-1.0\ncallers in this repo\nn\n")
+            self.assertIn(f"P-{n} written", r.stdout)
+        text = (self.root / "tasks" / "policies.md").read_text()
+        self.assertTrue(text.startswith("# Policies"))
+        self.assertIn("## Stances", text)
+        for n in (1, 2):
+            self.assertRegex(text, rf"### P-{n} No shims\n- \*\*Why:\*\* pre-1.0\n- \*\*Applies to:\*\* callers in this repo\n"
+                                   rf"- \*\*Examples:\*\* T-001: .*no shims for old callers.*\n- \*\*Decided:\*\* Tester \d{{4}}-\d\d-\d\d\n")
+
+
 if __name__ == "__main__":
     unittest.main()

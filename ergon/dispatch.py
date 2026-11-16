@@ -47,6 +47,20 @@ The task file, read-only to you (it lives in the main checkout):
 {text}
 """
 
+WORKER_POLICIES = """
+Policies a human settled on past review findings. Follow them. To propose one, end a line
+`POLICY: <title> — <why>` before the RESULT line (it becomes a note on the task); never write the
+policies file yourself:
+
+{policies}
+"""
+
+REVIEW_POLICIES = """
+Policies a human settled on past findings. Do not raise a finding one of them settles:
+
+{policies}
+"""
+
 COMPANION_OWN = """
 The companion repo {name} is yours alone at {pub}: a git worktree of the shared checkout
 {shared}, on branch {branch}, cut from its local {ctrunk}. Make and commit every change to it
@@ -119,6 +133,11 @@ def worker_settings():
 
 def worker_rules():
     return _config.WORKER_RULES.read_text().strip() if _config.WORKER_RULES and _config.WORKER_RULES.exists() else ""
+
+
+def policies_text():
+    """The policies file's text, or ''. Written by a human only: the guard refuses agent writes."""
+    return _config.POLICIES.read_text().strip() if _config.POLICIES.exists() else ""
 
 
 def base_branch(t, epics):
@@ -252,9 +271,11 @@ def worker_prompt(t, base, wt, branch, pubs, veto=None, lines=None):
         else:
             companions += COMPANION_NONE.format(name=c["name"], shared=c["path"])
     rules = worker_rules()
+    pol = policies_text()
     return WORKER_PROMPT.format(id=t["id"], wt=wt, branch=branch, base=base, retry=retry,
                                 nested=nested, companions=companions,
-                                rules=f"\nThis project's worker rules:\n\n{rules}\n" if rules else "",
+                                rules=(f"\nThis project's worker rules:\n\n{rules}\n" if rules else "")
+                                + (WORKER_POLICIES.format(policies=pol) if pol else ""),
                                 text=t["_path"].read_text())
 
 
@@ -288,6 +309,8 @@ def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
         return "blocked", f"worker errored ({d.get('subtype') or d.get('terminal_reason')}): {text[:200]}", info
     info["found"] = [(m[0].strip(" *`"), m[1].strip(" *`")) for m in
                      re.findall(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if m[0].strip(" *`")]
+    info["policy"] = [(m[0].strip(" *`"), m[1].strip(" *`")) for m in
+                      re.findall(r"^\W*POLICY:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if m[0].strip(" *`")]
     found = re.findall(r"^\W*RESULT:\s*(done|blocked)\b[\s—:–-]*(.*)$", text, re.M)
     if not found:
         return "blocked", "worker ended without a RESULT line", info
@@ -446,8 +469,10 @@ def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log):
         companions += (f"\nCompanion repo {c['name']}: worktree {pub}, branch {branch} cut from its "
                        f"{c['trunk']}. Its diff, `git -C {pub} diff {c['trunk']}...{branch}`{csize}:\n\n{cdiff}\n")
     rules = worker_rules()
+    pol = policies_text()
     prompt = REVIEW_PROMPT.format(id=t["id"], wt=wt, branch=branch, base=base, tier=tier, companions=companions,
-                                  rules=f"\nThe worker followed these project rules:\n\n{rules}\n" if rules else "",
+                                  rules=(f"\nThe worker followed these project rules:\n\n{rules}\n" if rules else "")
+                                  + (REVIEW_POLICIES.format(policies=pol) if pol else ""),
                                   text=t["_path"].read_text(), diff=diff, size=size)
     cmd = ["claude", "-p", "--agents", json.dumps({"task-review": dict(agent, model=who)}),
            "--agent", "task-review", "--permission-mode", args.permission_mode, "--settings", settings,
@@ -796,6 +821,7 @@ def dispatch(args):
             round_cost = finfo.get("cost", 0)
             info["cost"] = info.get("cost", 0) + round_cost
             info["found"] = (info.get("found") or []) + (finfo.get("found") or [])
+            info["policy"] = (info.get("policy") or []) + (finfo.get("policy") or [])
             info.update(log=finfo["log"], session=finfo.get("session") or info.get("session"),
                         asked=finfo.get("asked"))
             with live_lock:
@@ -876,6 +902,7 @@ def dispatch(args):
             v2, why, info2 = run_worker(dict(t, tier=up, escalated=True), base, wt, branch, pubs, args, agents, settings)
             info2["cost"] = info.get("cost", 0) + info2.get("cost", 0)
             info2["found"] = (info.get("found") or []) + (info2.get("found") or [])
+            info2["policy"] = (info.get("policy") or []) + (info2.get("policy") or [])
             verdict, info = v2, info2
         with live_lock:
             live[t["id"]] = info.get("cost", 0)
@@ -911,6 +938,11 @@ def dispatch(args):
                 _history.record("blocked", t, reason=why, log=info.get("log"), session=info.get("session"),
                                 asked=bool(info.get("asked")))
                 print(f"  blocked  {t['id']}  {why}")
+            if info.get("policy"):
+                cur = _tasks.load(_config.ITEMS)[t["id"]]
+                for title, why in info["policy"]:
+                    add_note(cur, f"policy proposed: {title}" + (f" — {why}" if why else ""), who="worker")
+                _tasks.dump(cur, _tasks.TASK_KEYS)
             for fid, title in file_found(t, info.get("found") or [], epics):
                 print(f"  proposed {fid}  (found by {t['id']})  {title}")
                 info.setdefault("filed", []).append(fid)

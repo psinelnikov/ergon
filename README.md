@@ -74,6 +74,7 @@ worker_rules = "tasks/WORKER.md"   # inlined into every dispatched prompt; `ergo
 verify = "make test"               # run in the task worktree before landing; non-zero exit blocks (a task's `verify:` field overrides)
 verify_rounds = 2                   # a red verify goes back to the worker this many times first; 0 blocks at once
 review = ["haiku", "sonnet"]       # worker tiers whose branches a reviewer one tier up must pass before landing
+policies = "tasks/policies.md"      # settled review findings, human-written in the interactive review (p); inlined into worker and reviewer prompts
 review_rounds = 2                  # a review fail goes back to the worker, then review again, this many times; then the task blocks (0: at once)
 review_resume_secs = 3300          # a fix round resumes the worker's session only if its last request is younger than this
 review_resume_tokens = 80000       # and its context smaller than this; otherwise a fresh worker on the same branch

@@ -39,6 +39,7 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # log = "TODO.md"               # the log a task's `source: TODO.md:<line>` cites
 # retired = "tasks/audit-retired.txt"   # `term | gate | note` rows for `audit`
 # worker_rules = "tasks/WORKER.md"      # inlined into every dispatched worker's prompt
+# policies = "tasks/policies.md"        # settled review findings (human-written; inlined into worker and reviewer prompts)
 # verify = "make test"          # run in the task worktree before landing; non-zero exit blocks the task
 #                               # (a task's `verify:` frontmatter overrides it)
 # verify_rounds = 2             # on a red verify, resume the worker with the output and verify again, up to
@@ -158,7 +159,7 @@ def configure(start=None, need_config=True):
     the main checkout: task state, worktrees, run logs and companion checkouts live there, so
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
-        RETIRED_FILE, WORKER_RULES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, REVIEW, ACCEPT, \
+        RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, REVIEW, ACCEPT, \
         REVIEW_ROUNDS, VERIFY_ROUNDS, RESUME_SECS, RESUME_TOKENS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
@@ -186,6 +187,8 @@ def configure(start=None, need_config=True):
     LOG = opt("log")  # a path relative to the repo, e.g. TODO.md
     RETIRED_FILE = REPO / opt("retired") if opt("retired") else None
     WORKER_RULES = REPO / opt("worker_rules") if opt("worker_rules") else None
+    # Settled review findings, written by a human only (the p answer of the interactive review); inlined into prompts.
+    POLICIES = HOME / opt("policies") if opt("policies") else STATE / "policies.md"
     # Worker tiers whose finished branches a reviewer must pass before they land. Opt-in: none
     # by default. After --escalate, either the task's own tier or the one that finished counts.
     REVIEW = CFG.get("review") or []
