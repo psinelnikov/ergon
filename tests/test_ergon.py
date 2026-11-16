@@ -22,8 +22,9 @@ FAKE_CLAUDE = r'''#!/usr/bin/env python3
 any companion worktree inside it, then reports RESULT: done. As the task-review agent it
 reports $FAKE_REVIEW (default REVIEW: pass; $FAKE_REVIEWS, |-separated, gives the nth review the
 nth verdict, the last repeating) and appends its model and prompt to $FAKE_SEEN. With
-$FAKE_TRANSCRIPT_AGE set, a worker leaves a transcript under $HOME/.claude/projects whose last
-request is that many seconds old and holds $FAKE_CONTEXT tokens (default 1000)."""
+$FAKE_TRANSCRIPT_AGE set, a worker leaves a transcript under $CLAUDE_CONFIG_DIR/projects (default
+$HOME/.claude/projects, as Claude Code does) whose last request is that many seconds old and
+holds $FAKE_CONTEXT tokens (default 1000)."""
 import json, os, re, subprocess, sys, time
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 prompt = sys.argv[-1]
@@ -46,7 +47,7 @@ if tier == "REVIEW":
     sys.exit()
 if os.environ.get("FAKE_TRANSCRIPT_AGE"):
     import datetime
-    d = os.path.join(os.path.expanduser("~/.claude/projects"), re.sub(r"[^A-Za-z0-9]", "-", os.getcwd()))
+    d = os.path.join(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"), "projects", re.sub(r"[^A-Za-z0-9]", "-", os.getcwd()))
     os.makedirs(d, exist_ok=True)
     at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=float(os.environ["FAKE_TRANSCRIPT_AGE"]))
     entry = {"type": "assistant", "timestamp": at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
@@ -796,6 +797,7 @@ class TestReviewRounds(DispatchProject):
         home = Path(self.tmp.name) / "home"  # where the fake leaves, and ergon reads, transcripts
         home.mkdir()
         self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0")
+        self.env.pop("CLAUDE_CONFIG_DIR", None)  # never the developer's own config dir
         self.ergon("new", "task", "Fixable", "--tier", "haiku")
         stamp(self.task_file("T-001"))
 
@@ -902,6 +904,18 @@ class TestReviewRounds(DispatchProject):
         self.assertIn("gap (review log", self.task_file("T-001").read_text())
         self.assertIn("; no fix round 1: $0.03 spent", self.task_file("T-001").read_text())
 
+    def test_relocated_config_dir_is_read(self):
+        # Claude Code keeps transcripts under $CLAUDE_CONFIG_DIR/projects when that is set: the fix
+        # round still finds the worker's and resumes it, and nothing lands under ~/.claude.
+        config = Path(self.tmp.name) / "config"
+        self.env.update(CLAUDE_CONFIG_DIR=str(config), FAKE_REVIEWS="REVIEW: fail — gap|REVIEW: pass")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual([(c["agent"], c["resume"]) for c in self.calls()],
+                         [("HAIKU", None), ("REVIEW", None), ("HAIKU", "s-1"), ("REVIEW", None)])
+        self.assertTrue(any((config / "projects").iterdir()))
+        self.assertFalse((Path(self.env["HOME"]) / ".claude").exists())
+
     def test_stale_or_heavy_session_starts_fresh(self):
         cases = [("stale", {"FAKE_TRANSCRIPT_AGE": "4000"}, "its last request was 67 min ago, so its prompt cache "
                   "has likely expired (review_resume_secs = 3300)"),
@@ -952,6 +966,7 @@ class TestVerifyRounds(DispatchProject):
         home = Path(self.tmp.name) / "home"
         home.mkdir()
         self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0")
+        self.env.pop("CLAUDE_CONFIG_DIR", None)  # never the developer's own config dir
         self.ergon("new", "task", "Verified", "--tier", "haiku")
         stamp(self.task_file("T-001"))
 

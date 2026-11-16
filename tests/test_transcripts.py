@@ -29,6 +29,27 @@ class TestTranscripts(unittest.TestCase):
         self.dir = os.path.join(self.tmp, T.project_name(self.cwd))
         self.cache = os.path.join(self.tmp, "transcripts.json")
 
+    def test_root_honours_claude_config_dir(self):
+        saved = os.environ.get("CLAUDE_CONFIG_DIR")
+        try:
+            os.environ["CLAUDE_CONFIG_DIR"] = self.tmp
+            self.assertEqual(T.root(), os.path.join(self.tmp, "projects"))
+            w(f"{self.tmp}/projects/{T.project_name(self.cwd)}/s.jsonl",
+              [asst("a", "2026-11-16T10:00:00Z", {"input_tokens": 7})])
+            self.assertEqual(T.last_request("s", self.cwd)[1], 7)
+            self.assertEqual(T.session_summary("s", self.cwd)["tokens"]["input"], 7)
+            for unset in ("", None):
+                if unset is None:
+                    del os.environ["CLAUDE_CONFIG_DIR"]
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = unset
+                self.assertEqual(T.root(), os.path.join(os.path.expanduser("~"), ".claude", "projects"))
+        finally:
+            if saved is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = saved
+
     def test_project_name(self):
         self.assertEqual(T.project_name("/a/b.c_d"), "-a-b-c-d")
 

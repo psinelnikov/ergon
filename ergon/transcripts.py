@@ -12,17 +12,24 @@ Ported from SClaude's sclaude/lib/metrics/claude_usage.py (read, project_name), 
     copyright notice and this permission notice shall be included in all copies or substantial
     portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 
-A session leaves ~/.claude/projects/<cwd, non-alphanumerics as "-">/<session>.jsonl, and its
-subagents under <session>/subagents/*.jsonl. Every reader here returns None, never raises, when
+A session leaves <config>/projects/<cwd, non-alphanumerics as "-">/<session>.jsonl, and its
+subagents under <session>/subagents/*.jsonl, where <config> is $CLAUDE_CONFIG_DIR when set, else
+~/.claude, as in Claude Code itself. Every reader here returns None, never raises, when
 a transcript is missing or moved.
 """
 import json
 import os
 import re
 
-ROOT = os.path.expanduser("~/.claude/projects")
 VERSION = 1  # bumped when a summary gains a field: every cached transcript is read again
 CACHE_REBUILT_MIN = 20000  # below this, a request writing more than it reads is a short context growing
+
+
+def root():
+    """Where Claude Code keeps every project's sessions: <config>/projects. Read at each call, so
+    a CLAUDE_CONFIG_DIR set after import (or in a test) is honoured."""
+    config = os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"
+    return os.path.join(os.path.expanduser(config), "projects")
 
 
 def project_name(path):
@@ -142,12 +149,12 @@ def _cached_read(path, cache, fresh):
     return summary
 
 
-def session_summary(session, cwd, cache_path=None, root=None):
+def session_summary(session, cwd, cache_path=None, base=None):
     """The summary of one session run in cwd, its subagents folded in, or None when the
     transcript is missing. Reads are cached by (size, mtime) in cache_path (a JSON file)."""
     if not session or not cwd:
         return None
-    d = os.path.join(root or ROOT, project_name(cwd))
+    d = os.path.join(base or root(), project_name(cwd))
     main = os.path.join(d, f"{session}.jsonl")
     cache = {}
     if cache_path:
@@ -215,7 +222,7 @@ def _unix(ts):
     return d.timestamp()
 
 
-def last_request(session, cwd, root=None):
+def last_request(session, cwd, base=None):
     """(when, tokens) of the last request a session made itself, or None when its transcript is
     missing or holds none: `when` a Unix time (the prompt cache lives from then) and `tokens`
     what that request sent, cached or not (the context the session holds). Subagents' requests
@@ -223,7 +230,7 @@ def last_request(session, cwd, root=None):
     Ported from SClaude's session_end.py (context, requested), MIT as above."""
     if not session or not cwd:
         return None
-    path = os.path.join(root or ROOT, project_name(cwd), f"{session}.jsonl")
+    path = os.path.join(base or root(), project_name(cwd), f"{session}.jsonl")
     got = None
     try:
         fh = open(path, "rb")
