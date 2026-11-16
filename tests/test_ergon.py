@@ -1647,6 +1647,46 @@ class TestAsking(DispatchProject):
         sonnet = [l.split() for l in self.ergon("stats").stdout.splitlines() if l.startswith("sonnet")][0]
         self.assertEqual(sonnet[:4], ["sonnet", "2", "1", "0"])  # the question isn't a block
 
+    def test_review_interactive_answers(self):
+        """T-042: the interactive review walks asking tasks too and answers them as `ergon answer` does."""
+        self.asks()
+        self.ergon("new", "task", "Other", "--tier", "haiku")  # T-002, proposed
+        review_i = lambda *a, inp="": self.ergon("review", "-i", *a, inp=inp, check=False,
+                                                 env=dict(self.env, ERGON_ASK_STDIN="1"))
+        r = self.ergon("review", "-i", check=False, env=clean_env(CLAUDECODE="1"))
+        self.assertIn("agent shell", r.stderr)
+        r = review_i("--tier", "haiku", inp="s\n")  # filters apply to asking tasks too
+        self.assertIn("T-002", r.stdout)
+        self.assertNotIn("Which store", r.stdout)
+        self.assertIn("nothing awaiting approval or an answer", review_i("--epic", "E-001").stderr)
+
+        r = review_i(inp="s\na\n1\nkeep it\nn\n")  # proposed first, then asking; declining writes nothing
+        self.assertLess(r.stdout.index("T-002"), r.stdout.index("[2/2]  T-001  Store it  (asking)"))
+        self.assertIn("1. sqlite  (recommended)", r.stdout)
+        self.assertIn("it's a re-plan: don't answer", r.stdout)
+        self.assertIn("aborted", r.stdout)
+        self.assertIn("answered 0  skipped 2", r.stdout)
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertRegex(self.text(), r"(?m)^asking: s-1$")
+
+        r = review_i("--tier", "sonnet", inp="a\n1\nkeep it\ny\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Q1  Which store should it use?", r.stdout)
+        self.assertIn("Send this answer to T-001's worker as Tester?", r.stdout)
+        self.assertIn("answered 1", r.stdout)
+        text = self.text()
+        self.assertEqual(self.status("T-001"), "ready")
+        self.assertNotRegex(text, r"(?m)^asking:")
+        self.assertRegex(text, r"(?m)^answered: s-1$")
+        self.assertIn("answer by Tester: Q1: sqlite. Q2: keep it.", text)
+        for key in ("approved: Tester 2026-01-01", "tier: sonnet", "touches: [store.py]"):
+            self.assertIn(key, text)
+        self.assertNotRegex(text, r"(?m)^accept:")
+        a = [r for r in history(self.root) if r["event"] == "answered"]
+        self.assertEqual([(x["by"], x["answer"], x["session"]) for x in a], [("Tester", "Q1: sqlite. Q2: keep it.", "s-1")])
+        self.assertEqual(self.status("T-002"), "proposed")
+        self.assertIn("resumes with your answer", self.ergon("dispatch", "--dry-run").stdout)
+
     def test_stale_session_starts_fresh_with_the_answer(self):
         self.env["FAKE_TRANSCRIPT_AGE"] = "4000"
         self.asks()

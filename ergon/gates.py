@@ -182,17 +182,44 @@ def write_policy(t):
 
 
 def review_interactive(args):
-    """HUMAN ONLY: walk the proposed queue one task at a time, then tasks whose review vetoed
-    them (offering `p`: save the finding as a policy). Every answer lands immediately."""
+    """HUMAN ONLY: walk the proposed queue one task at a time, then tasks waiting on an answer to
+    their worker's question (offering `a`: answer it, as `ergon answer` does), then tasks whose
+    review vetoed them (offering `p`: save the finding as a policy). Every answer lands immediately."""
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     pick = lambda t: ((not args.epic or t.get("epic") == args.epic) and (not args.tier or t["tier"] == args.tier))
     order = lambda t: (t.get("epic") or "~", t["id"])
     queue = sorted((t for t in tasks.values() if t["status"] == "proposed" and pick(t)), key=order)
-    queue += sorted((t for t in tasks.values() if vetoed(t) and pick(t)), key=order)
+    queue += sorted((t for t in tasks.values() if _tasks.is_asking(t) and pick(t)), key=order)
+    queue += sorted((t for t in tasks.values() if vetoed(t) and not _tasks.is_asking(t) and pick(t)), key=order)
     if not queue:
-        raise SystemExit("nothing awaiting approval")
-    stamp, tally = f"{approver()} {_tasks.today()}", {"approved": 0, "dropped": 0, "skipped": 0, "policies": 0}
+        raise SystemExit("nothing awaiting approval or an answer")
+    stamp = f"{approver()} {_tasks.today()}"
+    tally = {"approved": 0, "dropped": 0, "answered": 0, "skipped": 0, "policies": 0}
     for i, t in enumerate(queue, 1):
+        if _tasks.is_asking(t):
+            epic = epics.get(t.get("epic"))
+            print(f"\n{'=' * 78}\n[{i}/{len(queue)}]  {t['id']}  {t['title']}  (asking)"
+                  f"\n{epic['id'] + '  ' + epic['title'] if epic else '(no epic)'}")
+            show_questions(t)
+            while True:
+                choice = ask(f"\n{t['id']} [{t['tier']}]  [a]nswer  [s]kip  [q]uit > ").lower()
+                if choice == "a":
+                    try:
+                        answer_task(t)
+                        tally["answered"] += 1
+                    except SystemExit as err:  # no answer, not confirmed, or moved on meanwhile: nothing written
+                        if str(err).startswith("refused"):  # ask()'s agent-shell / no-tty refusal ends the review
+                            raise
+                        print(err)
+                        tally["skipped"] += 1
+                    break
+                if choice == "s":
+                    tally["skipped"] += 1
+                    break
+                if choice == "q":
+                    print("  ".join(f"{k} {v}" for k, v in tally.items()))
+                    return
+            continue
         while t["status"] != "proposed":
             print(f"\n{'=' * 78}\n[{i}/{len(queue)}]  {t['id']}  {t['title']}  ({t['status']})\n")
             print(_report.last_note(t) or "(held in review)")
@@ -361,27 +388,38 @@ RE_PLAN = ("An answer steers the work only. It never changes approved:, tier, to
            "`ergon close {id} --as dropped --reason R` and file a new one.")
 
 
+def show_questions(t):
+    """Print the question(s) t's worker parked it on, each with its options, and the re-plan rule."""
+    for n, (q, opts) in enumerate(_dispatch.asked(t)[0], 1):
+        print(f"\nQ{n}  {q}")
+        for i, o in enumerate(opts, 1):
+            print(f"    {i}. {o}" + ("  (recommended)" if i == 1 else ""))
+    print("\n" + RE_PLAN.format(id=t["id"]))
+
+
 def answer(args):
-    """HUMAN ONLY: answer the question(s) a dispatched worker parked its task on. Writes the answer
-    to Notes, swaps `asking:` for `answered:` and sets the task ready, so the next dispatch resumes
-    the worker's session with it (or a fresh worker, if the cache is gone). With no text, offers
-    each question's options to pick from. Never touches approved:, tier, touches: or accept:."""
+    """HUMAN ONLY: answer the question(s) a dispatched worker parked its task on."""
     t = _tasks.load(_config.ITEMS).get(args.id)
     if not t:
         raise SystemExit(f"no such task: {args.id}")
     if not _tasks.is_asking(t):
         raise SystemExit(f"{args.id} isn't waiting on an answer (status {t['status']}"
                          + (", answered already: the next dispatch resumes it" if t.get("answered") else "") + ")")
-    qs, _ = _dispatch.asked(t)
     print(f"{args.id}  {t['title']}")
-    for n, (q, opts) in enumerate(qs, 1):
-        print(f"\nQ{n}  {q}")
-        for i, o in enumerate(opts, 1):
-            print(f"    {i}. {o}" + ("  (recommended)" if i == 1 else ""))
-    print("\n" + RE_PLAN.format(id=args.id))
-    text = " ".join(args.text).strip() if args.text else ""
+    show_questions(t)
+    answer_task(t, " ".join(args.text).strip() if args.text else "")
+
+
+def answer_task(t, text=""):
+    """HUMAN ONLY, the one path for `ergon answer` and the interactive review: take an answer for
+    asking task t (with no text, offer each question's options to pick from) and confirm it; then
+    write it to Notes, swap `asking:` for `answered:` and set the task ready, so the next dispatch
+    resumes the worker's session with it (or a fresh worker, if the cache is gone). Never touches
+    approved:, tier, touches: or accept:. Raises SystemExit, writing nothing, if no answer is
+    given or confirmed."""
+    tid = t["id"]
     if not text:
-        parts = []
+        qs, parts = _dispatch.asked(t)[0], []
         for n, (q, opts) in enumerate(qs or [("(no question recorded)", [])], 1):
             got = ask(f"\nQ{n} answer" + (f" (1-{len(opts)}, or your own words)" if opts else "") + ": ")
             if got.isdigit() and opts and 1 <= int(got) <= len(opts):
@@ -392,19 +430,19 @@ def answer(args):
         text = parts[0] if len(parts) == 1 else " ".join(f"Q{n}: {a}." for n, a in enumerate(parts, 1))
     text = _dispatch.note_line(text)
     print(f"\nanswer: {text}")
-    if not human_gate(f"Send this answer to {args.id}'s worker as {approver()}?"):
+    if not human_gate(f"Send this answer to {tid}'s worker as {approver()}?"):
         raise SystemExit("aborted")
     with _gitops.state_lock():
-        t = _tasks.load(_config.ITEMS)[args.id]
+        t = _tasks.load(_config.ITEMS)[tid]
         if not _tasks.is_asking(t):
-            raise SystemExit(f"{args.id} is now {t['status']}; nothing written")
+            raise SystemExit(f"{tid} is now {t['status']}; nothing written")
         session = t.pop("asking")
         t["status"], t["answered"] = "ready", session
         _dispatch.add_note(t, text, who=f"answer by {approver()}")
         _tasks.dump(t, _tasks.TASK_KEYS)
         _history.record("answered", t, by=approver(), answer=text,
                         session=None if session == _dispatch.NO_SESSION else session)
-    print(f"{args.id} is ready: the next `ergon dispatch` resumes its worker with your answer")
+    print(f"{tid} is ready: the next `ergon dispatch` resumes its worker with your answer")
 
 
 def close(args):
