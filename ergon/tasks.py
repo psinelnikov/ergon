@@ -207,12 +207,45 @@ def review(args):
         print("\nfrom your own terminal:  ergon accept <ID|E-ID> ...   or   ergon reject <ID> --reason R")
 
 
+def _print_run_usage(tid):
+    """Tokens, top tools and denials of each run of tid whose transcript still exists."""
+    from . import transcripts
+    branch = _config.TASK_BRANCH + tid
+    try:
+        wt = _gitops.worktrees().get(branch)
+    except Exception:
+        wt = None
+    wt = str(wt or _config.WORKTREES / tid)
+    rows = []
+    for log in sorted(_config.RUNS.glob(f"{tid}-*.json")):
+        try:
+            d = json.loads(log.read_text())
+        except (OSError, ValueError):
+            continue
+        sid = d.get("session_id") if isinstance(d, dict) else None
+        s = None
+        for cwd in dict.fromkeys([wt, os.path.realpath(wt)]):
+            s = transcripts.session_summary(sid, cwd, str(_config.RUNS / "transcripts.json"))
+            if s:
+                break
+        if s:
+            rows.append((log.stem, s))
+    if rows:
+        print("RUNS")
+        for stem, s in rows:
+            print(f"  {stem}")
+            for l in transcripts.describe(s):
+                print(f"    {l}")
+
+
 def show(args):
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     item = tasks.get(args.id) or epics.get(args.id)
     if not item:
         raise SystemExit(f"no such id: {args.id}")
     print(item["_path"].read_text())
+    if args.id in tasks:
+        _print_run_usage(args.id)
     if args.id in epics:
         print("TASKS")
         for t in sorted((t for t in tasks.values() if t.get("epic") == args.id), key=lambda t: t["id"]):
