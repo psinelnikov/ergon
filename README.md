@@ -8,6 +8,7 @@ A task tracker for repos where AI agents do much of the work. **Humans approve, 
 - Each epic gets its own branch, worked in its own git worktree. When its last task closes, the branch merges back with a message listing every task and the commits that cite it.
 - `ergon dispatch` runs approved tasks headless, in parallel: one worktree, one `task/<ID>` branch and one `claude -p` worker per task. Finished branches merge into their epic. Nothing is ever pushed. `ergon dispatch --watch --budget-total USD [--interval SEC]` keeps running and picks up tasks you approve meanwhile, until the cap is reached or Ctrl-C (running workers finish; a second Ctrl-C kills them and marks them blocked). With `review` set, a reviewer one tier up must pass each branch before it lands; on a fail, dispatch hands the findings back to the worker (resuming its session while the prompt cache is warm, else a fresh one) and reviews again, up to `review_rounds` times (default 2), before it blocks the task with every round's reason in Notes.
 - `ergon import gh#123` turns a GitHub issue into a `proposed` task (see [Importing issues](#importing-issues)). When its epic merges, ergon prints the `gh issue comment` / `gh issue close` commands for you to run after you push. It never runs them.
+- `ergon serve` is a read-only web board for a browser or a phone: open work, what waits on you, live dispatch state, and each task's runs, reviews, costs and logs (see [Web board](#web-board-ergon-serve)). Loopback only unless you `--bind` elsewhere.
 - **Companion repos**: a separate repo checked out inside this one (say, a public product repo inside a private install). Each task that touches it gets its own worktree of that repo too. You can also refuse commits there that cite tracker IDs.
 
 The guide covers the workflow, schema and rules: [`skills/ergon/SKILL.md`](skills/ergon/SKILL.md), or `ergon guide`.
@@ -113,6 +114,28 @@ The design choices:
 - **GitHub only for now.** Linear has no official CLI, so supporting it would mean handling an API key inside ergon. `linear:ABC-12` is refused with a hint to use `ergon new task … --source linear:ABC-12`.
 - **The tier is not guessed.** An imported task gets `tier: human` unless you pass `--tier`, and `tier_why` says it's unsized. An issue body is text from outside the repo that anyone can write. Dispatch skips `human` tasks, so even approving a whole epic at once can't send an unread issue to a headless worker. To make it worker-ready, give it a tier with `ergon set T-NNN tier=…` or `review -i`.
 - **Nothing is closed or commented on automatically.** Ergon never pushes, so when an epic merges the fix isn't public yet. A closed issue pointing at a commit nobody can see would be wrong. Printing the commands keeps that step with whoever pushes.
+
+## Web board: `ergon serve`
+
+```bash
+ergon serve                          # http://127.0.0.1:4300/
+ergon serve --port 8080
+ergon serve --bind 100.101.102.103   # your tailscale IP, to read it from your phone
+```
+
+A small read-only web view of the same state, served by the standard library's `http.server` with its CSS and JS inlined in each page. It loads nothing from elsewhere. It follows the system's light or dark setting and works at phone width.
+
+- **The board** (`/`) shows open work by status, then tier, the way `ergon` prints it. Above it are three counts: tasks awaiting approval (`proposed`), awaiting acceptance (`review`), and awaiting an answer (open `human` tasks that a blocked worker filed). Below are the epics with their progress. A live table lists every `doing` task with its elapsed time, round, spend so far (the finished workers and reviewers of this dispatch, from the history) and the tokens of its newest transcript. The page polls `/live.json` every four seconds to keep that table current.
+- **A task** (`/t/T-NNN`) shows its frontmatter and the brief, rendered. Each worker run from `history.jsonl` gets a card with its round, tier, verdict, cost, time, reason, log, tokens, top tools and permission denials (from Claude Code's transcript), plus the `cd <worktree> && claude --resume <session>` command to pick the session up. Below that come the review verdicts by round, the full journal, and links to every raw log of the task. Run logs from before the history existed still show, read from the log file itself.
+
+It is read-only by construction:
+
+- Only GET and HEAD are served. Every other method gets `405`. No route writes a file (transcript summaries are cached in memory, not in `runs/transcripts.json`), runs git, or launches `claude`.
+- Only files directly inside `<state>/runs/` are served, by bare name. A name with a slash, a leading dot, `..` (encoded or not), or a symlink that resolves elsewhere gets `404`. Logs are sent as `text/plain` with `nosniff`, so a log full of HTML is still shown as text.
+- Task text is untrusted. Every value is HTML-escaped. The brief's markdown is a small subset (headings, lists, code, bold, task links) applied after escaping, so no raw HTML, attribute or link from a task gets through. Pages carry a Content-Security-Policy that allows only that response's own inline script and style, by nonce.
+- The `Host` header must be an IP address or `localhost`. That stops a DNS-rebinding web page from reading the board through your browser. It also means you open the board by IP, not by a MagicDNS or other host name.
+
+**The bind warning.** By default it listens on `127.0.0.1` only. Any other address has to be given with `--bind`, and ergon then prints a warning: **there is no login.** Anyone who can reach that address and port can read every task brief, run log, cost and session ID. Bind a tailnet IP or another interface only you can reach. Never bind `0.0.0.0` on a network you share, and never expose the port to the internet.
 
 ## Tests
 
