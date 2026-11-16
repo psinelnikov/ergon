@@ -5,6 +5,7 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
 
   /            the board: open work by status then tier, epics with progress, what waits on a
                human (approval, acceptance, answers), and live dispatch state
+  /metrics     charts and tables: stats, review, human latency, lead time, tokens; ?epic=&since=&until=
   /live.json   tasks `doing`: elapsed time, round, spend so far; the board polls it
   /e/E-NNN     one epic's replay timeline: a lane per task, a bar per phase from the journal,
                human waits hatched, a cost overlay, and a replay player (inline SVG, no libraries)
@@ -45,6 +46,7 @@ from pathlib import Path
 
 from . import config as _config
 from . import history as _history
+from . import metrics as _metrics
 from . import report as _report
 from . import tasks as _tasks
 from . import timeline as _timeline
@@ -380,7 +382,7 @@ def board_page(nonce):
     c = counts(tasks)
     now = time.time()
     lv = live(tasks, rows)
-    b = [f'<div class=top><h1>{esc(_config.HOME.name)}</h1><span class=crumb>ergon board · read-only</span></div>']
+    b = [f'<div class=top><h1>{esc(_config.HOME.name)}</h1><span class=crumb>ergon board · read-only · <a href="/metrics">metrics</a></span></div>']
     b.append("<div class=counts>")
     for key, label, anchor in (("approval", "awaiting approval", "#proposed"),
                                ("acceptance", "awaiting acceptance", "#review"),
@@ -597,6 +599,18 @@ def task_page(tid, nonce):
     return page(f"{tid} · {t.get('title', '')}", "".join(b), nonce)
 
 
+def metrics_page(query, nonce):
+    tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
+    q = urllib.parse.parse_qs(query)
+    one = lambda k, ok: next((v for v in q.get(k, []) if ok(v)), None)
+    date = lambda v: re.fullmatch(r"\d{4}-\d{2}-\d{2}", v)
+    f = {"epic": one("epic", lambda v: v in epics), "since": one("since", date), "until": one("until", date),
+         "epics": sorted(epics)}
+    rows = _history.read()
+    m = _metrics.compute(tasks, rows, _config.RUNS, f["since"], f["until"], f["epic"], summary, worktree_of)
+    return page("ergon · metrics", _metrics.render(m, esc, money, f), nonce)
+
+
 # ---------- HTTP ----------
 
 def csp(nonce=None):
@@ -650,13 +664,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if not host_ok(self.headers.get("Host")):
                 return self._text(403, "403: open this board by IP address or localhost, not a host name", head)
-            raw = self.path.split("?", 1)[0].split("#", 1)[0]
+            raw, _, query = self.path.split("#", 1)[0].partition("?")
             if not raw.startswith("/"):
                 return self._text(404, "404: not found", head)
             path = urllib.parse.unquote(raw)
             nonce = secrets.token_urlsafe(16)
             if path == "/":
                 return self._send(200, board_page(nonce).encode(), "text/html; charset=utf-8", head, nonce)
+            if path == "/metrics":
+                return self._send(200, metrics_page(query, nonce).encode(), "text/html; charset=utf-8", head, nonce)
             if path == "/live.json":
                 tasks = _tasks.load(_config.ITEMS)
                 data = {"now_ts": time.time(), "counts": counts(tasks), "doing": live(tasks, _history.read())}
