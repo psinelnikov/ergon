@@ -20,6 +20,7 @@ from pathlib import Path
 from . import config as _config
 from . import dispatch as _dispatch
 from . import gitops as _gitops
+from . import history as _history
 from . import tasks as _tasks
 
 
@@ -126,6 +127,7 @@ def approve(args):
     for t in todo:
         t["status"], t["approved"] = "ready", stamp
         _tasks.dump(t, _tasks.TASK_KEYS)
+        _history.record("approved", t, by=approver(), tier=t["tier"])
     print(f"approved {len(todo)}")
 
 
@@ -151,6 +153,7 @@ def review_interactive(args):
             if choice == "a":
                 t["status"], t["approved"] = "ready", stamp
                 _tasks.dump(t, _tasks.TASK_KEYS)
+                _history.record("approved", t, by=approver(), tier=t["tier"])
                 tally["approved"] += 1
                 break
             if choice == "r":
@@ -159,6 +162,7 @@ def review_interactive(args):
                 if reason:
                     t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {reason}\n"
                 _tasks.dump(t, _tasks.TASK_KEYS)
+                _history.record("rejected", t, by=approver(), reason=reason or None, **{"from": "proposed", "to": "dropped"})
                 tally["dropped"] += 1
                 break
             if choice == "t":
@@ -207,10 +211,12 @@ def reject(args):
         if args.reason:
             t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {args.reason}\n"
         _tasks.dump(t, _tasks.TASK_KEYS)
+        _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "proposed", "to": "dropped"})
     for t in back:
         t["status"] = "ready"
         _dispatch.add_note(t, f"rejected by {approver()}: {args.reason}", who="review")
         _tasks.dump(t, _tasks.TASK_KEYS)
+        _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "review", "to": "ready"})
     print(", ".join(x for x in (f"dropped {len(todo)}" if todo else "",
                                 f"sent {len(back)} back to ready" if back else "") if x))
 
@@ -266,9 +272,11 @@ def accept(args):
                       "commit or discard them, then accept again:\n  " + "\n  ".join(stray))
                 failed += 1
                 continue
+            _history.record("accepted", t, by=approver())
             verdict, why = _dispatch.land(t, base, wt, branch, pubs, accepted=who)
             if verdict != "done":
                 _dispatch.put_status(tid, "blocked", f"couldn't land it for {who}: {why}", who="accept")
+                _history.record("blocked", t, reason=f"couldn't land it for {who}: {why}", log=None, session=None, asked=False)
                 print(f"  blocked  {tid}  {why}")
                 failed += 1
                 continue
@@ -310,6 +318,7 @@ def close(args):
         t["status"] = args.as_
         t["_body"] = t["_body"].rstrip() + f"\n\nClosed {_tasks.today()} as {args.as_}: {args.reason}\n"
         _tasks.dump(t, _tasks.TASK_KEYS)
+        _history.record("closed", t, by=approver(), reason=args.reason, **{"as": args.as_})
     print(f"closed {len(todo)} as {args.as_}")
     for eid in sorted({t["epic"] for t in todo if t.get("epic") in epics}):
         if epics[eid]["status"] == "open" and _gitops.epic_complete(eid, _tasks.load(_config.ITEMS)):

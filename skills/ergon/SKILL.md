@@ -127,3 +127,27 @@ ergon dispatch --watch --budget-total 20 --interval 30   # keep running; pick up
 - **Skipped:** `human` tasks (listed at the end as yours), and tasks whose `touches:` include a nested repo, which a worktree doesn't contain. Work those interactively.
 - **Overlap.** A task whose `touches:` share a path with a running one (companion names themselves don't count) is held, not started, until that one lands or blocks, so the second never conflicts with the first. `--dry-run` prints `held  T-2 behind T-1` for these, and `overlap` for a shared path with a task already `doing` elsewhere.
 - Dependencies chain within one run: when a task lands, anything that was waiting on it gets picked up.
+
+## History: `<state>/runs/history.jsonl`
+
+One JSON object per line, appended as things happen, gitignored with `runs/`. Every row has `at` (ISO-8601 local time with offset, to the second), `task` (`T-NNN`, or null for an epic's own events), `epic` (`E-NNN` or null) and `event`. Paths (`log`, `worktree`) are relative to the main checkout. Each row is one `write()` on an `O_APPEND` descriptor under an `flock` on the file itself, so parallel workers, dispatch runs and terminals never interleave rows. A row that can't be written prints a warning; the command goes on. Rows are never rewritten, and fields are only ever added: a reader skips events and fields it doesn't know. `ergon stats` still counts from the run files, so runs from before the history count too. It's a record, not a gate: nothing in ergon decides from it, and anything that can write to `runs/` could append a row, so an `approved` row is no proof of approval (the task file's `approved:` stamp and the commits are).
+
+| event | when | fields beyond at / task / epic |
+|---|---|---|
+| `created` | `new`, `import`, a worker's FOUND line, a worker's `RESULT: blocked` (the human task) | `title`, `tier` (not for an epic), `source`, `by`: `new` / `import` / `found` / `blocked` |
+| `approved` | `approve`, `review -i` | `by`, `tier` |
+| `rejected` | `reject`, `review -i` | `by`, `reason`, `from` → `to`: `proposed` → `dropped` or `review` → `ready` |
+| `held` | dispatch holds a task behind a running one (once per blocker per run) | `behind`, `touches` (the shared paths) |
+| `dispatched` | a worker launches (status `doing`) | `tier`, `model`, `base`, `branch`, `worktree`, `companions` |
+| `worker_end` | a worker run ends, each run of an escalation included | `tier`, `verdict` (`done` / `blocked`), `reason`, `session`, `cost`, `seconds`, `log` |
+| `escalated` | `--escalate` retries a tier up | `from`, `to`, `model`, `reason` (why the lower tier blocked) |
+| `verify` | the verify command ran | `ok`, `cmd`, `seconds`, `log` (null on a pass), `exit` (on a fail; null on a timeout) |
+| `review` | the reviewer ran | `verdict` (`pass` / `fail`), `reviewer` (its tier), `tier` (the worker's), `reason` (null on a pass), `cost`, `seconds`, `log` |
+| `review_hold` | the gate passed but the task waits for a human (status `review`) | `base`, `branch` |
+| `accepted` | `accept`, before it lands the branch | `by` |
+| `landed` | the branch merged into its base (status `done` follows) | `base`, `branch`, `commit` (the base's new tip), `accepted_by` (null unless `accept`), `companions`: `[{name, trunk, commit}]` |
+| `blocked` | the task went `blocked`, from dispatch or a failed `accept` | `reason`, `log`, `session`, `asked` (the worker itself said blocked) |
+| `closed` | `close` | `by`, `as`, `reason` |
+| `epic_finished` | the epic merged into the trunk and closed (`task` is null) | `branch`, `commit` (the merge commit; both null if it never had a branch) |
+
+Reserved for the agentic loops (T-026..T-028): a `resumed` event (`session`, `round`) when a loop resumes a worker's session, and an optional `round` (1, 2, …) on `dispatched`, `worker_end`, `verify` and `review`. A row without `round` is round 1.

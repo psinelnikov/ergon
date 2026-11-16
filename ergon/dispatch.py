@@ -20,6 +20,7 @@ from pathlib import Path
 from . import config as _config
 from . import gates as _gates
 from . import gitops as _gitops
+from . import history as _history
 from . import report as _report
 from . import tasks as _tasks
 
@@ -205,7 +206,18 @@ def run_proc(cmd, cwd, timeout):
 
 
 def run_worker(t, base, wt, branch, pubs, args, agents, settings):
-    """Run one headless worker. Returns (verdict, reason, run info); never raises."""
+    """Run one headless worker and record its worker_end. Returns (verdict, reason, run info);
+    never raises."""
+    start = time.monotonic()
+    verdict, why, info = _run_worker(t, base, wt, branch, pubs, args, agents, settings)
+    info["seconds"] = round(time.monotonic() - start, 1)
+    _history.record("worker_end", t, tier=t["tier"], verdict=verdict, reason=why,
+                    session=info.get("session"), cost=info.get("cost", 0), seconds=info["seconds"],
+                    log=info.get("log"))
+    return verdict, why, info
+
+
+def _run_worker(t, base, wt, branch, pubs, args, agents, settings):
     retry = ""
     try:
         if _gitops.git("rev-list", "--count", f"{base}..{branch}") != "0":
@@ -281,6 +293,7 @@ def file_found(t, found, epics):
                 "source": t["id"], "created": _tasks.today(), "approved": "", "tier_why": "",
                 "_path": _tasks.task_home(t, epics) / f"{tid}-{_tasks.slug(title)}.md", "_body": body}
         _tasks.dump(meta, _tasks.TASK_KEYS)
+        _history.record("created", meta, tier=meta["tier"], title=title, source=t["id"], by="found")
         made.append((tid, title))
     return made
 
@@ -296,6 +309,7 @@ def file_human(t, why, epics):
             "source": t["id"], "created": _tasks.today(), "approved": "", "tier_why": "",
             "_path": _tasks.task_home(t, epics) / f"{tid}-{_tasks.slug(title)}.md", "_body": body}
     _tasks.dump(meta, _tasks.TASK_KEYS)
+    _history.record("created", meta, tier="human", title=title, source=t["id"], by="blocked")
     cur = _tasks.load(_config.ITEMS)[t["id"]]
     cur["depends"] = list(cur.get("depends") or []) + [tid]
     _tasks.dump(cur, _tasks.TASK_KEYS)
@@ -321,17 +335,21 @@ def run_verify(t, wt):
     cmd = t.get("verify") or _config.CFG.get("verify")
     if not cmd:
         return None
+    start = time.monotonic()
     try:
         r = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True, timeout=VERIFY_TIMEOUT)
         out, code = r.stdout + r.stderr, r.returncode
     except subprocess.TimeoutExpired as e:
         text_of = lambda b: (b.decode(errors="replace") if isinstance(b, bytes) else b) or ""
         out, code = f"{text_of(e.stdout)}{text_of(e.stderr)}\ntimed out after {VERIFY_TIMEOUT // 60} min\n", None
+    seconds = round(time.monotonic() - start, 1)
     if code == 0:
+        _history.record("verify", t, ok=True, cmd=cmd, seconds=seconds, log=None)
         return None
     _config.RUNS.mkdir(parents=True, exist_ok=True)
     log = _config.RUNS / f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-verify.log"
     log.write_text(out)
+    _history.record("verify", t, ok=False, cmd=cmd, seconds=seconds, log=log, exit=code)
     tail = " | ".join(l.strip() for l in out.strip().splitlines()[-5:])[-400:]
     how = "timed out" if code is None else f"failed (exit {code})"
     return f"verify `{cmd}` {how}: {tail} (full output {log.relative_to(_config.HOME)})"
@@ -387,10 +405,19 @@ def tree_state(trees, branch, repos):
 
 
 def run_review(t, tier, base, wt, branch, pubs, args, agent, settings):
-    """Run the reviewer on a finished task branch. Returns (failure reason or None, cost,
-    reviewer tier). Only a last line of `REVIEW: pass` passes: no such line, a fail, output that
-    isn't JSON, an error, a kill, a timeout, or a reviewer that changed the branch or worktree
-    all block the landing."""
+    """Run the reviewer on a finished task branch and record its review event. Returns (failure
+    reason or None, cost, reviewer tier). Only a last line of `REVIEW: pass` passes: no such
+    line, a fail, output that isn't JSON, an error, a kill, a timeout, or a reviewer that
+    changed the branch or worktree all block the landing."""
+    start = time.monotonic()
+    log = _config.RUNS / f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-review.json"
+    failed, cost, who = _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log)
+    _history.record("review", t, verdict="fail" if failed else "pass", reviewer=who, tier=tier,
+                    reason=failed, cost=cost, seconds=round(time.monotonic() - start, 1), log=log)
+    return failed, cost, who
+
+
+def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log):
     who = reviewer_tier(tier)
     trees, repos = [wt] + [pub for _, pub in pubs], [None] + [c["path"] for c, _ in pubs]
     before = tree_state(trees, branch, repos)
@@ -409,12 +436,10 @@ def run_review(t, tier, base, wt, branch, pubs, args, agent, settings):
            "--output-format", "json"]
     if args.budget:
         cmd += ["--max-budget-usd", str(args.budget)]
-    stem = f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-review"
-    log = _config.RUNS / f"{stem}.json"
     out, err = run_proc(cmd + [prompt], wt, args.timeout * 60)
     log.write_text(out)
     if err.strip():
-        (_config.RUNS / f"{stem}.err").write_text(err)
+        log.with_suffix(".err").write_text(err)
     fail = lambda why, cost=0: (f"review ({who}) failed: {why} (review log {log.relative_to(_config.HOME)})", cost, who)
     if err.startswith(KILLED):
         return fail("killed by a second Ctrl-C")
@@ -509,7 +534,7 @@ def land(t, base, wt, branch, pubs=(), accepted=None):
             _gitops.merge_check(base, branch)
         except _gitops.GitError as err:
             return "blocked", f"{err}. {kept}: merge by hand"
-    landed = []
+    landed, tips = [], []
     for c, pub in pubs:
         # A fast-forward writes no message at all; a merge commit cites no tracker ID if forbidden.
         msg = f"Merge {_config.TRACKER_ID.sub('', t['title']).strip()}" if c["forbid_ids"] else f"Merge {t['id']}: {t['title']}"
@@ -519,12 +544,15 @@ def land(t, base, wt, branch, pubs=(), accepted=None):
             return "blocked", (f"{c['name']}: {err}. {kept}: merge by hand"
                                + (f". Already landed: {', '.join(landed)}" if landed else ""))
         landed.append(f"{c['name']} {c['trunk']}")
+        tips.append({"name": c["name"], "trunk": c["trunk"], "commit": _gitops.tip(c["trunk"], c["path"])})
     try:
         _gitops.merge_into(base, branch, f"Merge {t['id']}: {t['title']}"
                    + (f"\n\nAccepted by {accepted}" if accepted else ""), no_ff=bool(accepted))
     except _gitops.GitError as err:
         return "blocked", (f"{err}. {kept}: merge by hand"
                            + (f". Already landed: {', '.join(landed)}" if landed else ""))
+    _history.record("landed", t, base=base, branch=branch, commit=_gitops.tip(base),
+                    accepted_by=accepted, companions=tips)
     # A companion worktree sits inside the task's own, and removing that would take it along
     # and leave the companion a stale entry: remove those first.
     left = ""
@@ -595,6 +623,8 @@ def dispatch(args):
             # the worker itself reported blocked: retry once a tier up on the same branch
             up = _config.WORKER_TIERS[_config.WORKER_TIERS.index(t["tier"]) + 1]
             print(f"  escalate {t['id']}  {t['tier']}→{up}: {why}")
+            _history.record("escalated", t, **{"from": t["tier"], "to": up, "model": agents[f"task-{up}"]["model"],
+                                               "reason": why})
             first, why1 = t["tier"], why
             v2, why, info2 = run_worker(dict(t, tier=up, escalated=True), base, wt, branch, pubs, args, agents, settings)
             info2["cost"] = info.get("cost", 0) + info2.get("cost", 0)
@@ -615,6 +645,7 @@ def dispatch(args):
             if verdict == "done" and _tasks.needs_accept(t, *([up] if up else [])):
                 verdict, why = "review", (f"waits for a human: `ergon accept {t['id']}` lands it, `ergon reject "
                                           f"{t['id']} --reason R` sends it back. {kept_note(wt, branch, pubs)}")
+                _history.record("review_hold", t, branch=branch, base=base)
             elif verdict == "done":
                 verdict, why = land(t, base, wt, branch, pubs)
             if verdict in ("done", "review"):
@@ -634,6 +665,8 @@ def dispatch(args):
             else:
                 put_status(t["id"], "blocked", f"{why} (log {info['log']}"
                            + (f", `claude --resume {info['session']}` in {wt}" if info.get("session") else "") + ")")
+                _history.record("blocked", t, reason=why, log=info.get("log"), session=info.get("session"),
+                                asked=bool(info.get("asked")))
                 print(f"  blocked  {t['id']}  {why}")
             for fid, title in file_found(t, info.get("found") or [], epics):
                 print(f"  proposed {fid}  (found by {t['id']})  {title}")
@@ -680,6 +713,7 @@ def dispatch(args):
                     print(f"  overlap    {a['id']} and {b['id']} ({b['status']}) both touch {', '.join(shared(a, b))}")
     else:
         running, launched, active = {}, 0, {}  # active: running task id -> task
+        held_on = {}  # task id -> the running task it was last recorded held behind
         stops, tick = [], 0.25
         stop_evt = threading.Event()
 
@@ -706,8 +740,12 @@ def dispatch(args):
                             queue = [] if launched >= args.max or capped else list(eligible(_tasks.load(_config.ITEMS)))
                             while queue and len(running) < args.jobs and launched < args.max:
                                 t = queue.pop(0)
-                                if any(shared(t, o) for o in active.values()):
-                                    continue  # held: stays eligible, retried when a running task lands
+                                behind = next((o for o in active.values() if shared(t, o)), None)
+                                if behind:  # held: stays eligible, retried when a running task lands
+                                    if held_on.get(t["id"]) != behind["id"]:  # once per blocker, not per scan
+                                        held_on[t["id"]] = behind["id"]
+                                        _history.record("held", t, behind=behind["id"], touches=shared(t, behind))
+                                    continue
                                 tried.add(t["id"])
                                 try:
                                     base, wt, branch, pubs = prepare(t, epics)
@@ -715,6 +753,9 @@ def dispatch(args):
                                     skipped[t["id"]] = f"couldn't make a worktree: {err}"
                                     continue
                                 put_status(t["id"], "doing")
+                                _history.record("dispatched", t, tier=t["tier"], model=agents[f"task-{t['tier']}"]["model"],
+                                                base=base, branch=branch, worktree=wt,
+                                                companions=[c["name"] for c, _ in pubs])
                                 print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
                                       + also(t) + f"  {t['title']}")
                                 running[pool.submit(one, t, base, wt, branch, pubs)] = t["id"]

@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import config as _config
+from . import history as _history
 from . import tasks as _tasks
 
 
@@ -44,6 +45,14 @@ def git(*args, raw=False, cwd=None):
     if r.returncode:
         raise GitError(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()}")
     return r.stdout if raw else r.stdout.strip()
+
+
+def tip(ref, repo=None):
+    """The commit `ref` points at, or None. For the history, so it never raises."""
+    try:
+        return git("rev-parse", ref, cwd=repo)
+    except GitError:
+        return None
 
 
 def epic_branch(e):
@@ -206,6 +215,7 @@ def finish_epic(eid):
     if not branch_exists(branch):
         e["status"] = "done"
         _tasks.dump(e, _tasks.EPIC_KEYS)
+        _history.record("epic_finished", e, branch=None, commit=None)
         print(f"{eid} done (never started on a branch, nothing to merge)")
         _tasks.print_issue_commands(eid, tasks)
         return
@@ -224,6 +234,7 @@ def finish_epic(eid):
     git("branch", "-D", branch)  # -d would check against this checkout's HEAD, not main
     e["status"] = "done"
     _tasks.dump(e, _tasks.EPIC_KEYS)
+    _history.record("epic_finished", e, branch=branch, commit=tip(_config.MAIN))
     print(f"{eid} done: merged {branch} into {_config.MAIN} (not pushed) and deleted the branch{note}")
     _tasks.print_issue_commands(eid, tasks, git("rev-parse", "--short", _config.MAIN))
 

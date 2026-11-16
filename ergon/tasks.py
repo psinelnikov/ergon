@@ -21,6 +21,7 @@ from . import config as _config
 from . import dispatch as _dispatch
 from . import gates as _gates
 from . import gitops as _gitops
+from . import history as _history
 
 
 TIERS = ["haiku", "sonnet", "opus", "human"]
@@ -286,6 +287,7 @@ def new(args):
                 "source": args.source or "", "created": today(), "approved": "", "tier_why": "",
                 "_path": home / f"{tid}-{slug(args.title)}.md", "_body": TASK_BODY}
         dump(meta, TASK_KEYS)
+        _history.record("created", meta, tier=args.tier, title=args.title, source=args.source or None, by="new")
     else:
         eid = next_id(_config.EPICS, "E")
         home = _config.EPICS / f"{eid}-{slug(args.title)}"
@@ -293,6 +295,7 @@ def new(args):
         meta = {"id": eid, "title": args.title, "status": "open", "created": today(),
                 "_path": home / _config.EPIC_FILE, "_body": EPIC_BODY}
         dump(meta, EPIC_KEYS)
+        _history.record("created", meta, title=args.title, by="new")
     print(meta["_path"].relative_to(_config.HOME))
 
 
@@ -379,6 +382,7 @@ def import_issue(args):
                 "tier_why": "" if args.tier else "imported, not sized: pick the tier before approving",
                 "_path": home / f"{tid}-{slug(title)}.md", "_body": import_body(ref, issue)}
         dump(meta, TASK_KEYS)
+        _history.record("created", meta, tier=meta["tier"], title=title, source=ref, by="import")
     print(f"{meta['_path'].relative_to(_config.HOME)}  ({tid}, proposed, tier {meta['tier']})")
 
 

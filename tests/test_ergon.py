@@ -497,10 +497,15 @@ class TestDispatch(DispatchProject):
                 out = self.ergon("dispatch", "--jobs", "2").stdout
                 self.assertEqual(self.status("T-002"), "done", out)
                 order = [l.split()[0] + l.split()[1] for l in out.splitlines() if l.split()[:1] in (["doing"], ["done"])]
+                held = [r for r in history(self.root) if r["event"] == "held"]
                 if touches == "shared.py":
                     self.assertEqual(order, ["doingT-001", "doneT-001", "doingT-002", "doneT-002"], out)
+                    self.assertEqual([(r["task"], r["behind"], r["touches"]) for r in held],
+                                     [("T-002", "T-001", ["shared.py"])])  # once, not once per scan
+                    self.assertEqual(events(self.root, "T-002")[1:3], ["held", "dispatched"])
                 else:
                     self.assertEqual(order[:2], ["doingT-001", "doingT-002"], out)
+                    self.assertEqual(held, [])
 
     def test_found_lines_become_proposed_tasks(self):
         for res, want in (("RESULT: done", "done"), ("RESULT: blocked — nope", "blocked")):
@@ -537,6 +542,12 @@ class TestDispatch(DispatchProject):
                 self.assertIn(f"tier: {want_tier}", text)
                 self.assertEqual(len(list((self.root / "tasks" / "runs").glob("*.json"))), runs, out)
                 self.assertEqual("escalated haiku\u2192sonnet: too hard" in text, want_tier == "sonnet")
+                rows = [r for r in history(self.root) if r["task"] == "T-001"]
+                self.assertEqual([r["tier"] for r in rows if r["event"] == "worker_end"],
+                                 ["haiku", "sonnet"][:runs] if tier == "haiku" else [tier])
+                esc = [r for r in rows if r["event"] == "escalated"]
+                self.assertEqual([(r["from"], r["to"], r["reason"]) for r in esc],
+                                 [("haiku", "sonnet", "too hard")] if want_tier == "sonnet" else [])
 
     def test_worker_block_files_human_task(self):
         self.ergon("new", "task", "Source", "--tier", "sonnet")
@@ -840,6 +851,11 @@ class TestAccept(DispatchProject):
         self.assertFalse(self.has_branch("task/T-001"))
         self.assertFalse(self.has_branch(branch))
         self.assertFalse((self.root / ".claude" / "worktrees" / "T-001").exists())
+        self.assertEqual(events(self.root, "T-001"),
+                         ["created", "dispatched", "worker_end", "review_hold", "accepted", "landed"])
+        rows = history(self.root)
+        self.assertRegex(rows[-2]["accepted_by"], r"^Tester \d{4}-")
+        self.assertEqual((rows[-1]["event"], rows[-1]["epic"]), ("epic_finished", "E-001"))
 
     def test_reject_sends_review_back_to_ready(self):
         self.ergon("new", "task", "Api", "--tier", "haiku", "--touches", "server/api.py")
@@ -869,6 +885,9 @@ class TestAccept(DispatchProject):
         self.assertIn("review: rejected by Tester: no test for the 404 path", self.task_file("T-001").read_text())
         self.assertTrue(self.has_branch("task/T-001"))  # kept for the next attempt
         self.assertFalse((self.root / "T-001.txt").exists())
+        rej = history(self.root)[-1]
+        self.assertEqual((rej["task"], rej["event"], rej["from"], rej["to"], rej["by"], rej["reason"]),
+                         ("T-001", "rejected", "review", "ready", "Tester", "no test for the 404 path"))
 
         seen = Path(self.tmp.name) / "seen.jsonl"
         self.env["FAKE_SEEN"] = str(seen)
@@ -894,6 +913,159 @@ class TestAccept(DispatchProject):
         (self.root / ".ergon.toml").write_text('[[accept]]\ntiers = ["human"]\n')
         r = self.ergon("board", check=False)
         self.assertIn("[[accept]] #1 needs tiers", r.stderr)
+
+
+def history(root):
+    """Every row of <state>/runs/history.jsonl. Fails the test on a line that isn't one JSON object."""
+    path = root / "tasks" / "runs" / "history.jsonl"
+    rows = []
+    for n, line in enumerate(path.read_text().splitlines(), 1) if path.exists() else ():
+        row = json.loads(line)  # raises on a torn or interleaved line
+        assert isinstance(row, dict) and {"at", "task", "epic", "event"} <= row.keys(), (n, line)
+        rows.append(row)
+    return rows
+
+
+def events(root, tid):
+    return [r["event"] for r in history(root) if r["task"] == tid]
+
+
+class TestHistory(DispatchProject):
+    """<state>/runs/history.jsonl: one ordered row per event, from every process and thread."""
+    config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
+                                            '        verify = "true"\n        review = ["haiku"]')
+
+    def test_done_blocked_and_reviewed_sequences(self):
+        self.ergon("new", "epic", "Small epic")
+        self.ergon("new", "task", "Plain", "--tier", "sonnet", "--epic", "E-001")
+        self.ergon("new", "task", "Stuck", "--tier", "opus")
+        self.ergon("new", "task", "Checked", "--tier", "haiku", "--source", "TODO.md:3")
+        code, out = TestAccept.human(self, "approve", "T-001", "T-002", "T-003")
+        self.assertEqual(code, 0, out)
+        self.env["FAKE_RESULT_OPUS"] = "RESULT: blocked \u2014 needs the prod password"
+        out = self.ergon("dispatch", "--jobs", "3").stdout
+        self.assertEqual([self.status(t) for t in ("T-001", "T-002", "T-003")], ["done", "blocked", "done"], out)
+        rows = history(self.root)
+
+        self.assertEqual(events(self.root, "T-001"),
+                         ["created", "approved", "dispatched", "worker_end", "verify", "landed"])
+        self.assertEqual(events(self.root, "T-002"),
+                         ["created", "approved", "dispatched", "worker_end", "blocked"])
+        self.assertEqual(events(self.root, "T-003"),
+                         ["created", "approved", "dispatched", "worker_end", "verify", "review", "landed"])
+        self.assertEqual(events(self.root, "T-004"), ["created"])  # the human task T-002 asked for
+        self.assertEqual([r["event"] for r in rows if r["task"] is None], ["created", "epic_finished"])
+
+        one = lambda tid, ev: next(r for r in rows if r["task"] == tid and r["event"] == ev)
+        for r in rows:
+            self.assertRegex(r["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$")
+        self.assertEqual([r["epic"] for r in rows if r["task"] == "T-001"], ["E-001"] * 6)
+        self.assertEqual({r["epic"] for r in rows if r["task"] in ("T-002", "T-003")}, {None})
+        self.assertEqual(one("T-003", "created")["source"], "TODO.md:3")
+        self.assertEqual(one("T-001", "approved")["by"], "Tester")
+        d = one("T-003", "dispatched")
+        self.assertEqual((d["tier"], d["model"], d["base"], d["branch"]), ("haiku", "haiku", "main", "task/T-003"))
+        self.assertTrue(one("T-001", "dispatched")["base"].startswith("epic/E-001-"))
+        w = one("T-003", "worker_end")
+        self.assertEqual((w["verdict"], w["session"], w["cost"], w["tier"]), ("done", "s-1", 0.01, "haiku"))
+        self.assertIsInstance(w["seconds"], (int, float))
+        self.assertRegex(w["log"], r"^tasks/runs/T-003-\d{8}-\d{6}\.json$")
+        self.assertTrue((self.root / w["log"]).exists())
+        v = one("T-003", "verify")
+        self.assertEqual((v["ok"], v["cmd"], v["log"]), (True, "true", None))
+        rv = one("T-003", "review")
+        self.assertEqual((rv["verdict"], rv["reviewer"], rv["cost"], rv["reason"]), ("pass", "sonnet", 0.02, None))
+        self.assertTrue((self.root / rv["log"]).exists())
+        landed = one("T-003", "landed")
+        self.assertEqual(landed["base"], "main")
+        self.assertRegex(landed["commit"], r"^[0-9a-f]{40}$")
+        sh("git", "merge-base", "--is-ancestor", landed["commit"], "main", cwd=self.root)
+        b = one("T-002", "blocked")
+        self.assertEqual((b["reason"], b["asked"], b["session"]), ("needs the prod password", True, "s-1"))
+        self.assertEqual(one("T-002", "worker_end")["verdict"], "blocked")
+        made = one("T-004", "created")
+        self.assertEqual((made["source"], made["tier"], made["by"]), ("T-002", "human", "blocked"))
+        fin = next(r for r in rows if r["event"] == "epic_finished")
+        self.assertEqual((fin["epic"], fin["task"]), ("E-001", None))
+        self.assertEqual(sh("git", "log", "-1", "--format=%s", fin["commit"], cwd=self.root).stdout.strip(),
+                         "Merge E-001: Small epic")
+        sh("git", "merge-base", "--is-ancestor", fin["commit"], "main", cwd=self.root)
+        # A worker's events come in order: nothing of a task after its landing or block.
+        for tid, last in (("T-001", "landed"), ("T-002", "blocked"), ("T-003", "landed")):
+            self.assertEqual(events(self.root, tid)[-1], last)
+
+        # stats still reads the run files, and doesn't take history.jsonl for one.
+        stats = self.ergon("stats").stdout
+        rows_by_tier = {l.split()[0]: l.split() for l in stats.splitlines()
+                        if l.split()[:1] in (["sonnet"], ["opus"], ["haiku"])}
+        self.assertEqual(rows_by_tier["haiku"][:4], ["haiku", "1", "1", "0"])
+        self.assertEqual(rows_by_tier["haiku"][5], "$0.03")  # the run and its review
+        self.assertEqual(rows_by_tier["opus"][:4], ["opus", "1", "0", "1"])
+        self.assertNotIn("skipped", stats)
+
+    def test_failed_verify_and_review(self):
+        self.ergon("new", "task", "Red", "--tier", "sonnet")
+        self.ergon("new", "task", "Vetoed", "--tier", "haiku")
+        for t in ("T-001", "T-002"):
+            stamp(self.task_file(t))
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("\ntier:", "\nverify: echo boom; exit 3\ntier:", 1))
+        self.env["FAKE_REVIEW"] = "REVIEW: fail \u2014 no tests"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual([self.status("T-001"), self.status("T-002")], ["blocked", "blocked"], out)
+        self.assertEqual(events(self.root, "T-001"), ["created", "dispatched", "worker_end", "verify", "blocked"])
+        self.assertEqual(events(self.root, "T-002"),
+                         ["created", "dispatched", "worker_end", "verify", "review", "blocked"])
+        rows = history(self.root)
+        v = next(r for r in rows if r["task"] == "T-001" and r["event"] == "verify")
+        self.assertEqual((v["ok"], v["exit"]), (False, 3))
+        self.assertIn("boom", (self.root / v["log"]).read_text())
+        rv = next(r for r in rows if r["task"] == "T-002" and r["event"] == "review")
+        self.assertEqual(rv["verdict"], "fail")
+        self.assertIn("no tests", rv["reason"])
+        b = next(r for r in rows if r["task"] == "T-002" and r["event"] == "blocked")
+        self.assertFalse(b["asked"])
+
+    def test_parallel_jobs_never_tear_a_row(self):
+        for n in range(6):
+            self.ergon("new", "task", f"Job {n}", "--tier", "sonnet")
+            stamp(self.task_file(f"T-00{n + 1}"))
+        self.env.update(FAKE_FOUND="|".join(f"Follow-up {i} — " + "why " * 300 for i in range(3)))
+        out = self.ergon("dispatch", "--jobs", "6").stdout
+        self.assertIn("6/6 done", out)
+        for n in range(1, 7):
+            self.assertEqual(events(self.root, f"T-00{n}"),
+                             ["created", "dispatched", "worker_end", "verify", "landed"], out)
+        self.assertEqual(sum(r["event"] == "created" and r.get("by") == "found" for r in history(self.root)), 18)
+
+        # Many processes at once, each row far past PIPE_BUF: every line is still whole.
+        writer = textwrap.dedent(f"""
+            import sys
+            sys.path.insert(0, {str(ERGON.parent)!r})
+            from ergon import config, history
+            config.configure({str(self.root)!r})
+            n = int(sys.argv[1])
+            for i in range(150):
+                history.record("worker_end", {{"id": f"T-{{n:03d}}", "epic": None}}, i=i, reason=str(n) * 20000)
+        """)
+        procs = [subprocess.Popen([sys.executable, "-c", writer, str(n)], cwd=self.root, env=self.env)
+                 for n in range(100, 108)]
+        for p in procs:
+            self.assertEqual(p.wait(), 0)
+        rows = [r for r in history(self.root) if r["task"] >= "T-100"]
+        self.assertEqual(len(rows), 8 * 150)
+        for r in rows:
+            self.assertEqual(r["reason"], r["task"][2:].lstrip("0") * 20000)
+        for n in range(100, 108):
+            self.assertEqual([r["i"] for r in rows if r["task"] == f"T-{n}"], list(range(150)))
+
+    def test_unwritable_history_never_stops_a_command(self):
+        runs = self.root / "tasks" / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        (runs / "history.jsonl").mkdir()  # can't be opened for append
+        r = self.ergon("new", "task", "Still made", "--tier", "haiku")
+        self.assertIn("couldn't record created", r.stderr)
+        self.assertEqual(self.status("T-001"), "proposed")
 
 
 class TestStats(Project):
