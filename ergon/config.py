@@ -161,7 +161,7 @@ def configure(start=None, need_config=True):
     the main checkout: task state, worktrees, run logs and companion checkouts live there, so
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
-        RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, REVIEW, ACCEPT, \
+        RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, \
         REVIEW_ROUNDS, VERIFY_ROUNDS, RESUME_SECS, RESUME_TOKENS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
@@ -236,3 +236,6 @@ def configure(start=None, need_config=True):
     state_rel = re.escape(STATE.relative_to(HOME).as_posix())
     TASK_FILE = re.compile(rf"(?:^|/){state_rel}/(items/[^/\s]+|epics/[^/\s]+/(EPIC|T-[^/\s]+))\.md$")
     TASK_DIR_IN_CMD = re.compile(rf"(?:^|[\s/\"'=]){state_rel}/(items|epics)\b")
+    # Run logs and history.jsonl: written by dispatch and the CLI only, never by an agent's tool call.
+    RUNS_PATH = re.compile(rf"(?:^|/){state_rel}/runs(?:/|$)")
+    RUNS_IN_CMD = re.compile(rf"(?:^|[\s/\"'=]){state_rel}/runs\b|\bhistory\.jsonl\b")
