@@ -174,7 +174,7 @@ def newest_session(wt, since_ts):
     """The session of the newest transcript in wt's project folder written since since_ts."""
     best = None
     for cwd in dict.fromkeys([str(wt), os.path.realpath(str(wt))]):
-        d = os.path.join(_transcripts.ROOT, _transcripts.project_name(cwd))
+        d = os.path.join(_transcripts.root(), _transcripts.project_name(cwd))
         try:
             names = [n for n in os.listdir(d) if n.endswith(".jsonl")]
         except OSError:
