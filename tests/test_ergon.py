@@ -678,6 +678,24 @@ class TestReview(DispatchProject):
     def calls(self):
         return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
 
+    def test_dry_run_estimate_counts_task_verify_and_a_reviewed_escalation(self):
+        self.ergon("new", "task", "Verified", "--tier", "sonnet")
+        self.ergon("new", "task", "Top", "--tier", "opus")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("\ntier:", "\nverify: true\ntier:", 1))
+        for t in ("T-001", "T-002"):
+            stamp(self.task_file(t))
+        # T-001: its worker + 2 verify fixes (its own verify:) = 3; T-002 (opus): worker + review = 2.
+        dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout
+        self.assertIn("estimated at most $5.00 for 2 task(s)", dry)
+        self.assertIn("plus the review and no fix rounds for a reviewed tier, "
+                      "plus up to 2 verify fix rounds (a fix each) if a verify is set", dry)
+        # --escalate: T-001 may finish as opus, which is reviewed: 2 workers + review + 2 verify fixes = 5.
+        # T-002 is already opus, so nothing escalates it.
+        dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1", "--escalate").stdout
+        self.assertIn("estimated at most $7.00 for 2 task(s)", dry)
+        self.assertEqual(self.calls(), [])
+
     def test_review_gates_landing(self):
         cases = [("pass", "REVIEW: pass", None, "done", None),
                  ("fail", "REVIEW: fail \u2014 skipped the Done when tests", None, "blocked",
@@ -813,11 +831,17 @@ class TestReviewRounds(DispatchProject):
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout
         self.assertIn(", reviewed by sonnet (up to 2 fix rounds)", [l for l in dry.splitlines() if "T-001" in l][0])
         self.assertNotIn("reviewed by", [l for l in dry.splitlines() if "T-002" in l][0])
-        # T-001: worker + review + 2 x (fix + review) = 6 calls; T-002: its worker = 1.
-        self.assertIn("estimated at most $7.00 for 2 task(s) at --budget $1 per call, counting a reviewed task as "
-                      "its worker and the review plus up to 2 fix rounds (a fix and a review each)", dry)
+        # verify = "true": T-001: worker + review + 2 x (fix + review) + 2 verify fixes = 8 calls;
+        # T-002: its worker + 2 verify fixes = 3.
+        self.assertIn("estimated at most $11.00 for 2 task(s) at --budget $1 per call, counting a task as its "
+                      "worker plus the review and up to 2 fix rounds (a fix and a review each) for a reviewed tier, "
+                      "plus up to 2 verify fix rounds (a fix each) if a verify is set", dry)
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1", "--max", "1").stdout
-        self.assertIn("estimated at most $6.00 for 1 task(s)", dry)  # the costliest one
+        self.assertIn("estimated at most $8.00 for 1 task(s)", dry)  # the costliest one
+        # --escalate adds a second worker a tier up: T-001 9 calls, T-002 (sonnet → opus, unreviewed) 4.
+        dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1", "--escalate").stdout
+        self.assertIn("estimated at most $13.00 for 2 task(s) at --budget $1 per call, counting a task as its "
+                      "worker plus a second worker if --escalate retries it a tier up, plus the review", dry)
         self.assertEqual(self.calls(), [])  # a dry run runs nothing
 
     def test_fail_then_fix_then_pass_lands(self):
