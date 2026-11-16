@@ -104,12 +104,115 @@ def add_note(t, note, who="dispatch"):
     t["_body"] = (body if "## Notes" in body else body + "\n\n## Notes") + f"\n- {_tasks.today()} {who}: {note}\n"
 
 
-def put_status(tid, status, note=None, who="dispatch"):
+def put_status(tid, status, note=None, who="dispatch", drop=()):
     t = _tasks.load(_config.ITEMS)[tid]
     t["status"] = status
+    for k in drop:
+        t.pop(k, None)
     if note:
         add_note(t, note, who)
     _tasks.dump(t, _tasks.TASK_KEYS)
+
+
+# ---------- questions ----------
+# A worker that needs a decision ends with `QUESTION: <text>` lines (each optionally followed by
+# `OPTIONS: a | b | c`, recommended first) and `RESULT: asking`. Dispatch parks the task: status
+# blocked, frontmatter `asking: <session>`, the questions as `question:` bullets in Notes, the
+# worktree and branch kept. Only a human's `ergon answer` moves it on: it writes the answer to
+# Notes, swaps `asking:` for `answered: <session>` and sets the task ready. The next dispatch
+# clears `answered:` at launch and resumes that session with the answer (a fresh worker with the
+# questions and answer in its prompt when resume_choice() says the cache is gone).
+
+ASKING_MARK = "dispatch: asking:"
+NO_SESSION = "-"
+
+
+def parse_questions(text):
+    """[(question, [options])] from a worker's QUESTION: / OPTIONS: lines. An OPTIONS line belongs
+    to the QUESTION line before it."""
+    out = []
+    for l in text.splitlines():
+        m = re.match(r"^\W*(QUESTION|OPTIONS):\s*(.*?)\s*$", l)
+        if not m:
+            continue
+        val = m[2].strip(" *`")
+        if m[1] == "QUESTION" and val:
+            out.append((val, []))
+        elif m[1] == "OPTIONS" and out and not out[-1][1]:
+            out[-1][1].extend(o.strip(" *`") for o in val.split("|") if o.strip(" *`"))
+    return out
+
+
+def note_line(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def question_note(q, opts):
+    return note_line(q) + (f" [options: {' | '.join(note_line(o) for o in opts)}]" if opts else "")
+
+
+def asked(t):
+    """(questions [(text, [options])], the human's answer or None) of t's last question round,
+    read back from its Notes."""
+    _, _, notes = t["_body"].partition("## Notes")
+    bullets = [l[2:].strip() for l in notes.splitlines() if l.startswith("- ")]
+    start = max((i for i, b in enumerate(bullets) if ASKING_MARK in b), default=None)
+    if start is None:
+        return [], None
+    qs, ans = [], None
+    for b in bullets[start + 1:]:
+        m = re.match(r"^\S+ question: (.*?)(?: \[options: (.*)\])?$", b)
+        if m:
+            qs.append((m[1], [o.strip() for o in (m[2] or "").split(" | ") if o.strip()]))
+        m = re.match(r"^\S+ answer by .*?: (.*)$", b)
+        if m:
+            ans = m[1]
+    return qs, ans
+
+
+def qa_text(t):
+    """The question round and its answer, as prompt lines."""
+    qs, ans = asked(t)
+    lines = [f"Q{i}: {q}" + (f" (options: {' | '.join(o)})" if o else "") for i, (q, o) in enumerate(qs, 1)]
+    return "\n".join(lines + [f"Answer: {ans or '(none recorded)'}"])
+
+
+ANSWER_NOTE = ("It steers the work only: it doesn't change the task's tier, touches:, accept: or approval. "
+               "If following it would need one of those, change nothing and end "
+               "`RESULT: blocked — re-plan: <why>`.")
+
+ANSWER_PROMPT = """A human answered the question(s) you asked on {id}:
+
+{qa}
+
+{note}
+Carry on with the task on {branch} in {wt}, and commit there citing {id}. End as before: a
+`FOUND: <title> — <why>` line for each piece of work you find but don't do, then `RESULT: done`,
+`RESULT: blocked — <why>`, or new `QUESTION:` lines and `RESULT: asking`.
+"""
+
+
+def answer_lines(t):
+    """Retry-prompt lines for a fresh worker on a task whose question a human answered."""
+    return (f"An earlier attempt on this branch stopped to ask a human, who answered:\n\n{qa_text(t)}\n\n"
+            f"{ANSWER_NOTE}\n")
+
+
+def park(t, info, wt, branch, pubs):
+    """A worker ended `RESULT: asking`: set t blocked with its questions in Notes and an `asking:`
+    mark, record a `question` event. Worktree and branch stay. Caller holds the state lock."""
+    qs, session = info.get("questions") or [], info.get("session") or NO_SESSION
+    cur = _tasks.load(_config.ITEMS)[t["id"]]
+    cur["status"], cur["asking"] = "blocked", session
+    cur.pop("answered", None)
+    add_note(cur, f"asking: {len(qs)} question(s) below; a human answers with `ergon answer {t['id']}`. "
+             f"{kept_note(wt, branch, pubs)} (log {info.get('log')}"
+             + (f", `claude --resume {session}` in {wt}" if session != NO_SESSION else "") + ")")
+    for q, opts in qs:
+        add_note(cur, question_note(q, opts), who="question")
+    _tasks.dump(cur, _tasks.TASK_KEYS)
+    _history.record("question", t, questions=[{"text": q, "options": o} for q, o in qs],
+                    session=info.get("session"), log=info.get("log"), tier=t["tier"])
 
 
 def worker_agents():
@@ -311,10 +414,15 @@ def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
                      re.findall(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if m[0].strip(" *`")]
     info["policy"] = [(m[0].strip(" *`"), m[1].strip(" *`")) for m in
                       re.findall(r"^\W*POLICY:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if m[0].strip(" *`")]
-    found = re.findall(r"^\W*RESULT:\s*(done|blocked)\b[\s—:–-]*(.*)$", text, re.M)
+    found = re.findall(r"^\W*RESULT:\s*(done|blocked|asking)\b[\s—:–-]*(.*)$", text, re.M)
     if not found:
         return "blocked", "worker ended without a RESULT line", info
     verdict, why = found[-1]
+    if verdict == "asking":
+        info["questions"] = parse_questions(text)
+        if not info["questions"]:
+            return "blocked", "worker ended `RESULT: asking` without a `QUESTION:` line", info
+        return "asking", f"{len(info['questions'])} question(s)", info
     info["asked"] = verdict == "blocked"  # the worker itself says what a human must do
     return verdict, why.strip(" *`") or "(no reason given)", info
 
@@ -562,7 +670,8 @@ FIX_PROMPT = """The reviewer vetoed your work on {id} (fix round {n} of {rounds}
 {log}
 Fix what it raised on {branch} in {wt}, and commit there citing {id}. The done checks, verify and
 the review run again when you finish. End as before: a `FOUND: <title> — <why>` line for each
-piece of work you find but don't do, then `RESULT: done` or `RESULT: blocked — <why>`.
+piece of work you find but don't do, then `RESULT: done`, `RESULT: blocked — <why>`, or
+`QUESTION:` lines and `RESULT: asking`.
 """
 
 
@@ -823,7 +932,7 @@ def dispatch(args):
             info["found"] = (info.get("found") or []) + (finfo.get("found") or [])
             info["policy"] = (info.get("policy") or []) + (finfo.get("policy") or [])
             info.update(log=finfo["log"], session=finfo.get("session") or info.get("session"),
-                        asked=finfo.get("asked"))
+                        asked=finfo.get("asked"), questions=finfo.get("questions"))
             with live_lock:
                 live[t["id"]] = info["cost"]
             if v == "done" and tips is not None and not verify:
@@ -872,7 +981,7 @@ def dispatch(args):
                 vfixes += 1
                 if v != "done":
                     info["rounds"] = f" (verify fix round {vfixes}, after: {failed})"
-                    return "blocked", w
+                    return ("asking" if v == "asking" else "blocked"), w
                 continue
             stop = ""
             if fixable and len(vetoes) < _config.REVIEW_ROUNDS:
@@ -886,10 +995,24 @@ def dispatch(args):
             if v != "done":
                 info["rounds"] = (f" (fix round {rnd - 1}, after "
                                   + "; ".join(f"round {i}: {x}" for i, x in enumerate(vetoes, 1)) + ")")
-                return "blocked", w
+                return ("asking" if v == "asking" else "blocked"), w
 
-    def one(t, base, wt, branch, pubs):
-        verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings)
+    def one(t, base, wt, branch, pubs, answered=None):
+        if answered:  # a human answered its question: resume that session, or a fresh worker
+            resume, fresh_because = resume_choice(None if answered == NO_SESSION else answered, wt)
+            if resume:
+                _history.record("resumed", t, session=answered, tier=t["tier"], after="answer")
+                print(f"  answer   {t['id']}  resumed {answered}", flush=True)
+                prompt = ANSWER_PROMPT.format(id=t["id"], qa=qa_text(t), note=ANSWER_NOTE, branch=branch, wt=wt)
+                verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings,
+                                                prompt=prompt, resume=answered)
+            else:
+                print(f"  answer   {t['id']}  fresh session ({fresh_because})", flush=True)
+                verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings,
+                                                lines=answer_lines(t))
+            info["resumed"], info["fresh_because"] = resume, fresh_because
+        else:
+            verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings)
         up = None
         if (args.escalate and verdict == "blocked" and info.get("asked")
                 and t["tier"] in _config.WORKER_TIERS[:-1]):
@@ -917,7 +1040,10 @@ def dispatch(args):
                 _history.record("review_hold", t, branch=branch, base=base)
             elif verdict == "done":
                 verdict, why = land(t, base, wt, branch, pubs)
-            if verdict in ("done", "review"):
+            if verdict == "asking":
+                park(t, info, wt, branch, pubs)
+                print(f"  asking   {t['id']}  {why}: `ergon answer {t['id']}`")
+            elif verdict in ("done", "review"):
                 put_status(t["id"], verdict, "; ".join(x for x in (
                     f"escalated {first}→{up}: {why1}" if up else "", info.get("fixed", ""),
                     why if verdict == "review" else "") if x) or None)
@@ -966,7 +1092,8 @@ def dispatch(args):
             e = epics.get(t.get("epic"))
             print(f"  would run  {t['id']}  {t['tier']:<6}  on {_gitops.epic_branch(e) if e else _config.MAIN}"
                   + also(t) + (f", reviewed by {reviewer_tier(t['tier'])}" if t["tier"] in _config.REVIEW else "")
-                  + (", held for your accept" if _tasks.needs_accept(t) else "") + f"  {t['title']}")
+                  + (", held for your accept" if _tasks.needs_accept(t) else "")
+                  + (", resumes with your answer" if t.get("answered") else "") + f"  {t['title']}")
         if not plan:
             print("nothing to dispatch")
         if cap is not None:
@@ -1027,13 +1154,17 @@ def dispatch(args):
                                 except _gitops.GitError as err:
                                     skipped[t["id"]] = f"couldn't make a worktree: {err}"
                                     continue
-                                put_status(t["id"], "doing")
+                                # An answered question rides along to the worker; the mark goes with
+                                # the launch, so a retry after this run starts over.
+                                answered = t.get("answered") or None
+                                put_status(t["id"], "doing", drop=("answered",))
                                 _history.record("dispatched", t, tier=t["tier"], model=agents[f"task-{t['tier']}"]["model"],
                                                 base=base, branch=branch, worktree=wt,
-                                                companions=[c["name"] for c, _ in pubs])
+                                                companions=[c["name"] for c, _ in pubs],
+                                                **({"answered": True} if answered else {}))
                                 print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
                                       + also(t) + f"  {t['title']}")
-                                running[pool.submit(one, t, base, wt, branch, pubs)] = t["id"]
+                                running[pool.submit(one, t, base, wt, branch, pubs, answered)] = t["id"]
                                 active[t["id"]] = t
                                 launched += 1
                         next_scan = time.monotonic() + args.interval
@@ -1065,7 +1196,9 @@ def dispatch(args):
         done = sum(r[1] == "done" for r in results)
         rcost = sum(r[3].get("review_cost", 0) for r in results)
         held = sum(r[1] == "review" for r in results)
+        asking = sum(r[1] == "asking" for r in results)
         print(f"\n{done}/{len(results)} done" + (f", {held} awaiting your accept" if held else "")
+              + (f", {asking} asking you a question" if asking else "")
               + f", ${cost:.2f}" + (f" (reviews ${rcost:.2f} of it)" if rcost else "")
               + f". Logs in {_config.RUNS.relative_to(_config.HOME)}/")
         filed = [f for r in results for f in r[3].get("filed", [])]
@@ -1084,6 +1217,11 @@ def dispatch(args):
     if yours:
         print(f"\nREADY FOR YOU ({len(yours)} human-tier)")
         for t in sorted(yours, key=lambda t: t["id"]):
+            print(_tasks.line(t, tasks))
+    waiting = [t for t in tasks.values() if _tasks.is_asking(t)]
+    if waiting:
+        print(f"\nAWAITING YOUR ANSWER ({len(waiting)}): `ergon answer <ID>` (human only) answers and requeues one")
+        for t in sorted(waiting, key=lambda t: t["id"]):
             print(_tasks.line(t, tasks))
     held = [t for t in tasks.values() if t["status"] == "review"]
     if held:

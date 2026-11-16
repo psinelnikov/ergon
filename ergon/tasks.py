@@ -125,6 +125,11 @@ def line(t, tasks):
 YES = ("yes", "true", "1")
 
 
+def is_asking(t):
+    """Is t parked on a worker's question, waiting for a human's `ergon answer`?"""
+    return t.get("status") == "blocked" and bool(t.get("asking"))
+
+
 def needs_accept(t, *tiers):
     """Does a finished branch of t wait at `review` for a human `accept`? Its own `accept: yes`, or
     an [[accept]] rule its tier (or any of `tiers`, e.g. the one an --escalate finished at) and
@@ -200,6 +205,14 @@ def review(args):
         print("nothing awaiting approval")
     else:
         print("\napprove from your own terminal:  ergon approve <ID|E-ID> ...")
+    asking = sorted((t for t in tasks.values() if is_asking(t)), key=lambda t: t["id"])
+    if asking:
+        print(f"\nAWAITING ANSWER ({len(asking)}): a worker asked, its branch is kept")
+        for t in asking:
+            print(line(t, tasks))
+            for n, (q, opts) in enumerate(_dispatch.asked(t)[0], 1):
+                print(f"         Q{n} {q}" + (f"  [{' | '.join(opts)}]" if opts else ""))
+        print('\nfrom your own terminal:  ergon answer <ID> "<text>"   or   ergon answer <ID>  (pick from the options)')
     held = sorted((t for t in tasks.values() if t["status"] == "review"), key=lambda t: t["id"])
     if held:
         print(f"\nAWAITING ACCEPTANCE ({len(held)}): finished branches, not merged")
@@ -640,6 +653,11 @@ def lint():
         if t.get("status") == "review" and not _gitops.branch_exists(_config.TASK_BRANCH + t["id"]):
             errs.append(f"{where}: in review but branch {_config.TASK_BRANCH}{t['id']} is gone, so there's nothing "
                         f"to accept; a human rejects it back to ready or closes it")
+        if t.get("asking") and t.get("status") not in ("blocked", "done", "dropped"):
+            errs.append(f"{where}: asking: is set but status is {t.get('status')}; a task waiting on an answer "
+                        f"is blocked until a human runs `ergon answer {t['id']}`")
+        if t.get("answered") and t.get("status") not in ("ready", "done", "dropped"):
+            errs.append(f"{where}: answered: is set but status is {t.get('status')}; `ergon answer` leaves it ready")
         if t.get("accept") and str(t["accept"]).lower() not in YES:
             errs.append(f"{where}: accept: {t['accept']!r} isn't `yes` (leave it out for no; config "
                         f"[[accept]] rules can't be opted out of)")
