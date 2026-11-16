@@ -1,5 +1,5 @@
 {
-  "description": "ergon: refuse agent edits that approve tasks, change their status by hand or drop their accept: mark, writes to the run logs and history, and the human-only commands (approve, reject, close, accept, review -i), and run `ergon check` before a session ends. Does nothing in a repo without .ergon.toml.",
+  "description": "ergon: refuse agent edits that approve tasks, change their status by hand, drop their accept: mark or touch their asking:/answered: marks, writes to the run logs and history, and the human-only commands (approve, reject, close, accept, answer, review -i), and run `ergon check` before a session ends. Does nothing in a repo without .ergon.toml.",
   "hooks": {
     "PreToolUse": [
       {

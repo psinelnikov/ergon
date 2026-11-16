@@ -24,7 +24,8 @@ reports $FAKE_REVIEW (default REVIEW: pass; $FAKE_REVIEWS, |-separated, gives th
 nth verdict, the last repeating) and appends its model and prompt to $FAKE_SEEN. With
 $FAKE_TRANSCRIPT_AGE set, a worker leaves a transcript under $CLAUDE_CONFIG_DIR/projects (default
 $HOME/.claude/projects, as Claude Code does) whose last request is that many seconds old and
-holds $FAKE_CONTEXT tokens (default 1000)."""
+holds $FAKE_CONTEXT tokens (default 1000). With $FAKE_ASK set, a worker whose prompt carries no
+answer yet commits, then ends with $FAKE_ASK (QUESTION lines) and RESULT: asking."""
 import json, os, re, subprocess, sys, time
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 prompt = sys.argv[-1]
@@ -54,7 +55,7 @@ if os.environ.get("FAKE_TRANSCRIPT_AGE"):
              "message": {"id": "m1", "usage": {"input_tokens": int(os.environ.get("FAKE_CONTEXT", "1000"))}}}
     with open(os.path.join(d, "s-1.jsonl"), "w") as f:
         f.write(json.dumps(entry, separators=(",", ":")) + "\n")
-tid = re.search(r"(?:dispatched|work) on (T-\d+)", prompt).group(1)
+tid = re.search(r"(?:dispatched|work|asked) on (T-\d+)", prompt).group(1)
 if resume and os.environ.get("FAKE_FIX_NOTHING"):
     print(json.dumps({"result": "nothing to change\nRESULT: done", "session_id": resume, "total_cost_usd": 0.01}))
     sys.exit()
@@ -73,6 +74,10 @@ if os.path.isdir(pub):
 if os.environ.get("FAKE_DIRTY"):
     open(f"{tid}.txt", "a").write("more\n")
 found = "".join(f"FOUND: {x}\n" for x in os.environ.get("FAKE_FOUND", "").split("|") if x)
+if os.environ.get("FAKE_ASK") and "answered" not in prompt:
+    print(json.dumps({"result": "need a call\n" + found + os.environ["FAKE_ASK"] + "\nRESULT: asking",
+                      "session_id": "s-1", "total_cost_usd": 0.01}))
+    sys.exit()
 print(json.dumps({"result": "did it\n" + found + os.environ.get("FAKE_RESULT_" + tier, os.environ.get("FAKE_RESULT", "RESULT: done")), "session_id": "s-1", "total_cost_usd": 0.01}))
 '''
 
@@ -1528,6 +1533,149 @@ class TestCommitHook(DispatchProject):
         self.ergon("init", "--hooks")
         (self.root / ".ergon.toml").unlink()  # no config: the hook does nothing
         self.assertEqual(self.commit("Work (T-001)").returncode, 0)
+
+class TestAsking(DispatchProject):
+    """T-028: a worker asks (QUESTION: lines, RESULT: asking); a human answers; dispatch resumes it."""
+    ASK = "QUESTION: Which store should it use?\nOPTIONS: sqlite | json\n- QUESTION: Keep the old flag?"
+
+    def setUp(self):
+        super().setUp()
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        home = Path(self.tmp.name) / "home"  # where the fake leaves, and ergon reads, transcripts
+        home.mkdir()
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0", FAKE_ASK=self.ASK)
+        self.ergon("new", "task", "Store it", "--tier", "sonnet", "--touches", "store.py")
+        stamp(self.task_file("T-001"))
+
+    def calls(self):
+        return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+
+    def text(self):
+        return self.task_file("T-001").read_text()
+
+    def answer(self, *args, inp="y\n", env=None):
+        return self.ergon("answer", "T-001", *args, inp=inp, check=False,
+                          env=env or dict(self.env, ERGON_ASK_STDIN="1"))
+
+    def asks(self):
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        return out
+
+    def test_ask_answer_resume_lands(self):
+        out = self.asks()
+        self.assertIn("asking   T-001  2 question(s): `ergon answer T-001`", out)
+        self.assertIn("AWAITING YOUR ANSWER (1)", out)
+        self.assertNotIn("proposed T-002", out)  # a question files no human task
+        text = self.text()
+        self.assertRegex(text, r"(?m)^asking: s-1$")
+        self.assertIn("question: Which store should it use? [options: sqlite | json]", text)
+        self.assertIn("question: Keep the old flag?\n", text)
+        self.assertTrue((self.root / ".claude" / "worktrees" / "T-001").is_dir())  # kept, with its commit
+        self.assertTrue(sh("git", "branch", "--list", "task/T-001", cwd=self.root).stdout.strip())
+        q = [r for r in history(self.root) if r["event"] == "question"][0]
+        self.assertEqual(q["questions"], [{"text": "Which store should it use?", "options": ["sqlite", "json"]},
+                                          {"text": "Keep the old flag?", "options": []}])
+        self.assertEqual(q["session"], "s-1")
+        self.assertIn("worker_end", events(self.root, "T-001"))
+        self.assertNotIn("blocked", events(self.root, "T-001"))
+        review = self.ergon("review").stdout
+        self.assertIn("AWAITING ANSWER (1)", review)
+        self.assertIn("Q1 Which store should it use?  [sqlite | json]", review)
+        self.ergon("check")
+
+        # Agents can't answer, nor move it on some other way.
+        r = self.ergon("answer", "T-001", "use json", check=False, env=clean_env(CLAUDECODE="1"))
+        self.assertIn("agent shell", r.stderr)
+        self.assertIn("human-only", self.guard("Bash", {"command": "ergon answer T-001 'use json'"}))
+        self.assertIn("human-only", self.guard("Bash", {"command": "python3 ergon.py answer T-001"}, "--worker"))
+        f = str(self.task_file("T-001"))
+        self.assertIn("ergon answer", self.guard("Edit", {"file_path": f, "old_string": "asking: s-1\n", "new_string": ""}))
+        self.assertIn("ergon answer", self.ergon("set", "T-001", "status=ready", check=False).stderr)
+        self.assertIn("ergon answer", self.ergon("set", "T-001", "answered=s-1", check=False).stderr)
+        self.assertEqual(self.status("T-001"), "blocked")
+
+        # A human answers interactively: an option by number, then free text, then confirms.
+        r = self.answer(inp="1\nkeep it for now\ny\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("1. sqlite  (recommended)", r.stdout)
+        self.assertIn("it's a re-plan: don't answer", r.stdout)
+        text = self.text()
+        self.assertEqual(self.status("T-001"), "ready")
+        self.assertNotRegex(text, r"(?m)^asking:")
+        self.assertRegex(text, r"(?m)^answered: s-1$")
+        self.assertIn("answer by Tester: Q1: sqlite. Q2: keep it for now.", text)
+        for key in ("approved: Tester 2026-01-01", "tier: sonnet", "touches: [store.py]"):
+            self.assertIn(key, text)  # an answer never changes these
+        a = [r for r in history(self.root) if r["event"] == "answered"][0]
+        self.assertEqual((a["by"], a["answer"], a["session"]), ("Tester", "Q1: sqlite. Q2: keep it for now.", "s-1"))
+        self.assertIn("isn't waiting on an answer", self.answer("again").stderr)
+        self.assertIn("resumes with your answer", self.ergon("dispatch", "--dry-run").stdout)
+
+        time.sleep(1.1)  # run logs are named to the second
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("answer   T-001  resumed s-1", out)
+        calls = self.calls()
+        self.assertEqual([(c["agent"], c["resume"]) for c in calls], [("SONNET", None), ("SONNET", "s-1")])
+        resumed = calls[1]["prompt"]
+        self.assertIn("A human answered the question(s) you asked on T-001", resumed)
+        self.assertIn("Q1: Which store should it use? (options: sqlite | json)\nQ2: Keep the old flag?\n"
+                      "Answer: Q1: sqlite. Q2: keep it for now.", resumed)
+        self.assertIn("re-plan", resumed)
+        self.assertNotIn("The task file", resumed)  # the resumed session has it already
+        self.assertEqual((self.root / "T-001.txt").read_text(), "work\nwork\n")  # both runs' commits landed
+        self.assertNotIn("answered:", self.text())
+        self.assertEqual(events(self.root, "T-001"),
+                         ["created", "dispatched", "worker_end", "question", "answered", "dispatched", "resumed",
+                          "worker_end", "landed"])
+        rows = [r for r in history(self.root) if r["task"] == "T-001"]
+        self.assertEqual(rows[2]["verdict"], "asking")
+        self.assertTrue(rows[5]["answered"])
+        self.assertEqual((rows[6]["session"], rows[6]["after"]), ("s-1", "answer"))
+        sonnet = [l.split() for l in self.ergon("stats").stdout.splitlines() if l.startswith("sonnet")][0]
+        self.assertEqual(sonnet[:4], ["sonnet", "2", "1", "0"])  # the question isn't a block
+
+    def test_stale_session_starts_fresh_with_the_answer(self):
+        self.env["FAKE_TRANSCRIPT_AGE"] = "4000"
+        self.asks()
+        r = self.answer("use", "json")  # text on the command line: still asks to confirm
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("answer by Tester: use json", self.text())
+        time.sleep(1.1)
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("answer   T-001  fresh session (its last request was 67 min ago", out)
+        calls = self.calls()
+        self.assertEqual([c["resume"] for c in calls], [None, None])
+        fresh = calls[1]["prompt"]
+        self.assertIn("You are dispatched on T-001", fresh)
+        self.assertIn("stopped to ask a human, who answered:\n\nQ1: Which store should it use? (options: sqlite | json)", fresh)
+        self.assertIn("Answer: use json", fresh)
+        self.assertIn("An earlier attempt left commits", fresh)
+        self.assertNotIn("resumed", events(self.root, "T-001"))
+
+    def test_declined_or_empty_answer_writes_nothing(self):
+        self.asks()
+        before = self.text()
+        self.assertIn("aborted", self.answer("use json", inp="n\n").stderr)
+        self.assertIn("no answer given", self.answer(inp="\n").stderr)
+        self.assertEqual(self.text(), before)
+
+    def test_asking_without_a_question_blocks(self):
+        self.env["FAKE_ASK"] = "OPTIONS: a | b"
+        self.asks()
+        self.assertIn("ended `RESULT: asking` without a `QUESTION:` line", self.text())
+        self.assertNotRegex(self.text(), r"(?m)^asking:")
+
+    def test_close_clears_the_mark(self):
+        self.asks()
+        code, out = TestAccept.human(self, "close", "T-001", "--as", "dropped", "--reason", "re-plan")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.status("T-001"), "dropped")
+        self.assertNotRegex(self.text(), r"(?m)^asking:")
+        self.ergon("check")
+
 
 class TestPolicies(TestReview):
     """T-029: a policies file reaches worker and reviewer prompts; only a human writes it."""

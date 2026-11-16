@@ -36,13 +36,19 @@ def setf(args):
     old_status = item.get("status")
     if new_status and _gitops.current_branch().startswith(_config.TASK_BRANCH):
         raise SystemExit("you're a dispatched worker: the dispatcher owns status. End your "
-                         "reply with `RESULT: done` or `RESULT: blocked — <why>`")
+                         "reply with `RESULT: done`, `RESULT: blocked — <why>`, or `QUESTION:` lines "
+                         "and `RESULT: asking`")
     if not is_task and new_status == "done":
         raise SystemExit(f"close epics with `ergon finish {args.id}` (it merges the epic branch)")
     for kv in args.pairs:
         key, _, val = kv.partition("=")
         if key == "approved":
             raise SystemExit("approval is human-only: use `approve` from a real terminal")
+        if is_task and key in ("asking", "answered"):
+            raise SystemExit(f"`{key}:` is written by dispatch and a human's `ergon answer` only")
+        if is_task and key == "status" and _tasks.is_asking(item):
+            raise SystemExit(f"{args.id} waits on an answer to its worker's question: a human runs "
+                             f"`ergon answer {args.id}` in their own terminal (or `ergon close` to give it up)")
         if is_task and key == "accept" and val.lower() not in _tasks.YES:
             raise SystemExit("set can only turn `accept:` on (accept=yes); a human clears it by editing the file")
         if is_task and key == "status":
@@ -350,6 +356,57 @@ def accept(args):
         sys.exit(1)
 
 
+RE_PLAN = ("An answer steers the work only. It never changes approved:, tier, touches: or accept:. If the "
+           "question needs one of those, it's a re-plan: don't answer. Edit the task by hand, or "
+           "`ergon close {id} --as dropped --reason R` and file a new one.")
+
+
+def answer(args):
+    """HUMAN ONLY: answer the question(s) a dispatched worker parked its task on. Writes the answer
+    to Notes, swaps `asking:` for `answered:` and sets the task ready, so the next dispatch resumes
+    the worker's session with it (or a fresh worker, if the cache is gone). With no text, offers
+    each question's options to pick from. Never touches approved:, tier, touches: or accept:."""
+    t = _tasks.load(_config.ITEMS).get(args.id)
+    if not t:
+        raise SystemExit(f"no such task: {args.id}")
+    if not _tasks.is_asking(t):
+        raise SystemExit(f"{args.id} isn't waiting on an answer (status {t['status']}"
+                         + (", answered already: the next dispatch resumes it" if t.get("answered") else "") + ")")
+    qs, _ = _dispatch.asked(t)
+    print(f"{args.id}  {t['title']}")
+    for n, (q, opts) in enumerate(qs, 1):
+        print(f"\nQ{n}  {q}")
+        for i, o in enumerate(opts, 1):
+            print(f"    {i}. {o}" + ("  (recommended)" if i == 1 else ""))
+    print("\n" + RE_PLAN.format(id=args.id))
+    text = " ".join(args.text).strip() if args.text else ""
+    if not text:
+        parts = []
+        for n, (q, opts) in enumerate(qs or [("(no question recorded)", [])], 1):
+            got = ask(f"\nQ{n} answer" + (f" (1-{len(opts)}, or your own words)" if opts else "") + ": ")
+            if got.isdigit() and opts and 1 <= int(got) <= len(opts):
+                got = opts[int(got) - 1]
+            if not got:
+                raise SystemExit("no answer given; nothing written")
+            parts.append(got)
+        text = parts[0] if len(parts) == 1 else " ".join(f"Q{n}: {a}." for n, a in enumerate(parts, 1))
+    text = _dispatch.note_line(text)
+    print(f"\nanswer: {text}")
+    if not human_gate(f"Send this answer to {args.id}'s worker as {approver()}?"):
+        raise SystemExit("aborted")
+    with _gitops.state_lock():
+        t = _tasks.load(_config.ITEMS)[args.id]
+        if not _tasks.is_asking(t):
+            raise SystemExit(f"{args.id} is now {t['status']}; nothing written")
+        session = t.pop("asking")
+        t["status"], t["answered"] = "ready", session
+        _dispatch.add_note(t, text, who=f"answer by {approver()}")
+        _tasks.dump(t, _tasks.TASK_KEYS)
+        _history.record("answered", t, by=approver(), answer=text,
+                        session=None if session == _dispatch.NO_SESSION else session)
+    print(f"{args.id} is ready: the next `ergon dispatch` resumes its worker with your answer")
+
+
 def close(args):
     """HUMAN ONLY: close approved tasks (ready / blocked / doing) whose work already landed
     elsewhere (--as done) or that no longer apply (--as dropped). Skips the epic-branch check
@@ -374,6 +431,8 @@ def close(args):
         raise SystemExit("aborted")
     for t in todo:
         t["status"] = args.as_
+        t.pop("asking", None)
+        t.pop("answered", None)
         t["_body"] = t["_body"].rstrip() + f"\n\nClosed {_tasks.today()} as {args.as_}: {args.reason}\n"
         _tasks.dump(t, _tasks.TASK_KEYS)
         _history.record("closed", t, by=approver(), reason=args.reason, **{"as": args.as_})
@@ -396,7 +455,7 @@ def close(args):
 # Shell writes: in-place editors, redirects (not to /dev/null or another fd), tee, mv/cp/rm.
 SHELL_WRITE = re.compile(r"\bsed\s+(-\w+\s+)*-i|\bperl\s+-\w*i|(?<![0-9&>])>(?!\s*/dev/null|&)|"
                          r"\btee\b|\b(mv|cp|rm|truncate|install)\s|python[0-9.]*\s+-c|<<")
-HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept)\b|\breview\s+(-i|--interactive)\b")
+HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept|answer)\b|\breview\s+(-i|--interactive)\b")
 GUARD_TOOLS = "Edit|Write|MultiEdit|Bash"
 GIT_WRITE = re.compile(r"\bgit\b[^;&|]*\s(add|commit|checkout|switch|reset|restore|merge|rebase|"
                        r"cherry-pick|revert|stash|apply|am|pull|push|fetch|branch|tag|worktree|"
@@ -472,8 +531,8 @@ def guard_reason(tool, inp, worker=False):
     if tool == "Bash":
         cmd = inp.get("command", "")
         if HUMAN_CMD.search(cmd):
-            return ("approve / reject / close / accept / review -i are human-only; ask the user to run them "
-                    "in their own terminal")
+            return ("approve / reject / close / accept / answer / review -i are human-only; ask the user to run "
+                    "them in their own terminal")
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
                      r"\b(CLAUDECODE|AI_AGENT)=", cmd):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
@@ -508,6 +567,9 @@ def guard_reason(tool, inp, worker=False):
         if fb.get("status") == "review":
             return "a task in review leaves it only by a human's `ergon accept` or `ergon reject`, run in their own terminal"
         return "change status with `ergon set ID status=…` (it enforces the allowed moves), not by editing the file"
+    for key in ("asking", "answered"):
+        if fb.get(key, "") != fa.get(key, ""):
+            return f"`{key}:` is written by dispatch and a human's `ergon answer` only"
     if fb.get("accept", "").lower() in _tasks.YES and fa.get("accept", "").lower() not in _tasks.YES:
         return "only a human takes `accept:` off a task (it holds the task's landing for their review)"
     return None

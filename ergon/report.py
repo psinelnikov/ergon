@@ -32,7 +32,7 @@ def aggregate_stats(runs_dir, tasks, since=None, epic=None):
     count} for tasks blocked more than once, "skipped": logs that were unreadable, not JSON
     (and not a timeout) or whose task is gone}. A reviewer's log (<ID>-<time>-review[N].json) and
     a fix round's worker log (<ID>-<time>-fix<N>.json) add their cost to the task's tier but
-    aren't runs. Never raises on a bad log."""
+    aren't runs. A run that ended `RESULT: asking` is a run, neither done nor blocked. Never raises on a bad log."""
     tiers, per_task, skipped = {}, {}, 0
     for log in sorted(Path(runs_dir).glob("*.json")):
         m = RUN_LOG.match(log.name)
@@ -71,11 +71,12 @@ def aggregate_stats(runs_dir, tasks, since=None, epic=None):
                 continue
             d = {}
         text = d.get("result") or ""
-        found = re.findall(r"^\W*RESULT:\s*(done|blocked)\b", text, re.M)
+        found = re.findall(r"^\W*RESULT:\s*(done|blocked|asking)\b", text, re.M)
         verdict = "blocked" if d.get("is_error") or not found else found[-1]
         row = tier_row()
         row["runs"] += 1
-        row[verdict] += 1
+        if verdict != "asking":  # a question parks the task; it isn't a block
+            row[verdict] += 1
         row["timeouts"] += timed_out
         row["cost"] += float(d.get("total_cost_usd") or 0)
         if verdict == "blocked":

@@ -33,6 +33,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon accept ID [ID ...]     HUMAN ONLY, real terminal. Land a task dispatch held at `review`
                                (merge its branch like dispatch would, close the epic if last).
                                An epic ID accepts its tasks in review
+  ergon answer ID ["text"]     HUMAN ONLY, real terminal. Answer the QUESTION: lines a worker
+                               parked its task on (`RESULT: asking`); no text offers the options.
+                               The task goes back to ready, and the next dispatch resumes the
+                               worker's session with the answer (a fresh one if its cache is gone).
+                               Never changes approved:, tier, touches: or accept:
   ergon close ID [ID ...] --as done|dropped --reason R
                                HUMAN ONLY. An approved task whose work landed elsewhere, or that
                                no longer applies; skips the epic-branch check, closes the epic
@@ -178,6 +183,9 @@ def main():
     a = sub.add_parser("approve")
     a.add_argument("ids", nargs="+")
     sub.add_parser("accept").add_argument("ids", nargs="+")
+    an = sub.add_parser("answer", help="HUMAN ONLY: answer a worker's question and requeue its task")
+    an.add_argument("id")
+    an.add_argument("text", nargs="*", help="the answer; leave it out to pick from the options")
     r = sub.add_parser("reject")
     r.add_argument("ids", nargs="+")
     r.add_argument("--reason")
@@ -246,7 +254,7 @@ def main():
             {"new": _tasks.new, "set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish, "close": _gates.close,
              "tidy": _tasks.tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours)
-        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "accept": _gates.accept,
+        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "accept": _gates.accept, "answer": _gates.answer,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
          "import": _tasks.import_issue, "serve": _serve.serve}[args.cmd](args)
 
