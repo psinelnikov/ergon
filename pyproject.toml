@@ -9,7 +9,10 @@ description = "Task tracker for AI-assisted repos: humans approve, agents execut
 requires-python = ">=3.9"
 
 [project.scripts]
-ergon = "ergon:main"
+ergon = "ergon.cli:main"
 
 [tool.setuptools]
-py-modules = ["ergon"]
+packages = ["ergon"]
+
+[tool.setuptools.package-data]
+ergon = ["*.html", "*.css", "*.js"]

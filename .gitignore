@@ -8,3 +8,4 @@ tasks/items/
 tasks/epics/
 tasks/runs/
 .claude/worktrees/
+ergon/_plugin/
