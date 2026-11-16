@@ -265,3 +265,37 @@ class TestServeUnits(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMetrics(ServeFixture):
+    def test_metrics_matches_stats(self):
+        code, headers, page = self.req("GET", "/metrics")
+        self.assertEqual(code, 200)
+        self.assertIn("<svg", page)
+        self.assertIn("Landed per week", page)
+        self.assertIn("2026-W47", page)
+        stats = self.ergon("stats").stdout
+        row = next(l for l in stats.splitlines() if l.startswith("sonnet")).split()
+        self.assertIn(f"<td>sonnet</td><td class=num>{row[1]}</td><td class=num>{row[2]}</td>"
+                      f"<td class=num>{row[3]}</td><td class=num>{row[4]}</td><td class=num>{row[5]}</td>", page)
+        self.assertIn("<td>sonnet</td><td class=num>1</td><td class=num>1</td>", page)
+        # the same range, filtered: nothing before the fixture's day
+        _, _, empty = self.req("GET", "/metrics?until=2020-01-01")
+        self.assertIn("No runs yet", empty)
+        self.assertEqual(self.snapshot(), self.before)
+
+    def test_metrics_veto_and_filter(self):
+        _, _, page = self.req("GET", "/metrics?epic=E-001&since=2026-11-16")
+        self.assertIn("veto rate", page)
+        self.assertIn("rounds that fixed it", page)
+        _, _, hostile = self.req("GET", "/metrics?epic=%3Cscript%3E&since=%22%3E")
+        self.assertNotIn("<script>alert", hostile)
+
+
+class TestMetricsEmpty(Project):
+    def test_empty_state(self):
+        from ergon import metrics
+        m = metrics.compute({}, [], self.root / "nothing")
+        self.assertTrue(m["empty"])
+        body = metrics.render(m, S.esc, S.money, {"epic": None, "since": None, "until": None, "epics": []})
+        self.assertIn("No runs yet", body)

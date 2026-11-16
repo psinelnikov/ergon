@@ -26,9 +26,9 @@ from . import tasks as _tasks
 RUN_LOG = re.compile(r"^(?P<id>[A-Z]+-\d+)-(?P<date>\d{4})(?P<m>\d{2})(?P<d>\d{2})-\d{6}(?:-\w+)?\.json$")
 
 
-def aggregate_stats(runs_dir, tasks, since=None, epic=None):
+def aggregate_stats(runs_dir, tasks, since=None, epic=None, until=None):
     """Per-tier numbers from the dispatch logs in runs_dir, joined with tasks (id -> meta).
-    since: 'YYYY-MM-DD' (runs started that day or later); epic: only that epic's tasks.
+    since / until: 'YYYY-MM-DD' (runs started that day or later / that day or earlier); epic: only that epic's tasks.
     Returns {"tiers": {tier: {runs, done, blocked, timeouts, cost}}, "repeat": {id: blocked
     count} for tasks blocked more than once, "skipped": logs that were unreadable, not JSON
     (and not a timeout) or whose task is gone}. A reviewer's log (<ID>-<time>-review[N].json) and
@@ -46,7 +46,8 @@ def aggregate_stats(runs_dir, tasks, since=None, epic=None):
             continue
         if epic and t.get("epic") != epic:
             continue
-        if since and f"{m['date']}-{m['m']}-{m['d']}" < since:
+        day = f"{m['date']}-{m['m']}-{m['d']}"
+        if (since and day < since) or (until and day > until):
             continue
         tier_row = lambda: tiers.setdefault(t.get("tier") or "?", {"runs": 0, "done": 0, "blocked": 0,
                                                                 "timeouts": 0, "cost": 0.0})
