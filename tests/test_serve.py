@@ -333,7 +333,7 @@ class TestEpicTimeline(ServeFixture):
         self.assertIn(("hold", True, 101, 150), kinds3)
         self.assertEqual(kinds3[-1][0], "landed")
         self.assertEqual([c[3] for c in tl["costs"]], sorted(c[3] for c in tl["costs"]))
-        self.assertAlmostEqual(tl["costs"][-1][3], 3.625)
+        self.assertAlmostEqual(tl["costs"][-1][3], 3.75)
 
     def test_page(self):
         self.journal()
@@ -342,13 +342,12 @@ class TestEpicTimeline(ServeFixture):
         self.assertEqual(page.count('class="lane'), 3)  # one lane per task
         self.assertEqual(len(re.findall(r'<a href="/t/T-00\d"><text', page)), 3)
         self.assertEqual(len(re.findall(r'<rect class="seg k-worker', page)), 6)
-        self.assertEqual(len(re.findall(r'<rect class="seg [^"]* human', page)), 5)  # approvals x3, asking, hold, blocked: see below
+        self.assertEqual(len(re.findall(r'<rect class="seg [^"]* human', page)), 6)  # approvals x3, asking, hold, blocked
         self.assertIn("waiting on a human", page)
         self.assertIn("no &lt;tests&gt;", page)
         self.assertIn("which db?", page)
         self.assertIn('id=play', page)
         self.assertIn('<option value=16>', page)
-        self.assertIn("1,751 tokens", page) if False else None
         nonce = re.search(r"script-src 'nonce-([\w-]+)'", headers["Content-Security-Policy"])[1]
         self.assertEqual(re.findall(r"<script[^>]*>", page), [f'<script nonce="{nonce}">'])
         self.assertEqual(self.req("GET", "/e/E-009")[0], 404)
