@@ -627,12 +627,13 @@ def resume_choice(session, wt):
     return True, None
 
 
-def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, veto, rnd, verify=None):
+def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, veto, rnd, verify=None, n=None):
     """Hand a reviewer's veto back to a worker on the same branch: its own session resumed if
     resume_choice() allows, else a fresh worker with the retry prompt. Returns run_worker's
     (verdict, reason, info), with info["resumed"] and, for a fresh one, info["fresh_because"].
-    `verify` = (n, rounds) makes it a round for a red verify (`veto` is run_verify's reason)."""
-    n, rounds = verify or (rnd - 1, _config.REVIEW_ROUNDS)  # review fix round n is review round n + 1
+    `verify` = (n, rounds) makes it a round for a red verify (`veto` is run_verify's reason).
+    `rnd` numbers every worker run (logs, history); a review fix round's own count is `n`."""
+    n, rounds = verify or (n, _config.REVIEW_ROUNDS)
     what = "verify fix" if verify else "fix"
     lines = verify_lines(veto) if verify else None
     resume, fresh_because = resume_choice(session, wt)
@@ -807,7 +808,7 @@ def dispatch(args):
         round_cost = info.get("cost", 0)
         info.setdefault("review_cost", 0)
 
-        def fix(failed, verify=None):
+        def fix(failed, verify=None, n=None):
             """One fix worker on the branch. Returns (verdict, reason); folds its cost, FOUND lines,
             log and session into info. A review round whose worker commits nothing blocks."""
             nonlocal rnd, round_cost
@@ -817,7 +818,7 @@ def dispatch(args):
             except _gitops.GitError:
                 tips = None
             v, w, finfo = fix_round(t, tier, base, wt, branch, pubs, args, agents, settings,
-                                    info.get("session"), failed, rnd, verify)
+                                    info.get("session"), failed, rnd, verify, n)
             round_cost = finfo.get("cost", 0)
             info["cost"] = info.get("cost", 0) + round_cost
             info["found"] = (info.get("found") or []) + (finfo.get("found") or [])
@@ -850,7 +851,7 @@ def dispatch(args):
                         f"verify passed after {vfixes} fix round(s)" if vfixes else "",
                         f"verify passed on rerun after the worker found the failure outside the branch: {outside}"
                         if outside else "",
-                        f"review passed in round {rnd}, after {len(vetoes)} fix round(s): "
+                        f"review passed in round {len(vetoes) + 1}, after {len(vetoes)} fix round(s): "
                         + "; ".join(f"round {i}: {x}" for i, x in enumerate(vetoes, 1)) if vetoes else "") if x)
                 return "done", ""
             if fixable == "verify":
@@ -882,9 +883,9 @@ def dispatch(args):
             if not fixable or stop or len(vetoes) >= _config.REVIEW_ROUNDS:
                 return "blocked", f"{rounds_note(failed, vetoes, stop)}. {kept}"
             vetoes.append(failed)
-            v, w = fix(failed)
+            v, w = fix(failed, n=len(vetoes))
             if v != "done":
-                info["rounds"] = (f" (fix round {rnd - 1}, after "
+                info["rounds"] = (f" (fix round {len(vetoes)}, after "
                                   + "; ".join(f"round {i}: {x}" for i, x in enumerate(vetoes, 1)) + ")")
                 return "blocked", w
 
