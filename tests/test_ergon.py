@@ -20,22 +20,43 @@ import ergon  # noqa: E402
 FAKE_CLAUDE = r'''#!/usr/bin/env python3
 """Stands in for `claude -p`: commits a change citing the task, in the task worktree and in
 any companion worktree inside it, then reports RESULT: done. As the task-review agent it
-reports $FAKE_REVIEW (default REVIEW: pass) and appends its model and prompt to $FAKE_SEEN."""
+reports $FAKE_REVIEW (default REVIEW: pass; $FAKE_REVIEWS, |-separated, gives the nth review the
+nth verdict, the last repeating) and appends its model and prompt to $FAKE_SEEN. With
+$FAKE_TRANSCRIPT_AGE set, a worker leaves a transcript under $HOME/.claude/projects whose last
+request is that many seconds old and holds $FAKE_CONTEXT tokens (default 1000)."""
 import json, os, re, subprocess, sys, time
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 prompt = sys.argv[-1]
 tier = sys.argv[sys.argv.index("--agent") + 1].replace("task-", "").upper()
+resume = sys.argv[sys.argv.index("--resume") + 1] if "--resume" in sys.argv else None
+nth = 0
 if os.environ.get("FAKE_SEEN"):
+    if os.path.exists(os.environ["FAKE_SEEN"]):
+        nth = sum('"agent": "REVIEW"' in l for l in open(os.environ["FAKE_SEEN"]))
     agents = json.loads(sys.argv[sys.argv.index("--agents") + 1])
     with open(os.environ["FAKE_SEEN"], "a") as f:
-        f.write(json.dumps({"agent": tier, "model": agents["task-" + tier.lower()]["model"], "prompt": prompt}) + "\n")
+        f.write(json.dumps({"agent": tier, "model": agents["task-" + tier.lower()]["model"], "prompt": prompt,
+                            "resume": resume}) + "\n")
 if tier == "REVIEW":
     if os.environ.get("FAKE_REVIEW_COMMIT"):
         subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "sneaky"], check=True)
-    print(json.dumps({"result": "looked\n" + os.environ.get("FAKE_REVIEW", "REVIEW: pass"),
-                      "session_id": "r-1", "total_cost_usd": 0.02}))
+    seq = os.environ.get("FAKE_REVIEWS", "").split("|") if os.environ.get("FAKE_REVIEWS") else None
+    verdict = seq[min(nth, len(seq) - 1)] if seq else os.environ.get("FAKE_REVIEW", "REVIEW: pass")
+    print(json.dumps({"result": "looked\n" + verdict, "session_id": "r-1", "total_cost_usd": 0.02}))
     sys.exit()
-tid = re.search(r"dispatched on (T-\d+)", prompt).group(1)
+if os.environ.get("FAKE_TRANSCRIPT_AGE"):
+    import datetime
+    d = os.path.join(os.path.expanduser("~/.claude/projects"), re.sub(r"[^A-Za-z0-9]", "-", os.getcwd()))
+    os.makedirs(d, exist_ok=True)
+    at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=float(os.environ["FAKE_TRANSCRIPT_AGE"]))
+    entry = {"type": "assistant", "timestamp": at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+             "message": {"id": "m1", "usage": {"input_tokens": int(os.environ.get("FAKE_CONTEXT", "1000"))}}}
+    with open(os.path.join(d, "s-1.jsonl"), "w") as f:
+        f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+tid = re.search(r"(?:dispatched|work) on (T-\d+)", prompt).group(1)
+if resume and os.environ.get("FAKE_FIX_NOTHING"):
+    print(json.dumps({"result": "nothing to change\nRESULT: done", "session_id": resume, "total_cost_usd": 0.01}))
+    sys.exit()
 def commit(where, msg):
     with open(os.path.join(where, f"{tid}.txt"), "a") as f:
         f.write("work\n")
@@ -640,7 +661,9 @@ class TestDispatch(DispatchProject):
 
 
 class TestReview(DispatchProject):
-    config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n        review = ["haiku", "opus"]')
+    """review_rounds = 0: a fail blocks at once, as before fix rounds (TestReviewRounds has those)."""
+    config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n        review = ["haiku", "opus"]'
+                                            '\n        review_rounds = 0')
 
     def setUp(self):
         super().setUp()
@@ -756,6 +779,149 @@ class TestReview(DispatchProject):
         (self.root / ".ergon.toml").write_text('review = ["human"]\n')
         r = self.ergon("board", check=False)
         self.assertIn("review lists worker tiers", r.stderr)
+
+
+class TestReviewRounds(DispatchProject):
+    """review_rounds (default 2): a reviewer's fail goes back to the worker, then review again."""
+    config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
+                                            '        verify = "true"\n        review = ["haiku"]')
+
+    def setUp(self):
+        super().setUp()
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        home = Path(self.tmp.name) / "home"  # where the fake leaves, and ergon reads, transcripts
+        home.mkdir()
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0")
+        self.ergon("new", "task", "Fixable", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+
+    def calls(self):
+        return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+
+    def rows(self, event):
+        return [r for r in history(self.root) if r["task"] == "T-001" and r["event"] == event]
+
+    def test_fail_then_fix_then_pass_lands(self):
+        self.env["FAKE_REVIEWS"] = "REVIEW: fail — no test for the empty list|REVIEW: pass"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        calls = self.calls()
+        self.assertEqual([(c["agent"], c["resume"]) for c in calls],
+                         [("HAIKU", None), ("REVIEW", None), ("HAIKU", "s-1"), ("REVIEW", None)])
+        fix = calls[2]["prompt"]
+        self.assertIn("The reviewer vetoed your work on T-001 (fix round 1 of 2): review (sonnet) failed: "
+                      "no test for the empty list", fix)
+        self.assertRegex(fix, r"Its full review is in /\S+/tasks/runs/T-001-\d+-\d+-review\.json\.")
+        self.assertNotIn("The task file", fix)  # a resumed session has it already
+        self.assertIn("fix      T-001  round 1/2: resumed s-1", out)
+        self.assertIn("review   T-001  sonnet: pass (round 2)", out)
+        self.assertEqual((self.root / "T-001.txt").read_text(), "work\nwork\n")  # both rounds' commits landed
+        self.assertIn("review passed in round 2, after 1 fix round(s): round 1: review (sonnet) failed: no test",
+                      self.task_file("T-001").read_text())
+        self.assertEqual(events(self.root, "T-001"),
+                         ["created", "dispatched", "worker_end", "verify", "review", "resumed",
+                          "worker_end", "verify", "review", "landed"])
+        self.assertEqual([r.get("round") for r in history(self.root) if r["task"] == "T-001"],
+                         [None] * 5 + [2] * 4 + [None])
+        self.assertEqual(self.rows("resumed")[0]["session"], "s-1")
+        self.assertRegex(self.rows("worker_end")[1]["log"], r"-fix2\.json$")
+        self.assertRegex(self.rows("review")[1]["log"], r"-review2\.json$")
+        self.assertIn("1/1 done, $0.06 (reviews $0.04 of it)", out)
+        haiku = [l.split() for l in self.ergon("stats").stdout.splitlines() if l.startswith("haiku")][0]
+        self.assertEqual(haiku[:4], ["haiku", "1", "1", "0"])  # a fix round isn't another run
+        self.assertEqual(haiku[5], "$0.06")
+
+    def test_fails_every_round_then_blocks_with_all_reasons(self):
+        self.env["FAKE_REVIEWS"] = "REVIEW: fail — first gap|REVIEW: fail — second gap|REVIEW: fail — third gap"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertEqual([c["agent"] for c in self.calls()], ["HAIKU", "REVIEW"] * 3)
+        note = self.task_file("T-001").read_text().split("## Notes", 1)[1]
+        self.assertRegex(note, r"dispatch: review \(sonnet\) failed: third gap \(review log tasks/runs/\S+-review3\.json\) "
+                               r"\(round 3, after 2 fix round\(s\)\); no fix rounds left \(review_rounds = 2\)\. "
+                               r"Earlier rounds: round 1: review \(sonnet\) failed: first gap \(review log \S+-review\.json\); "
+                               r"round 2: review \(sonnet\) failed: second gap \(review log \S+-review2\.json\)\. "
+                               r"Branch task/T-001 and worktree \S+ kept")
+        self.assertFalse((self.root / "T-001.txt").exists())
+        self.assertEqual(len(self.rows("resumed")), 2)
+        self.assertEqual([r["verdict"] for r in self.rows("review")], ["fail"] * 3)
+        # A human retry is told the last round's veto, and pointed at its review.
+        f = self.task_file("T-001")
+        f.write_text(re.sub(r"^status: blocked$", "status: ready", f.read_text(), flags=re.M))
+        self.seen.unlink()
+        self.env["FAKE_REVIEWS"] = "REVIEW: pass"
+        time.sleep(1.1)  # run logs are named to the second
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        worker = self.calls()[0]["prompt"]
+        self.assertIn("The reviewer vetoed the last attempt: review (sonnet) failed: third gap", worker)
+        self.assertRegex(worker, r"Its full review is in /\S+-review3\.json\.")
+
+    def test_malformed_review_blocks_without_a_round(self):
+        for name, reply in (("no line", "Looks fine to me."), ("misspelt", "REVIEW: passed")):
+            with self.subTest(name):
+                self.setUp()
+                self.env["FAKE_REVIEW"] = reply
+                out = self.ergon("dispatch").stdout
+                self.assertEqual(self.status("T-001"), "blocked", out)
+                self.assertEqual([c["agent"] for c in self.calls()], ["HAIKU", "REVIEW"])
+                self.assertIn("didn't end with a `REVIEW: pass`", self.task_file("T-001").read_text())
+                self.assertNotIn("fix round", self.task_file("T-001").read_text())
+                self.assertEqual(self.rows("resumed"), [])
+
+    def test_budget_cap_stops_the_loop(self):
+        # A round costs $0.03 (worker $0.01, review $0.02). After round 2: $0.06 spent, and a
+        # third round would take it to $0.09, past $0.07.
+        self.env["FAKE_REVIEWS"] = "REVIEW: fail — gap"
+        out = self.ergon("dispatch", "--budget-total", "0.07").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertEqual([c["agent"] for c in self.calls()], ["HAIKU", "REVIEW"] * 2)
+        self.assertIn("(round 2, after 1 fix round(s)); no fix round 2: $0.06 spent and a round costs about "
+                      "$0.03, past the $0.07 cap", self.task_file("T-001").read_text())
+        self.setUp()
+        self.env["FAKE_REVIEWS"] = "REVIEW: fail — gap"
+        out = self.ergon("dispatch", "--budget-total", "0.05").stdout
+        self.assertEqual([c["agent"] for c in self.calls()], ["HAIKU", "REVIEW"])
+        self.assertIn("gap (review log", self.task_file("T-001").read_text())
+        self.assertIn("; no fix round 1: $0.03 spent", self.task_file("T-001").read_text())
+
+    def test_stale_or_heavy_session_starts_fresh(self):
+        cases = [("stale", {"FAKE_TRANSCRIPT_AGE": "4000"}, "its last request was 67 min ago, so its prompt cache "
+                  "has likely expired (review_resume_secs = 3300)"),
+                 ("heavy", {"FAKE_CONTEXT": "90000"}, "its context holds 90,000 tokens (review_resume_tokens = 80,000)"),
+                 ("no transcript", {"FAKE_TRANSCRIPT_AGE": ""}, "its transcript can't be read")]
+        for name, env, why in cases:
+            with self.subTest(name):
+                self.setUp()
+                self.env.update(env, FAKE_REVIEWS="REVIEW: fail — no test for the empty list|REVIEW: pass")
+                out = self.ergon("dispatch").stdout
+                self.assertEqual(self.status("T-001"), "done", out)
+                calls = self.calls()
+                self.assertEqual([(c["agent"], c["resume"]) for c in calls],
+                                 [("HAIKU", None), ("REVIEW", None), ("HAIKU", None), ("REVIEW", None)])
+                fresh = calls[2]["prompt"]
+                self.assertIn("You are dispatched on T-001", fresh)
+                self.assertIn("The reviewer vetoed the last attempt: review (sonnet) failed: no test for the empty list", fresh)
+                self.assertIn("An earlier attempt left commits", fresh)
+                self.assertEqual(self.rows("resumed"), [])
+                d = self.rows("dispatched")
+                self.assertEqual([r.get("round") for r in d], [None, 2])
+                self.assertEqual(d[1]["fresh_because"], why)
+                self.assertIn(f"fresh session ({why})", out)
+
+    def test_fix_that_commits_nothing_blocks(self):
+        self.env.update(FAKE_REVIEWS="REVIEW: fail — gap|REVIEW: pass", FAKE_FIX_NOTHING="1")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertEqual([c["agent"] for c in self.calls()], ["HAIKU", "REVIEW", "HAIKU"])
+        self.assertIn("worker said done but committed nothing on task/T-001 since the review (fix round 1, "
+                      "after round 1: review (sonnet) failed: gap", self.task_file("T-001").read_text())
+
+    def test_bad_rounds_config(self):
+        for line in ("review_rounds = -1", 'review_rounds = "2"', "review_resume_secs = true"):
+            (self.root / ".ergon.toml").write_text(line + "\n")
+            r = self.ergon("board", check=False)
+            self.assertIn("is a whole number, 0 or more", r.stderr, line)
 
 
 class TestAccept(DispatchProject):
@@ -933,7 +1099,7 @@ def events(root, tid):
 class TestHistory(DispatchProject):
     """<state>/runs/history.jsonl: one ordered row per event, from every process and thread."""
     config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
-                                            '        verify = "true"\n        review = ["haiku"]')
+                                            '        verify = "true"\n        review = ["haiku"]\n        review_rounds = 0')
 
     def test_done_blocked_and_reviewed_sequences(self):
         self.ergon("new", "epic", "Small epic")

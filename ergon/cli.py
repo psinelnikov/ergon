@@ -53,6 +53,8 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                --watch (needs --budget-total) keeps rescanning for newly ready
                                tasks every --interval seconds (default 30) until the cap is hit
                                or Ctrl-C (stop launching, let workers finish; a second kills them)
+                               A reviewer's fail (`review` in .ergon.toml) goes back to the worker
+                               and is reviewed again, up to review_rounds times, then blocks
   ergon stats [--since DATE] [--epic E]
                                read-only: per tier, runs / done / blocked / block rate / cost /
                                timeouts from <state>/runs/*.json, and tasks that blocked twice+

@@ -199,3 +199,50 @@ def describe(s, top=3):
     if extra:
         lines.append(", ".join(extra))
     return lines
+
+
+def _unix(ts):
+    """A transcript timestamp ("2026-11-16T17:39:33.123Z") as a Unix time, or None."""
+    import datetime
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        d = datetime.datetime.fromisoformat(ts[:-1] + "+00:00" if ts.endswith("Z") else ts)
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc)
+    return d.timestamp()
+
+
+def last_request(session, cwd, root=None):
+    """(when, tokens) of the last request a session made itself, or None when its transcript is
+    missing or holds none: `when` a Unix time (the prompt cache lives from then) and `tokens`
+    what that request sent, cached or not (the context the session holds). Subagents' requests
+    and zero-usage ones (the synthetic message a usage limit ends a turn with) don't count.
+    Ported from SClaude's session_end.py (context, requested), MIT as above."""
+    if not session or not cwd:
+        return None
+    path = os.path.join(root or ROOT, project_name(cwd), f"{session}.jsonl")
+    got = None
+    try:
+        fh = open(path, "rb")
+    except OSError:
+        return None
+    with fh:
+        for line in fh:
+            if b'"type":"assistant"' not in line:
+                continue
+            entry = _load(line)
+            if entry.get("type") != "assistant" or entry.get("isSidechain"):
+                continue
+            usage = (entry.get("message") or {}).get("usage") or {}
+            try:
+                held = sum(int(usage.get(k) or 0) for k in
+                           ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            at = _unix(entry.get("timestamp"))
+            if held and at is not None:
+                got = (at, held)
+    return got

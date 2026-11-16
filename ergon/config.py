@@ -42,7 +42,11 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # verify = "make test"          # run in the task worktree before landing; non-zero exit blocks the task
 #                               # (a task's `verify:` frontmatter overrides it)
 # review = ["haiku", "sonnet"]  # worker tiers whose branches a reviewer one tier up must pass before
-#                               # landing (opus reviews opus); a fail blocks the task
+#                               # landing (opus reviews opus)
+# review_rounds = 2             # on a review fail, hand the findings back to the worker and review
+#                               # again, up to this many times; then block (0: block on the first fail)
+# review_resume_secs = 3300     # resume the worker's own session only if its last request is younger
+# review_resume_tokens = 80000  # and its context smaller than these; else a fresh worker on the branch
 
 # Tasks whose finished branch waits at status `review` for a human `ergon accept` instead of landing.
 # A task matches a rule if its tier is in tiers (when given) and a touches: entry matches (when
@@ -151,7 +155,8 @@ def configure(start=None, need_config=True):
     the main checkout: task state, worktrees, run logs and companion checkouts live there, so
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
-        RETIRED_FILE, WORKER_RULES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, REVIEW, ACCEPT
+        RETIRED_FILE, WORKER_RULES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, REVIEW, ACCEPT, \
+        REVIEW_ROUNDS, RESUME_SECS, RESUME_TOKENS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -184,6 +189,17 @@ def configure(start=None, need_config=True):
     REVIEW = [REVIEW] if isinstance(REVIEW, str) else REVIEW
     if not isinstance(REVIEW, list) or any(x not in WORKER_TIERS for x in REVIEW):
         raise NotConfigured(f"{CONFIG_FILE}: review lists worker tiers to review, from {WORKER_TIERS}")
+    # A review fail goes back to the worker this many times before the task blocks (T-026). The
+    # worker's own session is resumed while its prompt cache is likely alive (an hour's TTL less
+    # a margin) and its context is light; otherwise a fresh worker gets the findings.
+    def count(key, default):
+        v = CFG.get(key, default)
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise NotConfigured(f"{CONFIG_FILE}: {key} is a whole number, 0 or more")
+        return v
+    REVIEW_ROUNDS = count("review_rounds", 2)
+    RESUME_SECS = count("review_resume_secs", 3300)
+    RESUME_TOKENS = count("review_resume_tokens", 80000)
     COMPANIONS = []
     for c in CFG.get("companion") or []:
         if not c.get("path"):

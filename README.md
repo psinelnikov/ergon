@@ -6,7 +6,7 @@ A task tracker for repos where AI agents do much of the work. **Humans approve, 
 - Every task is sized by the cheapest model tier that can do it: `haiku`, `sonnet`, `opus` or `human`.
 - Agents can propose tasks, but only a human can approve one. This is enforced by the CLI, by a lint, by a Claude Code hook and, if you opt in, by a git hook that covers every other agent too (see [Agents other than Claude Code](#agents-other-than-claude-code)). It's a speed bump, not a security boundary.
 - Each epic gets its own branch, worked in its own git worktree. When its last task closes, the branch merges back with a message listing every task and the commits that cite it.
-- `ergon dispatch` runs approved tasks headless, in parallel: one worktree, one `task/<ID>` branch and one `claude -p` worker per task. Finished branches merge into their epic. Nothing is ever pushed. `ergon dispatch --watch --budget-total USD [--interval SEC]` keeps running and picks up tasks you approve meanwhile, until the cap is reached or Ctrl-C (running workers finish; a second Ctrl-C kills them and marks them blocked).
+- `ergon dispatch` runs approved tasks headless, in parallel: one worktree, one `task/<ID>` branch and one `claude -p` worker per task. Finished branches merge into their epic. Nothing is ever pushed. `ergon dispatch --watch --budget-total USD [--interval SEC]` keeps running and picks up tasks you approve meanwhile, until the cap is reached or Ctrl-C (running workers finish; a second Ctrl-C kills them and marks them blocked). With `review` set, a reviewer one tier up must pass each branch before it lands; on a fail, dispatch hands the findings back to the worker (resuming its session while the prompt cache is warm, else a fresh one) and reviews again, up to `review_rounds` times (default 2), before it blocks the task with every round's reason in Notes.
 - `ergon import gh#123` turns a GitHub issue into a `proposed` task (see [Importing issues](#importing-issues)). When its epic merges, ergon prints the `gh issue comment` / `gh issue close` commands for you to run after you push. It never runs them.
 - **Companion repos**: a separate repo checked out inside this one (say, a public product repo inside a private install). Each task that touches it gets its own worktree of that repo too. You can also refuse commits there that cite tracker IDs.
 
@@ -72,6 +72,10 @@ log = "TODO.md"                    # the log that `source: TODO.md:<line>` cites
 retired = "tasks/audit-retired.txt"  # `term | gate | note` rows: nouns that make a task stale
 worker_rules = "tasks/WORKER.md"   # inlined into every dispatched prompt; `ergon rules` prints it
 verify = "make test"               # run in the task worktree before landing; non-zero exit blocks (a task's `verify:` field overrides)
+review = ["haiku", "sonnet"]       # worker tiers whose branches a reviewer one tier up must pass before landing
+review_rounds = 2                  # a review fail goes back to the worker, then review again, this many times; then the task blocks (0: at once)
+review_resume_secs = 3300          # a fix round resumes the worker's session only if its last request is younger than this
+review_resume_tokens = 80000       # and its context smaller than this; otherwise a fresh worker on the same branch
 
 [[companion]]                      # repeatable
 name = "org/product"               # how tasks name it in touches:

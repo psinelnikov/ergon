@@ -77,6 +77,21 @@ class TestTranscripts(unittest.TestCase):
         json.dump(c, open(self.cache, "w"))
         self.assertEqual(T.session_summary("s", self.cwd, self.cache, self.tmp)["tools"], {"Cached": 9})
 
+    def test_last_request(self):
+        side = dict(asst("c", "2026-11-16T10:05:00Z", {"input_tokens": 999999}), isSidechain=True)
+        w(f"{self.dir}/s.jsonl", [
+            asst("a", "2026-11-16T10:00:00.500Z", {"input_tokens": 10, "cache_read_input_tokens": 100}),
+            asst("b", "2026-11-16T10:02:00.000Z", {"input_tokens": 5, "cache_read_input_tokens": 200,
+                                                   "cache_creation_input_tokens": 30, "output_tokens": 7}),
+            side,  # a subagent's request: its own context
+            asst("d", "2026-11-16T10:06:00Z", {"input_tokens": 0}),  # a usage limit's synthetic message
+        ])
+        at, held = T.last_request("s", self.cwd, self.tmp)
+        self.assertEqual(at, 1794823320.0)  # 2026-11-16T10:02:00Z
+        self.assertEqual(held, 235)
+        self.assertIsNone(T.last_request("nope", self.cwd, self.tmp))
+        self.assertIsNone(T.last_request(None, self.cwd, self.tmp))
+
     def test_missing(self):
         self.assertIsNone(T.session_summary("nope", self.cwd, self.cache, self.tmp))
         self.assertIsNone(T.session_summary(None, self.cwd, self.cache, self.tmp))
