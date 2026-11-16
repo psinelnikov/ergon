@@ -6,6 +6,8 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
   /            the board: open work by status then tier, epics with progress, what waits on a
                human (approval, acceptance, answers), and live dispatch state
   /live.json   tasks `doing`: elapsed time, round, spend so far; the board polls it
+  /e/E-NNN     one epic's replay timeline: a lane per task, a bar per phase from the journal,
+               human waits hatched, a cost overlay, and a replay player (inline SVG, no libraries)
   /t/T-NNN     one task: its brief, frontmatter, every run and review from the history
                journal, transcript usage, links to the raw logs, `claude --resume` commands
   /runs/NAME   one file directly inside <state>/runs/, as plain text
@@ -45,6 +47,7 @@ from . import config as _config
 from . import history as _history
 from . import report as _report
 from . import tasks as _tasks
+from . import timeline as _timeline
 from . import transcripts as _transcripts
 
 DEFAULT_PORT = 4300
@@ -331,7 +334,8 @@ def asset(name):
 
 
 def page(title, body, nonce, script=False):
-    js = f'<script nonce="{nonce}">{asset("serve.js")}</script>' if script else ""
+    """script: False, True (serve.js, the board's live table) or the name of another asset."""
+    js = f'<script nonce="{nonce}">{asset("serve.js" if script is True else script)}</script>' if script else ""
     return ("<!doctype html><html lang=en><head><meta charset=utf-8>"
             '<meta name=viewport content="width=device-width, initial-scale=1">'
             '<meta name=color-scheme content="light dark">'
@@ -410,13 +414,52 @@ def board_page(nonce):
             done = sum(t["status"] == "done" for t in kids)
             pending = sum(t["status"] == "proposed" for t in kids)
             note = " <span class=flags>needs breakdown</span>" if not kids and e.get("status") == "open" else ""
-            b.append(f'<tr><td class="mono id">{esc(e["id"])}</td><td>{esc(e.get("status"))}</td>'
+            b.append(f'<tr><td class="mono id"><a href="/e/{esc(e["id"])}">{esc(e["id"])}</a></td><td>{esc(e.get("status"))}</td>'
                      f'<td class=num>{bar(done, len(kids))} {done}/{len(kids)}</td>'
                      f'<td class="num hide-narrow">{pending or ""}</td><td>{esc(e.get("title"))}{note}</td></tr>')
         b.append("</tbody></table></div>")
     by_tier = {tier: sum(t.get("tier") == tier for t in open_) for tier in _tasks.TIERS}
     b.append("<footer>open by tier: " + esc("  ".join(f"{k}:{v}" for k, v in by_tier.items())) + "</footer>")
     return page(f"ergon · {_config.HOME.name}", "".join(b), nonce, script=True)
+
+
+def epic_page(eid, nonce, now=None):
+    epics = _tasks.load(_config.EPICS)
+    e = epics.get(eid)
+    if not e:
+        return None
+    tasks = _tasks.load(_config.ITEMS)
+    rows = _history.read()
+    trails = by_task(rows)
+
+    def tokens(r):
+        s = summary(r.get("session"), worktree_of(trails.get(r.get("task"), []), r.get("task")))
+        return sum(s["tokens"].get(k, 0) for k in ("input", "output", "cache_read", "cache_write")) if s else None
+
+    tl = _timeline.build(rows, tasks, eid, now or time.time(), tokens)
+    b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
+         f'<h1>{esc(eid)} {esc(e.get("title"))}</h1>']
+    if not tl["lanes"]:
+        b.append("<p class=muted>no task of this epic has a journal yet</p>")
+        return page(f"{eid} · {e.get('title', '')}", "".join(b), nonce)
+    human, machine = _timeline.totals(tl)
+    total = human + machine
+    spent = tl["costs"][-1][3] if tl["costs"] else 0
+    b.append(f'<p>{len(tl["lanes"])} task(s) · {esc(secs(tl["t1"] - tl["t0"]))} end to end · {money(spent)} · '
+             f'waiting on a human {esc(secs(human))}'
+             + (f' ({round(100 * human / total)}% of lane time)' if total else "") + "</p>")
+    b.append('<div class=player><button id=play type=button>▶ replay</button>'
+             '<label>speed <select id=speed><option value=1>×1<option value=2>×2<option value=4>×4'
+             '<option value=8>×8<option value=16>×16</select></label>'
+             '<input id=scrub type=range min=0 max=1000 value=1000 aria-label="position">'
+             '<span id=clock class=muted></span></div>'
+             '<div class=muted>×1 plays the whole epic in a minute.</div>')
+    b.append(f'<div class=tlwrap>{_timeline.svg(tl)}</div><div id=tip class=tip hidden></div>')
+    b.append('<p class=legend><span class="sw k-worker"></span>worker <span class="sw k-verify"></span>verify '
+             '<span class="sw k-review"></span>review <span class="sw o-fail"></span>failed '
+             '<span class="sw o-ok"></span>passed / landed <span class="sw human"></span>waiting on a human '
+             '(approval, answer, accept, blocked) <span class="sw k-queued"></span>queued</p>')
+    return page(f"{eid} · {e.get('title', '')}", "".join(b), nonce, script="epic.js")
 
 
 def run_card(label, r, where, tasks):
@@ -618,6 +661,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 tasks = _tasks.load(_config.ITEMS)
                 data = {"now_ts": time.time(), "counts": counts(tasks), "doing": live(tasks, _history.read())}
                 return self._send(200, json.dumps(data).encode(), "application/json", head)
+            m = re.fullmatch(r"/e/(E-\d{3,})", path)
+            if m:
+                body = epic_page(m[1], nonce)
+                if body is None:
+                    return self._text(404, f"404: no epic {m[1]}", head)
+                return self._send(200, body.encode(), "text/html; charset=utf-8", head, nonce)
             m = re.fullmatch(r"/t/(T-\d{3,})", path)
             if m:
                 body = task_page(m[1], nonce)
