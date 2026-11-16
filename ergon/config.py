@@ -41,6 +41,9 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # worker_rules = "tasks/WORKER.md"      # inlined into every dispatched worker's prompt
 # verify = "make test"          # run in the task worktree before landing; non-zero exit blocks the task
 #                               # (a task's `verify:` frontmatter overrides it)
+# verify_rounds = 2             # on a red verify, resume the worker with the output and verify again, up to
+#                               # this many times; then block (0: block at once). A worker that ends
+#                               # `RESULT: blocked — outside: <why>` costs no round: verify reruns once as is
 # review = ["haiku", "sonnet"]  # worker tiers whose branches a reviewer one tier up must pass before
 #                               # landing (opus reviews opus)
 # review_rounds = 2             # on a review fail, hand the findings back to the worker and review
@@ -156,7 +159,7 @@ def configure(start=None, need_config=True):
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, REVIEW, ACCEPT, \
-        REVIEW_ROUNDS, RESUME_SECS, RESUME_TOKENS
+        REVIEW_ROUNDS, VERIFY_ROUNDS, RESUME_SECS, RESUME_TOKENS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -198,6 +201,7 @@ def configure(start=None, need_config=True):
             raise NotConfigured(f"{CONFIG_FILE}: {key} is a whole number, 0 or more")
         return v
     REVIEW_ROUNDS = count("review_rounds", 2)
+    VERIFY_ROUNDS = count("verify_rounds", 2)  # a red verify goes back to the worker this many times (T-027)
     RESUME_SECS = count("review_resume_secs", 3300)
     RESUME_TOKENS = count("review_resume_tokens", 80000)
     COMPANIONS = []

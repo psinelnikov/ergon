@@ -57,6 +57,9 @@ tid = re.search(r"(?:dispatched|work) on (T-\d+)", prompt).group(1)
 if resume and os.environ.get("FAKE_FIX_NOTHING"):
     print(json.dumps({"result": "nothing to change\nRESULT: done", "session_id": resume, "total_cost_usd": 0.01}))
     sys.exit()
+if resume and os.environ.get("FAKE_FIX_RESULT"):  # a fix round that changes nothing and ends so
+    print(json.dumps({"result": os.environ["FAKE_FIX_RESULT"], "session_id": resume, "total_cost_usd": 0.01}))
+    sys.exit()
 def commit(where, msg):
     with open(os.path.join(where, f"{tid}.txt"), "a") as f:
         f.write("work\n")
@@ -599,6 +602,7 @@ class TestDispatch(DispatchProject):
         for cmd, want in (("true", "done"), ("echo boom-line; exit 3", "blocked")):
             with self.subTest(cmd):
                 self.setUp()
+                (self.root / ".ergon.toml").write_text("verify_rounds = 0\n" + (self.root / ".ergon.toml").read_text())
                 self.ergon("new", "task", "Gated", "--tier", "sonnet")
                 f = self.task_file("T-001")
                 stamp(f)
@@ -924,6 +928,89 @@ class TestReviewRounds(DispatchProject):
             self.assertIn("is a whole number, 0 or more", r.stderr, line)
 
 
+class TestVerifyRounds(DispatchProject):
+    """verify_rounds (default 2): a red verify goes back to the worker with its output."""
+    config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
+                                            '        verify = "echo noisy-output; test $(wc -l < T-001.txt) -ge 2"')
+
+    def setUp(self):
+        super().setUp()
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0")
+        self.ergon("new", "task", "Verified", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+
+    def calls(self):
+        return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+
+    def rows(self, event):
+        return [r for r in history(self.root) if r["task"] == "T-001" and r["event"] == event]
+
+    def notes(self):
+        return self.task_file("T-001").read_text().split("## Notes", 1)[1]
+
+    def test_red_fix_green_lands(self):
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        calls = self.calls()
+        self.assertEqual([(c["agent"], c["resume"]) for c in calls], [("HAIKU", None), ("HAIKU", "s-1")])
+        self.assertIn("Verify failed on your work on T-001 (verify fix round 1 of 2)", calls[1]["prompt"])
+        self.assertIn("noisy-output", calls[1]["prompt"])
+        self.assertRegex(calls[1]["prompt"], r"The full output is in /\S+-verify\.log")
+        self.assertIn("outside: <why>", calls[1]["prompt"])
+        self.assertIn("verify fix T-001  round 1/2: resumed s-1", out)
+        self.assertIn("verify passed after 1 fix round(s)", self.task_file("T-001").read_text())
+        self.assertEqual(events(self.root, "T-001"),
+                         ["created", "dispatched", "worker_end", "verify", "resumed", "worker_end", "verify", "landed"])
+        self.assertEqual([r["ok"] for r in self.rows("verify")], [False, True])
+
+    def test_red_every_round_blocks(self):
+        self.env["FAKE_FIX_RESULT"] = "tried\nRESULT: done"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertEqual([c["agent"] for c in self.calls()], ["HAIKU", "HAIKU", "HAIKU"])  # rounds + 1 verifies
+        self.assertEqual([r["ok"] for r in self.rows("verify")], [False] * 3)
+        self.assertIn("no verify fix rounds left (verify_rounds = 2)", self.notes())
+        self.assertEqual(len(list((self.root / "tasks" / "items").glob("T-002*"))), 0)
+
+    def test_zero_rounds_blocks_at_once(self):
+        (self.root / ".ergon.toml").write_text("verify_rounds = 0\n" + (self.root / ".ergon.toml").read_text())
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertEqual([c["agent"] for c in self.calls()], ["HAIKU"])
+        self.assertIn("noisy-output", self.notes())
+
+    def test_outside_then_green_lands_without_a_fix_round(self):
+        flag = Path(self.tmp.name) / "flake"
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(re.sub(r'verify = ".*"', f'verify = "test -e {flag} || {{ touch {flag}; exit 1; }}"', cfg.read_text()))
+        self.env["FAKE_FIX_RESULT"] = "looked\nRESULT: blocked \u2014 outside: the flaky network test"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual([c["agent"] for c in self.calls()], ["HAIKU", "HAIKU"])
+        self.assertEqual([r["ok"] for r in self.rows("verify")], [False, True])
+        self.assertIn("outside: the flaky network test", self.task_file("T-001").read_text())
+        self.assertEqual(len(list((self.root / "tasks" / "items").glob("T-002*"))), 0)
+
+    def test_outside_then_red_blocks_and_files_a_human_task(self):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(re.sub(r'verify = ".*"', 'verify = "echo broken trunk; exit 1"', cfg.read_text()))
+        self.env["FAKE_FIX_RESULT"] = "looked\nRESULT: blocked \u2014 outside: trunk is broken"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertEqual([c["agent"] for c in self.calls()], ["HAIKU", "HAIKU"])  # no second fix round
+        self.assertEqual([r["ok"] for r in self.rows("verify")], [False, False])
+        self.assertIn("verify still red on rerun", self.notes())
+        human = list((self.root / "tasks" / "items").glob("T-002*"))
+        self.assertEqual(len(human), 1, out)
+        text = human[0].read_text()
+        self.assertIn("tier: human", text)
+        self.assertIn("outside: trunk is broken", text)
+        self.assertIn("depends: [T-002]", self.task_file("T-001").read_text())
+
+
 class TestAccept(DispatchProject):
     """Human acceptance of output: dispatch holds a marked task at `review` instead of landing it."""
     config = DispatchProject.config + '''
@@ -1176,6 +1263,7 @@ class TestHistory(DispatchProject):
             stamp(self.task_file(t))
         f = self.task_file("T-001")
         f.write_text(f.read_text().replace("\ntier:", "\nverify: echo boom; exit 3\ntier:", 1))
+        (self.root / ".ergon.toml").write_text("verify_rounds = 0\n" + (self.root / ".ergon.toml").read_text())
         self.env["FAKE_REVIEW"] = "REVIEW: fail \u2014 no tests"
         out = self.ergon("dispatch").stdout
         self.assertEqual([self.status("T-001"), self.status("T-002")], ["blocked", "blocked"], out)

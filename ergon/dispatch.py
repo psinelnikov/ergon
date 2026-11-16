@@ -205,13 +205,13 @@ def run_proc(cmd, cwd, timeout):
     return out or "", err or ""
 
 
-def run_worker(t, base, wt, branch, pubs, args, agents, settings, rnd=None, prompt=None, resume=None, veto=None):
+def run_worker(t, base, wt, branch, pubs, args, agents, settings, rnd=None, prompt=None, resume=None, veto=None, lines=None):
     """Run one headless worker and record its worker_end. Returns (verdict, reason, run info);
     never raises. A fix round (rnd, from 2) either resumes the worker's session with `prompt`, or
     starts a fresh worker whose prompt quotes the reviewer's `veto`."""
     start = time.monotonic()
     if prompt is None:
-        prompt = worker_prompt(t, base, wt, branch, pubs, veto)
+        prompt = worker_prompt(t, base, wt, branch, pubs, veto, lines)
     verdict, why, info = _run_worker(t, wt, args, agents, settings, prompt, resume, rnd)
     info["seconds"] = round(time.monotonic() - start, 1)
     _history.record("worker_end", t, tier=t["tier"], verdict=verdict, reason=why,
@@ -225,7 +225,7 @@ def _round(rnd):
     return {"round": rnd} if rnd and rnd > 1 else {}
 
 
-def worker_prompt(t, base, wt, branch, pubs, veto=None):
+def worker_prompt(t, base, wt, branch, pubs, veto=None, lines=None):
     retry = ""
     try:
         if _gitops.git("rev-list", "--count", f"{base}..{branch}") != "0":
@@ -237,7 +237,7 @@ def worker_prompt(t, base, wt, branch, pubs, veto=None):
                           f"{c['trunk']}..HEAD`).\n")
     except _gitops.GitError:
         pass
-    retry += veto_lines(veto) if veto else review_retry(t)
+    retry += lines or (veto_lines(veto) if veto else review_retry(t))
     links = gitlinks()
     nested = (f"Nested repos ({', '.join(links)}) are empty in this worktree: if the task needs one, "
               "stop blocked.\n") if links else ""
@@ -513,8 +513,9 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None):
     then the reviewer passes if `review` names the task's tier or `tier`, the one that finished
     (after --escalate the lower tier's commits are on the branch too). The reviewer is one tier
     above `tier`. Touches only the task's own worktrees and branch, so a long verify or review
-    doesn't hold the state lock. Returns (failure reason or None, review cost, fixable): only a
-    reviewer's `REVIEW: fail` is fixable, by a fix round (fix_loop). The caller adds kept_note."""
+    doesn't hold the state lock. Returns (failure reason or None, review cost, fixable): a
+    reviewer's `REVIEW: fail` is fixable (True), and so is a red verify ("verify"), each by a fix
+    round (fix_loop). The caller adds kept_note."""
     for tree in [wt] + [pub for _, pub in pubs]:
         if _gitops.dirty_paths(tree):
             return f"worker said done but left uncommitted changes in {tree}", 0, False
@@ -523,7 +524,7 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None):
         return f"worker said done but no commit on {branch} cites {t['id']}", 0, False
     failed = run_verify(t, wt, rnd)
     if failed:
-        return failed, 0, False
+        return failed, 0, "verify"
     if t["tier"] not in _config.REVIEW and tier not in _config.REVIEW:
         return None, 0, False
     failed, cost, who, fixable = run_review(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd)
@@ -538,6 +539,42 @@ Fix what it raised on {branch} in {wt}, and commit there citing {id}. The done c
 the review run again when you finish. End as before: a `FOUND: <title> — <why>` line for each
 piece of work you find but don't do, then `RESULT: done` or `RESULT: blocked — <why>`.
 """
+
+
+VERIFY_FIX_PROMPT = """Verify failed on your work on {id} (verify fix round {n} of {rounds}): {failed}
+
+The last lines of its output:
+
+{tail}
+
+The full output is in {log}.
+Fix it on {branch} in {wt}, and commit there citing {id}. The done checks and verify run again
+when you finish. If the failure isn't caused by this branch (a flaky test, a broken trunk, a
+missing tool), change nothing and end `RESULT: blocked — outside: <why>`: verify runs once more
+as it is, and this doesn't use up a round. Otherwise end as before: a `FOUND: <title> — <why>`
+line for each piece of work you find but don't do, then `RESULT: done` or
+`RESULT: blocked — <why>`.
+"""
+
+
+def verify_detail(failed):
+    """(last ~200 lines of the verify output, its full log path) from run_verify's reason."""
+    m = re.search(r"\(full output (\S+?)\)\s*$", failed)
+    log = _config.HOME / m[1] if m else None
+    try:
+        tail = "\n".join(log.read_text(errors="replace").splitlines()[-200:])
+    except (OSError, AttributeError):
+        tail = "(output unavailable)"
+    return tail, log or "(unknown)"
+
+
+def verify_lines(failed):
+    """Prompt lines for a fresh worker told that verify failed."""
+    tail, log = verify_detail(failed)
+    return (f"Verify failed on the last attempt: {failed}\nThe last lines of its output:\n\n{tail}\n\n"
+            f"The full output is in {log}.\nFix it on this branch; verify runs again before this lands. "
+            "If the failure isn't caused by this branch (a flaky test, a broken trunk, a missing tool), "
+            "change nothing and end `RESULT: blocked — outside: <why>`.\n")
 
 
 def resume_choice(session, wt):
@@ -565,27 +602,36 @@ def resume_choice(session, wt):
     return True, None
 
 
-def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, veto, rnd):
+def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, veto, rnd, verify=None):
     """Hand a reviewer's veto back to a worker on the same branch: its own session resumed if
     resume_choice() allows, else a fresh worker with the retry prompt. Returns run_worker's
-    (verdict, reason, info), with info["resumed"] and, for a fresh one, info["fresh_because"]."""
-    n = rnd - 1  # fix round n is review round n + 1
+    (verdict, reason, info), with info["resumed"] and, for a fresh one, info["fresh_because"].
+    `verify` = (n, rounds) makes it a round for a red verify (`veto` is run_verify's reason)."""
+    n, rounds = verify or (rnd - 1, _config.REVIEW_ROUNDS)  # review fix round n is review round n + 1
+    what = "verify fix" if verify else "fix"
+    lines = verify_lines(veto) if verify else None
     resume, fresh_because = resume_choice(session, wt)
     tt = dict(t, tier=tier)
     if resume:
         _history.record("resumed", t, session=session, round=rnd, tier=tier)
-        print(f"  fix      {t['id']}  round {n}/{_config.REVIEW_ROUNDS}: resumed {session}", flush=True)
-        log = re.search(r"\(review log (\S+?\.json)\)", veto)
-        prompt = FIX_PROMPT.format(id=t["id"], n=n, rounds=_config.REVIEW_ROUNDS, veto=veto, branch=branch, wt=wt,
-                                   log=f"Its full review is in {_config.HOME / log[1]}.\n" if log else "")
+        print(f"  {what:<8} {t['id']}  round {n}/{rounds}: resumed {session}", flush=True)
+        if verify:
+            tail, vlog = verify_detail(veto)
+            prompt = VERIFY_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, tail=tail,
+                                              log=vlog, branch=branch, wt=wt)
+        else:
+            log = re.search(r"\(review log (\S+?\.json)\)", veto)
+            prompt = FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, veto=veto, branch=branch, wt=wt,
+                                       log=f"Its full review is in {_config.HOME / log[1]}.\n" if log else "")
         verdict, why, info = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd,
                                         prompt=prompt, resume=session)
     else:
         _history.record("dispatched", t, tier=tier, model=agents[f"task-{tier}"]["model"], base=base,
                         branch=branch, worktree=wt, companions=[c["name"] for c, _ in pubs],
                         round=rnd, fresh_because=fresh_because)
-        print(f"  fix      {t['id']}  round {n}/{_config.REVIEW_ROUNDS}: fresh session ({fresh_because})", flush=True)
-        verdict, why, info = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd, veto=veto)
+        print(f"  {what:<8} {t['id']}  round {n}/{rounds}: fresh session ({fresh_because})", flush=True)
+        verdict, why, info = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd,
+                                        veto=veto, lines=lines)
     info["resumed"], info["fresh_because"] = resume, fresh_because
     return verdict, why, info
 
@@ -724,14 +770,44 @@ def dispatch(args):
         return ""
 
     def fix_loop(t, tier, base, wt, branch, pubs, info):
-        """gate() the finished branch; on a reviewer's `REVIEW: fail`, hand its findings back to a
-        worker (fix_round) and gate again, up to review_rounds times. Returns (verdict, reason).
-        Folds every call's cost and FOUND lines, and the last worker's log and session, into info;
-        info["rounds"] gets the earlier vetoes when a fix round's worker blocks."""
+        """gate() the finished branch; on a red verify or a reviewer's `REVIEW: fail`, hand it back
+        to a worker (fix_round) and gate again: up to verify_rounds and review_rounds times. A
+        worker that ends `blocked — outside: <why>` on a verify round costs no round: verify reruns
+        once as it is, and a second red blocks the task and files a human task with that reason.
+        Returns (verdict, reason). Folds every call's cost and FOUND lines, and the last worker's
+        log and session, into info; info["rounds"] gets the earlier vetoes when a fix worker blocks."""
         kept, vetoes, rnd = kept_note(wt, branch, pubs), [], 1
+        vfixes, outside = 0, None
         repos = [None] + [c["path"] for c, _ in pubs]
         round_cost = info.get("cost", 0)
         info.setdefault("review_cost", 0)
+
+        def fix(failed, verify=None):
+            """One fix worker on the branch. Returns (verdict, reason); folds its cost, FOUND lines,
+            log and session into info. A review round whose worker commits nothing blocks."""
+            nonlocal rnd, round_cost
+            rnd += 1
+            try:
+                tips = [_gitops.git("rev-parse", branch, cwd=r) for r in repos]
+            except _gitops.GitError:
+                tips = None
+            v, w, finfo = fix_round(t, tier, base, wt, branch, pubs, args, agents, settings,
+                                    info.get("session"), failed, rnd, verify)
+            round_cost = finfo.get("cost", 0)
+            info["cost"] = info.get("cost", 0) + round_cost
+            info["found"] = (info.get("found") or []) + (finfo.get("found") or [])
+            info.update(log=finfo["log"], session=finfo.get("session") or info.get("session"),
+                        asked=finfo.get("asked"))
+            with live_lock:
+                live[t["id"]] = info["cost"]
+            if v == "done" and tips is not None and not verify:
+                try:
+                    if [_gitops.git("rev-parse", branch, cwd=r) for r in repos] == tips:
+                        v, w = "blocked", f"worker said done but committed nothing on {branch} since the review"
+                except _gitops.GitError:
+                    pass
+            return v, w
+
         while True:
             try:
                 failed, rcost, fixable = gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd)
@@ -743,10 +819,35 @@ def dispatch(args):
             with live_lock:
                 live[t["id"]] = info["cost"]
             if not failed:
-                if vetoes:
-                    info["fixed"] = (f"review passed in round {rnd}, after {len(vetoes)} fix round(s): "
-                                     + "; ".join(f"round {i}: {x}" for i, x in enumerate(vetoes, 1)))
+                if vetoes or vfixes or outside:
+                    info["fixed"] = "; ".join(x for x in (
+                        f"verify passed after {vfixes} fix round(s)" if vfixes else "",
+                        f"verify passed on rerun after the worker found the failure outside the branch: {outside}"
+                        if outside else "",
+                        f"review passed in round {rnd}, after {len(vetoes)} fix round(s): "
+                        + "; ".join(f"round {i}: {x}" for i, x in enumerate(vetoes, 1)) if vetoes else "") if x)
                 return "done", ""
+            if fixable == "verify":
+                if outside:  # the rerun as it was is red too: the worker's reason goes to a human
+                    info.update(asked=True, rounds=f" (verify still red on rerun: {failed})")
+                    return "blocked", f"{outside}. {kept}"
+                stop = ""
+                if vfixes >= _config.VERIFY_ROUNDS:
+                    stop = f"; no verify fix rounds left (verify_rounds = {_config.VERIFY_ROUNDS})" if vfixes else ""
+                else:
+                    stop = round_stop(info, round_cost, rnd + 1)
+                if stop or vfixes >= _config.VERIFY_ROUNDS:
+                    return "blocked", f"{failed}{stop}. {kept}"
+                v, w = fix(failed, (vfixes + 1, _config.VERIFY_ROUNDS))
+                if v == "blocked" and w.lower().startswith("outside:"):
+                    outside, info["asked"] = w, False
+                    print(f"  verify   {t['id']}  worker says outside the branch ({w}): rerunning as is", flush=True)
+                    continue
+                vfixes += 1
+                if v != "done":
+                    info["rounds"] = f" (verify fix round {vfixes}, after: {failed})"
+                    return "blocked", w
+                continue
             stop = ""
             if fixable and len(vetoes) < _config.REVIEW_ROUNDS:
                 stop = round_stop(info, round_cost, rnd + 1)
@@ -755,26 +856,7 @@ def dispatch(args):
             if not fixable or stop or len(vetoes) >= _config.REVIEW_ROUNDS:
                 return "blocked", f"{rounds_note(failed, vetoes, stop)}. {kept}"
             vetoes.append(failed)
-            rnd += 1
-            try:
-                tips = [_gitops.git("rev-parse", branch, cwd=r) for r in repos]
-            except _gitops.GitError:
-                tips = None
-            v, w, finfo = fix_round(t, tier, base, wt, branch, pubs, args, agents, settings,
-                                    info.get("session"), failed, rnd)
-            round_cost = finfo.get("cost", 0)
-            info["cost"] = info.get("cost", 0) + round_cost
-            info["found"] = (info.get("found") or []) + (finfo.get("found") or [])
-            info.update(log=finfo["log"], session=finfo.get("session") or info.get("session"),
-                        asked=finfo.get("asked"))
-            with live_lock:
-                live[t["id"]] = info["cost"]
-            if v == "done" and tips is not None:
-                try:
-                    if [_gitops.git("rev-parse", branch, cwd=r) for r in repos] == tips:
-                        v, w = "blocked", f"worker said done but committed nothing on {branch} since the review"
-                except _gitops.GitError:
-                    pass
+            v, w = fix(failed)
             if v != "done":
                 info["rounds"] = (f" (fix round {rnd - 1}, after "
                                   + "; ".join(f"round {i}: {x}" for i, x in enumerate(vetoes, 1)) + ")")

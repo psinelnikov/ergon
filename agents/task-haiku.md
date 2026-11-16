@@ -19,3 +19,5 @@ Your reply's last line is exactly one of these:
 
 RESULT: done
 RESULT: blocked — <one line: what stopped you and what a human must do>
+
+If dispatch resumes you because verify failed and the failure isn't caused by your branch (a flaky test, a broken trunk, a missing tool), change nothing and end `RESULT: blocked — outside: <why>`. Verify reruns once as it is, and that attempt doesn't count as a fix round.

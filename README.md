@@ -72,6 +72,7 @@ log = "TODO.md"                    # the log that `source: TODO.md:<line>` cites
 retired = "tasks/audit-retired.txt"  # `term | gate | note` rows: nouns that make a task stale
 worker_rules = "tasks/WORKER.md"   # inlined into every dispatched prompt; `ergon rules` prints it
 verify = "make test"               # run in the task worktree before landing; non-zero exit blocks (a task's `verify:` field overrides)
+verify_rounds = 2                   # a red verify goes back to the worker this many times first; 0 blocks at once
 review = ["haiku", "sonnet"]       # worker tiers whose branches a reviewer one tier up must pass before landing
 review_rounds = 2                  # a review fail goes back to the worker, then review again, this many times; then the task blocks (0: at once)
 review_resume_secs = 3300          # a fix round resumes the worker's session only if its last request is younger than this
