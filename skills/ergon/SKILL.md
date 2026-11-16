@@ -153,6 +153,7 @@ One JSON object per line, appended as things happen, gitignored with `runs/`. Ev
 | `landed` | the branch merged into its base (status `done` follows) | `base`, `branch`, `commit` (the base's new tip), `accepted_by` (null unless `accept`), `companions`: `[{name, trunk, commit}]` |
 | `blocked` | the task went `blocked`, from dispatch or a failed `accept` | `reason`, `log`, `session`, `asked` (the worker itself said blocked) |
 | `closed` | `close` | `by`, `as`, `reason` |
+| `status` | `set` changed a task's or epic's status: work moved by hand or by an interactive agent, outside dispatch (dispatch and the human gates record their own events, never this one) | `from`, `to`, `by` (git `user.name`), `agent` (true if run in an agent shell, `CLAUDECODE` or `AI_AGENT` set; a hint, not proof) |
 | `epic_finished` | the epic merged into the trunk and closed (`task` is null) | `branch`, `commit` (the merge commit; both null if it never had a branch) |
 
 `round` (2, 3, …) is on the `dispatched`, `resumed`, `worker_end`, `verify` and `review` rows of a fix round (review round N+1 is fix round N). A row without `round` is round 1. Other loops are to mark their rounds the same way.

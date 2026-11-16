@@ -1313,6 +1313,36 @@ class TestHistory(DispatchProject):
         for n in range(100, 108):
             self.assertEqual([r["i"] for r in rows if r["task"] == f"T-{n}"], list(range(150)))
 
+    def test_set_records_status_moves(self):
+        """Work moved by hand or by an interactive agent, outside dispatch, leaves rows too."""
+        self.ergon("new", "task", "Loose", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.ergon("set", "T-001", "status=doing", env=clean_env(CLAUDECODE="1"))
+        self.ergon("set", "T-001", "status=blocked")
+        self.ergon("set", "T-001", "tier=opus")  # no status change: no row
+        self.ergon("set", "T-001", "status=ready")
+        self.assertEqual(self.ergon("set", "T-001", "status=done", check=False).returncode, 1)  # refused: no row
+        moves = [(r["from"], r["to"], r["by"], r["agent"]) for r in history(self.root) if r["event"] == "status"]
+        self.assertEqual(moves, [("ready", "doing", "Tester", True), ("doing", "blocked", "Tester", False),
+                                 ("blocked", "ready", "Tester", False)])
+        self.assertEqual(events(self.root, "T-001"), ["created", "status", "status", "status"])
+
+        # In an epic: the task's move, then the epic it completed.
+        self.ergon("new", "epic", "Big thing")
+        self.ergon("new", "task", "Part one", "--tier", "sonnet", "--epic", "E-001")
+        stamp(self.task_file("T-002"))
+        wt = self.root / ".claude" / "worktrees" / "E-001"
+        self.ergon("start", "E-001")
+        self.ergon("set", "T-002", "status=doing", cwd=wt)
+        (wt / "part1.txt").write_text("x\n")
+        sh("git", "add", "-A", cwd=wt)
+        sh("git", "commit", "-qm", "Add part one (T-002)", cwd=wt)
+        self.ergon("set", "T-002", "status=done", cwd=wt)
+        rows = [r for r in history(self.root) if r["epic"] == "E-001"]
+        self.assertEqual([(r["task"], r["event"], r.get("to")) for r in rows],
+                         [(None, "created", None), ("T-002", "created", None), ("T-002", "status", "doing"),
+                          ("T-002", "status", "done"), (None, "epic_finished", None)])
+
     def test_unwritable_history_never_stops_a_command(self):
         runs = self.root / "tasks" / "runs"
         runs.mkdir(parents=True, exist_ok=True)

@@ -33,6 +33,7 @@ def setf(args):
     is_task = args.id in tasks
     epic = epics.get(item.get("epic")) if is_task else None
     new_status = dict(kv.partition("=")[::2] for kv in args.pairs).get("status")
+    old_status = item.get("status")
     if new_status and _gitops.current_branch().startswith(_config.TASK_BRANCH):
         raise SystemExit("you're a dispatched worker: the dispatcher owns status. End your "
                          "reply with `RESULT: done` or `RESULT: blocked — <why>`")
@@ -68,6 +69,9 @@ def setf(args):
         if old != item["_path"]:
             old.rename(item["_path"])
     _tasks.dump(item, _tasks.TASK_KEYS if is_task else _tasks.EPIC_KEYS)
+    if new_status and new_status != old_status:  # work moved outside dispatch leaves a row too
+        _history.record("status", item, by=approver(), agent=in_agent_shell(),
+                        **{"from": old_status, "to": new_status})
     if (epic and new_status == "done" and item["tier"] != "human"
             and _gitops.branch_exists(_gitops.epic_branch(epic))
             and not any(_gitops.cites(c, args.id) for c in _gitops.branch_commits(_gitops.epic_branch(epic)))):
@@ -80,9 +84,13 @@ def setf(args):
             print(f"{args.id} is {new_status}; {epic['id']} is complete but not merged: {err}")
 
 
+def in_agent_shell():
+    return bool(os.environ.get("CLAUDECODE") or os.environ.get("AI_AGENT"))
+
+
 def ask(prompt):
     """Speed bump, not security: refuse inside agent shells, ask on the controlling tty."""
-    if os.environ.get("CLAUDECODE") or os.environ.get("AI_AGENT"):
+    if in_agent_shell():
         raise SystemExit("refused: running inside an agent shell. A human approves from their own terminal.")
     if os.environ.get("ERGON_ASK_STDIN"):  # scripted answers (tests); the agent-shell refusal above still holds
         sys.stdout.write(prompt)
