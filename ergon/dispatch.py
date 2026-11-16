@@ -963,18 +963,29 @@ def dispatch(args):
     if args.dry_run:
         tasks = _tasks.load(_config.ITEMS)
         plan = list(eligible(tasks))
+        rr = _config.REVIEW_ROUNDS
+        rounds = f"up to {rr} fix round{'s' if rr != 1 else ''}" if rr else "no fix rounds"
         for t in plan:
             e = epics.get(t.get("epic"))
             print(f"  would run  {t['id']}  {t['tier']:<6}  on {_gitops.epic_branch(e) if e else _config.MAIN}"
-                  + also(t) + (f", reviewed by {reviewer_tier(t['tier'])}" if t["tier"] in _config.REVIEW else "")
+                  + also(t) + (f", reviewed by {reviewer_tier(t['tier'])} ({rounds})"
+                               if t["tier"] in _config.REVIEW else "")
                   + (", held for your accept" if _tasks.needs_accept(t) else "") + f"  {t['title']}")
         if not plan:
             print("nothing to dispatch")
         if cap is not None:
             n = min(len(plan), args.max)
+            # Calls a task may make, each capped at --budget: its worker, and for a reviewed tier
+            # the review plus every fix round (a fix worker and a review again). The n costliest
+            # count, so the estimate stays an upper bound whichever tasks launch.
+            calls = sorted((1 + (1 + 2 * rr if t["tier"] in _config.REVIEW else 0) for t in plan), reverse=True)[:n]
+            reviewed = any(t["tier"] in _config.REVIEW for t in plan)
             print(f"  cap        ${cap:.2f} total ({args.budget_pct:g}% of ${args.budget_total:.2f}): "
                   "no new task launches once finished workers' cost reaches it"
-                  + (f"; estimated at most ${n * args.budget:.2f} for {n} task(s) at --budget ${args.budget:g}"
+                  + (f"; estimated at most ${sum(calls) * args.budget:.2f} for {n} task(s) at --budget "
+                     f"${args.budget:g} per call" + (", counting a reviewed task as its worker and the review"
+                                                     + (f" plus {rounds} (a fix and a review each)" if rr else "")
+                                                     if reviewed else "")
                      if args.budget else "; no --budget, so no estimate"))
         # Shared touches: whichever lands second (task into epic, or epic into trunk) may conflict,
         # so a task sharing a path with an earlier one is held until that one lands.
