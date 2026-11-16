@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import config as _config
+from . import dispatch as _dispatch
 from . import gitops as _gitops
 from . import tasks as _tasks
 
@@ -131,10 +132,11 @@ def report(args):
     clip = lambda text: text if len(text) <= width else text[:width - 1] + "…"
     out = []
 
-    def section(title, lines):
+    def section(title, lines, full=()):
+        """full: indexes of lines printed whole, not clipped to the terminal (a question)."""
         if lines:
             out.append(f"{title}{' (since ' + since + ')' if since and title == 'Landed' else ''}")
-            out.extend(clip(l) for l in lines)
+            out.extend(l if n in full else clip(l) for n, l in enumerate(lines))
             out.append("")
 
     landed = []
@@ -143,8 +145,19 @@ def report(args):
             landed.append(f"  {i}  {t['title']}")
             landed.extend(f"      {c}" for c in cited.get(i, [])[:3])
     section("Landed", landed)
+    asking, full = [], set()
+    for i, t in sorted(tasks.items()):
+        if _tasks.is_asking(t):  # a worker's question: show it, not the last note
+            asking.append(f"  {i}  {t['title']}  (`ergon answer {i}`)")
+            qs = _dispatch.asked(t)[0]
+            for n, (q, opts) in enumerate(qs, 1):
+                full.add(len(asking))
+                asking.append(f"      Q{n} {q}" + (f"  [{' | '.join(opts)}]" if opts else ""))
+            if not qs:
+                asking.append("      (no question found in its Notes)")
+    section("Awaiting your answer", asking, full)
     section("Blocked", [f"  {i}  {t['title']}" + (f"\n      {last_note(t)}" if last_note(t) else "")
-                        for i, t in sorted(tasks.items()) if t["status"] == "blocked"])
+                        for i, t in sorted(tasks.items()) if t["status"] == "blocked" and not _tasks.is_asking(t)])
     section("Awaiting acceptance", [f"  {i}  {t['title']}  (`ergon accept {i}` or `ergon reject {i} --reason R`)"
                                     for i, t in sorted(tasks.items()) if t["status"] == "review"])
     out[:] = [l for x in out for l in x.split("\n")]

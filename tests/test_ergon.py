@@ -1444,14 +1444,25 @@ class TestReport(Project):
             f.write_text(re.sub(r"^status: \w+$", f"status: {st}", f.read_text(), flags=re.M))
         f = self.task_file("T-002")
         f.write_text(f.read_text().rstrip() + "\n- 2026-11-08 dispatch: needs a decision\n")
+        f = self.task_file("T-003")  # parked on a question; its last note is a policy note, not the question
+        text = re.sub(r"^status: \w+$", "status: blocked\nasking: s-1", f.read_text(), flags=re.M)
+        f.write_text(text.rstrip() + "\n- 2026-11-08 dispatch: asking: 2 question(s) below\n"
+                     "- 2026-11-08 question: Which store should it use? [options: sqlite | json]\n"
+                     "- 2026-11-08 question: Keep the old flag?\n"
+                     "- 2026-11-08 policy: unrelated policy note\n")
         (self.root / "x.txt").write_text("x")
         subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
         subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "Land it (T-001)"], check=True)
         time.sleep(1.1)  # git --since has one-second resolution
         out = self.ergon("report").stdout
         self.assertRegex(out, r"Landed\n  T-001  Task A\n      \w+ Land it \(T-001\)")
-        self.assertRegex(out, r"Blocked\n  T-002  Task B\n      .*needs a decision")
-        self.assertRegex(out, r"Awaiting approval\n  2 proposed\n    -\s+sonnet\s+2")
+        self.assertRegex(out, r"Blocked\n  T-002  Task B\n      .*needs a decision\n\n")
+        self.assertIn("Awaiting your answer\n  T-003  Task C  (`ergon answer T-003`)\n"
+                      "      Q1 Which store should it use?  [sqlite | json]\n"
+                      "      Q2 Keep the old flag?\n\n", out)
+        self.assertNotIn("unrelated policy note", out)
+        self.assertEqual(out.count("T-003"), 2)  # its row and its reply hint, not under Blocked
+        self.assertRegex(out, r"Awaiting approval\n  1 proposed\n    -\s+sonnet\s+1")
         self.assertNotIn("Human tasks", out)
         self.assertNotIn("Spend", out)
         self.assertTrue((self.root / "tasks" / ".report-last").exists())
