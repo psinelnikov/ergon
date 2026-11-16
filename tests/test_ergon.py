@@ -733,7 +733,7 @@ class TestReview(DispatchProject):
         for t in ("T-001", "T-002"):
             stamp(self.task_file(t))
         dry = self.ergon("dispatch", "--dry-run").stdout
-        self.assertRegex(dry, r"T-002  opus .*, reviewed by opus")
+        self.assertRegex(dry, r"T-002  opus .*, reviewed by opus \(no fix rounds\)")
         self.assertNotIn("reviewed by", [l for l in dry.splitlines() if "T-001" in l][0])
         self.env["FAKE_REVIEW"] = "REVIEW: fail \u2014 no test for the edge case"
         out = self.ergon("dispatch").stdout
@@ -804,6 +804,19 @@ class TestReviewRounds(DispatchProject):
 
     def rows(self, event):
         return [r for r in history(self.root) if r["task"] == "T-001" and r["event"] == event]
+
+    def test_dry_run_shows_fix_rounds_and_counts_them_in_the_estimate(self):
+        self.ergon("new", "task", "Unreviewed", "--tier", "sonnet")
+        stamp(self.task_file("T-002"))
+        dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout
+        self.assertIn(", reviewed by sonnet (up to 2 fix rounds)", [l for l in dry.splitlines() if "T-001" in l][0])
+        self.assertNotIn("reviewed by", [l for l in dry.splitlines() if "T-002" in l][0])
+        # T-001: worker + review + 2 x (fix + review) = 6 calls; T-002: its worker = 1.
+        self.assertIn("estimated at most $7.00 for 2 task(s) at --budget $1 per call, counting a reviewed task as "
+                      "its worker and the review plus up to 2 fix rounds (a fix and a review each)", dry)
+        dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1", "--max", "1").stdout
+        self.assertIn("estimated at most $6.00 for 1 task(s)", dry)  # the costliest one
+        self.assertEqual(self.calls(), [])  # a dry run runs nothing
 
     def test_fail_then_fix_then_pass_lands(self):
         self.env["FAKE_REVIEWS"] = "REVIEW: fail — no test for the empty list|REVIEW: pass"
