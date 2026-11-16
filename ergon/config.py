@@ -23,8 +23,10 @@ from . import tasks as _tasks
 PKG = Path(__file__).resolve().parent  # the ergon/ package folder
 HERE = PKG.parent  # this ergon checkout: the plugin root
 CONFIG_FILE = ".ergon.toml"
-GUIDE = HERE / "skills" / "ergon" / "SKILL.md"
-PLUGIN_AGENTS = HERE / "agents"
+# In a checkout the plugin files sit at HERE; an installed copy bundles them in ergon/_plugin.
+PLUGIN = HERE if (HERE / "skills" / "ergon" / "SKILL.md").exists() else PKG / "_plugin"
+GUIDE = PLUGIN / "skills" / "ergon" / "SKILL.md"
+PLUGIN_AGENTS = PLUGIN / "agents"
 EPIC_FILE = "EPIC.md"
 TASK_BRANCH = "task/"
 WORKER_TIERS = ["haiku", "sonnet", "opus"]
