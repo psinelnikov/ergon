@@ -151,13 +151,16 @@ def _cached_read(path, cache, fresh):
 
 def session_summary(session, cwd, cache_path=None, base=None):
     """The summary of one session run in cwd, its subagents folded in, or None when the
-    transcript is missing. Reads are cached by (size, mtime) in cache_path (a JSON file)."""
+    transcript is missing. Reads are cached by (size, mtime) in cache_path (a JSON file), or in
+    cache_path itself when it's a dict (kept in memory, never written: `ergon serve`)."""
     if not session or not cwd:
         return None
     d = os.path.join(base or root(), project_name(cwd))
     main = os.path.join(d, f"{session}.jsonl")
     cache = {}
-    if cache_path:
+    if isinstance(cache_path, dict):
+        cache = cache_path
+    elif cache_path:
         try:
             with open(cache_path, encoding="utf-8") as fh:
                 cache = json.load(fh)
@@ -178,7 +181,9 @@ def session_summary(session, cwd, cache_path=None, base=None):
             sub = _cached_read(os.path.join(subs, n), cache, fresh)
             if sub is not None:
                 _merge(out, json.loads(json.dumps(sub)))
-    if cache_path and fresh != {k: cache[k] for k in fresh if k in cache}:
+    if isinstance(cache_path, dict):
+        cache_path.update(fresh)
+    elif cache_path and fresh != {k: cache[k] for k in fresh if k in cache}:
         try:
             # entries for other sessions stay; this one's replace theirs
             cache.update(fresh)

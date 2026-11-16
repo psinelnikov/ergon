@@ -58,6 +58,10 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon stats [--since DATE] [--epic E]
                                read-only: per tier, runs / done / blocked / block rate / cost /
                                timeouts from <state>/runs/*.json, and tasks that blocked twice+
+  ergon serve [--port 4300] [--bind 127.0.0.1]
+                               read-only web board, task pages (brief, runs, reviews, logs, resume
+                               commands) and live dispatch state. GET/HEAD only; writes nothing.
+                               Any --bind other than loopback warns: there is no login
   ergon hook guard|stop        Claude Code hooks (the plugin wires them); not for humans
   ergon hook commit-msg FILE   the git hook `init --hooks` installs; not for humans
 """
@@ -84,6 +88,7 @@ from . import dispatch as _dispatch
 from . import gates as _gates
 from . import gitops as _gitops
 from . import report as _report
+from . import serve as _serve
 from . import tasks as _tasks
 
 
@@ -187,6 +192,10 @@ def main():
     ss.add_argument("--epic")
     rp = sub.add_parser("report")
     rp.add_argument("--since", metavar="DATE|last", help="YYYY-MM-DD, or `last` for the previous report")
+    sv = sub.add_parser("serve", help="read-only web board and task pages")
+    sv.add_argument("--port", type=int, default=_serve.DEFAULT_PORT, help=f"default {_serve.DEFAULT_PORT}")
+    sv.add_argument("--bind", default="127.0.0.1",
+                    help="address to listen on (default 127.0.0.1); anything but loopback warns: no login")
     sub.add_parser("check")
     sub.add_parser("tidy")
     d = sub.add_parser("dispatch")
@@ -239,7 +248,7 @@ def main():
     else:  # dispatch takes the lock itself, around each step (it runs for hours)
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "accept": _gates.accept,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
-         "import": _tasks.import_issue}[args.cmd](args)
+         "import": _tasks.import_issue, "serve": _serve.serve}[args.cmd](args)
 
 
 if __name__ == "__main__":
