@@ -1,0 +1,774 @@
+"""Headless workers: prepare, run, verify, review, land."""
+import argparse
+import datetime
+import fcntl
+import fnmatch
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from pathlib import Path
+
+from . import config as _config
+from . import gates as _gates
+from . import gitops as _gitops
+from . import report as _report
+from . import tasks as _tasks
+
+
+# ---------- dispatch ----------
+# Each ready task gets a worktree at <worktrees>/<ID> on branch task/<ID>, cut from its epic
+# branch (created as a ref, never checked out here) or from the trunk for a task with no epic.
+# A headless `claude -p --agent task-<tier>` works it and commits there. The dispatcher alone
+# moves status: doing when it launches, then done once the branch merges into its base, or
+# blocked (worktree and branch kept for you) on anything else, a merge conflict included.
+# A task whose touches: names a companion repo also gets its own worktree of that repo's
+# checkout, on a task/<ID> branch there too, which lands on the companion's local trunk first.
+# Nothing is ever pushed.
+
+WORKER_PROMPT = """You are dispatched on {id}.
+
+Working tree: {wt} (a git worktree of this repo), on branch {branch}, cut from {base}.
+{retry}{nested}{companions}{rules}
+Work you find but don't do: end your final message with one line per item, before the RESULT line,
+`FOUND: <title> — <why>`. The dispatcher files each as a proposed task.
+
+The task file, read-only to you (it lives in the main checkout):
+
+{text}
+"""
+
+COMPANION_OWN = """
+The companion repo {name} is yours alone at {pub}: a git worktree of the shared checkout
+{shared}, on branch {branch}, cut from its local {ctrunk}. Make and commit every change to it
+there, never in {shared}. {ids}Push neither repo; the dispatcher merges {branch} into {name}'s
+{ctrunk} and into {base}.
+"""
+
+COMPANION_NO_IDS = """Its commit messages never cite tracker IDs{policy}: your commit in {wt}, which
+cites {id}, names the {name} commit. """
+
+COMPANION_NONE = """
+This task's touches: doesn't name {name}, so it has no checkout of it. You may read {shared},
+but never change it: if the task needs a change there, stop blocked.
+"""
+
+
+def gitlinks():
+    return [l.split("\t", 1)[1] for l in _gitops.git("ls-files", "-s", raw=True).splitlines()
+            if l.startswith("160000")]
+
+
+def nested_touch(t, links):
+    for p in (x.strip("/") for x in t.get("touches") or []):
+        if any(p == g or p.startswith(g + "/") or g.startswith(p + "/") for g in links):
+            return p
+    return None
+
+
+def companion_touch(t, c):
+    """Does t's touches: name companion c (so its worker needs a checkout of it)?"""
+    return any(p == k or p.startswith(k + "/")
+               for p in (x.strip("/") for x in t.get("touches") or []) for k in c["touches"])
+
+
+def has_checkout(c):
+    return (c["path"] / ".git").exists()
+
+
+def add_note(t, note, who="dispatch"):
+    body = t["_body"].rstrip()
+    t["_body"] = (body if "## Notes" in body else body + "\n\n## Notes") + f"\n- {_tasks.today()} {who}: {note}\n"
+
+
+def put_status(tid, status, note=None, who="dispatch"):
+    t = _tasks.load(_config.ITEMS)[tid]
+    t["status"] = status
+    if note:
+        add_note(t, note, who)
+    _tasks.dump(t, _tasks.TASK_KEYS)
+
+
+def worker_agents():
+    """task-<tier> worker definitions, passed inline so a worktree cut from a base that predates
+    them still gets them. A project's own .claude/agents/task-<tier>.md (main checkout) wins over
+    the plugin's agents/task-<tier>.md."""
+    out = {}
+    for tier in _config.WORKER_TIERS:
+        path = next(p for p in (_config.AGENTS / f"task-{tier}.md", _config.PLUGIN_AGENTS / f"task-{tier}.md") if p.exists())
+        m = _tasks.parse(path)
+        out[f"task-{tier}"] = {"description": m["description"], "model": m.get("model") or tier,
+                               "prompt": m["_body"].strip()}
+    return out
+
+
+def worker_settings():
+    cmd = f'python3 "{_config.PKG}" hook guard --worker --project "{_config.HOME}"'
+    return json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": _gates.GUARD_TOOLS, "hooks": [{"type": "command", "command": cmd}]}]}})
+
+
+def worker_rules():
+    return _config.WORKER_RULES.read_text().strip() if _config.WORKER_RULES and _config.WORKER_RULES.exists() else ""
+
+
+def base_branch(t, epics):
+    e = epics.get(t.get("epic"))
+    if not e:
+        return _config.MAIN
+    b = _gitops.epic_branch(e)
+    if not _gitops.branch_exists(b):
+        _gitops.git("branch", b, _config.MAIN)
+        print(f"started {e['id']} on branch {b} (cut from {_config.MAIN}, not checked out)")
+    return b
+
+
+def prepare(t, epics):
+    """Worktree + branch for t, reusing both if an earlier run left them, and the same in each
+    companion t touches. Returns (base, wt, branch, pubs); pubs is [(companion, its worktree)]."""
+    base, branch, wt = base_branch(t, epics), _config.TASK_BRANCH + t["id"], _config.WORKTREES / t["id"]
+    if _gitops.worktrees().get(branch):
+        wt = Path(_gitops.worktrees()[branch])
+    elif _gitops.branch_exists(branch):
+        _gitops.git("worktree", "add", str(wt), branch)
+    else:
+        _gitops.git("worktree", "add", "-b", branch, str(wt), base)
+    pubs = []
+    for c in _config.COMPANIONS:
+        if not companion_touch(t, c):
+            continue
+        # Its own worktree of the shared checkout: never the checkout itself, never another
+        # task's. Same object store and refs, so the dispatcher merges it without a fetch.
+        pub = wt / c["rel"]
+        held = _gitops.worktrees(c["path"]).get(branch)
+        if held and Path(held).resolve() != pub.resolve():
+            raise _gitops.GitError(f"{c['name']} branch {branch} is checked out at {held}; free it (`git -C "
+                           f"{c['path']} worktree remove {held}`, or switch that checkout off it) and dispatch again")
+        if not held:
+            pub.parent.mkdir(parents=True, exist_ok=True)
+            if _gitops.branch_exists(branch, c["path"]):
+                _gitops.git("worktree", "add", str(pub), branch, cwd=c["path"])
+            else:
+                _gitops.git("worktree", "add", "-b", branch, str(pub), c["trunk"], cwd=c["path"])
+        pubs.append((c, pub))
+    return base, wt, branch, pubs
+
+
+KILLED = "ergon: killed"
+PROCS, PROCS_LOCK, KILL_ALL = set(), threading.Lock(), threading.Event()
+
+
+def kill_workers():
+    """Second Ctrl-C: kill every running worker (and its process group) and refuse new ones."""
+    KILL_ALL.set()
+    with PROCS_LOCK:
+        for p in list(PROCS):
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def run_proc(cmd, cwd, timeout):
+    """Run a worker in its own session (a terminal Ctrl-C doesn't reach it) so the dispatcher
+    decides what an interrupt means. Returns (stdout, stderr); stderr starts with KILLED if
+    kill_workers() ended it."""
+    with PROCS_LOCK:
+        if KILL_ALL.is_set():
+            return "", KILLED
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
+        PROCS.add(p)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        out, err = p.communicate()
+        err = f"timed out after {timeout // 60} min\n{err or ''}"
+    finally:
+        with PROCS_LOCK:
+            PROCS.discard(p)
+    if KILL_ALL.is_set() and p.returncode == -signal.SIGKILL and not err.startswith("timed out"):
+        return out or "", KILLED
+    return out or "", err or ""
+
+
+def run_worker(t, base, wt, branch, pubs, args, agents, settings):
+    """Run one headless worker. Returns (verdict, reason, run info); never raises."""
+    retry = ""
+    try:
+        if _gitops.git("rev-list", "--count", f"{base}..{branch}") != "0":
+            retry = (f"An earlier attempt left commits on this branch (`git log {base}..HEAD`) and "
+                     "notes in the task file. Pick up from there.\n")
+        for c, pub in pubs:
+            if _gitops.git("rev-list", "--count", f"{c['trunk']}..{branch}", cwd=c["path"]) != "0":
+                retry += (f"An earlier attempt left {c['name']} commits too (`git -C {pub} log "
+                          f"{c['trunk']}..HEAD`).\n")
+    except _gitops.GitError:
+        pass
+    retry += review_retry(t)
+    links = gitlinks()
+    nested = (f"Nested repos ({', '.join(links)}) are empty in this worktree: if the task needs one, "
+              "stop blocked.\n") if links else ""
+    own = {c["name"]: pub for c, pub in pubs}
+    companions = ""
+    for c in _config.COMPANIONS:
+        if c["name"] in own:
+            ids = COMPANION_NO_IDS.format(policy=f" ({c['policy']})" if c["policy"] else "", wt=wt,
+                                          id=t["id"], name=c["name"]) if c["forbid_ids"] else ""
+            companions += COMPANION_OWN.format(name=c["name"], pub=own[c["name"]], shared=c["path"],
+                                               branch=branch, ctrunk=c["trunk"], ids=ids, base=base)
+        else:
+            companions += COMPANION_NONE.format(name=c["name"], shared=c["path"])
+    rules = worker_rules()
+    prompt = WORKER_PROMPT.format(id=t["id"], wt=wt, branch=branch, base=base, retry=retry,
+                                  nested=nested, companions=companions,
+                                  rules=f"\nThis project's worker rules:\n\n{rules}\n" if rules else "",
+                                  text=t["_path"].read_text())
+    cmd = ["claude", "-p", "--agents", json.dumps(agents), "--agent", f"task-{t['tier']}",
+           "--permission-mode", args.permission_mode, "--settings", settings,
+           "--output-format", "json"]
+    if args.budget:
+        cmd += ["--max-budget-usd", str(args.budget)]
+    stem = f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}" + ("-" + t["tier"] if t.get("escalated") else "")
+    log = _config.RUNS / f"{stem}.json"
+    out, err = run_proc(cmd + [prompt], wt, args.timeout * 60)
+    log.write_text(out)
+    if err.strip():
+        (_config.RUNS / f"{stem}.err").write_text(err)
+    info = {"log": log.relative_to(_config.HOME)}
+    if err.startswith(KILLED):
+        return "blocked", "killed by a second Ctrl-C", info
+    try:
+        d = json.loads(out)
+    except ValueError:
+        return "blocked", "worker output wasn't JSON" + (f" ({err.strip().splitlines()[0]})" if err.strip() else ""), info
+    info.update(session=d.get("session_id"), cost=d.get("total_cost_usd") or 0)
+    text = d.get("result") or ""
+    if d.get("is_error"):
+        return "blocked", f"worker errored ({d.get('subtype') or d.get('terminal_reason')}): {text[:200]}", info
+    info["found"] = [(m[0].strip(" *`"), m[1].strip(" *`")) for m in
+                     re.findall(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if m[0].strip(" *`")]
+    found = re.findall(r"^\W*RESULT:\s*(done|blocked)\b[\s—:–-]*(.*)$", text, re.M)
+    if not found:
+        return "blocked", "worker ended without a RESULT line", info
+    verdict, why = found[-1]
+    info["asked"] = verdict == "blocked"  # the worker itself says what a human must do
+    return verdict, why.strip(" *`") or "(no reason given)", info
+
+
+def file_found(t, found, epics):
+    """Create each FOUND line a worker emitted as a `proposed` task: same tier, epic and a
+    source: of the task that found it. Never ready. Caller holds the state lock."""
+    made = []
+    for title, why in found:
+        tid = _tasks.next_id(_config.ITEMS, "T")
+        e = epics.get(t.get("epic"))
+        body = _tasks.TASK_BODY.replace("## What\n", f"## What\n{why or title}\n", 1)
+        meta = {"id": tid, "title": title, "tier": t["tier"], "status": "proposed",
+                "epic": t.get("epic") or "", "depends": [], "touches": [],
+                "source": t["id"], "created": _tasks.today(), "approved": "", "tier_why": "",
+                "_path": _tasks.task_home(t, epics) / f"{tid}-{_tasks.slug(title)}.md", "_body": body}
+        _tasks.dump(meta, _tasks.TASK_KEYS)
+        made.append((tid, title))
+    return made
+
+
+def file_human(t, why, epics):
+    """A worker reported `RESULT: blocked`: file a proposed human-tier task for what it asked
+    for and make the blocked task depend on it. Caller holds the state lock."""
+    tid = _tasks.next_id(_config.ITEMS, "T")
+    title = why if len(why) <= 100 else why[:97].rstrip() + "..."
+    body = _tasks.TASK_BODY.replace("## What\n", f"## What\n{why}\n", 1)
+    meta = {"id": tid, "title": title, "tier": "human", "status": "proposed",
+            "epic": t.get("epic") or "", "depends": [], "touches": [],
+            "source": t["id"], "created": _tasks.today(), "approved": "", "tier_why": "",
+            "_path": _tasks.task_home(t, epics) / f"{tid}-{_tasks.slug(title)}.md", "_body": body}
+    _tasks.dump(meta, _tasks.TASK_KEYS)
+    cur = _tasks.load(_config.ITEMS)[t["id"]]
+    cur["depends"] = list(cur.get("depends") or []) + [tid]
+    _tasks.dump(cur, _tasks.TASK_KEYS)
+    return tid, title
+
+
+def drop_worktree(wt, branch, repo=None):
+    """Remove a landed task's worktree, then its branch. Returns what's left for you, or ''."""
+    try:
+        _gitops.git("worktree", "remove", str(wt), cwd=repo)
+        _gitops.git("branch", "-D", branch, cwd=repo)  # merged: merge_into landed it
+        return ""
+    except _gitops.GitError as err:
+        return f"; left {wt} on {branch} for you to remove ({str(err)[:200]})"
+
+
+VERIFY_TIMEOUT = 15 * 60  # seconds
+
+
+def run_verify(t, wt):
+    """Run the verify command (task `verify:` over config `verify`) in the task worktree.
+    Returns None if it passes or none is set, else a reason; full output goes to <state>/runs/."""
+    cmd = t.get("verify") or _config.CFG.get("verify")
+    if not cmd:
+        return None
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True, timeout=VERIFY_TIMEOUT)
+        out, code = r.stdout + r.stderr, r.returncode
+    except subprocess.TimeoutExpired as e:
+        text_of = lambda b: (b.decode(errors="replace") if isinstance(b, bytes) else b) or ""
+        out, code = f"{text_of(e.stdout)}{text_of(e.stderr)}\ntimed out after {VERIFY_TIMEOUT // 60} min\n", None
+    if code == 0:
+        return None
+    _config.RUNS.mkdir(parents=True, exist_ok=True)
+    log = _config.RUNS / f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-verify.log"
+    log.write_text(out)
+    tail = " | ".join(l.strip() for l in out.strip().splitlines()[-5:])[-400:]
+    how = "timed out" if code is None else f"failed (exit {code})"
+    return f"verify `{cmd}` {how}: {tail} (full output {log.relative_to(_config.HOME)})"
+
+
+REVIEW_PROMPT = """You are reviewing {id} before it lands.
+
+Working tree: {wt}, on branch {branch}, cut from {base}. A {tier}-tier worker says the task is done.
+{companions}{rules}
+The task file:
+
+{text}
+
+The diff, `git diff {base}...{branch}`{size}:
+
+{diff}
+"""
+REVIEW_DIFF_MAX = 100_000  # characters inlined per diff; past that the reviewer runs git diff itself
+REVIEW_LINE = re.compile(r"^\W*REVIEW:\s*(pass|fail)\b[\s—:–-]*(.*)$")
+
+
+def reviewer_tier(tier):
+    """Who reviews a tier's work: one tier above, capped at opus (opus reviews opus)."""
+    return _config.WORKER_TIERS[min(_config.WORKER_TIERS.index(tier) + 1, len(_config.WORKER_TIERS) - 1)]
+
+
+def review_agent():
+    """The task-review definition (a project's .claude/agents/task-review.md wins over the
+    plugin's), minus a model: run_review sets that from reviewer_tier()."""
+    path = next(p for p in (_config.AGENTS / "task-review.md", _config.PLUGIN_AGENTS / "task-review.md") if p.exists())
+    m = _tasks.parse(path)
+    agent = {"description": m["description"], "prompt": m["_body"].strip()}
+    tools = m.get("tools")
+    if tools:
+        agent["tools"] = tools if isinstance(tools, list) else [x.strip() for x in tools.split(",") if x.strip()]
+    return agent
+
+
+def review_diff(base, branch, repo=None):
+    """(diff text for the prompt, size note). Past REVIEW_DIFF_MAX the prompt gets the stat only."""
+    diff = _gitops.git("diff", f"{base}...{branch}", raw=True, cwd=repo)
+    if len(diff) <= REVIEW_DIFF_MAX:
+        return diff or "(empty)", ""
+    stat = _gitops.git("diff", "--stat", f"{base}...{branch}", raw=True, cwd=repo)
+    return stat, f" (too long to inline at {len(diff)} characters: its --stat follows; run it yourself)"
+
+
+def tree_state(trees, branch, repos):
+    """What a read-only reviewer must leave as it found it: each tree's HEAD and tracked changes,
+    and where `branch` points in each repo."""
+    return ([(_gitops.git("rev-parse", "HEAD", cwd=x), _gitops.dirty_paths(x)) for x in trees]
+            + [_gitops.git("rev-parse", branch, cwd=r) for r in repos])
+
+
+def run_review(t, tier, base, wt, branch, pubs, args, agent, settings):
+    """Run the reviewer on a finished task branch. Returns (failure reason or None, cost,
+    reviewer tier). Only a last line of `REVIEW: pass` passes: no such line, a fail, output that
+    isn't JSON, an error, a kill, a timeout, or a reviewer that changed the branch or worktree
+    all block the landing."""
+    who = reviewer_tier(tier)
+    trees, repos = [wt] + [pub for _, pub in pubs], [None] + [c["path"] for c, _ in pubs]
+    before = tree_state(trees, branch, repos)
+    diff, size = review_diff(base, branch)
+    companions = ""
+    for c, pub in pubs:
+        cdiff, csize = review_diff(c["trunk"], branch, c["path"])
+        companions += (f"\nCompanion repo {c['name']}: worktree {pub}, branch {branch} cut from its "
+                       f"{c['trunk']}. Its diff, `git -C {pub} diff {c['trunk']}...{branch}`{csize}:\n\n{cdiff}\n")
+    rules = worker_rules()
+    prompt = REVIEW_PROMPT.format(id=t["id"], wt=wt, branch=branch, base=base, tier=tier, companions=companions,
+                                  rules=f"\nThe worker followed these project rules:\n\n{rules}\n" if rules else "",
+                                  text=t["_path"].read_text(), diff=diff, size=size)
+    cmd = ["claude", "-p", "--agents", json.dumps({"task-review": dict(agent, model=who)}),
+           "--agent", "task-review", "--permission-mode", args.permission_mode, "--settings", settings,
+           "--output-format", "json"]
+    if args.budget:
+        cmd += ["--max-budget-usd", str(args.budget)]
+    stem = f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-review"
+    log = _config.RUNS / f"{stem}.json"
+    out, err = run_proc(cmd + [prompt], wt, args.timeout * 60)
+    log.write_text(out)
+    if err.strip():
+        (_config.RUNS / f"{stem}.err").write_text(err)
+    fail = lambda why, cost=0: (f"review ({who}) failed: {why} (review log {log.relative_to(_config.HOME)})", cost, who)
+    if err.startswith(KILLED):
+        return fail("killed by a second Ctrl-C")
+    try:
+        d = json.loads(out)
+        if not isinstance(d, dict):
+            raise ValueError
+    except ValueError:
+        return fail("reviewer output wasn't JSON" + (f" ({err.strip().splitlines()[0]})" if err.strip() else ""))
+    cost = d.get("total_cost_usd") or 0
+    try:
+        changed = tree_state(trees, branch, repos) != before
+    except _gitops.GitError:
+        changed = True
+    if changed:
+        return fail("the reviewer changed the branch or worktree; it must stay read-only", cost)
+    text = d.get("result") or ""
+    if d.get("is_error"):
+        return fail(f"reviewer errored ({d.get('subtype') or d.get('terminal_reason')}): {text[:200]}", cost)
+    last = next((l for l in reversed(text.strip().splitlines()) if l.strip()), "")
+    m = REVIEW_LINE.match(last.strip(" *`"))
+    if not m:
+        return fail("reviewer didn't end with a `REVIEW: pass` or `REVIEW: fail` line", cost)
+    if m[1] == "pass":
+        return None, cost, who
+    return fail(m[2].strip(" *`") or "(no reason given)", cost)
+
+
+def review_retry(t):
+    """Retry-prompt lines for a task whose last attempt the reviewer vetoed or a human rejected
+    in review, or ''."""
+    note = _report.last_note(t)
+    human = re.search(r"\breview: rejected by (.*)", note)
+    if human:
+        return (f"A human reviewed the last attempt's branch and sent it back, not merged: rejected by {human[1]}\n"
+                "Fix what they raised on this branch; it waits for their acceptance again before it lands.\n")
+    m = re.search(r"\bdispatch: (review \(\w+\) failed: .*)", note)
+    if not m:
+        return ""
+    log = re.search(r"\(review log (\S+?\.json)\)", m[1])
+    return (f"The reviewer vetoed the last attempt: {m[1]}\n"
+            + (f"Its full review is in {_config.HOME / log[1]}.\n" if log else "")
+            + "Fix what it raised on this branch; it reviews again before this lands.\n")
+
+
+def kept_note(wt, branch, pubs):
+    return f"Branch {branch} and worktree {wt} kept" + "".join(f" ({c['name']} worktree {pub})" for c, pub in pubs)
+
+
+def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings):
+    """After a worker says done, before the merge lock: its done claim holds, verify passes,
+    then the reviewer passes if `review` names the task's tier or `tier`, the one that finished
+    (after --escalate the lower tier's commits are on the branch too). The reviewer is one tier
+    above `tier`. Touches
+    only the task's own worktrees and branch, so a long verify or review doesn't hold the state
+    lock. Returns (failure reason or None, review cost)."""
+    for tree in [wt] + [pub for _, pub in pubs]:
+        if _gitops.dirty_paths(tree):
+            return f"worker said done but left uncommitted changes in {tree}", 0
+    msgs = _gitops.git("log", "--format=%B%x1e", f"{base}..{branch}", raw=True)
+    if not re.search(rf"\b{t['id']}\b", msgs):
+        return f"worker said done but no commit on {branch} cites {t['id']}", 0
+    kept = kept_note(wt, branch, pubs)
+    failed = run_verify(t, wt)
+    if failed:
+        return f"{failed}. {kept}", 0
+    if t["tier"] not in _config.REVIEW and tier not in _config.REVIEW:
+        return None, 0
+    failed, cost, who = run_review(t, tier, base, wt, branch, pubs, args, reviewer, settings)
+    print(f"  review   {t['id']}  {who}: " + ("pass" if not failed else "fail"), flush=True)
+    return (f"{failed}. {kept}" if failed else None), cost
+
+
+def land(t, base, wt, branch, pubs=(), accepted=None):
+    """After gate() passes: merge (companions first), clean up. Returns (verdict, reason).
+    Nothing merges unless every merge would go through cleanly. Caller holds the state lock.
+    `accepted` ("<name> <date>", from `accept`) forces a merge commit into base that records
+    who accepted it: task files are local, so history is the only lasting record."""
+    kept = kept_note(wt, branch, pubs)
+    for c, pub in pubs:
+        if c["forbid_ids"]:
+            leak = _config.TRACKER_ID.search(_gitops.git("log", "--format=%B", f"{c['trunk']}..{branch}", raw=True, cwd=c["path"]))
+            if leak:
+                return "blocked", (f"a {c['name']} commit on {branch} cites {leak.group()}; tracker IDs stay out "
+                                   f"of {c['name']}, so reword it in {pub}. {kept}")
+        try:
+            _gitops.merge_check(c["trunk"], branch, c["path"])
+        except _gitops.GitError as err:
+            return "blocked", f"{c['name']}: {err}. {kept}: merge by hand"
+    if pubs:
+        try:
+            _gitops.merge_check(base, branch)
+        except _gitops.GitError as err:
+            return "blocked", f"{err}. {kept}: merge by hand"
+    landed = []
+    for c, pub in pubs:
+        # A fast-forward writes no message at all; a merge commit cites no tracker ID if forbidden.
+        msg = f"Merge {_config.TRACKER_ID.sub('', t['title']).strip()}" if c["forbid_ids"] else f"Merge {t['id']}: {t['title']}"
+        try:
+            _gitops.merge_into(c["trunk"], branch, msg, repo=c["path"])
+        except _gitops.GitError as err:
+            return "blocked", (f"{c['name']}: {err}. {kept}: merge by hand"
+                               + (f". Already landed: {', '.join(landed)}" if landed else ""))
+        landed.append(f"{c['name']} {c['trunk']}")
+    try:
+        _gitops.merge_into(base, branch, f"Merge {t['id']}: {t['title']}"
+                   + (f"\n\nAccepted by {accepted}" if accepted else ""), no_ff=bool(accepted))
+    except _gitops.GitError as err:
+        return "blocked", (f"{err}. {kept}: merge by hand"
+                           + (f". Already landed: {', '.join(landed)}" if landed else ""))
+    # A companion worktree sits inside the task's own, and removing that would take it along
+    # and leave the companion a stale entry: remove those first.
+    left = ""
+    for c, pub in pubs:
+        left += drop_worktree(pub, branch, c["path"])
+    left += drop_worktree(wt, branch) if not left else f"; left {wt} too"
+    return "done", f"merged into {base}" + "".join(f" and {c['name']} {c['trunk']}" for c, _ in pubs) + left
+
+
+def dispatch(args):
+    if args.watch and not args.budget_total:
+        raise SystemExit("--watch needs --budget-total (a cap on spend, so an unattended watch can't run away)")
+    if args.watch and args.dry_run:
+        raise SystemExit("--watch and --dry-run don't combine")
+    if args.max is None:
+        args.max = float("inf") if args.watch else 6
+    if _config.REPO != _config.HOME and not args.dry_run:  # a dry run only reads, so any checkout will do
+        raise SystemExit(f"run dispatch from the main checkout ({_config.HOME})")
+    if not shutil.which("claude") and not args.dry_run:
+        raise SystemExit("no `claude` on PATH")
+    if not args.dry_run:
+        _config.RUNS.mkdir(exist_ok=True)
+        _config.WORKTREES.mkdir(parents=True, exist_ok=True)
+        _gitops.git("worktree", "prune")
+        for c in _config.COMPANIONS:  # forget companion worktrees whose directory is gone (a removed task worktree)
+            if has_checkout(c):
+                _gitops.git("worktree", "prune", cwd=c["path"])
+    links, epics = gitlinks(), _tasks.load(_config.EPICS)
+    ids = set(args.ids.split(",")) if args.ids else None
+    agents, settings = worker_agents(), worker_settings()
+    reviewer = review_agent() if _config.REVIEW else None
+    tried, skipped, results = set(), {}, []
+    cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
+    capped = stopped = False
+
+    def spent():
+        return sum(r[3].get("cost", 0) for r in results)
+    every_touch = {k for c in _config.COMPANIONS for k in c["touches"]}
+
+    def eligible(tasks):
+        epics.update(_tasks.load(_config.EPICS))  # another run or session may have closed one
+        for t in sorted(tasks.values(), key=lambda t: (_tasks.TIERS.index(t["tier"]), t["id"])):
+            if (t["id"] in tried or t["status"] != "ready" or not _tasks.deps_done(t, tasks)
+                    or (ids and t["id"] not in ids) or (args.tier and t["tier"] != args.tier)
+                    or (args.epic and t.get("epic") != args.epic)):
+                continue
+            if t["tier"] == "human":
+                continue
+            nested = nested_touch(t, links)
+            if nested:
+                skipped[t["id"]] = f"touches nested repo {nested}: work it interactively"
+                continue
+            missing = [c for c in _config.COMPANIONS if companion_touch(t, c) and not has_checkout(c)]
+            if missing:
+                skipped[t["id"]] = (f"touches {missing[0]['name']} but there's no checkout at "
+                                    f"{missing[0]['path']}: clone the repo there")
+                continue
+            if t.get("epic") and epics.get(t["epic"], {}).get("status") != "open":
+                skipped[t["id"]] = f"epic {t['epic']} isn't open"
+                continue
+            yield t
+
+    def one(t, base, wt, branch, pubs):
+        verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings)
+        up = None
+        if (args.escalate and verdict == "blocked" and info.get("asked")
+                and t["tier"] in _config.WORKER_TIERS[:-1]):
+            # the worker itself reported blocked: retry once a tier up on the same branch
+            up = _config.WORKER_TIERS[_config.WORKER_TIERS.index(t["tier"]) + 1]
+            print(f"  escalate {t['id']}  {t['tier']}→{up}: {why}")
+            first, why1 = t["tier"], why
+            v2, why, info2 = run_worker(dict(t, tier=up, escalated=True), base, wt, branch, pubs, args, agents, settings)
+            info2["cost"] = info.get("cost", 0) + info2.get("cost", 0)
+            info2["found"] = (info.get("found") or []) + (info2.get("found") or [])
+            verdict, info = v2, info2
+        if verdict == "done":
+            try:
+                failed, rcost = gate(t, up or t["tier"], base, wt, branch, pubs, args, reviewer, settings)
+            except _gitops.GitError as err:
+                failed, rcost = f"{err}. {kept_note(wt, branch, pubs)}", 0
+            info["cost"] = info.get("cost", 0) + rcost
+            info["review_cost"] = rcost
+            if failed:
+                verdict, why = "blocked", failed
+        with _gitops.state_lock():  # also serializes every merge into a companion's trunk
+            # `t` is the task as it was at launch, so nothing the worker did to its file since
+            # (dropping `accept:`, retiering) lets the branch skip a human's acceptance.
+            if verdict == "done" and _tasks.needs_accept(t, *([up] if up else [])):
+                verdict, why = "review", (f"waits for a human: `ergon accept {t['id']}` lands it, `ergon reject "
+                                          f"{t['id']} --reason R` sends it back. {kept_note(wt, branch, pubs)}")
+            elif verdict == "done":
+                verdict, why = land(t, base, wt, branch, pubs)
+            if verdict in ("done", "review"):
+                put_status(t["id"], verdict, "; ".join(x for x in (
+                    f"escalated {first}→{up}: {why1}" if up else "", why if verdict == "review" else "") if x) or None)
+                if up:
+                    t2 = _tasks.load(_config.ITEMS)[t["id"]]
+                    t2["tier"] = up
+                    _tasks.dump(t2, _tasks.TASK_KEYS)
+                print(f"  {verdict:<8} {t['id']}  {why}")
+                e = epics.get(t.get("epic"))
+                if verdict == "done" and e and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
+                    try:
+                        _gitops.finish_epic(e["id"])
+                    except _gitops.GitError as err:
+                        print(f"  {e['id']} is complete but not merged: {err}")
+            else:
+                put_status(t["id"], "blocked", f"{why} (log {info['log']}"
+                           + (f", `claude --resume {info['session']}` in {wt}" if info.get("session") else "") + ")")
+                print(f"  blocked  {t['id']}  {why}")
+            for fid, title in file_found(t, info.get("found") or [], epics):
+                print(f"  proposed {fid}  (found by {t['id']})  {title}")
+                info.setdefault("filed", []).append(fid)
+            if verdict == "blocked" and info.get("asked"):
+                hid, title = file_human(t, why, epics)
+                print(f"  proposed {hid}  (human, {t['id']} now depends on it)  {title}")
+        return t, verdict, why, info
+
+    def shared(a, b):
+        """Paths both tasks name. A companion itself isn't shared: each task gets its own
+        worktree of it, so only paths inside it that both name count."""
+        return sorted((set(a.get("touches") or []) & set(b.get("touches") or [])) - every_touch)
+
+    def also(t):
+        return "".join(f" + {c['name']} {c['trunk']}" for c in _config.COMPANIONS if companion_touch(t, c))
+
+    if args.dry_run:
+        tasks = _tasks.load(_config.ITEMS)
+        plan = list(eligible(tasks))
+        for t in plan:
+            e = epics.get(t.get("epic"))
+            print(f"  would run  {t['id']}  {t['tier']:<6}  on {_gitops.epic_branch(e) if e else _config.MAIN}"
+                  + also(t) + (f", reviewed by {reviewer_tier(t['tier'])}" if t["tier"] in _config.REVIEW else "")
+                  + (", held for your accept" if _tasks.needs_accept(t) else "") + f"  {t['title']}")
+        if not plan:
+            print("nothing to dispatch")
+        if cap is not None:
+            n = min(len(plan), args.max)
+            print(f"  cap        ${cap:.2f} total ({args.budget_pct:g}% of ${args.budget_total:.2f}): "
+                  "no new task launches once finished workers' cost reaches it"
+                  + (f"; estimated at most ${n * args.budget:.2f} for {n} task(s) at --budget ${args.budget:g}"
+                     if args.budget else "; no --budget, so no estimate"))
+        # Shared touches: whichever lands second (task into epic, or epic into trunk) may conflict,
+        # so a task sharing a path with an earlier one is held until that one lands.
+        for i, a in enumerate(plan):
+            for b in plan[:i]:
+                if shared(a, b):
+                    print(f"  held       {a['id']} behind {b['id']}: both touch {', '.join(shared(a, b))}")
+                    break
+        for a in plan:
+            for b in (t for t in tasks.values() if t["status"] in ("doing", "review")):
+                if shared(a, b):
+                    print(f"  overlap    {a['id']} and {b['id']} ({b['status']}) both touch {', '.join(shared(a, b))}")
+    else:
+        running, launched, active = {}, 0, {}  # active: running task id -> task
+        stops, tick = [], 0.25
+        stop_evt = threading.Event()
+
+        def on_sigint(signum, frame):
+            stops.append(1)
+            if len(stops) == 1:
+                print("\n  interrupt: no new launches; waiting for running workers "
+                      "(Ctrl-C again kills them and marks them blocked)", flush=True)
+            else:
+                print("\n  interrupt: killing running workers", flush=True)
+                kill_workers()
+            stop_evt.set()
+        old_handler = signal.signal(signal.SIGINT, on_sigint)
+        next_scan, scan = 0.0, True
+        try:
+            with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                while True:
+                    stopping = bool(stops)
+                    if scan and not stopping:
+                        # the lock is held only for the scan, so `approve` works between scans
+                        with _gitops.state_lock():
+                            if cap is not None and spent() >= cap:
+                                capped = True
+                            queue = [] if launched >= args.max or capped else list(eligible(_tasks.load(_config.ITEMS)))
+                            while queue and len(running) < args.jobs and launched < args.max:
+                                t = queue.pop(0)
+                                if any(shared(t, o) for o in active.values()):
+                                    continue  # held: stays eligible, retried when a running task lands
+                                tried.add(t["id"])
+                                try:
+                                    base, wt, branch, pubs = prepare(t, epics)
+                                except _gitops.GitError as err:
+                                    skipped[t["id"]] = f"couldn't make a worktree: {err}"
+                                    continue
+                                put_status(t["id"], "doing")
+                                print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
+                                      + also(t) + f"  {t['title']}")
+                                running[pool.submit(one, t, base, wt, branch, pubs)] = t["id"]
+                                active[t["id"]] = t
+                                launched += 1
+                        next_scan = time.monotonic() + args.interval
+                    scan = False
+                    over = stopping or capped or launched >= args.max
+                    if not running and (not args.watch or over):
+                        break
+                    if running:
+                        finished, _ = wait(running, timeout=tick, return_when=FIRST_COMPLETED)
+                    else:
+                        stop_evt.wait(tick)
+                        finished = ()
+                    for f in finished:
+                        active.pop(running.pop(f), None)
+                        results.append(f.result())
+                        scan = True
+                    if args.watch and time.monotonic() >= next_scan:
+                        scan = True
+        finally:
+            signal.signal(signal.SIGINT, old_handler)
+        stopped = bool(stops)
+    for tid, why in sorted(skipped.items()):
+        print(f"  skipped  {tid}  {why}")
+    if results:
+        cost = sum(r[3].get("cost", 0) for r in results)
+        done = sum(r[1] == "done" for r in results)
+        rcost = sum(r[3].get("review_cost", 0) for r in results)
+        held = sum(r[1] == "review" for r in results)
+        print(f"\n{done}/{len(results)} done" + (f", {held} awaiting your accept" if held else "")
+              + f", ${cost:.2f}" + (f" (reviews ${rcost:.2f} of it)" if rcost else "")
+              + f". Logs in {_config.RUNS.relative_to(_config.HOME)}/")
+        filed = [f for r in results for f in r[3].get("filed", [])]
+        if filed:
+            print(f"{len(filed)} proposed from workers' FOUND lines: {', '.join(filed)}")
+    if stopped:
+        print("\ninterrupted: stopped launching" + ("; killed running workers" if KILL_ALL.is_set() else ""))
+    if capped:
+        left = [t["id"] for t in eligible(_tasks.load(_config.ITEMS))]
+        mean = spent() / len(results) if results else 0
+        print(f"\nbudget cap ${cap:.2f} reached (spent ${spent():.2f}): stopped launching. "
+              f"Not launched: {', '.join(left) or 'none'}"
+              + (f". Estimated ~${mean * len(left):.2f} more to run them (mean ${mean:.2f}/task)" if left else ""))
+    tasks = _tasks.load(_config.ITEMS)
+    yours = [t for t in tasks.values() if t["tier"] == "human" and t["status"] == "ready" and _tasks.deps_done(t, tasks)]
+    if yours:
+        print(f"\nREADY FOR YOU ({len(yours)} human-tier)")
+        for t in sorted(yours, key=lambda t: t["id"]):
+            print(_tasks.line(t, tasks))
+    held = [t for t in tasks.values() if t["status"] == "review"]
+    if held:
+        print(f"\nAWAITING YOUR ACCEPT ({len(held)}): `ergon accept <ID>` lands one, "
+              "`ergon reject <ID> --reason R` sends it back")
+        for t in sorted(held, key=lambda t: t["id"]):
+            print(_tasks.line(t, tasks))

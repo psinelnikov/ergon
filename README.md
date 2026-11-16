@@ -18,7 +18,7 @@ The only requirements are Python 3.9+ (standard library only) and git. Dispatch 
 
 | Path | What |
 |---|---|
-| `ergon.py` | the CLI (`ergon -h`), plus the hook entry points |
+| `ergon/` | the CLI package (`ergon -h`; `cli.py` is the entry point), plus the hook entry points |
 | `hooks/hooks.json` | PreToolUse guard and Stop-time `check`. Both do nothing in a repo without `.ergon.toml` |
 | `agents/task-{haiku,sonnet,opus}.md` | worker agents: one task, commit citing its ID, end with `RESULT: done/blocked` |
 | `skills/ergon/` | the workflow guide, as a skill |
@@ -54,7 +54,7 @@ The PreToolUse guard (`ergon hook guard`) only runs inside Claude Code. Codex, C
 Why a git hook and not an MCP server exposing `next`/`show`/`set`/`new` without `approve`:
 
 - **An MCP server only binds agents that choose to use it.** These agents still have a shell, so the CLI would be just as reachable as before. Every agent's work lands through git, so a git hook is on the one path all of it takes, whichever tool made it.
-- **It costs less.** A small shell script plus under a hundred lines of ergon.py, still standard library only. An MCP server is a long-running process with a protocol to keep up with, and every agent tool needs its own setup for it.
+- **It costs less.** A small shell script plus under a hundred lines of the ergon package, still standard library only. An MCP server is a long-running process with a protocol to keep up with, and every agent tool needs its own setup for it.
 - **It checks the outcome, not the request.** The hook doesn't care how a task got to look approved, only whether the commit cites one that is. Its weakness is the same: it only sees commits.
 
 It deliberately doesn't run the full `ergon check`. A problem in some unrelated task file would then block every commit, humans' included. The Claude Code Stop hook keeps running `check` as before.

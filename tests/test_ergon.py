@@ -13,7 +13,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-ERGON = Path(__file__).resolve().parent.parent / "ergon.py"
+ERGON = Path(__file__).resolve().parent.parent / "ergon"
 sys.path.insert(0, str(ERGON.parent))
 import ergon  # noqa: E402
 

@@ -5,14 +5,14 @@
       {
         "matcher": "Edit|Write|MultiEdit|Bash",
         "hooks": [
-          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/ergon.py\" hook guard", "timeout": 10 }
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/ergon\" hook guard", "timeout": 10 }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/ergon.py\" hook stop", "timeout": 30 }
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/ergon\" hook stop", "timeout": 30 }
         ]
       }
     ]
