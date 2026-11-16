@@ -975,17 +975,42 @@ def dispatch(args):
             print("nothing to dispatch")
         if cap is not None:
             n = min(len(plan), args.max)
-            # Calls a task may make, each capped at --budget: its worker, and for a reviewed tier
-            # the review plus every fix round (a fix worker and a review again). The n costliest
-            # count, so the estimate stays an upper bound whichever tasks launch.
-            calls = sorted((1 + (1 + 2 * rr if t["tier"] in _config.REVIEW else 0) for t in plan), reverse=True)[:n]
-            reviewed = any(t["tier"] in _config.REVIEW for t in plan)
+            vr = _config.VERIFY_ROUNDS
+            counted = set()
+
+            def max_calls(t):
+                """Calls `t` may make, each capped at --budget: its worker; a second worker a tier up
+                if --escalate retries it; then fix_loop's calls: per verify fix round a fix worker
+                (when a verify is set), and for a reviewed tier the review plus every fix round
+                (a fix worker and a review again)."""
+                verified = bool(vr and (t.get("verify") or _config.CFG.get("verify")))
+                if verified:
+                    counted.add("verify")
+
+                def after(reviewed):
+                    if reviewed:
+                        counted.add("review")
+                    return (1 + 2 * rr if reviewed else 0) + (vr if verified else 0)
+                own = t["tier"] in _config.REVIEW
+                calls = 1 + after(own)
+                if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1]:
+                    counted.add("escalate")  # after it the tier that finished is reviewed too
+                    up = _config.WORKER_TIERS[_config.WORKER_TIERS.index(t["tier"]) + 1]
+                    calls = max(calls, 2 + after(own or up in _config.REVIEW))
+                return calls
+            # The n costliest count, so the estimate stays an upper bound whichever tasks launch.
+            calls = sorted((max_calls(t) for t in plan), reverse=True)[:n]
+            what = [x for k, x in (
+                ("escalate", "a second worker if --escalate retries it a tier up"),
+                ("review", f"the review and {rounds}" + (" (a fix and a review each)" if rr else "")
+                           + " for a reviewed tier"),
+                ("verify", f"up to {vr} verify fix round{'s' if vr != 1 else ''} (a fix each) "
+                           "if a verify is set")) if k in counted]
             print(f"  cap        ${cap:.2f} total ({args.budget_pct:g}% of ${args.budget_total:.2f}): "
                   "no new task launches once finished workers' cost reaches it"
                   + (f"; estimated at most ${sum(calls) * args.budget:.2f} for {n} task(s) at --budget "
-                     f"${args.budget:g} per call" + (", counting a reviewed task as its worker and the review"
-                                                     + (f" plus {rounds} (a fix and a review each)" if rr else "")
-                                                     if reviewed else "")
+                     f"${args.budget:g} per call" + (", counting a task as its worker plus " + ", plus ".join(what)
+                                                     if what else "")
                      if args.budget else "; no --budget, so no estimate"))
         # Shared touches: whichever lands second (task into epic, or epic into trunk) may conflict,
         # so a task sharing a path with an earlier one is held until that one lands.
