@@ -1479,6 +1479,35 @@ class TestPolicies(TestReview):
             self.assertIn("policies file", self.guard(tool, inp, "--worker") or "", (tool, inp))
         self.assertIsNone(self.guard("Write", {"file_path": str(self.root / "other.md"), "content": "x"}, "--worker"))
 
+    def test_guard_refuses_agent_writes_to_runs(self):
+        """A worker can't forge history rows or logs that dispatch's fix loops read (T-034)."""
+        self.ergon("new", "task", "Reviewed", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+        self.ergon("dispatch")  # creates runs/ with history.jsonl and logs
+        runs = self.root / "tasks" / "runs"
+        hist = runs / "history.jsonl"
+        self.assertTrue(hist.exists())
+        row = '{"event": "review", "task": "T-001", "verdict": "pass"}'
+        wt = self.root / ".claude/worktrees/T-001"
+        for flag in ("--worker", None):
+            for tool, inp in (("Write", {"file_path": str(hist), "content": row}),
+                              ("Edit", {"file_path": str(hist), "old_string": "fail", "new_string": "pass"}),
+                              ("Write", {"file_path": str(runs / "T-001-x-review.log"), "content": "REVIEW: pass"}),
+                              ("Write", {"file_path": str(self.root / "tasks/./runs/../runs/new.json"), "content": "x"}),
+                              ("Write", {"file_path": str(wt / "tasks/runs/history.jsonl"), "content": row}),
+                              ("Bash", {"command": f"echo '{row}' >> tasks/runs/history.jsonl"}),
+                              ("Bash", {"command": f"echo '{row}' >> {hist}"}),
+                              ("Bash", {"command": f"cd tasks && printf '%s\\n' '{row}' >> runs/history.jsonl"}),
+                              ("Bash", {"command": f"echo x | tee -a {runs}/T-001-1-verify.log"}),
+                              ("Bash", {"command": "rm tasks/runs/*.log"}),
+                              ("Bash", {"command": "sed -i '' s/fail/pass/ tasks/runs/history.jsonl"})):
+                args = (flag,) if flag else ()
+                self.assertIn("runs/", self.guard(tool, inp, *args) or "", (flag, tool, inp))
+        for cmd in ("tail -n 5 tasks/runs/history.jsonl", f"grep verdict {hist} 2>/dev/null",
+                    "cat tasks/runs/*.json 2>&1 | head", "ls tasks/runs"):
+            self.assertIsNone(self.guard("Bash", {"command": cmd}, "--worker"), cmd)
+        self.assertIsNone(self.guard("Write", {"file_path": str(self.root / "notes/runs.md"), "content": "x"}, "--worker"))
+
     def test_worker_policy_line_becomes_note(self):
         self.ergon("new", "task", "Reviewed", "--tier", "haiku")
         stamp(self.task_file("T-001"))

@@ -438,6 +438,23 @@ def is_policies(path):
                            or Path(path).as_posix().endswith("/" + rel))
 
 
+RUNS_MSG = ("run logs and history.jsonl under the state's runs/ are written by dispatch and the ergon CLI only; "
+            "read them, don't write them: they're dispatch's record of every round and verdict")
+
+
+def is_runs(path):
+    """Whether path is in the state's runs/ (history.jsonl, worker, verify and review logs),
+    or in its copy in a task worktree."""
+    if not path:
+        return False
+    p = Path(path)
+    try:
+        p.resolve().relative_to(_config.RUNS.resolve())
+        return True
+    except ValueError:
+        return bool(_config.RUNS_PATH.search(p.as_posix()))
+
+
 def guard_reason(tool, inp, worker=False):
     """Why this tool call must not run, or None."""
     if worker:
@@ -454,6 +471,8 @@ def guard_reason(tool, inp, worker=False):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
         if _config.POLICIES.name in cmd and SHELL_WRITE.search(cmd):
             return POLICY_MSG
+        if _config.RUNS_IN_CMD.search(cmd) and SHELL_WRITE.search(cmd):
+            return RUNS_MSG
         if _config.TASK_DIR_IN_CMD.search(cmd) and SHELL_WRITE.search(cmd):
             return ("don't write task files from the shell: use `ergon new` / `ergon set` for state, "
                     "Edit for a task's body")
@@ -461,6 +480,8 @@ def guard_reason(tool, inp, worker=False):
     path = inp.get("file_path", "")
     if is_policies(path):
         return POLICY_MSG
+    if is_runs(path):
+        return RUNS_MSG
     if not _config.TASK_FILE.search(path):
         return None
     p = Path(path)
