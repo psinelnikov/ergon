@@ -11,6 +11,17 @@ A task tracker for repos where AI agents do much of the work. **Humans approve, 
 - `ergon serve` is a read-only web board for a browser or a phone: open work, what waits on you, live dispatch state, and each task's runs, reviews, costs and logs (see [Web board](#web-board-ergon-serve)). Loopback only unless you `--bind` elsewhere.
 - **Companion repos**: a separate repo checked out inside this one (say, a public product repo inside a private install). Each task that touches it gets its own worktree of that repo too. You can also refuse commits there that cite tracker IDs.
 
+**Priority.** Open work is ordered by `(cod + 25 × unblocks) / size`: the cost of delay (`cod:`, 0-100, set by `ergon grade`), plus 25 for each open task it unblocks, divided by the tier's size (haiku 1, sonnet 3, opus 8, human 3). `next`, `dispatch` and the board all use that order. A human can pin a task to the front or back with `ergon pin`, which overrides the score. Grading never un-approves a task.
+
+Commands for the ordering:
+
+```bash
+ergon grade [--all] [--epic E] [--per 4] [--model sonnet] [--budget USD] [--dry-run]
+                        # one claude -p compares tasks in pairs and writes cod:, cod_why: and graded:.
+                        # Only stale tasks (new, or brief changed) unless --all
+ergon pin ID first|last|clear   # HUMAN ONLY: pin a task first or last in the order, or clear the pin
+```
+
 The guide covers the workflow, schema and rules: [`skills/ergon/SKILL.md`](skills/ergon/SKILL.md), or `ergon guide`.
 
 The only requirements are Python 3.9+ (standard library only) and git. Dispatch also needs the `claude` CLI, and `import` needs the GitHub CLI `gh`.
