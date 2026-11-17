@@ -45,6 +45,8 @@ def setf(args):
         key, _, val = kv.partition("=")
         if key == "approved":
             raise SystemExit("approval is human-only: use `approve` from a real terminal")
+        if is_task and key == "pin":
+            raise SystemExit("`pin:` is human-only: use `ergon pin ID first|last|clear` from a real terminal")
         if is_task and key in ("asking", "answered"):
             raise SystemExit(f"`{key}:` is written by dispatch and a human's `ergon answer` only")
         if is_task and key == "status" and _tasks.is_asking(item):
@@ -641,6 +643,24 @@ def answer_task(t, text=""):
     print(f"{tid} is ready: the next `ergon dispatch` resumes its worker with your answer")
 
 
+def pin(args):
+    """HUMAN ONLY: `ergon pin ID first|last|clear` writes or removes `pin:`, which overrides the
+    priority score in the order. Reorders only, so it asks for no confirmation."""
+    if in_agent_shell():
+        raise SystemExit("refused: running inside an agent shell. A human pins from their own terminal.")
+    with _gitops.state_lock():
+        t = _tasks.load(_config.ITEMS).get(args.id)
+        if not t:
+            raise SystemExit(f"no such task: {args.id}")
+        if args.where == "clear":
+            t.pop("pin", None)
+        else:
+            t["pin"] = args.where
+        _tasks.dump(t, _tasks.TASK_KEYS)
+        _history.record("pinned", t, by=approver(), pin=None if args.where == "clear" else args.where)
+    print(f"{args.id}: " + ("pin cleared" if args.where == "clear" else f"pinned {args.where}"))
+
+
 def close(args):
     """HUMAN ONLY: close approved tasks (ready / blocked / doing) whose work already landed
     elsewhere (--as done) or that no longer apply (--as dropped). Skips the epic-branch check
@@ -698,8 +718,8 @@ SHELL_WRITE = re.compile(r"\bsed\s+(-\w+\s+)*-i|\bperl\s+-\w*i|(?<![0-9&>])>(?!\
                          r"\btee\b|\b(mv|cp|rm|truncate|install)\s|python[0-9.]*\s+-c|<<")
 # The human-only commands as plain text. human_cmd falls back to it for text it can't split into
 # words and for strings handed to a program that runs them as code (bash -c, python -c, ssh, ...).
-HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept|answer|sync)\b|\breview\s+(-i|--interactive)\b")
-HUMAN_VERBS = {"approve", "reject", "close", "accept", "answer", "sync"}
+HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept|answer|sync|pin)\b|\breview\s+(-i|--interactive)\b")
+HUMAN_VERBS = {"approve", "reject", "close", "accept", "answer", "sync", "pin"}
 # Programs that run a string argument or their stdin as code: what's quoted for them is a command.
 CODE_RUNNER = re.compile(r"(?:ba|da|z|k|mk|c|tc|fi|a)?sh|busybox|eval|env|ssh|su|watch|script|tmux|screen|"
                          r"parallel|flock|expect|osascript|python[0-9.]*|pypy[0-9.]*|perl|ruby|node|nodejs|"
@@ -1107,7 +1127,7 @@ def guard_reason(tool, inp, worker=False, cwd=None):
         if why:
             return why
         if human_cmd(cmd):
-            return ("approve / reject / close / accept / answer / sync / review -i are human-only; ask the user to run "
+            return ("approve / reject / close / accept / answer / sync / pin / review -i are human-only; ask the user to run "
                     "them in their own terminal")
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
                      r"\b(CLAUDECODE|AI_AGENT)=", cmd):
@@ -1143,6 +1163,8 @@ def guard_reason(tool, inp, worker=False, cwd=None):
         if fb.get("status") == "review":
             return "a task in review leaves it only by a human's `ergon accept` or `ergon reject`, run in their own terminal"
         return "change status with `ergon set ID status=…` (it enforces the allowed moves), not by editing the file"
+    if fb.get("pin", "") != fa.get("pin", ""):
+        return "`pin:` is written by a human's `ergon pin` only"
     for key in ("asking", "answered"):
         if fb.get(key, "") != fa.get(key, ""):
             return f"`{key}:` is written by dispatch and a human's `ergon answer` only"

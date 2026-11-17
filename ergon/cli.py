@@ -311,6 +311,9 @@ def main():
     a = sub.add_parser("approve")
     a.add_argument("ids", nargs="+")
     sub.add_parser("accept").add_argument("ids", nargs="+")
+    pn = sub.add_parser("pin", help="HUMAN ONLY: pin a task first or last in the order, or clear the pin")
+    pn.add_argument("id")
+    pn.add_argument("where", choices=["first", "last", "clear"])
     an = sub.add_parser("answer", help="HUMAN ONLY: answer a worker's question and requeue its task")
     an.add_argument("id")
     an.add_argument("text", nargs="*", help="the answer; leave it out to pick from the options")
@@ -393,7 +396,7 @@ def main():
             {"new": _tasks.new, "set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish, "close": _gates.close,
              "tidy": _tasks.tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours)
-        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "accept": _gates.accept, "answer": _gates.answer,
+        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
          "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "sync": _shared.sync}[args.cmd](args)
 

@@ -241,6 +241,30 @@ class TestBasics(Project):
         self.ergon("set", "T-001", "status=doing")
         self.assertEqual(self.status("T-001"), "doing")
 
+    def test_pin_is_human_only(self):
+        self.ergon("new", "task", "Fix it", "--tier", "sonnet")
+        f = self.task_file("T-001")
+        self.ergon("pin", "T-001", "first")
+        self.assertIn("pin: first", f.read_text())
+        self.ergon("pin", "T-001", "clear")
+        self.assertNotIn("pin:", f.read_text())
+        r = self.ergon("set", "T-001", "pin=first", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("human-only", r.stderr)
+        r = self.ergon("pin", "T-001", "last", check=False, env=clean_env(CLAUDECODE="1"))
+        self.assertIn("agent shell", r.stderr)
+        self.assertNotIn("pin:", f.read_text())
+        self.assertIn("human-only", self.guard("Bash", {"command": "ergon pin T-001 first"}))
+        p = str(f)
+        self.assertIn("ergon pin", self.guard("Edit", {"file_path": p, "old_string": "status: proposed",
+                                                      "new_string": "status: proposed\npin: first"}))
+        self.assertIsNone(self.guard("Edit", {"file_path": p, "old_string": "## What", "new_string": "## What\nmore"}))
+        # a pin left on a closed task is a warning, not a failure
+        f.write_text(f.read_text().replace("status: proposed", "status: dropped\npin: last"))
+        r = self.ergon("check", check=False)
+        self.assertIn("warning: T-001: pin: last", r.stdout)
+        self.assertEqual(r.returncode, 0)
+
     def test_check_fails_on_unstamped_ready(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")
