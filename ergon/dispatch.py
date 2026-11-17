@@ -20,6 +20,7 @@ from pathlib import Path
 from . import config as _config
 from . import gates as _gates
 from . import gitops as _gitops
+from . import priority as _priority
 from . import history as _history
 from . import limits as _limits
 from . import report as _report
@@ -975,7 +976,7 @@ def dispatch(args):
     def eligible(tasks):
         epics.update(_tasks.load(_config.EPICS))  # another run or session may have closed one
         apr = _gitops.approvals()  # shared mode: verified now, after the scan's sync; None otherwise
-        for t in sorted(tasks.values(), key=lambda t: (_tasks.TIERS.index(t["tier"]), t["id"])):
+        for t in sorted(tasks.values(), key=lambda t: _priority.sort_key(t, tasks)):
             if (t["id"] in tried or t["status"] != "ready" or not _tasks.deps_done(t, tasks)
                     or (ids and t["id"] not in ids) or (args.tier and t["tier"] != args.tier)
                     or (args.epic and t.get("epic") != args.epic)):

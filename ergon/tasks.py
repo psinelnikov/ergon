@@ -189,6 +189,14 @@ def line(t, tasks):
     if t["status"] == "ready" and not deps_done(t, tasks):
         flags.append("waits on " + ",".join(d for d in t["depends"]
                                              if tasks.get(d, {}).get("status") != "done"))
+    from . import priority as _pri
+    n = _pri.unblocks(t, tasks)
+    flags.append(f"p={_pri.score(t, tasks):.1f}")
+    if n > 0:
+        flags.append(f"unblocks {n}")
+    pin = str(t.get("pin") or "").strip()
+    if pin in ("first", "last"):
+        flags.append(f"pinned {pin}")
     tail = f"  ({'; '.join(flags)})" if flags else ""
     return f"  {t['id']}  {t['tier']:<6}  {t['title']}{tail}"
 
@@ -292,7 +300,8 @@ def nxt(args):
     apr = _gitops.approvals()  # shared mode: only tasks whose signed approval verifies
     hidden = [t for t in ok if apr and apr.problem(t)]
     ok = [t for t in ok if t not in hidden]
-    for t in sorted(ok, key=lambda t: (TIERS.index(t["tier"]), t["id"])):
+    from . import priority as _pri
+    for t in sorted(ok, key=lambda t: _pri.sort_key(t, tasks)):
         print(line(t, tasks))
     if not ok:
         print("nothing approved and unblocked" + (f" for {args.tier}" if args.tier else ""))
@@ -377,6 +386,10 @@ def show(args):
         raise SystemExit(f"no such id: {args.id}")
     print(item["_path"].read_text())
     if args.id in tasks:
+        from . import priority as _pri
+        t = tasks[args.id]
+        print(f"PRIORITY  cod={t.get('cod', '')}  cod_why={t.get('cod_why', '')}  graded={t.get('graded', '')}"
+              f"  unblocks={_pri.unblocks(t, tasks)}  p={_pri.score(t, tasks):.1f}")
         _print_run_usage(args.id)
     if args.id in epics:
         print("TASKS")
@@ -784,6 +797,8 @@ def lint():
                         f"is blocked until a human runs `ergon answer {t['id']}`")
         if t.get("answered") and t.get("status") not in ("ready", "done", "dropped"):
             errs.append(f"{where}: answered: is set but status is {t.get('status')}; `ergon answer` leaves it ready")
+        if t.get("pin") and t.get("status") in ("done", "dropped"):
+            print(f"warning: {where}: pin: {t['pin']} left on a {t['status']} task; clear it with `ergon pin {t['id']} clear`")
         if t.get("accept") and str(t["accept"]).lower() not in YES:
             errs.append(f"{where}: accept: {t['accept']!r} isn't `yes` (leave it out for no; config "
                         f"[[accept]] rules can't be opted out of)")

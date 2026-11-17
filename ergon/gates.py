@@ -45,6 +45,8 @@ def setf(args):
         key, _, val = kv.partition("=")
         if key == "approved":
             raise SystemExit("approval is human-only: use `approve` from a real terminal")
+        if is_task and key == "pin":
+            raise SystemExit("`pin:` is human-only: use `ergon pin ID first|last|clear` from a real terminal")
         if is_task and key in ("asking", "answered"):
             raise SystemExit(f"`{key}:` is written by dispatch and a human's `ergon answer` only")
         if is_task and key == "status" and _tasks.is_asking(item):
@@ -641,6 +643,24 @@ def answer_task(t, text=""):
     print(f"{tid} is ready: the next `ergon dispatch` resumes its worker with your answer")
 
 
+def pin(args):
+    """HUMAN ONLY: `ergon pin ID first|last|clear` writes or removes `pin:`, which overrides the
+    priority score in the order. Reorders only, so it asks for no confirmation."""
+    if in_agent_shell():
+        raise SystemExit("refused: running inside an agent shell. A human pins from their own terminal.")
+    with _gitops.state_lock():
+        t = _tasks.load(_config.ITEMS).get(args.id)
+        if not t:
+            raise SystemExit(f"no such task: {args.id}")
+        if args.where == "clear":
+            t.pop("pin", None)
+        else:
+            t["pin"] = args.where
+        _tasks.dump(t, _tasks.TASK_KEYS)
+        _history.record("pinned", t, by=approver(), pin=None if args.where == "clear" else args.where)
+    print(f"{args.id}: " + ("pin cleared" if args.where == "clear" else f"pinned {args.where}"))
+
+
 def close(args):
     """HUMAN ONLY: close approved tasks (ready / blocked / doing) whose work already landed
     elsewhere (--as done) or that no longer apply (--as dropped). Skips the epic-branch check
@@ -696,10 +716,11 @@ def close(args):
 # Shell writes: in-place editors, redirects (not to /dev/null or another fd), tee, mv/cp/rm.
 SHELL_WRITE = re.compile(r"\bsed\s+(-\w+\s+)*-i|\bperl\s+-\w*i|(?<![0-9&>])>(?!\s*/dev/null|&)|"
                          r"\btee\b|\b(mv|cp|rm|truncate|install)\s|python[0-9.]*\s+-c|<<")
+TAR_WRITE = re.compile(r"\btar\s+[xcru]|\btar\s[^;&|]*(\s-\w*[xcru]|--(extract|create|append|update|get))")
 # The human-only commands as plain text. human_cmd falls back to it for text it can't split into
 # words and for strings handed to a program that runs them as code (bash -c, python -c, ssh, ...).
-HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept|answer|sync)\b|\breview\s+(-i|--interactive)\b")
-HUMAN_VERBS = {"approve", "reject", "close", "accept", "answer", "sync"}
+HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept|answer|sync|pin)\b|\breview\s+(-i|--interactive)\b")
+HUMAN_VERBS = {"approve", "reject", "close", "accept", "answer", "sync", "pin"}
 # Programs that run a string argument or their stdin as code: what's quoted for them is a command.
 CODE_RUNNER = re.compile(r"(?:ba|da|z|k|mk|c|tc|fi|a)?sh|busybox|eval|env|ssh|su|watch|script|tmux|screen|"
                          r"parallel|flock|expect|osascript|python[0-9.]*|pypy[0-9.]*|perl|ruby|node|nodejs|"
@@ -712,7 +733,8 @@ GIT_WRITE = re.compile(r"\bgit\b[^;&|]*\s(add|commit|checkout|switch|reset|resto
 
 def shell_commands(s, i=0, close=None):
     """Split shell text into simple commands, each (its words after quote removal, its heredoc
-    bodies as (text, expands)). The commands inside $(...), `...` and (...) come out as commands of
+    bodies as (text, expands)). A command piped from one with heredocs shares them (`cat <<EOF | sh`
+    runs the body). The commands inside $(...), `...` and (...) come out as commands of
     their own; a word holding a substitution keeps its source text. Returns (commands, the index
     after `close`). Raises ValueError on text it can't split (an open quote, an unclosed paren)."""
     cmds, words, docs, word, pending, n = [], [], [], [], [], len(s)
@@ -725,12 +747,12 @@ def shell_commands(s, i=0, close=None):
         word.clear()
         inword = False
 
-    def end_cmd():
+    def end_cmd():  # a command with no words keeps its heredocs for the next (`cat <<EOF |` + newline)
         nonlocal words, docs
         end_word()
         if words:
             cmds.append((words, docs))
-        words, docs = [], []
+            words, docs = [], []
 
     def sub(i):  # s[i:] starts with "$(": the commands up to its ")" are commands too
         found, j = shell_commands(s, i + 2, ")")
@@ -833,7 +855,15 @@ def shell_commands(s, i=0, close=None):
         elif c == "\n":
             end_cmd()
             i = bodies(i + 1)
-        elif c in ";&|":
+        elif s.startswith("||", i):
+            end_cmd()
+            i += 2
+        elif c == "|":  # a pipe: the heredocs read so far feed the next command's stdin too
+            piped = docs
+            end_cmd()
+            docs = piped
+            i += 2 if s.startswith("|&", i) else 1
+        elif c in ";&":
             end_cmd()
             i += 1
         elif c == "(":
@@ -1021,6 +1051,113 @@ def is_runs(path):
         return bool(_config.RUNS_PATH.search(p.as_posix()))
 
 
+def names_outside_data(cmd, pattern, cwd=None):
+    """Whether shell text names pattern anywhere but in a heredoc's data. A heredoc's body is data
+    (`cat > tests/t.py <<'EOF'` writing a test that mentions the path) unless it reaches a program
+    that runs it or turns it into arguments (a shell or interpreter, xargs, also through a pipe),
+    or it expands a $(...) or `...`. Text that can't be split is matched whole.
+    With cwd (where the command runs), a word also counts as the path it names from there, after
+    any `cd` or `pushd` before it: `cd tasks && echo x > items/T-001.md` names tasks/items. A `cd`
+    can fail or sit in a subshell, so a word is tried from every directory the shell may be in."""
+    return _names_outside_data(cmd, pattern, {os.path.normpath(cwd)} if cwd else set())
+
+
+MAX_CWDS = 256  # directories _names_outside_data follows before it gives up and counts the text as a match
+
+
+def _chdir_targets(words):
+    """Directories that `env -C/--chdir`, `make -C`, `tar -C` and `git -C` in a command's words
+    start their command in."""
+    out = []
+    for k, w in enumerate(words):
+        prog = _program(w)
+        if prog not in ("env", "make", "gmake", "tar", "git"):
+            continue
+        rest = words[k + 1:]
+        for i, a in enumerate(rest):
+            if a.startswith("--chdir=") and prog == "env":
+                out.append(a[8:])
+            elif a.startswith("--directory=") and prog in ("make", "gmake", "tar"):
+                out.append(a[12:])
+            elif a in ("-C", "--chdir", "--directory") and i + 1 < len(rest):
+                out.append(rest[i + 1])
+            elif a.startswith("-C") and len(a) > 2 and prog in ("make", "gmake", "tar"):
+                out.append(a[2:])
+    return out
+
+
+_MSG_SHORT = re.compile(r"-[A-Za-z]*m$")
+
+
+def _without_messages(words):
+    """The words of a command minus the values of `git commit/tag/notes -m` and `--message[=]`, which are
+    text, not paths. A value with $(...) or backticks may run a command, so it stays."""
+    k = next((i for i, w in enumerate(words) if _program(w) == "git"), None)
+    if k is None or not any(w in ("commit", "tag", "notes") for w in words[k + 1:]):
+        return words
+    live = re.compile(r"\$\(|`")
+    out, skip = [], False
+    for w in words:
+        if skip:
+            skip = False
+            if not live.search(w):
+                continue
+        elif w == "--message" or _MSG_SHORT.match(w):
+            skip = True
+        elif w.startswith("--message=") and not live.search(w):
+            continue
+        out.append(w)
+    return out
+
+
+def _names_outside_data(cmd, pattern, dirs):
+    try:
+        cmds = shell_commands(cmd)[0]
+    except (ValueError, RecursionError):
+        return bool(pattern.search(cmd))
+    dirs = set(dirs)
+
+    def names_in(t, ds):
+        return any(pattern.search(os.path.normpath(os.path.join(d, os.path.expanduser(t)))) for d in ds)
+
+    def names(t):
+        return bool(pattern.search(t)) or names_in(t, dirs)
+
+    for words, docs in cmds:
+        words = _without_messages(words)
+        runs = any(CODE_RUNNER.fullmatch(_program(w)) for w in words)
+        code = runs or any(_program(w) == "xargs" for w in words)
+        live = [d for d, expands in docs if code or (expands and re.search(r"\$\(|`", d))]
+        if any(names(t) for t in words + live):
+            return True
+        # env -C tasks sh -c '...', make -C tasks, tar -C tasks -x...: the command and the text it runs
+        # start in another directory. tar and make write into the directory itself, so probe its children.
+        moved = _chdir_targets(words)
+        if moved and dirs:
+            inner = {os.path.normpath(os.path.join(d, t)) for d in dirs for t in moved}
+            if len(dirs | inner) > MAX_CWDS:
+                return True
+            if any(pattern.search(os.path.join(d, sub)) for d in inner for sub in ("items", "epics", "runs")
+                   if any(_program(w) == "tar" for w in words)):
+                return True
+            if any(names_in(t, inner) for t in words + live) or any(
+                    t != cmd and _names_outside_data(t, pattern, inner)
+                    for t in (words if runs else []) + live):
+                return True
+        # bash -c 'cd tasks && ...', a heredoc fed to sh, or one whose $(...) runs a command
+        if dirs and any(t != cmd and _names_outside_data(t, pattern, dirs) for t in (words if runs else []) + live):
+            return True
+        k = next((i for i, w in enumerate(words) if _program(w) in ("cd", "pushd")), None)
+        if k is None or not dirs:
+            continue
+        target = next((w for w in words[k + 1:] if not w.startswith("-")), None)
+        target = os.path.expanduser(target or "~")
+        dirs |= {os.path.normpath(os.path.join(d, target)) for d in dirs}
+        if len(dirs) > MAX_CWDS:
+            return True
+    return False
+
+
 # git subcommands that change a repository, its refs or a worktree (state_git_reason).
 STATE_GIT_WRITES = {"add", "commit", "checkout", "switch", "reset", "restore", "merge", "rebase", "cherry-pick",
                     "revert", "stash", "apply", "am", "pull", "push", "fetch", "branch", "tag", "worktree", "clean",
@@ -1107,16 +1244,16 @@ def guard_reason(tool, inp, worker=False, cwd=None):
         if why:
             return why
         if human_cmd(cmd):
-            return ("approve / reject / close / accept / answer / sync / review -i are human-only; ask the user to run "
+            return ("approve / reject / close / accept / answer / sync / pin / review -i are human-only; ask the user to run "
                     "them in their own terminal")
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
                      r"\b(CLAUDECODE|AI_AGENT)=", cmd):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
-        if _config.POLICIES.name in cmd and SHELL_WRITE.search(cmd):
+        if SHELL_WRITE.search(cmd) and names_outside_data(cmd, re.compile(re.escape(_config.POLICIES.name))):
             return POLICY_MSG
-        if _config.RUNS_IN_CMD.search(cmd) and SHELL_WRITE.search(cmd):
+        if (SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd)) and names_outside_data(cmd, _config.RUNS_IN_CMD, cwd or str(_config.HOME)):
             return RUNS_MSG
-        if _config.TASK_DIR_IN_CMD.search(cmd) and SHELL_WRITE.search(cmd):
+        if (SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd)) and names_outside_data(cmd, _config.TASK_DIR_IN_CMD, cwd or str(_config.HOME)):
             return ("don't write task files from the shell: use `ergon new` / `ergon set` for state, "
                     "Edit for a task's body")
         return None
@@ -1143,6 +1280,8 @@ def guard_reason(tool, inp, worker=False, cwd=None):
         if fb.get("status") == "review":
             return "a task in review leaves it only by a human's `ergon accept` or `ergon reject`, run in their own terminal"
         return "change status with `ergon set ID status=…` (it enforces the allowed moves), not by editing the file"
+    if fb.get("pin", "") != fa.get("pin", ""):
+        return "`pin:` is written by a human's `ergon pin` only"
     for key in ("asking", "answered"):
         if fb.get(key, "") != fa.get(key, ""):
             return f"`{key}:` is written by dispatch and a human's `ergon answer` only"

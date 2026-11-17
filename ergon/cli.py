@@ -72,6 +72,14 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                one `claude -p` (no tools) writes a multiple-choice quiz on the
                                proposed briefs to <state>/runs/quiz/, for /review. Keeps the
                                questions still current in the newest quiz; --all asks afresh
+  ergon grade [--all] [--epic E] [--per 4] [--model sonnet] [--budget USD] [--dry-run]
+                               one `claude -p` (no tools) compares open tasks (proposed, ready,
+                               blocked) in pairs by cost of delay; a Bradley-Terry fit writes
+                               cod: 0-100, cod_why: and graded: (nothing else; the brief digest,
+                               so a signed approval, is unchanged). Record in <state>/runs/grade/.
+                               Only new and changed tasks are graded, against --per anchors
+                               spread over the graded ones (all, with under 3 graded, or --all).
+                               --dry-run lists the pairs and asks nothing
   ergon journal [E-ID ...] [--all] [--model sonnet] [--budget USD]
                                one `claude -p` (no tools) per epic writes its journal entry: what it
                                set out to do, what landed, how the work went (from its history rows
@@ -98,9 +106,7 @@ import re
 import shlex
 import shutil
 import signal
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -111,6 +117,7 @@ from . import config as _config
 from . import dispatch as _dispatch
 from . import gates as _gates
 from . import gitops as _gitops
+from . import grade as _grade
 from . import history as _history
 from . import report as _report
 from . import serve as _serve
@@ -182,8 +189,6 @@ array, no prose and no code fence:
 
 {briefs}"""
 
-QUIZ_TIMEOUT = 600
-
 
 def quiz_brief(t):
     keys = ("title", "tier", "tier_why", "depends", "touches", "epic")
@@ -193,16 +198,7 @@ def quiz_brief(t):
 
 def quiz_items(text):
     """The JSON array in claude's reply (bare, fenced or with prose around it), or None."""
-    text = (text or "").strip()
-    m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.S)
-    for cand in ([m[1]] if m else []) + [text, text[text.find("["):text.rfind("]") + 1]]:
-        try:
-            got = json.loads(cand)
-        except ValueError:
-            continue
-        if isinstance(got, list):
-            return got
-    return None
+    return _grade.reply_json(text, lambda v: isinstance(v, list))
 
 
 def quiz(args):
@@ -218,26 +214,10 @@ def quiz(args):
     if not ask:
         print("every proposed task already has current questions in the newest quiz; --all to write them again")
         return
-    if not shutil.which("claude"):
-        raise SystemExit("ergon quiz: `claude` isn't on PATH")
     hashes = {i: _serve.brief_hash(t) for i, t in ask.items()}
     prompt = QUIZ_PROMPT.format(per=args.per, briefs="\n".join(quiz_brief(t) for t in ask.values()))
-    cmd = ["claude", "-p", "--model", args.model, "--tools", "", "--output-format", "json"]
-    if args.budget:
-        cmd += ["--max-budget-usd", str(args.budget)]
     print(f"ergon quiz: asking {args.model} about {len(ask)} task(s): {' '.join(ask)}", flush=True)
-    with tempfile.TemporaryDirectory() as cwd:  # no project CLAUDE.md or hooks; the briefs are inline
-        try:
-            r = subprocess.run(cmd, input=prompt, cwd=cwd, capture_output=True, text=True, timeout=QUIZ_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            raise SystemExit(f"ergon quiz: claude took over {QUIZ_TIMEOUT // 60} min; nothing written")
-    try:
-        d = json.loads(r.stdout)
-    except ValueError:
-        d = None
-    if not isinstance(d, dict) or d.get("is_error"):
-        why = (d or {}).get("result") if isinstance(d, dict) else (r.stderr.strip() or r.stdout.strip())
-        raise SystemExit(f"ergon quiz: claude failed ({str(why or 'no output')[:300]}); nothing written")
+    d = _grade.call(prompt, args.model, args.budget, "quiz")
     items = quiz_items(d.get("result"))
     if items is None:
         raise SystemExit(f"ergon quiz: claude's reply wasn't a JSON array of questions; nothing written:\n"
@@ -350,6 +330,9 @@ def main():
     a = sub.add_parser("approve")
     a.add_argument("ids", nargs="+")
     sub.add_parser("accept").add_argument("ids", nargs="+")
+    pn = sub.add_parser("pin", help="HUMAN ONLY: pin a task first or last in the order, or clear the pin")
+    pn.add_argument("id")
+    pn.add_argument("where", choices=["first", "last", "clear"])
     an = sub.add_parser("answer", help="HUMAN ONLY: answer a worker's question and requeue its task")
     an.add_argument("id")
     an.add_argument("text", nargs="*", help="the answer; leave it out to pick from the options")
@@ -381,6 +364,13 @@ def main():
                     help="questions per task (1-5, default 2)")
     qz.add_argument("--all", action="store_true", help="ask about every proposed task, not only those without current questions")
     qz.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
+    gr = sub.add_parser("grade", help="grade open tasks' cost of delay by pairwise comparison (runs claude -p)")
+    gr.add_argument("--epic")
+    gr.add_argument("--per", type=int, default=4, metavar="N", help="comparisons per task (default 4)")
+    gr.add_argument("--model", default="sonnet", help="default sonnet")
+    gr.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
+    gr.add_argument("--all", action="store_true", help="regrade every open task, not only new and changed ones")
+    gr.add_argument("--dry-run", action="store_true", help="print the pairs; ask nothing, write nothing")
     jn = sub.add_parser("journal", help="write each epic's journal entry, shown on /e/E-NNN (runs claude -p)")
     jn.add_argument("ids", nargs="*", metavar="E-ID", help="epics to write (default: those with no entry or newer history)")
     jn.add_argument("--all", action="store_true", help="every epic, not only those with a missing or stale entry")
@@ -447,10 +437,11 @@ def run(args):
         with _gitops.state_lock():
             {"new": _tasks.new, "set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish, "close": _gates.close,
              "tidy": _tasks.tidy}[args.cmd](args)
-    else:  # dispatch takes the lock itself, around each step (it runs for hours)
-        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "accept": _gates.accept, "answer": _gates.answer,
+    else:  # dispatch takes the lock itself, around each step (it runs for hours); grade around its
+        # writes only, not the minutes claude takes to answer
+        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
-         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "journal": journal, "sync": _shared.sync}[args.cmd](args)
+         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "journal": journal, "sync": _shared.sync}[args.cmd](args)
 
 
 if __name__ == "__main__":

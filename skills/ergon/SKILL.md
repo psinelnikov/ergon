@@ -24,7 +24,9 @@ The project's own rules (tier signals that are specific to it, hosts that need a
 
 - Every task an agent creates starts `status: proposed`. That includes tasks from breaking down an epic.
 - Only a human moves a task to `ready`: either `ergon approve <ID|E-ID>` from their own terminal (it refuses inside agent shells and asks for confirmation), or by hand-editing `status: ready` + `approved: <name> <date>`.
-- **Agents never write `approved:`, never set `status: ready` on a proposed task, and never work a task that isn't `ready`.** `ergon set` enforces this, and `ergon check` fails on any task past `proposed` that has no stamp. The plugin's PreToolUse hook (`ergon hook guard`) also refuses agent edits that change a task file's `status:`, `approved:`, `asking:` or `answered:`, shell writes to task files, any write to `<state>/runs/` (`history.jsonl` and the run logs), `approve`/`reject`/`close`/`accept`/`answer`/`review -i`, and touching `CLAUDECODE`/`AI_AGENT`. Its Stop hook runs `check` once before a session ends. All of it is a speed bump, not security. Bypassing it breaks this rule.
+- **Agents never write `approved:`, never set `status: ready` on a proposed task, and never work a task that isn't `ready`.** `ergon set` enforces this, and `ergon check` fails on any task past `proposed` that has no stamp. The plugin's PreToolUse hook (`ergon hook guard`) also refuses agent edits that change a task file's `status:`, `approved:`, `asking:`, `answered:` or `pin:`, shell writes to task files, any write to `<state>/runs/` (`history.jsonl` and the run logs), `approve`/`reject`/`close`/`accept`/`answer`/`pin`/`review -i`, and touching `CLAUDECODE`/`AI_AGENT`.
+  Its Stop hook runs `check` once before a session ends. All of it is a speed bump, not security. Bypassing it breaks this rule. (The guard refuses edits to `pin:` as well.)
+- **Pins are a human's too.** `ergon pin <ID> first|last|clear` (human only: it refuses inside agent shells) sets or clears the `pin:` field, which puts a task first or last in the order whatever its score (see Priority). It reorders only, so it asks for no confirmation.
 - **Humans accept output too, where the project asks for it.** A task marked for acceptance (its own `accept: yes`, or an `[[accept]]` rule in `.ergon.toml` matching its tier or `touches:`) stops at `status: review` when dispatch would land it: verify and any reviewer agent have passed, the branch and worktree are kept, nothing is merged. Only a human moves it on: `ergon accept <ID|E-ID>` lands it (the merge dispatch would have done, then the epic closes if that was its last task), and `ergon reject <ID> --reason R` sends it back to `ready` with the reason in its Notes. Both refuse inside agent shells and ask for confirmation, like `approve`. **Agents never move a task out of `review`, never take `accept:` off a task, and never run `accept`.** `set` refuses the move, and the guard refuses the file edits and the command.
 - **Answers are a human's too.** `ergon answer <ID> "<text>"` (or `ergon answer <ID>` to pick from the worker's options) steers what an approved task does, so it is gated like `approve`: it refuses inside agent shells, asks for confirmation, and the guard refuses it from a tool call. It is never to be exposed over HTTP. An answer only steers: it never changes `approved:`, tier, `touches:` or `accept:`. A question that needs one of those is a re-plan. Edit the task yourself, or close it and file a new one.
 - Reviewing a long queue: `ergon review -i [--epic E-00N] [--tier T]` walks it one task at a time, in three groups. Proposed tasks: approve / reject / change tier / open in `$EDITOR` / skip. Tasks awaiting an answer (`asking`): it prints the worker's questions and offers `a` to answer, which does what `ergon answer` does (same confirmation, same Notes line, the task goes `ready`; it lands at once), or skip. Tasks held on a review veto: `p` to save the finding as a policy, or skip. Human only, like `approve`.
@@ -42,6 +44,20 @@ The project's own rules (tier signals that are specific to it, hosts that need a
 A project can pin minimums with `[[protect]]` in `.ergon.toml` (`touches = ["server/auth/**", "prod-db"]`, `min_tier = "opus"` or `"human"`, optional `note`). `ergon check` fails any open task whose `touches:` match a pattern (fnmatch, also against parent directories) but whose tier is below the minimum. Done and dropped tasks are ignored.
 
 When in doubt, go one tier up. Put the reason in `tier_why:` in one line. If a task has a human step and a code step, split it into two tasks and link them with `depends:`.
+
+## Priority: what goes first
+
+`ergon/priority.py` orders the open work. For each task:
+
+`score = (cod + 25 × unblocks) / size`
+
+- **`cod`**: cost of delay, 0-100, from the task's `cod:` field. A missing or unparseable value counts as the neutral 50, and out-of-range values are clamped.
+- **`unblocks`**: how many open tasks depend on this one, directly or through a chain. Done and dropped tasks don't count.
+- **`size`**: haiku 1, sonnet 3, opus 8, human 3.
+
+Order: tasks pinned `first` go to the top, tasks pinned `last` to the bottom, and the rest sit between by score, highest first. Ties go to the cheaper tier, then the lower ID. `ergon next`, `dispatch` and the `ergon serve` board all use this order. `ergon show` prints the score and its parts.
+
+`ergon grade [--all] [--epic E] [--per 4] [--model sonnet] [--budget USD] [--dry-run]` sets `cod:` by pairwise comparison (one `claude -p`, no tools). By default only stale tasks are graded: those with no `graded:` stamp, or whose stamp no longer matches the brief. `--all` regrades every open task. Grading writes only `cod:`, `cod_why:` and `graded:`. None of them is in the brief digest, so grading never un-approves a task and a signed approval still holds.
 
 ## Lifecycle
 
@@ -82,6 +98,10 @@ created: 2026-10-04
 approved:               # "<name> <date>", written by a human only
 tier_why: one line
 accept: yes             # optional: dispatch holds the finished branch at `review` for a human
+cod: 60                 # optional, 0-100 cost of delay: written by `ergon grade` (absent counts as 50)
+cod_why: one line       # optional, why that grade: written by `ergon grade`
+graded: 2026-11-17 3f9a0c1d2e4b   # optional, `ergon grade` stamp: day and brief-hash prefix; stale once the brief changes
+pin: first              # optional, HUMAN ONLY (`ergon pin ID first|last|clear`): first or last in the order
 ---
 ## What
 ## Done when
@@ -196,5 +216,7 @@ One JSON object per line, appended as things happen, gitignored with `runs/`. Ev
 | `status` | `set` changed a task's or epic's status: work moved by hand or by an interactive agent, outside dispatch (dispatch and the human gates record their own events, never this one) | `from`, `to`, `by` (git `user.name`), `agent` (true if run in an agent shell, `CLAUDECODE` or `AI_AGENT` set; a hint, not proof) |
 | `window` | a dispatch run ended and both probes read the 5-hour window (`task` and `epic` are null) | `before`, `after` (utilization, 0..1), `resets_at` (epoch seconds), `cost` (the run's workers, reviewers and probes, USD), `same` (false if the window reset in between: no rate from it) |
 | `epic_finished` | the epic merged into the trunk and closed (`task` is null) | `branch`, `commit` (the merge commit; both null if it never had a branch) |
+| `graded` | `ergon grade` wrote cost-of-delay grades (`task` is null) | `tasks` (the IDs it wrote), `model`, `cost`, `dropped` (comparison replies it threw away) |
+| `pinned` | `ergon pin` set or cleared a task's `pin:` (human only) | `by`, `pin`: `first`, `last`, or null on a clear |
 
 `round` (2, 3, …) is on the `dispatched`, `resumed`, `worker_end`, `verify` and `review` rows of a fix round (review round N+1 is fix round N). A row without `round` is round 1. Other loops are to mark their rounds the same way.
