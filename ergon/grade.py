@@ -250,25 +250,28 @@ def set_fields(text, fields):
     return text[:m.start(1)] + "\n".join(lines) + text[m.end(1):]
 
 
-def call(text, model, budget):
-    """claude's JSON envelope for `text`; SystemExit (nothing written) when the call failed."""
+def call(text, model, budget, who="grade"):
+    """claude's JSON envelope for `text`, from one `claude -p` with no tools, run in an empty
+    folder (no project CLAUDE.md or hooks; whatever it needs is inline in `text`). SystemExit
+    (nothing written) when the call failed; `who` names the command in the message. `ergon quiz`
+    asks through here too."""
     if not shutil.which("claude"):
-        raise SystemExit("ergon grade: `claude` isn't on PATH")
+        raise SystemExit(f"ergon {who}: `claude` isn't on PATH")
     cmd = ["claude", "-p", "--model", model, "--tools", "", "--output-format", "json"]
     if budget:
         cmd += ["--max-budget-usd", str(budget)]
-    with tempfile.TemporaryDirectory() as cwd:  # no project CLAUDE.md or hooks; the briefs are inline
+    with tempfile.TemporaryDirectory() as cwd:
         try:
             r = subprocess.run(cmd, input=text, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT)
         except subprocess.TimeoutExpired:
-            raise SystemExit(f"ergon grade: claude took over {TIMEOUT // 60} min; nothing written")
+            raise SystemExit(f"ergon {who}: claude took over {TIMEOUT // 60} min; nothing written")
     try:
         d = json.loads(r.stdout)
     except ValueError:
         d = None
     if not isinstance(d, dict) or d.get("is_error"):
         why = d.get("result") if isinstance(d, dict) else (r.stderr.strip() or r.stdout.strip())
-        raise SystemExit(f"ergon grade: claude failed ({str(why or 'no output')[:300]}); nothing written")
+        raise SystemExit(f"ergon {who}: claude failed ({str(why or 'no output')[:300]}); nothing written")
     return d
 
 
