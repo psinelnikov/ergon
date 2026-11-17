@@ -1,5 +1,5 @@
 """Priority score for ordering work: no I/O. tasks maps id -> task dict."""
-from .tasks import TIERS
+from . import tasks as _tasks
 
 SIZE = {"haiku": 1, "sonnet": 3, "opus": 8, "human": 3}
 NEUTRAL_COD = 50
@@ -42,4 +42,4 @@ def _bucket(t):
 
 
 def sort_key(t, tasks):
-    return (_bucket(t), -score(t, tasks), TIERS.index(t.get("tier")), t.get("id"))
+    return (_bucket(t), -score(t, tasks), _tasks.TIERS.index(t.get("tier")), t.get("id"))
