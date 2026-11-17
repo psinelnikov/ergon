@@ -161,34 +161,76 @@ def stamp_approved(todo):
     """Approve `todo`: proposed tasks move to ready, and each gets `approved: <name> <date>`. In
     shared mode the stamp also names its brief digest, and the stamps go in one SSH-signed state
     commit with an `Ergon-Approve: <ID> sha256:<digest>` trailer per task, which is what makes
-    them count. If signing fails, nothing is approved (SystemExit). Takes the state lock."""
+    them count. If signing fails, nothing is approved (SystemExit). Takes the state lock.
+
+    A task under a [[two_person]] rule only gets its trailer in the signed commit. Then the
+    approvals that verify are counted: with two different principals it moves to ready and its
+    stamp names both; with fewer it gets a Note (`approved by Pavel (1 of 2)`), stays (or goes
+    back to) proposed, and its approved: is emptied. What verifies decides, never who this clone
+    thinks it is, so a second key of the same person still counts once. Returns the IDs of the
+    two-person tasks still waiting for an approval."""
     shared = _config.SHARED is not None
+    two = {t["id"] for t in todo if _tasks.two_person(t)}
     with _gitops.state_lock():
         if shared:
             _shared.commit_pending()  # hand edits go in a commit of their own, not the signed one
         trailers, stamp = [], f"{approver()} {_tasks.today()}"
         for t in todo:
             digest = _tasks.brief_digest(t)
+            trailers.append(f"{_gitops.APPROVE_TRAILER}: {t['id']} sha256:{digest}")
+            if t["id"] in two:
+                continue
             if t["status"] == "proposed":
                 t["status"] = "ready"
             t["approved"] = f"{stamp} sha256:{digest[:8]}" if shared else stamp
             _tasks.dump(t, _tasks.TASK_KEYS)
-            trailers.append(f"{_gitops.APPROVE_TRAILER}: {t['id']} sha256:{digest}")
         if shared:
-            _gitops.sign_state("approve", trailers, [t["_path"] for t in todo])
+            _gitops.sign_state("approve", trailers, [t["_path"] for t in todo if t["id"] not in two])
+        apr = _gitops.approvals() if shared else None
         for t in todo:
-            _history.record("approved", t, by=approver(), tier=t["tier"])
+            if t["id"] not in two:
+                _history.record("approved", t, by=approver(), tier=t["tier"])
+                continue
+            # the files change after the signed commit, from what it verifies as: committed
+            # unsigned as the lock is released, like sync's restamp, since they grant nothing
+            old = t["status"]
+            who = [] if apr.error else apr.signers(t)
+            if len(who) >= apr.needed(t):
+                t["status"] = "ready" if old == "proposed" else old
+                t["approved"] = apr.stamp(t)
+                _history.record("approved", t, by=approver(), tier=t["tier"], approvers=[n for _, n, _ in who])
+            else:
+                if old == "ready":  # approved before, under another brief: it waits for its second approver
+                    t["status"] = "proposed"
+                t["approved"] = ""
+                if who:
+                    _dispatch.add_note(t, f"approved by {', '.join(n for _, n, _ in who)} "
+                                          f"({len(who)} of {apr.needed(t)})", who="approve")
+                _history.record("approval", t, by=approver(), tier=t["tier"], count=len(who), needed=apr.needed(t))
+            _tasks.dump(t, _tasks.TASK_KEYS)
+            if old == "ready" and t["status"] == "proposed":
+                _history.record("status", t, by=approver(), **{"from": old, "to": t["status"]})
+    waiting = []
     if shared:  # e.g. a key user.signingkey didn't name, so approve_ready couldn't check it
-        apr = _gitops.approvals()
         for t in todo:
             why = apr.problem(t)
-            if why:
+            if t["id"] in two and why:
+                waiting.append(t["id"])
+            if t["id"] in two and (not why or apr.signers(t)):
+                print(f"{t['id']}: two-person rule, {apr.tally(t)}" + (f"; it stays {t['status']}" if why else ""))
+            elif why:
                 print(f"warning: {t['id']}'s approval doesn't verify: {why}")
+    return waiting
 
 
 def approve(args):
-    tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     approve_ready()
+    # With [[two_person]] rules, sync before and after: whether a task matches a rule, and whose
+    # approvals it has, is only known from the latest state, and the others must see this one.
+    count = bool(_config.SHARED and _config.TWO_PERSON)
+    if count:
+        sync_for_count(args.ids)
+    tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     named = targets(args.ids, tasks, epics)
     todo = [t for t in named if t["status"] == "proposed"]
     # shared mode: an approved task whose approval no longer verifies (its brief was edited, or it
@@ -203,13 +245,44 @@ def approve(args):
     # shared mode: an unpublished ID can still be renumbered, so sync first (or refuse)
     _shared.ensure_published([t["id"] for t in todo] + [i for i in args.ids if i in epics])
     tasks = _tasks.load(_config.ITEMS)
-    todo = [tasks[t["id"]] for t in todo]
+    gone = [t["id"] for t in todo if tasks[t["id"]]["status"] != t["status"]]  # a sync moved it on
+    if gone:
+        print(f"left out, their status changed in the sync: {', '.join(gone)}")
+    todo = [tasks[t["id"]] for t in todo if t["id"] not in gone]
+    if not todo:
+        raise SystemExit("nothing left to approve")
+    apr = _gitops.approvals() if count else apr
     for t in todo:
-        print(_tasks.line(t, tasks) + (f"  (approve again: {again[t['id']]})" if t["id"] in again else ""))
+        print(_tasks.line(t, tasks) + (f"  (approve again: {again[t['id']]})" if t["id"] in again else "")
+              + (f"  (two-person: {apr.tally(t)})" if _tasks.two_person(t) else ""))
     if not human_gate(f"Approve these {len(todo)} task(s) as {approver()}?"):
         raise SystemExit("aborted")
-    stamp_approved(todo)
-    print(f"approved {len(todo)}")
+    waiting = stamp_approved(todo)
+    print(f"approved {len(todo) - len(waiting)}"
+          + (f"; {len(waiting)} wait for another approver: {', '.join(waiting)}" if waiting else ""))
+    if count:  # publish, so the other approvers see this approval
+        sync_for_count([t["id"] for t in todo], after=True)
+
+
+def sync_for_count(ids, after=False):
+    """Shared mode, around approving two-person tasks: sync, so the count includes approvals other
+    clones published, and so they see this one. A failure is reported, not fatal: counting fewer
+    approvals than were made only ever leaves a task waiting, and an approval of a stale brief
+    doesn't verify once the newer one merges in. Refuses if the sync renumbered one of `ids`, so
+    a named ID never comes to mean another task. Refuses in an agent shell or on a task branch
+    first, as `ergon sync` does: this runs before approve's prompt, which would refuse an agent
+    only after the push."""
+    _shared.refuse()
+    try:
+        moved = _shared.sync_core(quiet=True)
+    except SystemExit as err:
+        print(f"warning: couldn't sync ({err}); " + (
+            "run `ergon sync` to publish this approval" if after else
+            "approvals published from other clones since the last sync aren't counted"))
+        return
+    hit = [f"{o} is now {moved[o]}" for o in ids if o in moved]
+    if hit:
+        raise SystemExit(f"refused: the sync renumbered {'; '.join(hit)}. Check the new IDs, then run the command again.")
 
 
 POLICY_HEAD = "# Policies\n\nSettled review findings, written by a human (`ergon review -i`, p). Workers and reviewers read them.\n\n## Stances\n"
@@ -262,6 +335,10 @@ def review_interactive(args):
             print(f"refused, not published to {_shared.remote()}: {', '.join(sorted(held))}")
     else:
         held = set()
+        if _config.SHARED and _config.TWO_PERSON:  # see the latest briefs and approvals, as approve does
+            sync_for_count([t["id"] for t in tasks.values() if t["status"] == "proposed"])
+            tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
+    apr = _gitops.approvals() if any(_tasks.two_person(t) for t in tasks.values()) else None
     pick = lambda t: (t["id"] not in held and (not args.epic or t.get("epic") == args.epic) and (not args.tier or t["tier"] == args.tier))
     order = lambda t: (t.get("epic") or "~", t["id"])
     queue = sorted((t for t in tasks.values() if t["status"] == "proposed" and pick(t)), key=order)
@@ -315,15 +392,22 @@ def review_interactive(args):
             waits = [d for d in t.get("depends") or [] if tasks.get(d, {}).get("status") != "done"]
             if waits:
                 print(f"\n(waits on {', '.join(waits)})")
+            if apr and _tasks.two_person(t):
+                print(f"\n(two-person: {apr.tally(t)})")
             choice = ask(f"\n{t['id']} [{t['tier']}]  [a]pprove  [r]eject  [t]ier  [e]dit  [s]kip  [q]uit > ").lower()
             if choice == "a":
                 try:  # shared mode: refuses, approving nothing, unless the approval would verify
                     approve_ready()
-                    stamp_approved([t])
+                    waiting = stamp_approved([t])
                 except SystemExit as err:
                     print(err)
                     continue
-                tally["approved"] += 1
+                if waiting:  # a two-person task still waiting for its second approver
+                    tally["1 of 2"] = tally.get("1 of 2", 0) + 1
+                else:
+                    tally["approved"] += 1
+                if _config.TWO_PERSON:  # publish it, so the other approvers see it
+                    sync_for_count([t["id"]], after=True)
                 break
             if choice == "r":
                 try:
@@ -1128,15 +1212,18 @@ def cited_tasks(msg):
 
 
 def commit_msg_reason(msg, tasks):
-    """Why a commit with this message must not land, or None. Each task it cites must exist and
-    carry a human's `approved:` stamp: a proposed task, one rejected to dropped, one hand-edited
-    to ready, or an ID nobody filed are all refused. Epic IDs aren't approved, so aren't checked."""
+    """Why a commit with this message must not land, or None. Each task it cites must exist, be
+    out of `proposed` and carry a human's `approved:` stamp: a proposed task (stamped or not), one
+    rejected to dropped, one hand-edited to ready, or an ID nobody filed are all refused. Epic IDs
+    aren't approved, so aren't checked."""
     bad = []
     for tid in cited_tasks(msg):
         t = tasks.get(tid)
         if not t:
             bad.append(f"{tid}: no such task in this tracker")
-        elif not t.get("approved"):
+        elif not t.get("approved") or t.get("status") == "proposed":
+            # a proposed task is unapproved whatever its stamp says: a two-person task waiting for
+            # its second approver, or a stamp written by hand
             bad.append(f"{tid}: {t.get('status') or 'no status'}, and no human has approved it")
     if not bad:
         return None

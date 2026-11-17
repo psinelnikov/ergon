@@ -373,17 +373,47 @@ class Approvals:
 
     def __init__(self, error=None, good=None, seen=None):
         self.error = error  # why nothing verifies, or None
-        self.good = good or {}  # {task ID: {digest: (signer name, date)}}, newest approval first
+        # {task ID: {digest: [(principal, signer name, date), ...]}}, newest approval first. The
+        # principal is who the approvers file says the key belongs to (%GS), so one person's two
+        # keys are one principal; the name is the signed commit's author, for display.
+        self.good = good or {}
         self.seen = seen or set()  # task IDs some Ergon-Approve trailer names, signed or not
+
+    def needed(self, t):
+        """How many different principals must approve t's current brief: 2 under [[two_person]]."""
+        return 2 if _tasks.two_person(t) else 1
+
+    def signers(self, t):
+        """[(principal, name, date)] of the different principals whose approval of t's current
+        brief verifies, each at its first approval, oldest first."""
+        out = {}
+        for who in reversed((self.good.get(t["id"]) or {}).get(_tasks.brief_digest(t)) or []):
+            out.setdefault(who[0], who)
+        return list(out.values())
+
+    def tally(self, t):
+        """`1 of 2: Pavel; needs another approver (not Pavel)`, for `ergon review` and approve."""
+        if self.error:
+            return f"approvals not checked: {self.error}"
+        who, need = self.signers(t), self.needed(t)
+        names = ", ".join(n for _, n, _ in who)
+        out = f"{len(who)} of {need}" + (f": {names}" if who else "")
+        if len(who) < need:
+            out += f"; needs another approver (not {names})" if who else f"; needs {need} approvers"
+        return out
 
     def problem(self, t):
         """Why t's approval doesn't verify, or None if it does."""
         if self.error:
             return self.error
         tid, d = t["id"], _tasks.brief_digest(t)
-        mine = self.good.get(tid) or {}
-        if d in mine:
+        who, need = self.signers(t), self.needed(t)
+        if len(who) >= need:
             return None
+        if who:
+            return (f"two-person rule: {len(who)} of {need} approvals of this brief "
+                    f"({', '.join(n for _, n, _ in who)}); another approver runs `ergon approve {tid}`")
+        mine = self.good.get(tid) or {}
         if mine:
             old = next(iter(mine))
             return (f"brief changed after approval (approved sha256:{old[:8]}, now sha256:{d[:8]}): "
@@ -395,11 +425,13 @@ class Approvals:
                 f"signed; a human approves it with `ergon approve {tid}`")
 
     def stamp(self, t):
-        """The approved: stamp t's verified approval makes, or None if it doesn't verify."""
+        """The approved: stamp t's verified approval makes (each approver's name, the date of the
+        latest), or None if it doesn't verify."""
         if self.problem(t):
             return None
-        name, date = self.good[t["id"]][_tasks.brief_digest(t)]
-        return f"{name} {date} sha256:{_tasks.brief_digest(t)[:8]}"
+        who = self.signers(t)
+        names = " and ".join(n for _, n, _ in who)
+        return f"{names} {max(d for _, _, d in who)} sha256:{_tasks.brief_digest(t)[:8]}"
 
 
 def approvals():
@@ -428,23 +460,24 @@ def approvals():
             ["git", "-C", str(_config.STATE), "-c", f"gpg.ssh.allowedSignersFile={allowed}",
              "-c", f"gpg.ssh.program={keygen}", "-c", "log.showSignature=false",
              "log", f"--grep=^{APPROVE_TRAILER}:", f"refs/heads/{_shared.branch()}",
-             f"--format=%G?%x1f%an%x1f%as%x1f%(trailers:key={APPROVE_TRAILER},valueonly,separator=%x1e)%x1d"],
+             f"--format=%G?%x1f%GS%x1f%GK%x1f%an%x1f%as%x1f%(trailers:key={APPROVE_TRAILER},valueonly,separator=%x1e)%x1d"],
             capture_output=True, text=True)
     if r.returncode:
         return Approvals(error=f"reading approvals failed: {(r.stderr or r.stdout).strip()[:300]}")
     good, seen = {}, set()
     for rec in r.stdout.split("\x1d"):
         fields = rec.strip("\n").split("\x1f")
-        if len(fields) != 4:
+        if len(fields) != 6:
             continue
-        status, name, date, values = fields
+        status, principal, key, name, date, values = fields
+        principal = principal.strip() or key.strip()  # who the approvers file says signed it
         for v in values.split("\x1e"):
             m = APPROVE_VALUE.match(v.strip())
             if not m:
                 continue
             seen.add(m.group(1))
-            if status == "G":
-                good.setdefault(m.group(1), {}).setdefault(m.group(2), (name, date))
+            if status == "G" and principal:
+                good.setdefault(m.group(1), {}).setdefault(m.group(2), []).append((principal, name, date))
     return Approvals(good=good, seen=seen)
 
 

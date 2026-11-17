@@ -864,3 +864,137 @@ class TestSignedApprovals(Shared):
             event = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(self.a)})
             out = self.ergon(self.a, "hook", "guard", inp=event).stdout
             self.assertIn("only ergon writes it", out, cmd)
+
+
+class TestTwoPerson(Shared):
+    """[[two_person]] (T-021): a matching task needs verified approvals of its current brief from
+    two different principals in the approvers file before it leaves `proposed`."""
+
+    RULES = '\n[[two_person]]\ntiers = ["opus"]\n\n[[two_person]]\ntouches = ["server/auth/**"]\n'
+
+    counts, doesnt_count, digest = TestSignedApprovals.counts, TestSignedApprovals.doesnt_count, TestSignedApprovals.digest
+
+    def setUp(self):
+        super().setUp()
+        # A's second key, listed under the same principal: one person, two keys
+        sh("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "a2@example.com", "-f", str(self.keys / "a2"), cwd=self.a)
+        with open(self.a / ".ergon" / "approvers", "a") as f:
+            f.write(f'a@example.com namespaces="git" {(self.keys / "a2.pub").read_text().strip()}\n')
+        sh("git", "commit", "-qam", "a's second key", cwd=self.a)
+        sh("git", "push", "-q", str(self.remote), "main", cwd=self.a)
+        for where in (self.a, self.b):
+            with open(where / ".ergon.toml", "a") as f:
+                f.write(self.RULES)
+        sh("git", "config", "user.name", "Dana", cwd=self.b)
+        self.env_b = clean_env(ERGON_ASK_STDIN="1", GIT_AUTHOR_NAME="Dana", GIT_COMMITTER_NAME="Dana")
+
+    def as_b(self, *args, **kw):
+        return self.ergon(self.b, *args, env=self.env_b, **kw)
+
+    def text(self, where, tid="T-001"):
+        return self.task(where, tid).read_text()
+
+    def waits(self, where, tid, who):
+        """tid is still proposed, unstamped, with a `1 of 2` Note, and nothing runs it."""
+        text = self.text(where, tid)
+        self.assertIn("status: proposed", text)
+        self.assertIn("\napproved:\n", text)
+        self.assertRegex(text, rf"\n- \d{{4}}-\d\d-\d\d approve: approved by {who} \(1 of 2\)\n")
+        self.assertNotIn(f"  {tid}  ", self.ergon(where, "next").stdout)
+        self.assertNotIn(f"would run  {tid}", self.ergon(where, "dispatch", "--dry-run").stdout)
+
+    def test_one_principal_leaves_it_proposed_and_a_second_makes_it_ready(self):
+        self.start()
+        self.ergon(self.a, "set", "T-001", "tier=opus")
+        r = self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.assertIn("T-001: two-person rule, 1 of 2: Tester; needs another approver (not Tester); it stays proposed", r.stdout)
+        self.assertIn("approved 0; 1 wait for another approver: T-001", r.stdout)
+        self.assertIn("pushed ergon-state", r.stdout)  # published, so the other approvers see it
+        self.waits(self.a, "T-001", "Tester")
+        self.assertIn("two-person: 1 of 2: Tester; needs another approver (not Tester)", self.ergon(self.a, "review").stdout)
+        # the same person again, then with their second key: still one principal
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.signing(self.a, "a2")
+        r = self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.assertIn("1 of 2: Tester;", r.stdout)
+        self.waits(self.a, "T-001", "Tester")
+        self.assertEqual(len(re.findall(r"approved by Tester \(1 of 2\)", self.text(self.a, "T-001"))), 3)
+        # a stamp written by hand on the proposed task doesn't let a commit cite it
+        f = self.task(self.a, "T-001")
+        f.write_text(f.read_text().replace("\napproved:\n", "\napproved: Tester 2026-01-01\n"))
+        r = sh("git", "commit", "--allow-empty", "-m", "Work (T-001)", cwd=self.a, check=False, env=self.env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("T-001: proposed, and no human has approved it", r.stderr)
+        f.write_text(f.read_text().replace("\napproved: Tester 2026-01-01\n", "\napproved:\n"))
+        # a second principal: approve syncs first, so B counts A's approvals
+        r = self.as_b("approve", "T-001", inp="y\n")
+        self.assertIn("(two-person: 1 of 2: Tester; needs another approver (not Tester))", r.stdout)
+        self.assertIn("T-001: two-person rule, 2 of 2: Tester, Dana", r.stdout)
+        self.assertIn("approved 1", r.stdout)
+        d = self.digest(self.b, "T-001")
+        self.assertRegex(self.text(self.b), rf"\nstatus: ready\n")
+        self.assertRegex(self.text(self.b), rf"\napproved: Tester and Dana \d{{4}}-\d\d-\d\d sha256:{d[:8]}\n")
+        self.counts(self.b, "T-001")
+        self.assertEqual(sh("git", "commit", "--allow-empty", "-m", "Work (T-001)", cwd=self.b,
+                            env=self.env_b, check=False).returncode, 0)
+        r = self.ergon(self.a, "sync")
+        self.assertNotIn("restamped", r.stdout)  # the stamp approve wrote is what verifies
+        self.counts(self.a, "T-001")
+
+    def test_retiering_into_a_rule_after_one_approval_needs_two_fresh_ones(self):
+        self.start()
+        # a task no rule matches needs one approval
+        r = self.as_b("approve", "T-001", inp="y\n")
+        self.assertIn("approved 1", r.stdout)
+        self.assertIn("status: ready", self.text(self.b))
+        self.counts(self.b, "T-001")
+        self.ergon(self.a, "sync")
+        self.ergon(self.a, "set", "T-001", "tier=opus")
+        self.doesnt_count(self.a, "T-001", "brief changed after approval")
+        # B's approval of the haiku brief doesn't count as one of the two
+        r = self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.assertIn("(approve again: brief changed after approval", r.stdout)
+        self.assertIn("1 of 2: Tester;", r.stdout)
+        self.waits(self.a, "T-001", "Tester")  # back to proposed, where the other approvers look
+        self.assertEqual(self.ergon(self.a, "check", check=False).returncode, 0)
+        r = self.as_b("approve", "T-001", inp="y\n")
+        self.assertIn("2 of 2: Tester, Dana", r.stdout)
+        self.assertIn("tier: opus", self.text(self.b))
+        self.assertIn("status: ready", self.text(self.b))
+        self.counts(self.b, "T-001")
+
+    def test_a_touches_rule_matches_and_a_ready_task_with_one_approval_doesnt_run(self):
+        self.start()
+        self.ergon(self.a, "new", "task", "Keys", "--tier", "haiku", "--touches", "server/auth/keys.py")
+        self.ergon(self.a, "approve", "T-001", "T-002", inp="y\n")
+        self.assertIn("status: ready", self.text(self.a, "T-001"))
+        self.waits(self.a, "T-002", "Tester")
+        # approve syncs before its prompt here, so an agent shell is refused before anything is pushed
+        tip = self.remote_tip()
+        self.ergon(self.a, "new", "task", "Three", "--tier", "opus")
+        r = self.ergon(self.a, "approve", "T-003", check=False, inp="y\n", env=clean_env(ERGON_ASK_STDIN="1", CLAUDECODE="1"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("refused: running inside an agent shell", r.stderr)
+        self.assertEqual(self.remote_tip(), tip)
+        # moved to ready by hand with its one approval: nothing runs it, and check says why
+        f = self.task(self.a, "T-002")
+        f.write_text(f.read_text().replace("status: proposed", "status: ready"))
+        self.doesnt_count(self.a, "T-002", "two-person rule: 1 of 2 approvals of this brief (Tester)")
+
+
+class TestTwoPersonConfig(unittest.TestCase):
+    def test_two_person_without_shared_is_a_config_error(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve() / "proj"
+        git_init(root)
+        env = clean_env()
+        sh(sys.executable, str(ERGON), "init", cwd=root, env=env)
+        with open(root / ".ergon.toml", "a") as f:
+            f.write('\n[[two_person]]\ntiers = ["opus"]\n')
+        r = sh(sys.executable, str(ERGON), "board", cwd=root, env=env, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("[[two_person]] needs [shared]", r.stderr)
+        (root / ".ergon.toml").write_text((root / ".ergon.toml").read_text().replace('tiers = ["opus"]', 'tiers = ["gpt"]'))
+        r = sh(sys.executable, str(ERGON), "board", cwd=root, env=env, check=False)
+        self.assertIn("[[two_person]] #1 needs tiers", r.stderr)

@@ -236,15 +236,23 @@ def needs_accept(t, *tiers):
     touches: match."""
     if str(t.get("accept", "")).lower() in YES:
         return True
-    have = {t.get("tier"), *tiers}
-    for rule in _config.ACCEPT:
-        if rule["tiers"] and not have & set(rule["tiers"]):
-            continue
-        if rule["touches"] and not any(_config.protect_hit(str(x), p) for x in t.get("touches") or []
-                                       for p in rule["touches"]):
-            continue
-        return True
-    return False
+    return any(rule_hit(rule, t, tiers) for rule in _config.ACCEPT)
+
+
+def rule_hit(rule, t, tiers=()):
+    """Does t match an [[accept]] or [[two_person]] rule? Its tier (or one of `tiers`) is in the
+    rule's tiers, when given, and a touches: entry falls under one of its patterns, when given."""
+    if rule["tiers"] and not {t.get("tier"), *tiers} & set(rule["tiers"]):
+        return False
+    return not rule["touches"] or any(_config.protect_hit(str(x), p) for x in t.get("touches") or []
+                                      for p in rule["touches"])
+
+
+def two_person(t):
+    """Does t need approvals from two different approvers ([[two_person]], shared mode only)? It is
+    matched against the task as it is now, so retiering it into or out of a rule changes the answer
+    (and its digest, so earlier approvals stop counting either way)."""
+    return bool(_config.SHARED) and any(rule_hit(rule, t) for rule in _config.TWO_PERSON)
 
 
 def board(args):
@@ -301,12 +309,16 @@ def review(args):
     by_epic = {}
     for t in waiting:
         by_epic.setdefault(t.get("epic") or "", []).append(t)
+    # shared mode: who has approved each two-person task so far, and how many more it needs
+    apr = _gitops.approvals() if any(two_person(t) for t in waiting) else None
     for eid, group in sorted(by_epic.items()):
         print(f"\n{eid + '  ' + epics[eid]['title'] if eid in epics else '(no epic)'}")
         for t in sorted(group, key=lambda t: t["id"]):
             print(line(t, tasks))
             if t.get("tier_why"):
                 print(f"         why {t['tier']}: {t['tier_why']}")
+            if apr and two_person(t):
+                print(f"         two-person: {apr.tally(t)}")
     if not waiting:
         print("nothing awaiting approval")
     else:

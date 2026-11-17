@@ -79,6 +79,13 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # remote = "origin"             # a remote name or URL
 # branch = "ergon-state"
 
+# Shared mode only: a task matching a rule needs signed approvals of its current brief from two
+# different principals in the approvers file before it leaves `proposed`. Matched like [[accept]]:
+# its tier is in tiers (when given) and a touches: entry matches (when given).
+# [[two_person]]
+# tiers = ["opus"]
+# touches = ["server/auth/**"]
+
 # Paths or nouns no task below a tier may touch; `check` fails an open task that does.
 # [[protect]]
 # touches = ["server/auth/**", "prod-db"]   # fnmatch patterns against a task's touches:
@@ -90,6 +97,7 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 SHARED = None  # [shared]: {remote, branch}, or None for local-only state
 PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
 ACCEPT = []  # [[accept]] rules: {tiers, touches}
+TWO_PERSON = []  # [[two_person]] rules: {tiers, touches}; shared mode only
 
 
 def protect_hit(touch, pattern):
@@ -172,7 +180,7 @@ def configure(start=None, need_config=True):
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, \
-        REVIEW_ROUNDS, VERIFY_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED
+        REVIEW_ROUNDS, VERIFY_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -249,14 +257,28 @@ def configure(start=None, need_config=True):
             raise NotConfigured(f"{CONFIG_FILE}: [[protect]] #{n} needs touches and a min_tier in {_tasks.TIERS}")
         PROTECT.append({"touches": [str(x).strip("/") for x in pr["touches"]],
                         "min_tier": pr["min_tier"], "note": pr.get("note", "")})
-    ACCEPT = []
-    for n, ac in enumerate(CFG.get("accept") or [], 1):
-        tiers, touches = ac.get("tiers") or [], ac.get("touches") or []
-        tiers = [tiers] if isinstance(tiers, str) else tiers
-        touches = [touches] if isinstance(touches, str) else touches
-        if not (tiers or touches) or any(x not in WORKER_TIERS for x in tiers):
-            raise NotConfigured(f"{CONFIG_FILE}: [[accept]] #{n} needs tiers (from {WORKER_TIERS}) and/or touches")
-        ACCEPT.append({"tiers": list(tiers), "touches": [str(x).strip("/") for x in touches]})
+    def match_rules(key, allowed):
+        """[[key]] rules as {tiers, touches}: each needs tiers (from `allowed`) and/or touches."""
+        out = []
+        for n, rule in enumerate(CFG.get(key) or [], 1):
+            if not isinstance(rule, dict):
+                raise NotConfigured(f"{CONFIG_FILE}: {key} must be a [[{key}]] table")
+            tiers, touches = rule.get("tiers") or [], rule.get("touches") or []
+            tiers = [tiers] if isinstance(tiers, str) else tiers
+            touches = [touches] if isinstance(touches, str) else touches
+            if (not (tiers or touches) or not isinstance(tiers, list) or not isinstance(touches, list)
+                    or any(x not in allowed for x in tiers)):
+                raise NotConfigured(f"{CONFIG_FILE}: [[{key}]] #{n} needs tiers (from {allowed}) and/or touches")
+            out.append({"tiers": list(tiers), "touches": [str(x).strip("/") for x in touches]})
+        return out
+    ACCEPT = match_rules("accept", WORKER_TIERS)
+    # The two-person rule (docs/shared-state.md) counts verified approvals from distinct
+    # principals in the approvers file, which only shared mode has. Without [shared] it would
+    # silently mean nothing, so it is an error instead.
+    TWO_PERSON = match_rules("two_person", _tasks.TIERS)
+    if TWO_PERSON and SHARED is None:
+        raise NotConfigured(f"{CONFIG_FILE}: [[two_person]] needs [shared]: it counts signed approvals from "
+                            f"different approvers, and only shared mode signs and verifies approvals")
     state_rel = re.escape(STATE.relative_to(HOME).as_posix())
     TASK_FILE = re.compile(rf"(?:^|/){state_rel}/(items/[^/\s]+|epics/[^/\s]+/(EPIC|T-[^/\s]+))\.md$")
     TASK_DIR_IN_CMD = re.compile(rf"(?:^|[\s/\"'=]){state_rel}/(items|epics)\b")

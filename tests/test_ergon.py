@@ -1648,6 +1648,13 @@ class TestCommitHook(DispatchProject):
         f = self.task_file("T-001")
         f.write_text(f.read_text().replace("status: proposed", "status: ready"))
         self.assertEqual(self.commit("Sneak (T-001)").returncode, 1)
+        # Nor is a stamp on a task still in proposed (a two-person task waiting for its second
+        # approver, T-021, or a stamp written by hand).
+        f.write_text(re.sub(r"^approved:.*$", "approved: Tester 2026-01-01", f.read_text().replace(
+            "status: ready", "status: proposed"), flags=re.M))
+        r = self.commit("Stamped but proposed (T-001)")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("T-001: proposed, and no human has approved it", r.stderr)
 
     def test_worktree_and_merge(self):
         self.ergon("init", "--hooks")
