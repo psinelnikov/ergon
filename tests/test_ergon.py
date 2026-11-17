@@ -1468,6 +1468,16 @@ class TestReport(Project):
         self.assertTrue((self.root / "tasks" / ".report-last").exists())
         self.assertNotIn("Landed", self.ergon("report", "--since", "last").stdout)
 
+    def test_report_blocked_clips_title_and_note_separately(self):
+        self.ergon("new", "task", "T" * 150, "--tier", "sonnet")
+        f = self.task_file("T-001")
+        f.write_text(re.sub(r"^status: \w+$", "status: blocked", f.read_text(), flags=re.M).rstrip()
+                     + "\n- 2026-11-08 dispatch: " + "n" * 150 + "\n")
+        out = self.ergon("report").stdout
+        lines = out.split("Blocked\n")[1].splitlines()
+        self.assertTrue(lines[0].startswith("  T-001  TTT") and lines[0].endswith("…"))
+        self.assertTrue(lines[1].startswith("      ") and "nnn" in lines[1] and lines[1].endswith("…"))
+
 
 
 class TestCommitHook(DispatchProject):

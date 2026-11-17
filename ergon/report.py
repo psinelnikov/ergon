@@ -157,8 +157,13 @@ def report(args):
             if not qs:
                 asking.append("      (no question found in its Notes)")
     section("Awaiting your answer", asking, full)
-    section("Blocked", [f"  {i}  {t['title']}" + (f"\n      {last_note(t)}" if last_note(t) else "")
-                        for i, t in sorted(tasks.items()) if t["status"] == "blocked" and not _tasks.is_asking(t)])
+    blocked = []
+    for i, t in sorted(tasks.items()):
+        if t["status"] == "blocked" and not _tasks.is_asking(t):
+            blocked.append(f"  {i}  {t['title']}")
+            if last_note(t):
+                blocked.append(f"      {last_note(t)}")
+    section("Blocked", blocked)
     section("Awaiting acceptance", [f"  {i}  {t['title']}  (`ergon accept {i}` or `ergon reject {i} --reason R`)"
                                     for i, t in sorted(tasks.items()) if t["status"] == "review"])
     out[:] = [l for x in out for l in x.split("\n")]
