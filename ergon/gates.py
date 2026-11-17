@@ -1050,19 +1050,47 @@ def is_runs(path):
         return bool(_config.RUNS_PATH.search(p.as_posix()))
 
 
-def names_outside_data(cmd, pattern):
+def names_outside_data(cmd, pattern, cwd=None):
     """Whether shell text names pattern anywhere but in a heredoc's data. A heredoc's body is data
     (`cat > tests/t.py <<'EOF'` writing a test that mentions the path) unless it reaches a program
     that runs it or turns it into arguments (a shell or interpreter, xargs, also through a pipe),
-    or it expands a $(...) or `...`. Text that can't be split is matched whole."""
+    or it expands a $(...) or `...`. Text that can't be split is matched whole.
+    With cwd (where the command runs), a word also counts as the path it names from there, after
+    any `cd` or `pushd` before it: `cd tasks && echo x > items/T-001.md` names tasks/items. A `cd`
+    can fail or sit in a subshell, so a word is tried from every directory the shell may be in."""
+    return _names_outside_data(cmd, pattern, {os.path.normpath(cwd)} if cwd else set())
+
+
+MAX_CWDS = 256  # directories _names_outside_data follows before it gives up and counts the text as a match
+
+
+def _names_outside_data(cmd, pattern, dirs):
     try:
         cmds = shell_commands(cmd)[0]
     except (ValueError, RecursionError):
         return bool(pattern.search(cmd))
+    dirs = set(dirs)
+
+    def names(t):
+        return bool(pattern.search(t)) or any(
+            pattern.search(os.path.normpath(os.path.join(d, os.path.expanduser(t)))) for d in dirs)
+
     for words, docs in cmds:
-        code = any(CODE_RUNNER.fullmatch(_program(w)) or _program(w) == "xargs" for w in words)
+        runs = any(CODE_RUNNER.fullmatch(_program(w)) for w in words)
+        code = runs or any(_program(w) == "xargs" for w in words)
         live = [d for d, expands in docs if code or (expands and re.search(r"\$\(|`", d))]
-        if any(pattern.search(t) for t in words + live):
+        if any(names(t) for t in words + live):
+            return True
+        # bash -c 'cd tasks && ...', a heredoc fed to sh, or one whose $(...) runs a command
+        if dirs and any(t != cmd and _names_outside_data(t, pattern, dirs) for t in (words if runs else []) + live):
+            return True
+        k = next((i for i, w in enumerate(words) if _program(w) in ("cd", "pushd")), None)
+        if k is None or not dirs:
+            continue
+        target = next((w for w in words[k + 1:] if not w.startswith("-")), None)
+        target = os.path.expanduser(target or "~")
+        dirs |= {os.path.normpath(os.path.join(d, target)) for d in dirs}
+        if len(dirs) > MAX_CWDS:
             return True
     return False
 
@@ -1162,7 +1190,7 @@ def guard_reason(tool, inp, worker=False, cwd=None):
             return POLICY_MSG
         if SHELL_WRITE.search(cmd) and names_outside_data(cmd, _config.RUNS_IN_CMD):
             return RUNS_MSG
-        if SHELL_WRITE.search(cmd) and names_outside_data(cmd, _config.TASK_DIR_IN_CMD):
+        if SHELL_WRITE.search(cmd) and names_outside_data(cmd, _config.TASK_DIR_IN_CMD, cwd or str(_config.HOME)):
             return ("don't write task files from the shell: use `ergon new` / `ergon set` for state, "
                     "Edit for a task's body")
         return None

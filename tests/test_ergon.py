@@ -160,8 +160,8 @@ class Project(unittest.TestCase):
     def status(self, tid):
         return re.search(r"^status: (\w+)", self.task_file(tid).read_text(), re.M).group(1)
 
-    def guard(self, tool, tool_input, *extra, env=None):
-        event = json.dumps({"tool_name": tool, "tool_input": tool_input, "cwd": str(self.root)})
+    def guard(self, tool, tool_input, *extra, env=None, cwd=None):
+        event = json.dumps({"tool_name": tool, "tool_input": tool_input, "cwd": str(cwd or self.root)})
         out = self.ergon("hook", "guard", *extra, inp=event, env=env).stdout
         return json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"] if out.strip() else None
 
@@ -2004,6 +2004,37 @@ class TestPolicies(TestReview):
                         f"cat > notes.md <<EOF\n`echo x >> {target}`\nEOF",
                         f"cat <<EOF > x 'open quote\n{target}\nEOF"):
                 self.assertIn(why, self.guard("Bash", {"command": cmd}, "--worker") or "", cmd)
+
+    def test_guard_task_dir_rule_follows_cd(self):
+        """A write that names a task file relative to a `cd` into the state dir is still refused (T-088)."""
+        why = "task files"
+        tasks = self.root / "tasks"
+        for cmd in ("cd tasks && echo x > items/T-001.md",
+                    "cd tasks; rm epics/E-001/T-002.md",
+                    "cd ./tasks/ && cd items && sed -i s/a/b/ T-001.md",
+                    f"cd {tasks} && cp /tmp/x items/T-001.md",
+                    "pushd tasks >/dev/null && echo x >> items/T-001.md",
+                    "cd /nonexistent; cd tasks && echo x > items/T-001.md",
+                    "(cd tasks && echo x > items/T-001.md)",
+                    "(cd /tmp); echo x > tasks/items/T-001.md",
+                    "cd docs && echo x > ../tasks/items/T-001.md",
+                    "bash -c 'cd tasks && echo x > items/T-001.md'",
+                    "sh <<'EOF'\ncd tasks\necho x > items/T-001.md\nEOF",
+                    "cat <<'EOF' | bash\ncd tasks/items && echo x > T-001.md\nEOF",
+                    "cd tasks && cat > notes.md <<EOF\n$(rm items/T-001.md)\nEOF"):
+            self.assertIn(why, self.guard("Bash", {"command": cmd}, "--worker") or "", cmd)
+        # The hook's cwd is where the shell already is: a session that ran `cd tasks` earlier.
+        for cmd in ("echo x > items/T-001.md", "rm epics/E-001/T-002.md", "cd items && echo x > T-001.md",
+                    "(cd /tmp); echo x > items/T-001.md", "cd /nonexistent; echo x > items/T-001.md"):
+            self.assertIn(why, self.guard("Bash", {"command": cmd}, cwd=tasks) or "", cmd)
+        self.assertIn(why, self.guard("Bash", {"command": "echo x > T-001.md"}, cwd=tasks / "items") or "")
+        # Relative writes elsewhere, and heredoc data that only mentions the dirs, still pass.
+        for cmd, cwd in (("cd tasks && echo x > notes.md", None),
+                         ("cd docs && echo x > items/T-001.md", None),
+                         ("cd tasks && cd .. && echo x > README.md", None),
+                         ("cd tasks && cat > ../tests/test_x.py <<'EOF'\nf = 'items/T-001.md'\nEOF", None),
+                         ("echo x > ../README.md", tasks)):
+            self.assertIsNone(self.guard("Bash", {"command": cmd}, "--worker", cwd=cwd), cmd)
 
     def test_worker_policy_line_becomes_note(self):
         self.ergon("new", "task", "Reviewed", "--tier", "haiku")
