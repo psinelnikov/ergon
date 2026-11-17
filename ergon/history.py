@@ -15,6 +15,7 @@ import datetime
 import fcntl
 import json
 import os
+import re
 import sys
 
 from . import config as _config
@@ -81,4 +82,80 @@ def read(p=None):
                     out.append(r)
     except OSError:
         pass
+    return out
+
+
+_OUTSIDE = re.compile(r"^outside:|Ctrl-C|dispatch was interrupted|past the \$[\d.]+ cap", re.I)
+_STAMP = re.compile(r"^(?P<who>.*?)\s+(?P<day>\d{4}-\d{2}-\d{2})\s*$")
+
+
+def _week(at):
+    try:
+        y, w, _ = datetime.date.fromisoformat(str(at or "")[:10]).isocalendar()
+    except ValueError:
+        return None
+    return f"{y}-W{w:02d}"
+
+
+def approver_signals(tasks, rows, since=None, epic=None, until=None):
+    """How the tasks each approver approved went, as counts of tasks:
+    {name: {"approved", "tiers", "landed", "escalated", "blocked", "asked", "fails", "sent_back",
+    "weeks": {week: {"landed", "tiers", "escalated", "fails"}}}}; `fails` counts the review fails
+    of landed tasks. Rows outside since/until/epic are left out. A task with no `approved` row
+    is attributed from its `approved:` stamp; one nobody can be found for goes under "(unknown)".
+    Never raises on odd rows."""
+    keep = []
+    for r in rows:
+        d = str(r.get("at") or "")[:10]
+        if (since and d < since) or (until and d > until) or (epic and r.get("epic") != epic):
+            continue
+        keep.append(r)
+    by = {}
+    for r in keep:
+        by.setdefault(r.get("task"), []).append(r)
+    has_row = {r.get("task") for r in rows if r.get("event") == "approved"}
+    who_of = {}  # task -> (names, tier)
+    for tid, trail in by.items():
+        ap = [r for r in trail if r["event"] == "approved"]
+        if ap:
+            r = ap[-1]
+            names = r.get("approvers") if isinstance(r.get("approvers"), list) and r["approvers"] else [r.get("by")]
+            who_of[tid] = ([str(n) for n in names if n] or ["(unknown)"], r.get("tier"))
+    for tid, t in tasks.items():
+        if tid in has_row or not t.get("approved"):
+            continue
+        if epic and t.get("epic") != epic:
+            continue
+        m = _STAMP.match(re.sub(r"\s*sha256:\S+\s*$", "", str(t["approved"])).strip())
+        if m and ((since and m["day"] < since) or (until and m["day"] > until)):
+            continue
+        names = [n.strip() for n in m["who"].split(" and ") if n.strip()] if m else []
+        who_of[tid] = (names or ["(unknown)"], None)
+    out = {}
+    for tid, (names, tier) in who_of.items():
+        trail = by.get(tid, [])
+        ev = lambda e: [r for r in trail if r["event"] == e]
+        tier = tier or (tasks.get(tid) or {}).get("tier") or "?"
+        landed = ev("landed")
+        fails = sum(r.get("verdict") == "fail" for r in ev("review"))
+        blocked = any(not r.get("asked") and not _OUTSIDE.search(str(r.get("reason") or "")) for r in ev("blocked"))
+        esc = bool(ev("escalated"))
+        week = _week(landed[0]["at"]) if landed else None
+        for name in dict.fromkeys(names):
+            a = out.setdefault(name, {"approved": 0, "tiers": {}, "landed": 0, "escalated": 0, "blocked": 0,
+                                      "asked": 0, "fails": 0, "sent_back": 0, "weeks": {}})
+            a["approved"] += 1
+            a["tiers"][tier] = a["tiers"].get(tier, 0) + 1
+            a["landed"] += bool(landed)
+            a["escalated"] += esc
+            a["blocked"] += blocked
+            a["asked"] += bool(ev("question"))
+            a["fails"] += fails if landed else 0
+            a["sent_back"] += any(r.get("from") == "review" and r.get("to") == "ready" for r in ev("rejected"))
+            if week:
+                w = a["weeks"].setdefault(week, {"landed": 0, "tiers": {}, "escalated": 0, "fails": 0})
+                w["landed"] += 1
+                w["tiers"][tier] = w["tiers"].get(tier, 0) + 1
+                w["escalated"] += esc
+                w["fails"] += fails
     return out

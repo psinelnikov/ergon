@@ -60,7 +60,7 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                or Ctrl-C (stop launching, let workers finish; a second kills them)
                                A reviewer's fail (`review` in .ergon.toml) goes back to the worker
                                and is reviewed again, up to review_rounds times, then blocks
-  ergon stats [--since DATE] [--epic E]
+  ergon stats [--since DATE] [--epic E] [--approver NAME | --approvers]
                                read-only: per tier, runs / done / blocked / block rate / cost /
                                timeouts from <state>/runs/*.json, and tasks that blocked twice+
   ergon serve [--port 4300] [--bind 127.0.0.1]
@@ -80,6 +80,13 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                Only new and changed tasks are graded, against --per anchors
                                spread over the graded ones (all, with under 3 graded, or --all).
                                --dry-run lists the pairs and asks nothing
+  ergon journal [E-ID ...] [--all] [--model sonnet] [--budget USD]
+                               one `claude -p` (no tools) per epic writes its journal entry: what it
+                               set out to do, what landed, how the work went (from its history rows
+                               and commits), to <state>/runs/journal/E-NNN-<time>.json, shown on
+                               /e/E-NNN. No IDs: epics with no entry or newer history rows; --all:
+                               every epic; IDs always rewrite. An epic that finishes gets one too,
+                               unless `journal = false` in .ergon.toml
   ergon sync [--init | --join] HUMAN ONLY, with [shared] in .ergon.toml (docs/shared-state.md):
                                commit pending state edits, fetch, merge and push the state branch.
                                --init creates it from local state (first person), --join checks
@@ -97,6 +104,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import sys
 import threading
@@ -110,6 +118,7 @@ from . import dispatch as _dispatch
 from . import gates as _gates
 from . import gitops as _gitops
 from . import grade as _grade
+from . import history as _history
 from . import report as _report
 from . import serve as _serve
 from . import shared as _shared
@@ -244,6 +253,37 @@ def quiz(args):
         print(f"no usable question on {' '.join(missed)}: run `ergon quiz` again for them")
 
 
+def journal(args):
+    epics = _tasks.load(_config.EPICS)
+    if args.ids:
+        bad = [i for i in args.ids if i not in epics]
+        if bad:
+            raise SystemExit(f"no such epic: {' '.join(bad)}")
+        todo = list(dict.fromkeys(args.ids))
+    elif args.all:
+        todo = sorted(epics)
+    else:
+        rows = _history.read()
+        todo = [i for i in sorted(epics) if _gitops.journal_stale(i, rows, _gitops.latest_journal(i)[1])]
+    if not todo:
+        print("every epic's journal entry is newer than its last history row; --all writes them again")
+        return
+    if not shutil.which("claude"):
+        raise SystemExit("ergon journal: `claude` isn't on PATH")
+    failed = 0
+    for eid in todo:
+        print(f"ergon journal: asking {args.model} about {eid}", flush=True)
+        try:
+            path = _gitops.journal_entry(eid, args.model, args.budget)
+        except _gitops.GitError as err:
+            print(f"ergon journal: {eid}: {err}; nothing written", file=sys.stderr)
+            failed += 1
+            continue
+        print(f"wrote {path.relative_to(_config.HOME)}")
+    if failed:
+        sys.exit(1)
+
+
 def rules(args):
     text = _dispatch.worker_rules()
     print(text or f"(no worker_rules in {_config.CONFIG_FILE}: follow the project's CLAUDE.md / AGENTS.md)")
@@ -308,6 +348,10 @@ def main():
     ss = sub.add_parser("stats")
     ss.add_argument("--since", metavar="DATE", help="YYYY-MM-DD: runs started that day or later")
     ss.add_argument("--epic")
+    ss.add_argument("--approver", metavar="NAME", help="show this approver's record, not yours")
+    ss.add_argument("--approvers", action="store_true",
+                    help="show every approver on one table (by default each person sees only their own record: "
+                         "it's for judging your own briefs, not a league table)")
     rp = sub.add_parser("report")
     rp.add_argument("--since", metavar="DATE|last", help="YYYY-MM-DD, or `last` for the previous report")
     sv = sub.add_parser("serve", help="read-only web board and task pages")
@@ -327,6 +371,11 @@ def main():
     gr.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
     gr.add_argument("--all", action="store_true", help="regrade every open task, not only new and changed ones")
     gr.add_argument("--dry-run", action="store_true", help="print the pairs; ask nothing, write nothing")
+    jn = sub.add_parser("journal", help="write each epic's journal entry, shown on /e/E-NNN (runs claude -p)")
+    jn.add_argument("ids", nargs="*", metavar="E-ID", help="epics to write (default: those with no entry or newer history)")
+    jn.add_argument("--all", action="store_true", help="every epic, not only those with a missing or stale entry")
+    jn.add_argument("--model", default="sonnet", help="default sonnet")
+    jn.add_argument("--budget", type=float, help="max USD per epic (--max-budget-usd)")
     sub.add_parser("check")
     sub.add_parser("tidy")
     sy = sub.add_parser("sync", help="HUMAN ONLY: commit, fetch, merge and push the shared state branch")
@@ -372,6 +421,13 @@ def main():
     _config.ITEMS.mkdir(parents=True, exist_ok=True)
     _config.EPICS.mkdir(parents=True, exist_ok=True)
     _shared.COMMAND = args.cmd
+    try:
+        run(args)
+    finally:  # no lock is held here: epics this command finished get their journal entry now
+        _gitops.flush_journals()
+
+
+def run(args):
     if args.cmd in (None, "board"):
         if args.cmd is None:
             args.tier = args.epic = None
@@ -385,7 +441,7 @@ def main():
         # writes only, not the minutes claude takes to answer
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
-         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "sync": _shared.sync}[args.cmd](args)
+         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "journal": journal, "sync": _shared.sync}[args.cmd](args)
 
 
 if __name__ == "__main__":
