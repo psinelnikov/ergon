@@ -2018,7 +2018,13 @@ class TestPriority(unittest.TestCase):
     def test_score(self):
         from ergon.priority import score
         ts = self.mk({"id": "A", "cod": "30"}, {"id": "B", "depends": ["A"]})
-        self.assertEqual(score(ts["A"], ts), (30 + 25) / 3)
+        self.assertEqual(score(ts["A"], ts), (30 + 60) / 3)
+
+    def test_sonnet_with_two_dependents_outranks_haiku_at_mid_cod(self):
+        from ergon.priority import score
+        ts = self.mk({"id": "A", "cod": 50}, {"id": "B", "depends": ["A"]}, {"id": "C", "depends": ["A"]},
+                     {"id": "H", "tier": "haiku", "cod": 50})
+        self.assertGreater(score(ts["A"], ts), score(ts["H"], ts))
 
     def test_pin_buckets(self):
         from ergon.priority import sort_key

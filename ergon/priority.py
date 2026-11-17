@@ -3,7 +3,7 @@ from . import tasks as _tasks
 
 SIZE = {"haiku": 1, "sonnet": 3, "opus": 8, "human": 3}
 NEUTRAL_COD = 50
-UNBLOCK_WEIGHT = 25
+UNBLOCK_WEIGHT = 60  # sonnet w/ 2 dependents beats haiku while cod < 60 (covers NEUTRAL_COD)
 CLOSED = {"done", "dropped"}
 
 
