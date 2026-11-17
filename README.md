@@ -140,6 +140,8 @@ branch = "ergon-state"       # orphan branch holding items/ and epics/
    min_tier = "human"
    ```
 
+5. Keep the policies file on the trunk. In local mode it defaults to `<state>/policies.md`, which is yours alone. In shared mode only `items/` and `epics/` travel on the state branch, and policies are inlined into every worker's and reviewer's prompt, so they don't go on the unsigned state branch. Set `policies = ".ergon/policies.md"` (or any trunk path) and commit the file through normal code review. `ergon sync --init` and `--join` print a hint while it is unset or points into `<state>/`.
+
 **Privacy.** Syncing publishes every brief and every Note. If the code repo is public, an `ergon-state` branch on the same remote is public too. Set `remote` to the URL of a separate private repo.
 
 **Who syncs.** Only humans and the dispatcher. `ergon sync` refuses inside an agent shell and on a `task/` branch, and the guard blocks git writes in the state worktree. An agent's `new` or `set` is committed locally and goes out at your next sync. `approve`, `accept`, `reject` and `close` sync before and after. Run logs (`runs/`) stay local, so `stats` and `report` are per machine.

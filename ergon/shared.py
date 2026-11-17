@@ -862,6 +862,18 @@ def init_warnings():
     return out
 
 
+def policies_hint():
+    """A one-line hint when the policies file is unset or inside <state>/, where shared mode
+    tracks nothing of it: policies are inlined into every worker's prompt, so they belong on the
+    trunk, under code review (like the approvers file)."""
+    pol = _config.POLICIES.resolve()
+    if _config.CFG.get("policies") and not pol.is_relative_to(_config.STATE.resolve()):
+        return
+    print('hint: policies stay on this machine in shared mode (not on the state branch). Set '
+          'policies = ".ergon/policies.md" (or any trunk path) in .ergon.toml and commit the file '
+          'through your normal review flow.')
+
+
 def exclude_state():
     """Keep <state>/ out of the trunk's `git status` and `git add -A`: a nested worktree shows up
     there as one untracked folder. In .git/info/exclude, so it is this clone's alone."""
@@ -958,6 +970,7 @@ def init():
             print(f"warning: {_config.STATE} differs from what was pushed:\n{stray}")
     print(f"pushed {b} to {remote()}; {_config.STATE} is now a worktree of it. Commit [shared] in "
           f"{_config.CONFIG_FILE}; teammates then run `ergon sync --join`.")
+    policies_hint()
 
 
 def join():
@@ -988,3 +1001,4 @@ def join():
             raise SystemExit(f"sync --join: {err}")
     print(f"joined: {_config.STATE} is a worktree of {b} ({len(task_files())} task and epic files). "
           f"Run `ergon sync` to stay in step.")
+    policies_hint()

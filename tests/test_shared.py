@@ -358,6 +358,21 @@ class TestWhoSyncs(Shared):
         self.assertFalse((self.a / "tasks" / ".git").exists())
         self.assertEqual(sh("git", "ls-remote", "--heads", str(origin), "ergon-state", cwd=self.a).stdout, "")
 
+    def test_init_and_join_hint_about_policies_unless_on_the_trunk(self):
+        hint = "policies stay on this machine"
+        self.ergon(self.a, "new", "task", "One", "--tier", "haiku")
+        r = self.ergon(self.a, "sync", "--init", inp="y\n")
+        self.assertIn(hint, r.stdout)
+        r = self.ergon(self.b, "sync", "--join")
+        self.assertIn(hint, r.stdout)
+        # configured to a trunk path: no hint
+        c = Path(self.tmp.name) / "c"
+        sh("git", "clone", "-q", str(self.a), str(c), cwd=self.a)
+        (c / ".ergon.toml").write_text(
+            SHARED_CONFIG.replace("[shared]", 'policies = ".ergon/policies.md"\n\n[shared]').format(remote=self.remote))
+        r = self.ergon(c, "sync", "--join")
+        self.assertNotIn(hint, r.stdout)
+
     def test_join_refuses_local_tasks_and_init_refuses_twice(self):
         self.start()
         r = self.ergon(self.a, "sync", "--init", check=False, inp="y\n")
