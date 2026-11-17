@@ -629,6 +629,51 @@ class TestDispatch(DispatchProject):
                     self.assertEqual(order[:2], ["doingT-001", "doingT-002"], out)
                     self.assertEqual(held, [])
 
+    def test_empty_touches_and_parent_dirs_overlap(self):
+        cases = [  # (touches of One, touches of Two, held?)
+            ("", "x.py", True),          # empty vs anything
+            ("x.py", "", True),
+            ("", "", True),
+            ("ergon", "ergon/gates.py", True),   # parent / child
+            ("skills/ergon/SKILL.md", "skills", True),
+            ("ergon", "ergonx/a.py", False),     # near miss
+            ("ergon/a.py", "ergon/b.py", False),
+            ("shared.py", "shared.py", True),
+        ]
+        for one, two, want in cases:
+            with self.subTest(one=one, two=two):
+                self.setUp()
+                for title, touches in (("One", one), ("Two", two)):
+                    args = ["new", "task", title, "--tier", "sonnet"] + (["--touches", touches] if touches else [])
+                    self.ergon(*args)
+                for t in ("T-001", "T-002"):
+                    stamp(self.task_file(t))
+                dry = self.ergon("dispatch", "--dry-run").stdout
+                self.assertEqual("held       T-002 behind T-001" in dry, want, dry)
+                self.assertEqual("overlap" in dry, False, dry)
+                if not (one and two):
+                    self.assertIn("no touches: declared", dry)
+                out = self.ergon("dispatch", "--jobs", "2").stdout
+                self.assertEqual(self.status("T-002"), "done", out)
+                order = [l.split()[0] + l.split()[1] for l in out.splitlines() if l.split()[:1] in (["doing"], ["done"])]
+                held = [r for r in history(self.root) if r["event"] == "held"]
+                if want:
+                    self.assertEqual(order, ["doingT-001", "doneT-001", "doingT-002", "doneT-002"], out)
+                    reason = ["(none declared)"] if not (one and two) else [max(one, two, key=lambda p: p.count("/"))]
+                    self.assertEqual([(r["task"], r["touches"]) for r in held], [("T-002", reason)])
+                else:
+                    self.assertEqual(order[:2], ["doingT-001", "doingT-002"], out)
+                    self.assertEqual(held, [])
+
+    def test_companion_name_alone_does_not_hold(self):
+        for title in ("One", "Two"):
+            self.ergon("new", "task", title, "--tier", "sonnet", "--touches", "acme/public")
+        for t in ("T-001", "T-002"):
+            stamp(self.task_file(t))
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertNotIn("held       T-002", dry)
+        self.assertNotIn("overlap", dry)
+
     def test_found_lines_become_proposed_tasks(self):
         for res, want in (("RESULT: done", "done"), ("RESULT: blocked — nope", "blocked")):
             with self.subTest(res):
@@ -1227,8 +1272,8 @@ class TestAccept(DispatchProject):
 
     def test_review_holds_then_accept_lands_and_closes_epic(self):
         self.ergon("new", "epic", "Big thing")
-        self.ergon("new", "task", "Risky", "--tier", "opus", "--epic", "E-001")
-        self.ergon("new", "task", "Routine", "--tier", "sonnet", "--epic", "E-001")
+        self.ergon("new", "task", "Risky", "--tier", "opus", "--epic", "E-001", "--touches", "r.py")
+        self.ergon("new", "task", "Routine", "--tier", "sonnet", "--epic", "E-001", "--touches", "q.py")
         for t in ("T-001", "T-002"):
             stamp(self.task_file(t))
         dry = self.ergon("dispatch", "--dry-run").stdout
@@ -1364,9 +1409,9 @@ class TestHistory(DispatchProject):
 
     def test_done_blocked_and_reviewed_sequences(self):
         self.ergon("new", "epic", "Small epic")
-        self.ergon("new", "task", "Plain", "--tier", "sonnet", "--epic", "E-001")
-        self.ergon("new", "task", "Stuck", "--tier", "opus")
-        self.ergon("new", "task", "Checked", "--tier", "haiku", "--source", "TODO.md:3")
+        self.ergon("new", "task", "Plain", "--tier", "sonnet", "--epic", "E-001", "--touches", "p.py")
+        self.ergon("new", "task", "Stuck", "--tier", "opus", "--touches", "s.py")
+        self.ergon("new", "task", "Checked", "--tier", "haiku", "--source", "TODO.md:3", "--touches", "c.py")
         code, out = TestAccept.human(self, "approve", "T-001", "T-002", "T-003")
         self.assertEqual(code, 0, out)
         self.env["FAKE_RESULT_OPUS"] = "RESULT: blocked \u2014 needs the prod password"
@@ -1431,8 +1476,8 @@ class TestHistory(DispatchProject):
         self.assertNotIn("skipped", stats)
 
     def test_failed_verify_and_review(self):
-        self.ergon("new", "task", "Red", "--tier", "sonnet")
-        self.ergon("new", "task", "Vetoed", "--tier", "haiku")
+        self.ergon("new", "task", "Red", "--tier", "sonnet", "--touches", "r.py")
+        self.ergon("new", "task", "Vetoed", "--tier", "haiku", "--touches", "v.py")
         for t in ("T-001", "T-002"):
             stamp(self.task_file(t))
         f = self.task_file("T-001")
@@ -1456,7 +1501,7 @@ class TestHistory(DispatchProject):
 
     def test_parallel_jobs_never_tear_a_row(self):
         for n in range(6):
-            self.ergon("new", "task", f"Job {n}", "--tier", "sonnet")
+            self.ergon("new", "task", f"Job {n}", "--tier", "sonnet", "--touches", f"j{n}.py")
             stamp(self.task_file(f"T-00{n + 1}"))
         self.env.update(FAKE_FOUND="|".join(f"Follow-up {i} — " + "why " * 300 for i in range(3)))
         out = self.ergon("dispatch", "--jobs", "6").stdout

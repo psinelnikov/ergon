@@ -971,6 +971,7 @@ def dispatch(args):
 
     def spent():
         return sum(r[3].get("cost", 0) for r in results)
+    NO_TOUCHES = "(none declared)"
     every_touch = {k for c in _config.COMPANIONS for k in c["touches"]}
 
     def eligible(tasks):
@@ -1200,9 +1201,27 @@ def dispatch(args):
         return t, verdict, why, info
 
     def shared(a, b):
-        """Paths both tasks name. A companion itself isn't shared: each task gets its own
-        worktree of it, so only paths inside it that both name count."""
-        return sorted((set(a.get("touches") or []) & set(b.get("touches") or [])) - every_touch)
+        """Paths both tasks name, or one inside the other (split on `/`). A task with no
+        `touches:` overlaps every other task. A companion itself isn't shared: each task gets
+        its own worktree of it, so only paths inside it that both name count."""
+        ta, tb = a.get("touches") or [], b.get("touches") or []
+        if not ta or not tb:
+            return [NO_TOUCHES]
+        out = set()
+        for x in ta:
+            for y in tb:
+                px, py = x.strip("/").split("/"), y.strip("/").split("/")
+                n = min(len(px), len(py))
+                if px[:n] == py[:n]:
+                    out.add(x if len(px) >= len(py) else y)
+        return sorted(out - every_touch)
+
+    def why_shared(a, b):
+        got = shared(a, b)
+        if got == [NO_TOUCHES]:
+            who = [t["id"] for t in (a, b) if not t.get("touches")]
+            return " and ".join(who) + (" has" if len(who) == 1 else " have") + " no touches: declared"
+        return "both touch " + ", ".join(got)
 
     def also(t):
         return "".join(f" + {c['name']} {c['trunk']}" for c in _config.COMPANIONS if companion_touch(t, c))
@@ -1269,12 +1288,12 @@ def dispatch(args):
         for i, a in enumerate(plan):
             for b in plan[:i]:
                 if shared(a, b):
-                    print(f"  held       {a['id']} behind {b['id']}: both touch {', '.join(shared(a, b))}")
+                    print(f"  held       {a['id']} behind {b['id']}: {why_shared(a, b)}")
                     break
         for a in plan:
             for b in (t for t in tasks.values() if t["status"] in ("doing", "review")):
                 if shared(a, b):
-                    print(f"  overlap    {a['id']} and {b['id']} ({b['status']}) both touch {', '.join(shared(a, b))}")
+                    print(f"  overlap    {a['id']} and {b['id']} ({b['status']}) {why_shared(a, b)}")
     else:
         running, launched, active = {}, 0, {}  # active: running task id -> task
         held_on = {}  # task id -> the running task it was last recorded held behind
