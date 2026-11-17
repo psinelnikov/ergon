@@ -97,11 +97,8 @@ import json
 import os
 import re
 import shlex
-import shutil
 import signal
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -183,8 +180,6 @@ array, no prose and no code fence:
 
 {briefs}"""
 
-QUIZ_TIMEOUT = 600
-
 
 def quiz_brief(t):
     keys = ("title", "tier", "tier_why", "depends", "touches", "epic")
@@ -219,26 +214,10 @@ def quiz(args):
     if not ask:
         print("every proposed task already has current questions in the newest quiz; --all to write them again")
         return
-    if not shutil.which("claude"):
-        raise SystemExit("ergon quiz: `claude` isn't on PATH")
     hashes = {i: _serve.brief_hash(t) for i, t in ask.items()}
     prompt = QUIZ_PROMPT.format(per=args.per, briefs="\n".join(quiz_brief(t) for t in ask.values()))
-    cmd = ["claude", "-p", "--model", args.model, "--tools", "", "--output-format", "json"]
-    if args.budget:
-        cmd += ["--max-budget-usd", str(args.budget)]
     print(f"ergon quiz: asking {args.model} about {len(ask)} task(s): {' '.join(ask)}", flush=True)
-    with tempfile.TemporaryDirectory() as cwd:  # no project CLAUDE.md or hooks; the briefs are inline
-        try:
-            r = subprocess.run(cmd, input=prompt, cwd=cwd, capture_output=True, text=True, timeout=QUIZ_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            raise SystemExit(f"ergon quiz: claude took over {QUIZ_TIMEOUT // 60} min; nothing written")
-    try:
-        d = json.loads(r.stdout)
-    except ValueError:
-        d = None
-    if not isinstance(d, dict) or d.get("is_error"):
-        why = (d or {}).get("result") if isinstance(d, dict) else (r.stderr.strip() or r.stdout.strip())
-        raise SystemExit(f"ergon quiz: claude failed ({str(why or 'no output')[:300]}); nothing written")
+    d = _grade.call(prompt, args.model, args.budget, "quiz")
     items = quiz_items(d.get("result"))
     if items is None:
         raise SystemExit(f"ergon quiz: claude's reply wasn't a JSON array of questions; nothing written:\n"

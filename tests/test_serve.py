@@ -434,6 +434,17 @@ class TestReview(ServeFixture):
         self.assertIn("nothing written", r.stderr)
         self.assertFalse((self.runs / "quiz").exists())
 
+    def test_quiz_claude_error_names_quiz(self):
+        # the claude -p call is grade.call, shared with `ergon grade`; its messages name the caller
+        env = self.fake_claude()
+        bindir = Path(self.tmp.name) / "bin"
+        (bindir / "claude").write_text(f"#!{sys.executable}\nimport json\n"
+                                       f"print(json.dumps({{'is_error': True, 'result': 'over budget'}}))\n")
+        r = self.ergon("quiz", env=env, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("ergon quiz: claude failed (over budget); nothing written", r.stderr)
+        self.assertFalse((self.runs / "quiz").exists())
+
 
 class TestServeUnits(unittest.TestCase):
     def test_quiz_items(self):
