@@ -9,8 +9,10 @@ a [shared] table in .ergon.toml nothing here runs, and no command touches git fo
   the state branch as the lock is released. Those commits never need the network.
 - `ergon sync` commits pending edits, fetches, merges and pushes, and fetches and merges again
   when the push is rejected because someone pushed in between. It merges, never rebases.
-- The merge is conservative for now: if both sides changed the same task since they last met,
-  sync stops, reports it, and merges and pushes nothing. Field-level merging replaces that.
+- The merge pairs tasks and epics by ID and merges each one changed on both sides field by field
+  ("Concurrent edits to one task"): status is compare-and-set, `approved:` is never merged as
+  text, `accept:` sticks to yes, Notes are a union, the brief goes through `git merge-file`, and
+  the remote wins a real conflict, which is reported. Ergon computes the merge commit's tree.
 - Only a human syncs: never from an agent shell, never from a task/ branch. The guard refuses
   `ergon sync` and git writes in the state worktree from agents.
 """
@@ -20,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from . import config as _config
@@ -193,34 +196,336 @@ def is_ancestor(a, b):
     return run("merge-base", "--is-ancestor", a, b).returncode == 0
 
 
+# ---------- merging both sides' edits ----------
+# docs/shared-state.md, "Concurrent edits to one task". Tasks and epics pair by ID, not path, so a
+# task moved into an epic folder on one side still meets its other side. Each one changed on both
+# sides since the merge base is merged field by field. The remote wins a real conflict, because it
+# is what the team has already seen, and every loss is reported. Nothing writes conflict markers.
+
+NOTES = "## Notes"
+# Fields written together with a status move: approve stamps a task ready, dispatch's asking:
+# parks it blocked, `ergon answer` leaves answered: on a ready task. They come from whichever
+# side's status wins, never mixed, so a merge can't pair one side's status with the other's stamp.
+# That is also how `approved:` is "not merged as text": once approvals are verified signed commits
+# (T-020), it is recomputed from those instead.
+STATUS_BOUND = ("approved", "asking", "answered")
+DATED = re.compile(r"^- (\d{4}-\d{2}-\d{2})\b")
+
+
+def tree(rev):
+    """{path: (mode, blob)} of every file at rev."""
+    out = {}
+    for entry in git("ls-tree", "-r", "-z", rev, raw=True).split("\0"):
+        if entry:
+            meta, path = entry.split("\t", 1)
+            mode, _, sha = meta.split(" ")
+            out[path] = (mode, sha)
+    return out
+
+
+def split_tree(t):
+    """({ID: path} of the task and epic files, [the other paths]) of a tree()."""
+    ids, rest = {}, []
+    for path in t:
+        if path.startswith(("items/", "epics/")) and ID_IN_PATH.search(path):
+            ids[item_id(path)] = path
+        else:
+            rest.append(path)
+    return ids, rest
+
+
+def cat(sha):
+    return git("cat-file", "blob", sha, raw=True)
+
+
+def three_way(base, ours, theirs):
+    """(result, conflicted): a change beats no change, and the remote wins a real conflict."""
+    if ours == base or ours == theirs:
+        return theirs, False
+    if theirs == base:
+        return ours, False
+    return theirs, True
+
+
+def merge_file(base, ours, theirs):
+    """(text, clean): `git merge-file` of three texts. On a conflict (or a failure) the text is
+    the remote's, so no conflict marker is ever kept."""
+    if ours == base or ours == theirs:
+        return theirs, True
+    if theirs == base:
+        return ours, True
+    with tempfile.TemporaryDirectory(prefix="ergon-merge-") as d:
+        names = []
+        for name, text in (("ours", ours), ("base", base), ("theirs", theirs)):
+            (Path(d) / name).write_text(text)
+            names.append(str(Path(d) / name))
+        r = subprocess.run(["git", "merge-file", "-p", *names], capture_output=True, text=True)
+    return (r.stdout, True) if r.returncode == 0 else (theirs, False)
+
+
+def split_notes(body):
+    """(the body with the lines under ## Notes taken out, those lines). The heading stays."""
+    lines = body.splitlines(keepends=True)
+    for i, l in enumerate(lines):
+        if l.rstrip() == NOTES:
+            end = next((j for j in range(i + 1, len(lines)) if lines[j].startswith("## ")), len(lines))
+            return "".join(lines[:i + 1] + lines[end:]), [x.rstrip("\n") for x in lines[i + 1:end]]
+    return body, []
+
+
+def note_entries(lines):
+    """Notes as entries: a `- ` bullet and the lines under it, trailing blank lines dropped."""
+    out = []
+    for l in lines:
+        if l.startswith("- ") or not out:
+            out.append([l])
+        else:
+            out[-1].append(l)
+    return [tuple(e[:max(i for i, x in enumerate(e) if x.strip()) + 1]) for e in out if any(x.strip() for x in e)]
+
+
+def dated(entries):
+    """[(date, entry)]: an entry without a date of its own takes the one before it."""
+    out, last = [], ""
+    for e in entries:
+        m = DATED.match(e[0])
+        last = m.group(1) if m else last
+        out.append((last, e))
+    return out
+
+
+def union_notes(ours, theirs, extra=()):
+    """Both sides' Notes lines, each entry once, in time order (the remote's first on a tie), then
+    `extra`. One side's lines come back untouched when the union is just that side."""
+    o, t = note_entries(ours), note_entries(theirs)
+    have = set(t)
+    both = dated(t) + [x for x in dated(o) if x[1] not in have]
+    entries = [e for _, e in sorted(both, key=lambda x: x[0])] + [(x,) for x in extra]
+    if entries == t:
+        return theirs
+    if entries == o:
+        return ours
+    return [l for e in entries for l in e]
+
+
+def join_notes(brief, notes):
+    """Put Notes lines back under the brief's ## Notes heading (adding the heading if it has none)."""
+    if not notes:
+        return brief
+    text = "\n".join(notes) + "\n"
+    lines = brief.splitlines(keepends=True)
+    for i, l in enumerate(lines):
+        if l.rstrip() == NOTES:
+            rest = "".join(lines[i + 1:])
+            gap = "\n" if rest.strip() and notes[-1].strip() else ""
+            return "".join(lines[:i]) + l.rstrip("\n") + "\n" + text + gap + rest
+    return brief.rstrip("\n") + "\n\n" + NOTES + "\n" + text
+
+
+def local_name():
+    """Who this clone's commits are by (what sync's merge commit is authored as)."""
+    r = run("var", "GIT_AUTHOR_IDENT")
+    return r.stdout.split(" <")[0].strip() or os.environ.get("USER") or "this clone"
+
+
+def fmt(v):
+    if v is None or v == "":
+        return "(empty)"
+    return "[" + ", ".join(v) + "]" if isinstance(v, list) else str(v)
+
+
+def merge_item(key, base, ours, theirs, epic=False):
+    """Merge one task or epic file changed on both sides. Returns (text, [what to report],
+    brief_lost): brief_lost means What / Done when conflicted and the remote's was kept."""
+    keys = _tasks.EPIC_KEYS if epic else _tasks.TASK_KEYS
+    b, o, t = (_tasks.parse_text(x, key) for x in (base, ours, theirs))
+    said, out, extra_note = [], {}, []
+    # status: compare-and-set against the status the local change moved from, the merge base's.
+    # If the remote moved too, it pushed first: the local move is dropped, even to the same status
+    # (two dispatchers claiming one task both move it ready->doing; the second claim lost).
+    moved = o.get("status") != b.get("status")
+    if moved and t.get("status") != b.get("status"):
+        side, move = t, f"{b.get('status')}->{o.get('status')}"
+        said.append(f"{key}: dropped this clone's {move}: {remote()} had moved it to {t.get('status')} "
+                    f"first (noted in its Notes)")
+        extra_note.append(f"- {_tasks.today()} sync: dropped {local_name()}'s {move}, remote had "
+                          f"moved to {t.get('status')}")
+    else:
+        side = o if moved else t
+    other = t if side is o else o
+    for k in ("status",) + STATUS_BOUND:
+        out[k] = side.get(k)
+        if k != "status" and other.get(k) != b.get(k) and other.get(k) != out[k]:
+            said.append(f"{key}: kept {k}: {fmt(out[k])}, which goes with its status; "
+                        f"{'this clone' if other is o else remote()}'s {fmt(other.get(k))} dropped")
+    # accept: sticky toward yes. Only a one-sided edit, which needs no merge, takes it off.
+    yes = [x.get("accept") for x in (t, o) if str(x.get("accept") or "").lower() in _tasks.YES]
+    out["accept"] = yes[0] if yes else three_way(b.get("accept"), o.get("accept"), t.get("accept"))[0]
+    names = list(keys)
+    for m in (t, o, b):
+        names += [k for k in m if not k.startswith("_") and k not in names]
+    for k in names:
+        if k in out or k == "id":
+            continue
+        out[k], clash = three_way(b.get(k), o.get(k), t.get(k))
+        if clash:
+            said.append(f"{key}: both sides changed {k}; kept {remote()}'s {fmt(t.get(k))}, "
+                        f"this clone's {fmt(o.get(k))} dropped")
+    # the body: Notes are a union of lines, the rest goes through git merge-file
+    (bb, _), (ob, on), (tb, tn) = (split_notes(x["_body"]) for x in (b, o, t))
+    brief, clean = merge_file(bb, ob, tb)
+    meta = {"id": t.get("id") or key}
+    meta.update((k, out[k]) for k in names if k != "id" and out.get(k) is not None)
+    meta["_body"] = join_notes(brief, union_notes(on, tn, extra_note))
+    same = lambda m: {k: v for k, v in m.items() if v != ""}
+    for m, raw in ((t, theirs), (o, ours)):  # no reformatting when the result is one side's file
+        if same(meta) == same(m):
+            return raw, said, not clean
+    return _tasks.render(meta, keys), said, not clean
+
+
+def save_conflict(name, text):
+    """Keep the local side of a conflict the remote won, in <state>/conflicts/ (never shared)."""
+    d = _config.STATE / "conflicts"
+    d.mkdir(exist_ok=True)
+    stem, n = f"{name}-{time.strftime('%Y%m%dT%H%M%S')}", 1
+    f = d / f"{stem}.md"
+    while f.exists():
+        n += 1
+        f = d / f"{stem}-{n}.md"
+    f.write_text(text)
+    try:
+        return f.relative_to(_config.HOME)
+    except ValueError:
+        return f
+
+
+def merged_tree(base, ours, theirs):
+    """The merge of three commits' state: ({path: (mode, blob) or (mode, None, text)}, [reports]).
+    Raises Conflict if each side created one ID for a different task (renumber() leaves those)."""
+    tb, to, tt = tree(base), tree(ours), tree(theirs)
+    (ib, rb), (io, ro), (it, rt) = split_tree(tb), split_tree(to), split_tree(tt)
+    clash = sorted(k for k in (io.keys() & it.keys()) - ib.keys() if to[io[k]][1] != tt[it[k]][1])
+    if clash:
+        raise Conflict("\n".join(f"  {k}: each side created a different {k}" for k in clash))
+    said = []
+
+    def pick(k):
+        """(path, entry, merged fields or None) of ID k in the result, or None if it's gone."""
+        pb, po, pt = ib.get(k), io.get(k), it.get(k)
+        sb, so, st = (pb, tb.get(pb)), (po, to.get(po)), (pt, tt.get(pt))
+        if so == sb:
+            return (pt, tt[pt], None) if pt else None
+        if st == sb:
+            return (po, to[po], None) if po else None
+        if po is None or pt is None:
+            said.append(f"{k}: removed {'on ' + remote() if po else 'here'} but changed "
+                        f"{'here' if po else 'on ' + remote()}; kept the changed file")
+            return (po, to[po], None) if po else (pt, tt[pt], None)
+        if pb is None:  # both sides created the same file
+            return pt, tt[pt], None
+        epic = pt.endswith("/" + _config.EPIC_FILE)
+        ours_text = cat(to[po][1])
+        text, notes, lost = merge_item(k, cat(tb[pb][1]), ours_text, cat(tt[pt][1]), epic)
+        said.extend(notes)
+        if lost:
+            said.append(f"{k}: both sides changed What / Done when and they conflict; kept {remote()}'s, "
+                        f"and this clone's file is saved as {save_conflict(k, ours_text)}")
+        # where it lives: the file name (an epic's folder name) merges three-way
+        if epic:
+            folder = three_way(*(os.path.dirname(x) for x in (pb, po, pt)))[0]
+            return f"{folder}/{_config.EPIC_FILE}", (tt[pt][0], None, text), None
+        name = three_way(*(os.path.basename(x) for x in (pb, po, pt)))[0]
+        return f"{os.path.dirname(pt)}/{name}", (tt[pt][0], None, text), _tasks.parse_text(text, k)
+
+    picked = {k: pick(k) for k in sorted(io.keys() | it.keys())}
+    folders = {k: os.path.dirname(v[0]) for k, v in picked.items() if v and k.startswith("E-")}
+    result = {}
+    for k, v in picked.items():
+        if not v:
+            continue
+        path, entry, meta = v
+        if k.startswith("T-"):  # a task sits in its epic's folder, wherever that folder ended up
+            home = os.path.dirname(path)
+            if meta is not None:
+                home = folders.get(meta.get("epic")) or "items"
+            elif m := re.match(r"epics/(E-\d+)", home):
+                home = folders.get(m.group(1), home)
+            path = f"{home}/{os.path.basename(path)}"
+        result[path] = entry
+    # everything else (the state branch's .gitignore, notes kept in an epic's folder) by path
+    for path in sorted(set(rb) | set(ro) | set(rt)):
+        eb, eo, et = tb.get(path), to.get(path), tt.get(path)
+        if eo == eb or eo == et:
+            entry = et
+        elif et == eb:
+            entry = eo
+        elif eo is None or et is None:
+            entry = eo or et
+            said.append(f"{path}: removed on one side and changed on the other; kept the changed file")
+        else:
+            text, clean = merge_file(cat(eb[1]) if eb else "", cat(eo[1]), cat(et[1]))
+            entry = (et[0], None, text)
+            if not clean:
+                saved = save_conflict(path.replace("/", "_").removesuffix(".md"), cat(eo[1]))
+                said.append(f"{path}: both sides changed it and they conflict; kept {remote()}'s, "
+                            f"and this clone's is saved as {saved}")
+        if entry:
+            result[path] = entry
+    return result, said
+
+
+def write_tree(result):
+    """A tree object holding merged_tree()'s result, built in a throwaway index."""
+    lines = []
+    for path, entry in sorted(result.items()):
+        sha = entry[1]
+        if sha is None:
+            r = subprocess.run(["git", "-C", str(_config.STATE), "hash-object", "-w", "--stdin"],
+                               input=entry[2], capture_output=True, text=True)
+            if r.returncode:
+                raise _gitops.GitError(f"git hash-object: {r.stderr.strip()}")
+            sha = r.stdout.strip()
+        lines.append(f"{entry[0]} {sha}\t{path}\0")
+    tmp = Path(tempfile.mkdtemp(prefix="ergon-index-"))
+    env = dict(os.environ, GIT_INDEX_FILE=str(tmp / "index"))
+    try:
+        r = subprocess.run(["git", "-C", str(_config.STATE), "update-index", "--add", "-z", "--index-info"],
+                           input="".join(lines), capture_output=True, text=True, env=env)
+        if r.returncode:
+            raise _gitops.GitError(f"git update-index: {r.stderr.strip()}")
+        w = run("write-tree", env=env)
+        if w.returncode:
+            raise _gitops.GitError(f"git write-tree: {w.stderr.strip()}")
+        return w.stdout.strip()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def merge(theirs):
-    """Merge the fetched remote state into the state branch. Returns what came in. Raises
-    Conflict, merging nothing, if both sides changed one task since they last met."""
+    """Merge the fetched remote state into the state branch. Returns (what came in, [what the
+    merge had to drop or keep, to report]). Raises Conflict, merging nothing, if each side created
+    one ID for a different task."""
     ours = git("rev-parse", "HEAD")
     if theirs is None or is_ancestor(theirs, ours):
-        return []
+        return [], []
     if is_ancestor(ours, theirs):
         came = changes(ours, theirs)
         git("merge", "-q", "--ff-only", theirs)
-        return [what for what, _ in came.values()]
+        return [what for what, _ in came.values()], []
     r = run("merge-base", ours, theirs)
     if r.returncode:
         raise _gitops.GitError(f"{remote()} {branch()} shares no history with this clone's: was it made by "
                                f"another `ergon sync --init`? Nothing was merged")
-    base = r.stdout.strip()
-    mine, came = changes(base, ours), changes(base, theirs)
-    both = sorted(k for k in mine.keys() & came.keys()
-                  if blob(ours, mine[k][1]) != blob(theirs, came[k][1]))
-    if both:
-        raise Conflict("\n".join(f"  {k}: here {mine[k][0].split(' ', 1)[1]}, on {remote()} "
-                                 f"{came[k][0].split(' ', 1)[1]}" for k in both))
-    m = run("-c", "commit.gpgsign=false", "merge", "-q", "--no-ff", "--no-verify", "--no-edit",
-            "-m", f"sync: merge {remote()} {branch()}", theirs)
-    if m.returncode:
-        run("merge", "--abort")
-        raise _gitops.GitError(f"git couldn't merge {remote()} {branch()}, so nothing was merged: "
-                               f"{(m.stderr or m.stdout).strip()[:400]}")
-    return [what for what, _ in came.values()]
+    result, said = merged_tree(r.stdout.strip(), ours, theirs)
+    msg = f"sync: merge {remote()} {branch()}" + ("\n\n" + "\n".join(said) if said else "")
+    # A merge commit whose tree ergon computed, never a rebase: approvals become signed commits,
+    # and a rebase would rewrite them. The worktree is clean (sync committed first), so this
+    # fast-forward only writes the merged files out.
+    commit = git("-c", "commit.gpgsign=false", "commit-tree", write_tree(result), "-p", ours, "-p", theirs, "-m", msg)
+    came = changes(ours, commit)
+    git("merge", "-q", "--ff-only", commit)
+    return [what for what, _ in came.values()], said
 
 
 def refuse():
@@ -349,17 +654,18 @@ def sync_core():
                     if moved:
                         renamed.update(moved)
                         commit_pending("sync")
-                came = merge(theirs)
+                came, said = merge(theirs)
             except Conflict as c:
                 raise SystemExit(
-                    f"sync stopped: these changed both here and on {remote()} since the last sync:\n{c}\n"
-                    f"Nothing was merged or pushed. Merging both sides' edits to one task isn't built yet: "
-                    f"merge by hand in {_config.STATE} (git merge {remote_ref()}, fix the files, commit), "
+                    f"sync stopped: these IDs name different tasks here and on {remote()}:\n{c}\n"
+                    f"Nothing was merged or pushed. Refile or close the local one in {_config.STATE}, "
                     f"then run `ergon sync` again.")
             except _gitops.GitError as err:
                 raise SystemExit(f"sync: {err}")
             if came:
                 print("pulled: " + ", ".join(came))
+            for line in said:
+                print(f"merged: {line}")
             if theirs and git("rev-parse", "HEAD") == theirs:
                 print(f"{branch()} is up to date with {remote()}")
                 return renamed

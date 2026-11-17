@@ -44,11 +44,11 @@ EPIC_KEYS = ["id", "title", "status", "created"]
 
 # ---------- file format ----------
 
-def parse(path):
-    text = path.read_text()
+def parse_text(text, where="task file"):
+    """Frontmatter fields and `_body` of a task or epic file's text (no `_path`)."""
     m = re.match(r"---\n(.*?)\n---\n?(.*)", text, re.S)
     if not m:
-        raise SystemExit(f"{path}: missing frontmatter")
+        raise SystemExit(f"{where}: missing frontmatter")
     meta = {}
     for line in m.group(1).splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
@@ -58,12 +58,18 @@ def parse(path):
         if val.startswith("[") and val.endswith("]"):
             val = [v.strip() for v in val[1:-1].split(",") if v.strip()]
         meta[key.strip()] = val
-    meta["_path"] = path
     meta["_body"] = m.group(2)
     return meta
 
 
-def dump(meta, keys):
+def parse(path):
+    meta = parse_text(path.read_text(), path)
+    meta["_path"] = path
+    return meta
+
+
+def render(meta, keys):
+    """The file text for meta: `keys` first (empty when missing), then any other fields."""
     lines = ["---"]
     for k in keys + [k for k in meta if k not in keys and not k.startswith("_")]:
         v = meta.get(k, "")
@@ -71,7 +77,11 @@ def dump(meta, keys):
             v = "[" + ", ".join(v) + "]"
         lines.append(f"{k}: {v}".rstrip())
     lines.append("---")
-    meta["_path"].write_text("\n".join(lines) + "\n" + meta["_body"])
+    return "\n".join(lines) + "\n" + meta["_body"]
+
+
+def dump(meta, keys):
+    meta["_path"].write_text(render(meta, keys))
 
 
 def files(kind):
