@@ -433,13 +433,13 @@ def run(args):
             args.tier = args.epic = None
             args.all = False
         _tasks.board(args)
-    elif args.cmd in ("new", "set", "start", "finish", "close", "tidy"):  # read, then write state: one at a time
+    elif args.cmd in ("new", "set", "start", "finish", "tidy"):  # read, then write state: one at a time
         with _gitops.state_lock():
-            {"new": _tasks.new, "set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish, "close": _gates.close,
+            {"new": _tasks.new, "set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish,
              "tidy": _tasks.tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours); grade around its
         # writes only, not the minutes claude takes to answer
-        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
+        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
          "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "journal": journal, "sync": _shared.sync}[args.cmd](args)
 

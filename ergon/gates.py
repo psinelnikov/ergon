@@ -266,7 +266,7 @@ def approve(args):
         sync_for_count([t["id"] for t in todo], after=True)
 
 
-def sync_for_count(ids, after=False):
+def sync_for_count(ids, after=False, what="approval"):
     """Shared mode, around approving two-person tasks: sync, so the count includes approvals other
     clones published, and so they see this one. A failure is reported, not fatal: counting fewer
     approvals than were made only ever leaves a task waiting, and an approval of a stale brief
@@ -279,8 +279,9 @@ def sync_for_count(ids, after=False):
         moved = _shared.sync_core(quiet=True)
     except SystemExit as err:
         print(f"warning: couldn't sync ({err}); " + (
-            "run `ergon sync` to publish this approval" if after else
-            "approvals published from other clones since the last sync aren't counted"))
+            f"run `ergon sync` to publish this {what}" if after else
+            "approvals published from other clones since the last sync aren't counted" if what == "approval" else
+            "acting on the state as last fetched"))
         return
     hit = [f"{o} is now {moved[o]}" for o in ids if o in moved]
     if hit:
@@ -459,6 +460,8 @@ def reject(args):
     """HUMAN ONLY. A proposed task is dropped. A task in `review` goes back to `ready` with the
     reason in its Notes; its branch and worktree stay, so the next dispatch picks up from them
     and its worker is told why."""
+    if _config.SHARED:  # act on the latest state, and publish the result
+        sync_for_count(args.ids, what="rejection")
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     named = targets(args.ids, tasks, epics)
     todo = [t for t in named if t["status"] == "proposed"]
@@ -495,6 +498,8 @@ def reject(args):
             _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "review", "to": "ready"})
     print(", ".join(x for x in (f"dropped {len(todo)}" if todo else "",
                                 f"sent {len(back)} back to ready" if back else "") if x))
+    if _config.SHARED:
+        sync_for_count(args.ids, after=True, what="rejection")
 
 
 def held_branch(t, epics):
@@ -520,6 +525,8 @@ def accept(args):
     """HUMAN ONLY: land tasks that dispatch held at `review` the way dispatch would have (companions
     first, then the task branch into its epic branch or the trunk), mark them done, and close an
     epic whose last task this was. A landing that fails marks the task blocked, as in dispatch."""
+    if _config.SHARED:  # act on the latest state, and publish the result
+        sync_for_count(args.ids, what="acceptance")
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     todo = [t for t in targets(args.ids, tasks, epics, "review") if t["status"] == "review"]
     if not todo:
@@ -577,6 +584,8 @@ def accept(args):
                     _gitops.finish_epic(e["id"])
                 except _gitops.GitError as err:
                     print(f"  {e['id']} is complete but not merged: {err}")
+    if _config.SHARED:
+        sync_for_count(args.ids, after=True, what="acceptance")
     if failed or away:
         sys.exit(1)
 
@@ -664,7 +673,10 @@ def pin(args):
 def close(args):
     """HUMAN ONLY: close approved tasks (ready / blocked / doing) whose work already landed
     elsewhere (--as done) or that no longer apply (--as dropped). Skips the epic-branch check
-    on purpose: the work isn't happening on the branch. Proposed tasks go through `reject`."""
+    on purpose: the work isn't happening on the branch. Proposed tasks go through `reject`.
+    Takes the state lock itself (the CLI doesn't), so the shared-mode syncs run outside it."""
+    if _config.SHARED:  # act on the latest state, and publish the result
+        sync_for_count(args.ids, what="close")
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     todo = []
     for i in args.ids:
@@ -684,19 +696,20 @@ def close(args):
         print(_tasks.line(t, tasks))
     if not human_gate(f"Close these {len(todo)} task(s) as {args.as_}?"):
         raise SystemExit("aborted")
-    if sign:  # the CLI holds the state lock around close
-        _shared.commit_pending()  # hand edits go in a commit of their own, not the signed one
-    for t in todo:
-        t["status"] = args.as_
-        t.pop("asking", None)
-        t.pop("answered", None)
-        t["_body"] = t["_body"].rstrip() + f"\n\nClosed {_tasks.today()} as {args.as_}: {args.reason}\n"
-        _tasks.dump(t, _tasks.TASK_KEYS)
-    if sign:
-        _gitops.sign_state("close", [f"{_gitops.CLOSE_TRAILER}: {t['id']} {args.as_}" for t in todo],
-                           [t["_path"] for t in todo])
-    for t in todo:
-        _history.record("closed", t, by=approver(), reason=args.reason, **{"as": args.as_})
+    with _gitops.state_lock():
+        if sign:
+            _shared.commit_pending()  # hand edits go in a commit of their own, not the signed one
+        for t in todo:
+            t["status"] = args.as_
+            t.pop("asking", None)
+            t.pop("answered", None)
+            t["_body"] = t["_body"].rstrip() + f"\n\nClosed {_tasks.today()} as {args.as_}: {args.reason}\n"
+            _tasks.dump(t, _tasks.TASK_KEYS)
+        if sign:
+            _gitops.sign_state("close", [f"{_gitops.CLOSE_TRAILER}: {t['id']} {args.as_}" for t in todo],
+                               [t["_path"] for t in todo])
+        for t in todo:
+            _history.record("closed", t, by=approver(), reason=args.reason, **{"as": args.as_})
     print(f"closed {len(todo)} as {args.as_}")
     for eid in sorted({t["epic"] for t in todo if t.get("epic") in epics}):
         if epics[eid]["status"] == "open" and _gitops.epic_complete(eid, _tasks.load(_config.ITEMS)):
@@ -704,6 +717,8 @@ def close(args):
                 _gitops.finish_epic(eid)
             except _gitops.GitError as err:
                 print(f"{eid} is complete but not merged: {err}")
+    if _config.SHARED:
+        sync_for_count(args.ids, after=True, what="close")
 
 
 

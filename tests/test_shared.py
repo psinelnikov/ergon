@@ -684,6 +684,73 @@ class TestDispatchClaims(Shared):
         self.assertEqual(self.status(self.a, "T-001"), "ready")
         self.assertIn("would run  T-001", self.ergon(self.a, "dispatch", "--dry-run", env=agent).stdout)
 
+    # --- accept / reject / close sync before and after (T-064)
+    def remote_status(self, tid):
+        names = sh("git", "ls-tree", "-r", "--name-only", "ergon-state", cwd=self.remote).stdout.split()
+        f = next(n for n in names if f"/{tid}-" in "/" + n or n.startswith(f"{tid}-"))
+        text = sh("git", "show", f"ergon-state:{f}", cwd=self.remote).stdout
+        return re.search(r"^status: (\S+)", text, re.M).group(1)
+
+    def held_in_review(self):
+        self.start()
+        self.ergon(self.a, "set", "T-001", "accept=yes")
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.ergon(self.a, "dispatch", env=self.env_a)
+        self.assertEqual(self.status(self.a, "T-001"), "review")
+
+    def test_accept_publishes_straight_away(self):
+        self.held_in_review()
+        self.ergon(self.a, "accept", "T-001", inp="y\n", env=self.env_a)
+        self.assertEqual(self.remote_status("T-001"), "done")
+
+    def test_reject_and_close_publish_straight_away(self):
+        self.start()
+        self.ergon(self.a, "new", "task", "Two", "--tier", "haiku")
+        self.ergon(self.a, "sync")
+        self.ergon(self.a, "reject", "T-002", inp="y\n", env=self.env_a)
+        self.assertEqual(self.remote_status("T-002"), "dropped")
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.ergon(self.a, "close", "T-001", "--as", "done", "--reason", "x", inp="y\n", env=self.env_a)
+        self.assertEqual(self.remote_status("T-001"), "done")
+
+    def test_reject_skips_a_task_another_clone_already_closed(self):
+        self.start()
+        self.ergon(self.a, "new", "task", "Two", "--tier", "haiku")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        # B drops it before A (not yet synced) tries to
+        self.ergon(self.b, "reject", "T-002", inp="y\n", env=self.env_b)
+        self.assertEqual(self.remote_status("T-002"), "dropped")
+        r = self.ergon(self.a, "reject", "T-002", check=False, inp="y\n", env=self.env_a)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("nothing in `proposed` or `review`", r.stderr + r.stdout)
+        self.assertEqual(self.status(self.a, "T-002"), "dropped")
+
+    def test_close_reports_a_task_another_clone_already_closed(self):
+        self.start()
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        self.ergon(self.b, "close", "T-001", "--as", "done", "--reason", "x", inp="y\n", env=self.env_b)
+        r = self.ergon(self.a, "close", "T-001", "--as", "dropped", "--reason", "y", check=False, inp="y\n", env=self.env_a)
+        self.assertIn("skip T-001: already done", r.stdout)
+        self.assertEqual(self.status(self.a, "T-001"), "done")
+
+    def test_each_still_commits_and_warns_with_the_remote_unreachable(self):
+        self.held_in_review()
+        self.ergon(self.a, "new", "task", "Two", "--tier", "haiku")
+        self.ergon(self.a, "new", "task", "Three", "--tier", "haiku")
+        self.ergon(self.a, "approve", "T-003", inp="y\n")
+        shutil.move(str(self.remote), str(self.remote) + ".gone")
+        for args in (("accept", "T-001"), ("reject", "T-002"),
+                     ("close", "T-003", "--as", "dropped", "--reason", "x")):
+            r = self.ergon(self.a, *args, inp="y\n", env=self.env_a)
+            self.assertIn("run `ergon sync` to publish", r.stdout, args)
+            self.assertIn("couldn't sync", r.stdout, args)
+        self.assertEqual(self.status(self.a, "T-001"), "done")
+        self.assertEqual(self.status(self.a, "T-002"), "dropped")
+        self.assertEqual(self.status(self.a, "T-003"), "dropped")
+
 
 class TestSignedApprovals(Shared):
     """Approvals are SSH-signed state commits, verified against the approvers file on the remote's
