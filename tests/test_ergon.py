@@ -28,7 +28,12 @@ holds $FAKE_CONTEXT tokens (default 1000). With $FAKE_ASK set, a worker whose pr
 answer yet commits, then ends with $FAKE_ASK (QUESTION lines) and RESULT: asking. Called
 without --agent it is dispatch's 5-hour-window probe: it counts itself in $FAKE_PROBES and, with
 $FAKE_FIVE_HOUR set (|-separated utilizations, the nth probe the nth, the last repeating), streams
-a rate_limit_event; without it, no window, as on an API key."""
+a rate_limit_event; without it, no window, as on an API key. A worker writes its task ID over
+$FAKE_SHARED (and $FAKE_PUB_SHARED in the companion) too, so two tasks conflict, and sleeps
+$FAKE_SLEEP_<TIER> first. Handed a conflict round, it merges each base named and keeps both sides
+of each conflicted file, then ends $FAKE_CONFLICT_RESULT (default RESULT: done); $FAKE_CONFLICT
+= markers commits the markers, nomerge aborts the merge and commits something else, and still
+lands a conflicting commit on the main checkout's trunk after merging."""
 import json, os, re, subprocess, sys, time
 if "--agent" not in sys.argv:
     n = 0
@@ -72,21 +77,54 @@ if os.environ.get("FAKE_TRANSCRIPT_AGE"):
     with open(os.path.join(d, "s-1.jsonl"), "w") as f:
         f.write(json.dumps(entry, separators=(",", ":")) + "\n")
 tid = re.search(r"(?:dispatched|work|asked) on (T-\d+)", prompt).group(1)
+if "conflicts with its base" in prompt:
+    mode = os.environ.get("FAKE_CONFLICT", "resolve")
+    for tree, base in re.findall(r"`git -C (\S+) log --oneline \S+?\.\.(\S+)`", prompt):
+        own = os.path.realpath(tree) == os.path.realpath(os.getcwd())
+        msg = f"Merge {base} ({tid})" if own else f"Merge {base}"
+        r = subprocess.run(["git", "-C", tree, "merge", "--no-edit", base], capture_output=True, text=True)
+        if mode == "nomerge":
+            subprocess.run(["git", "-C", tree, "merge", "--abort"], capture_output=True)
+            open(os.path.join(tree, f"{tid}.txt"), "a").write("again\n")
+            subprocess.run(["git", "-C", tree, "commit", "-qam", f"Try again ({tid})" if own else "Try again"], check=True)
+            continue
+        if r.returncode:
+            names = subprocess.run(["git", "-C", tree, "diff", "--name-only", "--diff-filter=U"],
+                                   capture_output=True, text=True).stdout.split()
+            for name in names:
+                path = os.path.join(tree, name)
+                if mode != "markers":
+                    keep = [l for l in open(path) if not l.startswith(("<<<<<<< ", "=======", ">>>>>>> "))]
+                    open(path, "w").writelines(keep)
+            subprocess.run(["git", "-C", tree, "add", "-A"], check=True)
+            subprocess.run(["git", "-C", tree, "commit", "-qm", msg], check=True)
+    if mode == "still":  # another task lands a conflicting change meanwhile
+        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True).stdout.strip()
+        root = os.path.dirname(common)
+        open(os.path.join(root, os.environ["FAKE_SHARED"]), "w").write("third\n")
+        subprocess.run(["git", "-C", root, "commit", "-qm", "Meanwhile", "--", os.environ["FAKE_SHARED"]], check=True)
+    print(json.dumps({"result": "merged\n" + os.environ.get("FAKE_CONFLICT_RESULT", "RESULT: done"),
+                      "session_id": "s-1", "total_cost_usd": 0.01}))
+    sys.exit()
+time.sleep(float(os.environ.get("FAKE_SLEEP_" + tier, "0")))
 if resume and os.environ.get("FAKE_FIX_NOTHING"):
     print(json.dumps({"result": "nothing to change\nRESULT: done", "session_id": resume, "total_cost_usd": 0.01}))
     sys.exit()
 if resume and os.environ.get("FAKE_FIX_RESULT"):  # a fix round that changes nothing and ends so
     print(json.dumps({"result": os.environ["FAKE_FIX_RESULT"], "session_id": resume, "total_cost_usd": 0.01}))
     sys.exit()
-def commit(where, msg):
+def commit(where, msg, shared=None):
     with open(os.path.join(where, f"{tid}.txt"), "a") as f:
         f.write("work\n")
+    if shared and not resume and "An earlier attempt" not in prompt:  # the first run only
+        open(os.path.join(where, shared), "w").write(tid + "\n")
     subprocess.run(["git", "-C", where, "add", "-A"], check=True)
     subprocess.run(["git", "-C", where, "commit", "-qm", msg], check=True)
-commit(".", f"Do the thing ({tid})")
+commit(".", f"Do the thing ({tid})", os.environ.get("FAKE_SHARED"))
 pub = os.path.join("pub", "src")
 if os.path.isdir(pub):
-    commit(pub, os.environ.get("FAKE_PUB_MSG", "Do the public thing").replace("{id}", tid))
+    commit(pub, os.environ.get("FAKE_PUB_MSG", "Do the public thing").replace("{id}", tid), os.environ.get("FAKE_PUB_SHARED"))
 if os.environ.get("FAKE_DIRTY"):
     open(f"{tid}.txt", "a").write("more\n")
 found = "".join(f"FOUND: {x}\n" for x in os.environ.get("FAKE_FOUND", "").split("|") if x)
@@ -852,15 +890,16 @@ class TestReview(DispatchProject):
         f.write_text(f.read_text().replace("\ntier:", "\nverify: true\ntier:", 1))
         for t in ("T-001", "T-002"):
             stamp(self.task_file(t))
-        # T-001: its worker + 2 verify fixes (its own verify:) = 3; T-002 (opus): worker + review = 2.
+        # T-001: its worker + 2 verify fixes (its own verify:) = 3; T-002 (opus): worker + review = 2;
+        # each + 1 conflict round.
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout
-        self.assertIn("estimated at most $5.00 for 2 task(s)", dry)
+        self.assertIn("estimated at most $7.00 for 2 task(s)", dry)
         self.assertIn("plus the review and no fix rounds for a reviewed tier, "
                       "plus up to 2 verify fix rounds (a fix each) if a verify is set", dry)
-        # --escalate: T-001 may finish as opus, which is reviewed: 2 workers + review + 2 verify fixes = 5.
-        # T-002 is already opus, so nothing escalates it.
+        # --escalate: T-001 may finish as opus, which is reviewed: 2 workers + review + 2 verify fixes
+        # + 1 conflict round = 6. T-002 is already opus, so nothing escalates it.
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1", "--escalate").stdout
-        self.assertIn("estimated at most $7.00 for 2 task(s)", dry)
+        self.assertIn("estimated at most $9.00 for 2 task(s)", dry)
         self.assertEqual(self.calls(), [])
 
     def test_review_gates_landing(self):
@@ -998,16 +1037,16 @@ class TestReviewRounds(DispatchProject):
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout
         self.assertIn(", reviewed by sonnet (up to 2 fix rounds)", [l for l in dry.splitlines() if "T-001" in l][0])
         self.assertNotIn("reviewed by", [l for l in dry.splitlines() if "T-002" in l][0])
-        # verify = "true": T-001: worker + review + 2 x (fix + review) + 2 verify fixes = 8 calls;
-        # T-002: its worker + 2 verify fixes = 3.
-        self.assertIn("estimated at most $11.00 for 2 task(s) at --budget $1 per call, counting a task as its "
+        # verify = "true": T-001: worker + review + 2 x (fix + review) + 2 verify fixes + 1 conflict
+        # round = 9 calls; T-002: its worker + 2 verify fixes + 1 conflict round = 4.
+        self.assertIn("estimated at most $13.00 for 2 task(s) at --budget $1 per call, counting a task as its "
                       "worker plus the review and up to 2 fix rounds (a fix and a review each) for a reviewed tier, "
                       "plus up to 2 verify fix rounds (a fix each) if a verify is set", dry)
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1", "--max", "1").stdout
-        self.assertIn("estimated at most $8.00 for 1 task(s)", dry)  # the costliest one
-        # --escalate adds a second worker a tier up: T-001 9 calls, T-002 (sonnet → opus, unreviewed) 4.
+        self.assertIn("estimated at most $9.00 for 1 task(s)", dry)  # the costliest one
+        # --escalate adds a second worker a tier up: T-001 10 calls, T-002 (sonnet → opus, unreviewed) 5.
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1", "--escalate").stdout
-        self.assertIn("estimated at most $13.00 for 2 task(s) at --budget $1 per call, counting a task as its "
+        self.assertIn("estimated at most $15.00 for 2 task(s) at --budget $1 per call, counting a task as its "
                       "worker plus a second worker if --escalate retries it a tier up, plus the review", dry)
         self.assertEqual(self.calls(), [])  # a dry run runs nothing
 
@@ -1228,6 +1267,213 @@ class TestVerifyRounds(DispatchProject):
         self.assertIn("tier: human", text)
         self.assertIn("outside: trunk is broken", text)
         self.assertIn("depends: [T-002]", self.task_file("T-001").read_text())
+
+
+class TestConflictRounds(DispatchProject):
+    """conflict_rounds (default 1): a branch that conflicts with its base goes back to its worker.
+    T-001 (haiku) and T-002 (sonnet, slower) run at once and both rewrite shared.txt's one line,
+    so T-002, landing second, conflicts with T-001's."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "shared.txt").write_text("base\n")
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "shared file", cwd=self.root)
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0",
+                        FAKE_SHARED="shared.txt", FAKE_SLEEP_SONNET="1.5")
+        self.env.pop("CLAUDE_CONFIG_DIR", None)  # never the developer's own config dir
+        self.wt = self.root / ".claude" / "worktrees" / "T-002"
+
+    def tasks(self, *touches):
+        self.ergon("new", "task", "First", "--tier", "haiku", *touches)
+        self.ergon("new", "task", "Second", "--tier", "sonnet", *touches)
+        for t in ("T-001", "T-002"):
+            stamp(self.task_file(t))
+
+    def add_config(self, line):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(line + "\n" + cfg.read_text())
+
+    def calls(self, tid="T-002"):
+        rows = [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+        return [c for c in rows if f"on {tid}" in c["prompt"] or f"{tid}\n" in c["prompt"]]
+
+    def rows(self, event, tid="T-002"):
+        return [r for r in history(self.root) if r["task"] == tid and r["event"] == event]
+
+    def notes(self, tid="T-002"):
+        return self.task_file(tid).read_text().split("## Notes", 1)[1]
+
+    def kept(self):
+        self.assertTrue(self.wt.exists())
+        self.assertIn("task/T-002", sh("git", "branch", "--list", "task/T-002", cwd=self.root).stdout)
+
+    def test_second_task_merges_the_first_and_lands(self):
+        self.tasks()
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertIn(", up to 1 conflict round if its branch conflicts", dry)
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.status("T-002"), "done", out)
+        self.assertEqual((self.root / "shared.txt").read_text(), "T-002\nT-001\n")  # both sides survive
+        calls = self.calls()
+        self.assertEqual([c["resume"] for c in calls], [None, "s-1"])
+        prompt = calls[1]["prompt"]
+        self.assertIn("Your work on T-002 conflicts with its base, which moved since you started "
+                      "(conflict round 1 of 1)", prompt)
+        self.assertIn("task/T-002 conflicts with main", prompt)
+        self.assertIn("in shared.txt. Merge it with `git -C", prompt)
+        self.assertIn("Do the thing (T-001)", prompt)  # the base's commits since the fork
+        self.assertIn("with a message citing T-002", prompt)
+        self.assertIn("conflict T-002  round 1/1 (conflicts with main in shared.txt): resumed s-1", out)
+        self.assertIn("resolved a conflict with main in shared.txt", self.notes())
+        merge = sh("git", "log", "-1", "--format=%P%n%s", "main^{/Merge main}", cwd=self.root).stdout.split("\n")
+        self.assertEqual(merge[1], "Merge main (T-002)")
+        self.assertEqual(len(merge[0].split()), 2)  # a real merge commit landed
+        c = self.rows("conflict")
+        self.assertEqual([(r["files"], r["base"], r["round"], r["companion"]) for r in c],
+                         [(["shared.txt"], "main", 2, None)])
+        self.assertEqual(events(self.root, "T-002")[-4:], ["conflict", "resumed", "worker_end", "landed"])
+        self.assertEqual(self.rows("resumed")[0]["round"], 2)
+        self.assertEqual(self.rows("resumed")[0]["after"], "conflict")
+        self.assertEqual([r.get("round") for r in self.rows("worker_end")], [None, 2])
+        self.assertRegex(self.rows("worker_end")[1]["log"], r"-fix2\.json$")
+        self.assertFalse(self.wt.exists())
+
+    def test_fresh_worker_when_the_session_cannot_resume(self):
+        self.tasks()
+        self.env["FAKE_TRANSCRIPT_AGE"] = ""
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        self.assertEqual(self.status("T-002"), "done", out)
+        calls = self.calls()
+        self.assertEqual([c["resume"] for c in calls], [None, None])
+        self.assertIn("You are dispatched on T-002", calls[1]["prompt"])
+        self.assertIn("What's left is merging the base in", calls[1]["prompt"])
+        d = self.rows("dispatched")
+        self.assertEqual([(r.get("round"), r.get("after")) for r in d], [(None, None), (2, "conflict")])
+        self.assertEqual(d[1]["fresh_because"], "its transcript can't be read")
+
+    def test_a_bad_merge_blocks_and_keeps_the_branch(self):
+        cases = [("markers", "conflict markers left in shared.txt on task/T-002"),
+                 ("nomerge", "the worker said done but the tip of task/T-002 isn't a merge commit, so main isn't merged in"),
+                 ("still", "task/T-002 still conflicts with main in shared.txt after the merge")]
+        for mode, why in cases:
+            with self.subTest(mode):
+                self.setUp()
+                self.tasks()
+                self.env["FAKE_CONFLICT"] = mode
+                out = self.ergon("dispatch", "--jobs", "2").stdout
+                self.assertEqual(self.status("T-002"), "blocked", out)
+                self.assertIn(f"{why} (conflict round 1, after: conflicts with main in shared.txt). "
+                              "Branch task/T-002 and worktree", self.notes())
+                self.kept()
+                self.assertEqual((self.root / "shared.txt").read_text(), "third\n" if mode == "still" else "T-001\n")
+                self.assertEqual(len(self.calls()), 2)
+                self.assertFalse(list(self.root.glob("tasks/**/T-003*")))  # no human task: dispatch's check
+                self.assertEqual(self.rows("blocked")[0]["asked"], False)
+
+    def test_worker_that_cannot_reconcile_asks_or_blocks(self):
+        for result, want in (("QUESTION: keep whose wording?\nRESULT: asking", "blocked"),
+                             ("RESULT: blocked — the two sides contradict", "blocked")):
+            with self.subTest(result):
+                self.setUp()
+                self.tasks()
+                self.env.update(FAKE_CONFLICT="nomerge", FAKE_CONFLICT_RESULT=result)
+                out = self.ergon("dispatch", "--jobs", "2").stdout
+                self.assertEqual(self.status("T-002"), want, out)
+                self.kept()
+                text = self.task_file("T-002").read_text()
+                if "asking" in result:
+                    self.assertIn("asking: s-1", text)
+                    self.assertIn("question: keep whose wording?", text)
+                else:
+                    self.assertIn("the two sides contradict (conflict round 1, after: conflicts with main", text)
+                    self.assertIn("depends: [T-003]", text)  # the worker's own block files a human task
+
+    def test_zero_rounds_blocks_as_before(self):
+        self.add_config("conflict_rounds = 0")
+        self.tasks()
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertNotIn("conflict round", dry)
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        self.assertEqual(self.status("T-002"), "blocked", out)
+        self.assertRegex(self.notes(), r"dispatch: conflicts with main in shared\.txt\. Branch task/T-002 and "
+                                       r"worktree \S+ kept: merge by hand \(log tasks/runs/\S+\.json")
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.rows("conflict"), [])
+        self.kept()
+
+    def test_base_moving_again_takes_another_round_or_blocks(self):
+        # T-002's verify moves main again (a third change to shared.txt) the first time it runs
+        # on the merged branch, so the branch conflicts again after round 1.
+        for rounds in (1, 2):
+            with self.subTest(rounds=rounds):
+                self.setUp()
+                flag, script = Path(self.tmp.name) / "moved", Path(self.tmp.name) / "move.sh"
+                script.write_text(f"if git rev-parse -q --verify HEAD^2 >/dev/null && [ ! -e {flag} ]; then\n"
+                                  f"  touch {flag}; cd {self.root} && echo fourth > shared.txt && "
+                                  "git commit -qm Later -- shared.txt\nfi\n")
+                self.add_config(f"conflict_rounds = {rounds}")
+                self.tasks()
+                f = self.task_file("T-002")
+                f.write_text(f.read_text().replace("\ntier:", f"\nverify: sh {script}\ntier:", 1))
+                out = self.ergon("dispatch", "--jobs", "2").stdout
+                if rounds == 1:
+                    self.assertEqual(self.status("T-002"), "blocked", out)
+                    self.assertRegex(self.notes(), r"conflicts with main in shared\.txt \(after 1 conflict round\(s\)\); "
+                                     r"no conflict rounds left \(conflict_rounds = 1\)\. Earlier rounds: round 1: conflicts "
+                                     r"with main in shared\.txt\. Branch task/T-002 and worktree \S+ kept: merge by hand")
+                    self.assertEqual([r["round"] for r in self.rows("conflict")], [2, 3])
+                    self.kept()
+                else:
+                    self.assertEqual(self.status("T-002"), "done", out)
+                    self.assertEqual((self.root / "shared.txt").read_text(), "T-002\nT-001\nfourth\n")
+                    self.assertEqual(self.notes().count("resolved a conflict with main in shared.txt"), 2)
+                    self.assertIn("round 2/2", out)
+
+    def test_verify_and_review_run_again_after_the_merge(self):
+        # Verify is red once shared.txt holds both lines, until T-002 commits a second line of its own.
+        self.add_config('verify = "test $(wc -l < shared.txt) -lt 2 || test $(wc -l < T-002.txt) -ge 2"\n'
+                    'review = ["sonnet"]')
+        self.tasks()
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        self.assertEqual(self.status("T-002"), "done", out)
+        calls = self.calls()
+        self.assertEqual([c["agent"] for c in calls], ["SONNET", "REVIEW", "SONNET", "SONNET", "REVIEW"])
+        self.assertIn("conflicts with its base", calls[2]["prompt"])
+        self.assertIn("Verify failed on your work on T-002 (verify fix round 1 of 2)", calls[3]["prompt"])
+        self.assertEqual([r["ok"] for r in self.rows("verify")], [True, False, True])
+        self.assertEqual([r.get("round") for r in self.rows("verify")], [None, 2, 3])
+        self.assertEqual(len(self.rows("review")), 2)
+        notes = self.notes()
+        self.assertIn("resolved a conflict with main in shared.txt; verify passed after 1 fix round(s)", notes)
+
+    def test_companion_conflict_is_merged_in_its_worktree(self):
+        pub = self.root / "pub" / "src"
+        (pub / "shared.txt").write_text("base\n")
+        sh("git", "add", "-A", cwd=pub)
+        sh("git", "commit", "-qm", "shared file", cwd=pub)
+        self.env.pop("FAKE_SHARED")
+        self.env["FAKE_PUB_SHARED"] = "shared.txt"
+        self.tasks("--touches", "acme/public")
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.status("T-002"), "done", out)
+        self.assertEqual((pub / "shared.txt").read_text(), "T-002\nT-001\n")
+        prompt = self.calls()[1]["prompt"]
+        self.assertIn("acme/public, in its worktree", prompt)
+        self.assertIn('`git -C ' + str(self.wt / "pub" / "src") + ' commit -m "Merge main"`', prompt)
+        self.assertIn("resolved a conflict with acme/public main in shared.txt", self.notes())
+        self.assertEqual([(r["companion"], r["files"]) for r in self.rows("conflict")], [("acme/public", ["shared.txt"])])
+        self.assertNotRegex(sh("git", "log", "--format=%B", "main", cwd=pub).stdout, r"\bT-\d{3}")
+        self.assertIn("Merge main", sh("git", "log", "--format=%s", "main", cwd=pub).stdout)
+
+    def test_bad_config(self):
+        (self.root / ".ergon.toml").write_text("conflict_rounds = -1\n")
+        self.assertIn("conflict_rounds is a whole number", self.ergon("board", check=False).stderr)
 
 
 class TestAccept(DispatchProject):

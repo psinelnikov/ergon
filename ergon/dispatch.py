@@ -33,7 +33,8 @@ from . import tasks as _tasks
 # branch (created as a ref, never checked out here) or from the trunk for a task with no epic.
 # A headless `claude -p --agent task-<tier>` works it and commits there. The dispatcher alone
 # moves status: doing when it launches, then done once the branch merges into its base, or
-# blocked (worktree and branch kept for you) on anything else, a merge conflict included.
+# blocked (worktree and branch kept for you) on anything else. A merge conflict goes back to the
+# worker first (conflict rounds, below), and blocks only once those run out.
 # A task whose touches: names a companion repo also gets its own worktree of that repo's
 # checkout, on a task/<ID> branch there too, which lands on the companion's local trunk first.
 # No code is ever pushed. In shared mode the state branch is, to claim tasks (see "claims").
@@ -864,6 +865,117 @@ def rounds_note(last, vetoes, stop=""):
             + "; ".join(f"round {i}: {v}" for i, v in enumerate(vetoes, 1)))
 
 
+# ---------- conflict rounds ----------
+# A finished branch that won't merge cleanly into its base (or a companion's trunk), because the
+# base moved while it was worked, goes back to its worker before it blocks: up to conflict_rounds
+# times (0 blocks at once, for a hand merge). The worker merges the base in and commits the merge;
+# dispatch checks the merge mechanically, then the done checks, verify and review run again.
+
+CONFLICT_LOG_MAX = 40  # base commits listed per conflicted repo
+
+CONFLICT_RULES = """
+Resolve only the conflicted hunks, so that both sides' intent survives: the commits above say what
+the base side meant. Don't rebase, reset or force-move the branch, and change nothing else. When
+you finish, the dispatcher checks each conflicted repo: its worktree is clean, the branch tip is a
+merge commit with the base's tip as a parent, no conflict marker lines (`<<<<<<< ` or `>>>>>>> `
+at the start of a line) are left in the files the branch changes, and the branch now merges
+cleanly. A miss blocks the task. Then the done checks, verify and review (where set) run again,
+since the resolution is new code. If you can't reconcile the two sides, don't guess: end with
+`QUESTION:` lines and `RESULT: asking`, or `RESULT: blocked — <why>`.
+"""
+
+CONFLICT_PROMPT = """Your work on {id} conflicts with its base, which moved since you started (conflict round {n} of {rounds}):
+
+{body}
+End as before: a `FOUND: <title> — <why>` line for each piece of work you find but don't do, then
+`RESULT: done`, `RESULT: blocked — <why>`, or `QUESTION:` lines and `RESULT: asking`.
+"""
+
+CONFLICT_LINES = """The work on this branch is done, but the branch conflicts with its base, which moved since
+(conflict round {n} of {rounds}). What's left is merging the base in:
+
+{body}
+"""
+
+
+def find_conflicts(base, wt, branch, pubs):
+    """Where the task branch won't merge cleanly, companions first (land()'s order), each as a dict:
+    c (the companion, or None), base, repo, tree (the task's worktree there), files, tip (the
+    base's), fork, log (`git log --oneline fork..base`), reason (as land() would block). Raises GitError."""
+    spots = [(c, c["trunk"], c["path"], pub) for c, pub in pubs] + [(None, base, None, wt)]
+    out = []
+    for c, b, repo, tree in spots:
+        merged, files = _gitops.merge_tree(b, branch, repo)
+        if merged is not None:
+            continue
+        fork = _gitops.git("merge-base", b, branch, cwd=repo)
+        out.append({"c": c, "base": b, "repo": repo, "tree": tree, "files": files, "fork": fork,
+                    "tip": _gitops.git("rev-parse", b, cwd=repo),
+                    "log": _gitops.git("log", "--oneline", f"{fork}..{b}", cwd=repo),
+                    "reason": (f"{c['name']}: " if c else "") + _gitops.conflict_text(b, files)})
+    return out
+
+
+def conflict_body(t, found, branch):
+    """The conflict round's instructions: per conflicted repo, the base, its tip, the conflicted
+    files, how to merge and commit, and the base's commits since the fork."""
+    parts = []
+    for s in found:
+        c, b, tree = s["c"], s["base"], s["tree"]
+        lines = s["log"].splitlines()
+        shown = "\n".join("    " + l for l in lines[:CONFLICT_LOG_MAX]) + (
+            f"\n    ... and {len(lines) - CONFLICT_LOG_MAX} more" if len(lines) > CONFLICT_LOG_MAX else "")
+        cite = (f'with a message that cites no tracker ID, such as `git -C {tree} commit -m "Merge {b}"` '
+                f"({c['name']} commits never cite them, and git's default merge message names {branch}, which does)"
+                if c and c["forbid_ids"] else f"with a message citing {t['id']}")
+        parts.append(f"- {c['name'] + ', in its worktree' if c else 'This repo, in'} {tree}: {branch} conflicts with "
+                     f"{b} (now at {s['tip'][:12]}) in {', '.join(s['files']) or 'files git did not name'}. Merge "
+                     f"it with `git -C {tree} merge {b}`, and commit the merge {cite}. {b}'s commits since "
+                     f"{branch} forked from it, `git -C {tree} log --oneline {s['fork'][:12]}..{b}`:\n{shown or '    (none)'}")
+    return "\n".join(parts) + "\n" + CONFLICT_RULES
+
+
+def conflict_checks(found, branch):
+    """After a conflict round's worker says done: None, or why its merge doesn't hold. Per
+    conflicted repo: the worktree is clean (no merge under way), the branch tip is a merge commit
+    with a parent on the base at or past the tip the worker was given, no conflict marker line is
+    left in a file the branch changes, and the branch now merges cleanly. Raises GitError."""
+    for s in found:
+        c, b, repo, tree = s["c"], s["base"], s["repo"], s["tree"]
+        where = f"{c['name']} " if c else ""
+        if _gitops.merging(tree):
+            return f"the worker said done but left the merge in {tree} uncommitted"
+        if _gitops.dirty_paths(tree):
+            return f"the worker said done but left uncommitted changes in {tree}"
+        parents = _gitops.git("rev-list", "--parents", "-n", "1", branch, cwd=repo).split()[1:]
+        if len(parents) < 2:
+            return f"the worker said done but the tip of {where}{branch} isn't a merge commit, so {b} isn't merged in"
+        if not any(_gitops.is_ancestor(s["tip"], p, repo) and _gitops.is_ancestor(p, b, repo) for p in parents):
+            return f"the merge commit at the tip of {where}{branch} doesn't have {b}'s tip as a parent"
+        changed = _gitops.git("diff", "--name-only", "--diff-filter=d", s["tip"], branch, cwd=repo).splitlines()
+        left = _gitops.marker_files(branch, changed, repo)
+        if left:
+            return f"conflict markers left in {where}{', '.join(left)} on {branch}"
+        merged, files = _gitops.merge_tree(b, branch, repo)
+        if merged is None:
+            return f"{where}{branch} still {_gitops.conflict_text(b, files)} after the merge"
+    return None
+
+
+def conflict_note(last, earlier, stop=""):
+    """A block reason after conflict rounds: the last conflict, why no round followed it, then
+    each earlier round's conflict (as rounds_note does for fix rounds)."""
+    if not earlier:
+        return last + stop
+    return (f"{last} (after {len(earlier)} conflict round(s)){stop}. Earlier rounds: "
+            + "; ".join(f"round {i}: {r}" for i, r in enumerate(earlier, 1)))
+
+
+def resolved_note(found):
+    return "; ".join(f"resolved a conflict with {s['c']['name'] + ' ' if s['c'] else ''}{s['base']} in "
+                     f"{', '.join(s['files']) or 'unnamed files'}" for s in found)
+
+
 def kept_note(wt, branch, pubs):
     return f"Branch {branch} and worktree {wt} kept" + "".join(f" ({c['name']} worktree {pub})" for c, pub in pubs)
 
@@ -1004,19 +1116,20 @@ def dispatch(args):
 
     live, live_lock = {}, threading.Lock()  # running task id -> what its calls have cost so far
 
-    def round_stop(info, round_cost, rnd):
-        """Why no fix round may start now, or ''. Not after a Ctrl-C, nor when what's spent (the
-        finished tasks, and every running task's calls so far) plus about one more round (the
-        last one's cost; each call is capped at --budget) would cross the --budget-total cap."""
+    def round_stop(info, round_cost, rnd, kind="fix"):
+        """Why no fix round (or `kind` round) may start now, or ''. Not after a Ctrl-C, nor when
+        what's spent (the finished tasks, and every running task's calls so far) plus about one
+        more round (the last one's cost; each call is capped at --budget) would cross the
+        --budget-total cap."""
         if stops:
-            return "; no fix round: dispatch was interrupted"
+            return f"; no {kind} round: dispatch was interrupted"
         if cap is None:
             return ""
         with live_lock:
             now = spent() + sum(live.values())
         est = min(round_cost, 2 * args.budget) if args.budget else round_cost
         if now + est > cap:
-            return (f"; no fix round {rnd - 1}: ${now:.2f} spent and a round costs about ${est:.2f}, "
+            return (f"; no {kind} round {rnd - 1}: ${now:.2f} spent and a round costs about ${est:.2f}, "
                     f"past the ${cap:.2f} cap")
         return ""
 
@@ -1026,11 +1139,13 @@ def dispatch(args):
         worker that ends `blocked — outside: <why>` on a verify round costs no round: verify reruns
         once as it is, and a second red blocks the task and files a human task with that reason.
         Returns (verdict, reason). Folds every call's cost and FOUND lines, and the last worker's
-        log and session, into info; info["rounds"] gets the earlier vetoes when a fix worker blocks."""
-        kept, vetoes, rnd = kept_note(wt, branch, pubs), [], 1
+        log and session, into info; info["rounds"] gets the earlier vetoes when a fix worker blocks.
+        Worker runs are numbered on from info["rnd"] (after a conflict round, say), and what the
+        rounds fixed is added to info["fixed"]."""
+        kept, vetoes, rnd = kept_note(wt, branch, pubs), [], info.get("rnd", 1)
         vfixes, outside = 0, None
         repos = [None] + [c["path"] for c, _ in pubs]
-        round_cost = info.get("cost", 0)
+        round_cost = info.get("round_cost", info.get("cost", 0))
         info.setdefault("review_cost", 0)
 
         def fix(failed, verify=None, n=None):
@@ -1038,6 +1153,7 @@ def dispatch(args):
             log and session into info. A review round whose worker commits nothing blocks."""
             nonlocal rnd, round_cost
             rnd += 1
+            info["rnd"] = rnd
             try:
                 tips = [_gitops.git("rev-parse", branch, cwd=r) for r in repos]
             except _gitops.GitError:
@@ -1068,11 +1184,12 @@ def dispatch(args):
             info["cost"] = info.get("cost", 0) + rcost
             info["review_cost"] += rcost
             round_cost += rcost
+            info["round_cost"] = round_cost
             with live_lock:
                 live[t["id"]] = info["cost"]
             if not failed:
                 if vetoes or vfixes or outside:
-                    info["fixed"] = "; ".join(x for x in (
+                    info["fixed"] = "; ".join(x for x in (info.get("fixed"),
                         f"verify passed after {vfixes} fix round(s)" if vfixes else "",
                         f"verify passed on rerun after the worker found the failure outside the branch: {outside}"
                         if outside else "",
@@ -1114,6 +1231,88 @@ def dispatch(args):
                                   + "; ".join(f"round {i}: {x}" for i, x in enumerate(vetoes, 1)) + ")")
                 return ("asking" if v == "asking" else "blocked"), w
 
+    def conflict_stop(info, n):
+        """Why conflict round n may not run, or ''."""
+        if n > _config.CONFLICT_ROUNDS:
+            return f"; no conflict rounds left (conflict_rounds = {_config.CONFLICT_ROUNDS})"
+        return round_stop(info, info.get("round_cost", info.get("cost", 0)), n + 1, kind="conflict")
+
+    def conflict_seen(t, info, found):
+        """Record a `conflict` row per conflicted repo; returns the round that would resolve it."""
+        n = len(info.get("conflicts") or []) + 1
+        for s in found:
+            _history.record("conflict", t, files=s["files"], base=s["base"], round=info.get("rnd", 1) + 1,
+                            companion=s["c"]["name"] if s["c"] else None)
+        return n
+
+    def conflict_round(t, tier, base, wt, branch, pubs, info, found, n):
+        """Hand the conflicts in `found` to a worker on the branch: its own session resumed if
+        resume_choice() allows, else a fresh worker. Then check its merge (conflict_checks).
+        Returns (verdict, reason); folds the call into info like a fix round."""
+        kept, what = kept_note(wt, branch, pubs), "; ".join(s["reason"] for s in found)
+        info["rnd"] = rnd = info.get("rnd", 1) + 1
+        info.setdefault("conflicts", []).append(what)
+        body, rounds, session = conflict_body(t, found, branch), _config.CONFLICT_ROUNDS, info.get("session")
+        resume, fresh_because = resume_choice(session, wt)
+        tt = dict(t, tier=tier)
+        if resume:
+            _history.record("resumed", t, session=session, round=rnd, tier=tier, after="conflict")
+            print(f"  conflict {t['id']}  round {n}/{rounds} ({what}): resumed {session}", flush=True)
+            v, w, finfo = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd, resume=session,
+                                     prompt=CONFLICT_PROMPT.format(id=t["id"], n=n, rounds=rounds, body=body))
+        else:
+            _history.record("dispatched", t, tier=tier, model=agents[f"task-{tier}"]["model"], base=base,
+                            branch=branch, worktree=wt, companions=[c["name"] for c, _ in pubs],
+                            round=rnd, fresh_because=fresh_because, after="conflict")
+            print(f"  conflict {t['id']}  round {n}/{rounds} ({what}): fresh session ({fresh_because})", flush=True)
+            v, w, finfo = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd,
+                                     lines=CONFLICT_LINES.format(n=n, rounds=rounds, body=body))
+        info["round_cost"] = finfo.get("cost", 0)
+        info["cost"] = info.get("cost", 0) + info["round_cost"]
+        info["found"] = (info.get("found") or []) + (finfo.get("found") or [])
+        info["policy"] = (info.get("policy") or []) + (finfo.get("policy") or [])
+        info.update(log=finfo["log"], session=finfo.get("session") or session,
+                    asked=finfo.get("asked"), questions=finfo.get("questions"))
+        with live_lock:
+            live[t["id"]] = info["cost"]
+        if v != "done":
+            info["rounds"] = f" (conflict round {n}, after: {what})"
+            return v, w
+        try:
+            failed = conflict_checks(found, branch)
+        except _gitops.GitError as err:
+            failed = str(err)
+        if failed:
+            info["asked"] = False
+            return "blocked", f"{failed} (conflict round {n}, after: {what}). {kept}"
+        info["fixed"] = "; ".join(x for x in (info.get("fixed"), resolved_note(found)) if x)
+        print(f"  conflict {t['id']}  round {n}/{rounds}: merged; checking again", flush=True)
+        return "done", ""
+
+    def resolve(t, tier, base, wt, branch, pubs, info):
+        """Before the state lock, on a branch whose gate passed: while it conflicts with its base
+        (or a companion's trunk), a conflict round and then fix_loop again on the new tip, up to
+        conflict_rounds in all. Returns (verdict, reason)."""
+        kept = kept_note(wt, branch, pubs)
+        while True:
+            try:
+                found = find_conflicts(base, wt, branch, pubs)
+            except _gitops.GitError as err:
+                return "blocked", f"{err}. {kept}"
+            if not found:
+                return "done", ""
+            n = conflict_seen(t, info, found)
+            stop = conflict_stop(info, n)
+            if stop:
+                return "blocked", (f"{conflict_note('; '.join(s['reason'] for s in found), info.get('conflicts'), stop)}"
+                                   f". {kept}: merge by hand")
+            v, w = conflict_round(t, tier, base, wt, branch, pubs, info, found, n)
+            if v != "done":
+                return v, w
+            v, w = fix_loop(t, tier, base, wt, branch, pubs, info)
+            if v != "done":
+                return v, w
+
     def one(t, base, wt, branch, pubs, answered=None):
         if answered:  # a human answered its question: resume that session, or a fresh worker
             resume, fresh_because = resume_choice(None if answered == NO_SESSION else answered, wt)
@@ -1146,54 +1345,73 @@ def dispatch(args):
             verdict, info = v2, info2
         with live_lock:
             live[t["id"]] = info.get("cost", 0)
+        tier = up or t["tier"]
         if verdict == "done":
-            verdict, why = fix_loop(t, up or t["tier"], base, wt, branch, pubs, info)
-        with _gitops.state_lock():  # also serializes every merge into a companion's trunk
-            # `t` is the task as it was at launch, so nothing the worker did to its file since
-            # (dropping `accept:`, retiering) lets the branch skip a human's acceptance.
-            if verdict == "done" and _tasks.needs_accept(t, *([up] if up else [])):
-                verdict, why = "review", (f"waits for a human: `ergon accept {t['id']}` lands it, `ergon reject "
-                                          f"{t['id']} --reason R` sends it back. {kept_note(wt, branch, pubs)}"
-                                          # the branch is in this clone only: the Note says which
-                                          + (f" (held: {_tasks.clone_id()})" if claims else ""))
-                _history.record("review_hold", t, branch=branch, base=base)
-            elif verdict == "done":
-                verdict, why = land(t, base, wt, branch, pubs)
-            if verdict == "asking":
-                park(t, info, wt, branch, pubs)
-                print(f"  asking   {t['id']}  {why}: `ergon answer {t['id']}`")
-            elif verdict in ("done", "review"):
-                put_status(t["id"], verdict, "; ".join(x for x in (
-                    f"escalated {first}→{up}: {why1}" if up else "", info.get("fixed", ""),
-                    why if verdict == "review" else "") if x) or None)
-                if up:
-                    t2 = _tasks.load(_config.ITEMS)[t["id"]]
-                    t2["tier"] = up
-                    _tasks.dump(t2, _tasks.TASK_KEYS)
-                print(f"  {verdict:<8} {t['id']}  {why}")
-                e = epics.get(t.get("epic"))
-                if verdict == "done" and e and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
-                    try:
-                        _gitops.finish_epic(e["id"])
-                    except _gitops.GitError as err:
-                        print(f"  {e['id']} is complete but not merged: {err}")
-            else:
-                put_status(t["id"], "blocked", f"{why}{info.get('rounds', '')} (log {info['log']}"
-                           + (f", `claude --resume {info['session']}` in {wt}" if info.get("session") else "") + ")")
-                _history.record("blocked", t, reason=why, log=info.get("log"), session=info.get("session"),
-                                asked=bool(info.get("asked")))
-                print(f"  blocked  {t['id']}  {why}")
-            if info.get("policy"):
-                cur = _tasks.load(_config.ITEMS)[t["id"]]
-                for title, why in info["policy"]:
-                    add_note(cur, f"policy proposed: {title}" + (f" — {why}" if why else ""), who="worker")
-                _tasks.dump(cur, _tasks.TASK_KEYS)
-            for fid, title in file_found(t, info.get("found") or [], epics):
-                print(f"  proposed {fid}  (found by {t['id']})  {title}")
-                info.setdefault("filed", []).append(fid)
-            if verdict == "blocked" and info.get("asked"):
-                hid, title = file_human(t, why, epics)
-                print(f"  proposed {hid}  (human, {t['id']} now depends on it)  {title}")
+            verdict, why = fix_loop(t, tier, base, wt, branch, pubs, info)
+        while True:  # a conflict found under the lock loops back here for another round
+            if verdict == "done" and _config.CONFLICT_ROUNDS:
+                verdict, why = resolve(t, tier, base, wt, branch, pubs, info)
+            with _gitops.state_lock():  # also serializes every merge into a companion's trunk
+                # `t` is the task as it was at launch, so nothing the worker did to its file since
+                # (dropping `accept:`, retiering) lets the branch skip a human's acceptance.
+                if verdict == "done" and _tasks.needs_accept(t, *([up] if up else [])):
+                    verdict, why = "review", (f"waits for a human: `ergon accept {t['id']}` lands it, `ergon reject "
+                                              f"{t['id']} --reason R` sends it back. {kept_note(wt, branch, pubs)}"
+                                              # the branch is in this clone only: the Note says which
+                                              + (f" (held: {_tasks.clone_id()})" if claims else ""))
+                    _history.record("review_hold", t, branch=branch, base=base)
+                elif verdict == "done":
+                    found = None
+                    if _config.CONFLICT_ROUNDS:
+                        try:
+                            found = find_conflicts(base, wt, branch, pubs)
+                        except _gitops.GitError:
+                            found = None  # land() reports it
+                    if found and not conflict_stop(info, len(info.get("conflicts") or []) + 1):
+                        continue  # the base moved again since resolve(): another round, outside the lock
+                    if found:
+                        n = conflict_seen(t, info, found)
+                        verdict, why = "blocked", (
+                            conflict_note("; ".join(s["reason"] for s in found), info.get("conflicts"),
+                                          conflict_stop(info, n)) + f". {kept_note(wt, branch, pubs)}: merge by hand")
+                    else:
+                        verdict, why = land(t, base, wt, branch, pubs)
+                if verdict == "asking":
+                    park(t, info, wt, branch, pubs)
+                    print(f"  asking   {t['id']}  {why}: `ergon answer {t['id']}`")
+                elif verdict in ("done", "review"):
+                    put_status(t["id"], verdict, "; ".join(x for x in (
+                        f"escalated {first}→{up}: {why1}" if up else "", info.get("fixed", ""),
+                        why if verdict == "review" else "") if x) or None)
+                    if up:
+                        t2 = _tasks.load(_config.ITEMS)[t["id"]]
+                        t2["tier"] = up
+                        _tasks.dump(t2, _tasks.TASK_KEYS)
+                    print(f"  {verdict:<8} {t['id']}  {why}")
+                    e = epics.get(t.get("epic"))
+                    if verdict == "done" and e and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
+                        try:
+                            _gitops.finish_epic(e["id"])
+                        except _gitops.GitError as err:
+                            print(f"  {e['id']} is complete but not merged: {err}")
+                else:
+                    put_status(t["id"], "blocked", f"{why}{info.get('rounds', '')} (log {info['log']}"
+                               + (f", `claude --resume {info['session']}` in {wt}" if info.get("session") else "") + ")")
+                    _history.record("blocked", t, reason=why, log=info.get("log"), session=info.get("session"),
+                                    asked=bool(info.get("asked")))
+                    print(f"  blocked  {t['id']}  {why}")
+                if info.get("policy"):
+                    cur = _tasks.load(_config.ITEMS)[t["id"]]
+                    for title, why in info["policy"]:
+                        add_note(cur, f"policy proposed: {title}" + (f" — {why}" if why else ""), who="worker")
+                    _tasks.dump(cur, _tasks.TASK_KEYS)
+                for fid, title in file_found(t, info.get("found") or [], epics):
+                    print(f"  proposed {fid}  (found by {t['id']})  {title}")
+                    info.setdefault("filed", []).append(fid)
+                if verdict == "blocked" and info.get("asked"):
+                    hid, title = file_human(t, why, epics)
+                    print(f"  proposed {hid}  (human, {t['id']} now depends on it)  {title}")
+            break
         if claims:  # publish where it stopped (and what it filed) now, not at the next scan
             failed = sync_state()
             if failed:
@@ -1231,6 +1449,8 @@ def dispatch(args):
         plan = list(eligible(tasks))
         rr = _config.REVIEW_ROUNDS
         rounds = f"up to {rr} fix round{'s' if rr != 1 else ''}" if rr else "no fix rounds"
+        cr = _config.CONFLICT_ROUNDS
+        crounds = f"up to {cr} conflict round{'s' if cr != 1 else ''}"
         for t in plan:
             e = epics.get(t.get("epic"))
             print(f"  would run  {t['id']}  {t['tier']:<6}  on {_gitops.epic_branch(e) if e else _config.MAIN}"
@@ -1238,6 +1458,7 @@ def dispatch(args):
                                if t["tier"] in _config.REVIEW else "")
                   + (f", up to {_config.VERIFY_ROUNDS} verify fix round{'s' if _config.VERIFY_ROUNDS != 1 else ''}"
                      if _config.VERIFY_ROUNDS and (t.get("verify") or _config.CFG.get("verify")) else "")
+                  + (f", {crounds} if its branch conflicts" if cr else "")
                   + (f", escalates to {_config.WORKER_TIERS[_config.WORKER_TIERS.index(t['tier']) + 1]} if blocked"
                      if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1] else "")
                   + (", held for your accept" if _tasks.needs_accept(t) else "")
@@ -1253,7 +1474,7 @@ def dispatch(args):
                 """Calls `t` may make, each capped at --budget: its worker; a second worker a tier up
                 if --escalate retries it; then fix_loop's calls: per verify fix round a fix worker
                 (when a verify is set), and for a reviewed tier the review plus every fix round
-                (a fix worker and a review again)."""
+                (a fix worker and a review again); and a worker per conflict round."""
                 verified = bool(vr and (t.get("verify") or _config.CFG.get("verify")))
                 if verified:
                     counted.add("verify")
@@ -1263,11 +1484,13 @@ def dispatch(args):
                         counted.add("review")
                     return (1 + 2 * rr if reviewed else 0) + (vr if verified else 0)
                 own = t["tier"] in _config.REVIEW
-                calls = 1 + after(own)
+                if cr:
+                    counted.add("conflict")
+                calls = 1 + cr + after(own)
                 if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1]:
                     counted.add("escalate")  # after it the tier that finished is reviewed too
                     up = _config.WORKER_TIERS[_config.WORKER_TIERS.index(t["tier"]) + 1]
-                    calls = max(calls, 2 + after(own or up in _config.REVIEW))
+                    calls = max(calls, 2 + cr + after(own or up in _config.REVIEW))
                 return calls
             # The n costliest count, so the estimate stays an upper bound whichever tasks launch.
             calls = sorted((max_calls(t) for t in plan), reverse=True)[:n]
@@ -1276,7 +1499,8 @@ def dispatch(args):
                 ("review", f"the review and {rounds}" + (" (a fix and a review each)" if rr else "")
                            + " for a reviewed tier"),
                 ("verify", f"up to {vr} verify fix round{'s' if vr != 1 else ''} (a fix each) "
-                           "if a verify is set")) if k in counted]
+                           "if a verify is set"),
+                ("conflict", f"{crounds} (a worker each) if the branch conflicts")) if k in counted]
             print(f"  cap        ${cap:.2f} total ({args.budget_pct:g}% of ${args.budget_total:.2f}): "
                   "no new task launches once finished workers' cost reaches it"
                   + (f"; estimated at most ${sum(calls) * args.budget:.2f} for {n} task(s) at --budget "
