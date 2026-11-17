@@ -355,7 +355,7 @@ def bar(done, total):
 def task_li(t, tasks, extra=""):
     flags = []
     if t.get("epic"):
-        flags.append(esc(t["epic"]))
+        flags.append(f'<a href="/e/{esc(t["epic"])}">{esc(t["epic"])}</a>')
     if t["status"] == "ready" and not _tasks.deps_done(t, tasks):
         waits = [d for d in t.get("depends") or [] if tasks.get(d, {}).get("status") != "done"]
         flags.append("waits on " + link_ids(esc(",".join(waits)), tasks))

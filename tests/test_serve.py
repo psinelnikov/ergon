@@ -352,6 +352,7 @@ class TestEpicTimeline(ServeFixture):
         self.assertEqual(re.findall(r"<script[^>]*>", page), [f'<script nonce="{nonce}">'])
         self.assertEqual(self.req("GET", "/e/E-009")[0], 404)
         self.assertIn('href="/e/E-001"', self.req("GET", "/")[2])
+        self.assertIn('(<a href="/e/E-001">E-001</a>', self.req("GET", "/")[2])
         self.assertEqual(self.snapshot().keys() - self.before.keys(), set())
 
     @unittest.skipUnless(shutil.which("node"), "node not installed")
