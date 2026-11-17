@@ -310,7 +310,8 @@ class TestBasics(Project):
                     "ergon \\\n approve T-1", 'ergon approve T-1 "unterminated', "xargs ergon approve <<< T-1",
                     "(ergon approve T-1)", "sudo ergon accept T-1", "FOO=1 ~/bin/ergon reject T-1 --reason x",
                     "python3 -c \"import os; os.system('ergon approve T-1')\"", "ssh host 'ergon approve T-1'",
-                    "cat <<EOF\n$(ergon approve T-1)\nEOF", "diff <(ergon accept T-1) x", "ls; ergon approve T-1 &"]:
+                    "cat <<EOF\n$(ergon approve T-1)\nEOF", "diff <(ergon accept T-1) x", "ls; ergon approve T-1 &",
+                    "cat <<'EOF' | sh\nergon approve T-1\nEOF", "cat <<'EOF' |\nergon close T-1\nEOF\nbash"]:
             self.assertTrue(human_cmd(cmd), cmd)
 
     def test_guard_human_cmd_git_runs_its_arguments(self):
@@ -1956,6 +1957,29 @@ class TestPolicies(TestReview):
                     "cat tasks/runs/*.json 2>&1 | head", "ls tasks/runs"):
             self.assertIsNone(self.guard("Bash", {"command": cmd}, "--worker"), cmd)
         self.assertIsNone(self.guard("Write", {"file_path": str(self.root / "notes/runs.md"), "content": "x"}, "--worker"))
+
+    def test_guard_runs_rule_lets_heredoc_data_through(self):
+        """A heredoc that only names history.jsonl or runs/ in its text is data, not a write (T-084)."""
+        test = "hist = root / 'tasks/runs/history.jsonl'\nassert 'history.jsonl' in out\n"
+        for cmd in (f"cat > tests/test_x.py <<'EOF'\n{test}EOF",
+                    f"cat <<EOF > tests/test_x.py\n{test}EOF\npython3 -m pytest tests/test_x.py",
+                    f"cat > notes.md <<-EOF\n\tsee tasks/runs/ for $HOME\n\tEOF",
+                    f"cat <<'A' > a.py && cat <<'B' > b.py\n{test}A\n{test}B",
+                    f"cat <<'EOF' | tee tests/test_x.py\n{test}EOF",
+                    f"git commit -F - <<'EOF'\nStop writing tasks/runs/history.jsonl by hand\nEOF"):
+            self.assertIsNone(self.guard("Bash", {"command": cmd}, "--worker"), cmd)
+        row = '{"verdict": "pass"}'
+        for cmd in (f"cat <<'EOF' > tasks/runs/history.jsonl\n{row}\nEOF",
+                    f"cat > x <<'EOF' && cp x tasks/runs/history.jsonl\n{row}\nEOF",
+                    f"python3 - <<'EOF'\nopen('tasks/runs/history.jsonl', 'a').write('{row}')\nEOF",
+                    f"bash <<'EOF'\necho '{row}' >> tasks/runs/history.jsonl\nEOF",
+                    f"cat <<'EOF' | sh\necho '{row}' >> tasks/runs/history.jsonl\nEOF",
+                    f"cat <<'EOF' |& bash\necho '{row}' >> tasks/runs/history.jsonl\nEOF",
+                    "cat <<'EOF' | xargs rm\ntasks/runs/history.jsonl\nEOF",
+                    "cat > notes.md <<EOF\n$(rm tasks/runs/history.jsonl)\nEOF",
+                    "cat > notes.md <<EOF\n`echo x >> tasks/runs/history.jsonl`\nEOF",
+                    "cat <<EOF > x 'open quote\ntasks/runs/history.jsonl\nEOF"):
+            self.assertIn("runs/", self.guard("Bash", {"command": cmd}, "--worker") or "", cmd)
 
     def test_worker_policy_line_becomes_note(self):
         self.ergon("new", "task", "Reviewed", "--tier", "haiku")

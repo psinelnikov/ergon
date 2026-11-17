@@ -732,7 +732,8 @@ GIT_WRITE = re.compile(r"\bgit\b[^;&|]*\s(add|commit|checkout|switch|reset|resto
 
 def shell_commands(s, i=0, close=None):
     """Split shell text into simple commands, each (its words after quote removal, its heredoc
-    bodies as (text, expands)). The commands inside $(...), `...` and (...) come out as commands of
+    bodies as (text, expands)). A command piped from one with heredocs shares them (`cat <<EOF | sh`
+    runs the body). The commands inside $(...), `...` and (...) come out as commands of
     their own; a word holding a substitution keeps its source text. Returns (commands, the index
     after `close`). Raises ValueError on text it can't split (an open quote, an unclosed paren)."""
     cmds, words, docs, word, pending, n = [], [], [], [], [], len(s)
@@ -745,12 +746,12 @@ def shell_commands(s, i=0, close=None):
         word.clear()
         inword = False
 
-    def end_cmd():
+    def end_cmd():  # a command with no words keeps its heredocs for the next (`cat <<EOF |` + newline)
         nonlocal words, docs
         end_word()
         if words:
             cmds.append((words, docs))
-        words, docs = [], []
+            words, docs = [], []
 
     def sub(i):  # s[i:] starts with "$(": the commands up to its ")" are commands too
         found, j = shell_commands(s, i + 2, ")")
@@ -853,7 +854,15 @@ def shell_commands(s, i=0, close=None):
         elif c == "\n":
             end_cmd()
             i = bodies(i + 1)
-        elif c in ";&|":
+        elif s.startswith("||", i):
+            end_cmd()
+            i += 2
+        elif c == "|":  # a pipe: the heredocs read so far feed the next command's stdin too
+            piped = docs
+            end_cmd()
+            docs = piped
+            i += 2 if s.startswith("|&", i) else 1
+        elif c in ";&":
             end_cmd()
             i += 1
         elif c == "(":
@@ -1041,6 +1050,23 @@ def is_runs(path):
         return bool(_config.RUNS_PATH.search(p.as_posix()))
 
 
+def names_outside_data(cmd, pattern):
+    """Whether shell text names pattern anywhere but in a heredoc's data. A heredoc's body is data
+    (`cat > tests/t.py <<'EOF'` writing a test that mentions the path) unless it reaches a program
+    that runs it or turns it into arguments (a shell or interpreter, xargs, also through a pipe),
+    or it expands a $(...) or `...`. Text that can't be split is matched whole."""
+    try:
+        cmds = shell_commands(cmd)[0]
+    except (ValueError, RecursionError):
+        return bool(pattern.search(cmd))
+    for words, docs in cmds:
+        code = any(CODE_RUNNER.fullmatch(_program(w)) or _program(w) == "xargs" for w in words)
+        live = [d for d, expands in docs if code or (expands and re.search(r"\$\(|`", d))]
+        if any(pattern.search(t) for t in words + live):
+            return True
+    return False
+
+
 # git subcommands that change a repository, its refs or a worktree (state_git_reason).
 STATE_GIT_WRITES = {"add", "commit", "checkout", "switch", "reset", "restore", "merge", "rebase", "cherry-pick",
                     "revert", "stash", "apply", "am", "pull", "push", "fetch", "branch", "tag", "worktree", "clean",
@@ -1134,7 +1160,7 @@ def guard_reason(tool, inp, worker=False, cwd=None):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
         if _config.POLICIES.name in cmd and SHELL_WRITE.search(cmd):
             return POLICY_MSG
-        if _config.RUNS_IN_CMD.search(cmd) and SHELL_WRITE.search(cmd):
+        if SHELL_WRITE.search(cmd) and names_outside_data(cmd, _config.RUNS_IN_CMD):
             return RUNS_MSG
         if _config.TASK_DIR_IN_CMD.search(cmd) and SHELL_WRITE.search(cmd):
             return ("don't write task files from the shell: use `ergon new` / `ergon set` for state, "
