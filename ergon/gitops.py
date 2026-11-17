@@ -95,14 +95,47 @@ def worktrees(repo=None):
     return out
 
 
-def merge_check(base, branch, repo=None):
-    """The tree merging branch into base would give, or GitError naming the conflicts."""
+def merge_tree(base, branch, repo=None):
+    """(the tree merging branch into base would give, or None on a conflict; the conflicted files)."""
     tree = subprocess.run(["git", "-C", str(repo or _config.REPO), "merge-tree", "--write-tree", base, branch],
                           capture_output=True, text=True)
     if tree.returncode:
-        files = sorted(set(re.findall(r"CONFLICT \([^)]*\): .*? in (\S+)", tree.stdout)))
-        raise GitError(f"conflicts with {base}" + (f" in {', '.join(files)}" if files else ""))
-    return tree.stdout.split()[0]
+        return None, sorted(set(re.findall(r"CONFLICT \([^)]*\): .*? in (\S+)", tree.stdout)))
+    return tree.stdout.split()[0], []
+
+
+def conflict_text(base, files):
+    return f"conflicts with {base}" + (f" in {', '.join(files)}" if files else "")
+
+
+def merge_check(base, branch, repo=None):
+    """The tree merging branch into base would give, or GitError naming the conflicts."""
+    tree, files = merge_tree(base, branch, repo)
+    if tree is None:
+        raise GitError(conflict_text(base, files))
+    return tree
+
+
+def is_ancestor(a, b, repo=None):
+    return subprocess.run(["git", "-C", str(repo or _config.REPO), "merge-base", "--is-ancestor", a, b],
+                          capture_output=True).returncode == 0
+
+
+def marker_files(ref, paths, repo=None):
+    """Of `paths`, those whose text at `ref` still holds a conflict marker line."""
+    if not paths:
+        return []
+    r = subprocess.run(["git", "-C", str(repo or _config.REPO), "grep", "-I", "-l", "-E",
+                        "^(<<<<<<< |>>>>>>> )", ref, "--", *paths], capture_output=True, text=True)
+    if r.returncode > 1:
+        raise GitError(f"git grep for conflict markers: {(r.stderr or r.stdout).strip()}")
+    return sorted(l.split(":", 1)[1] for l in r.stdout.splitlines() if ":" in l)
+
+
+def merging(tree):
+    """Is a merge under way (MERGE_HEAD set) in the checkout at `tree`?"""
+    return subprocess.run(["git", "-C", str(tree), "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                          capture_output=True).returncode == 0
 
 
 def merge_into(base, branch, msg, no_ff=False, repo=None):
