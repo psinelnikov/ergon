@@ -133,6 +133,7 @@ def stamp(path):
 
 class Project(unittest.TestCase):
     config = ""
+    journal = False  # finishing an epic would run `claude -p` for its journal entry; only tests of that turn it on
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -142,6 +143,9 @@ class Project(unittest.TestCase):
         self.ergon("init")
         if self.config:
             (self.root / ".ergon.toml").write_text(textwrap.dedent(self.config))
+        if not self.journal:
+            cfg = self.root / ".ergon.toml"
+            cfg.write_text("journal = false\n" + cfg.read_text())
         sh("git", "add", "-A", cwd=self.root)
         sh("git", "commit", "-qm", "ergon", cwd=self.root)
 

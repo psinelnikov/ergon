@@ -51,6 +51,7 @@ import urllib.parse
 from pathlib import Path
 
 from . import config as _config
+from . import gitops as _gitops
 from . import history as _history
 from . import metrics as _metrics
 from . import report as _report
@@ -432,6 +433,18 @@ def board_page(nonce):
     return page(f"ergon · {_config.HOME.name}", "".join(b), nonce, script=True)
 
 
+def journal_block(eid, tasks):
+    """The epic's newest journal entry as HTML (model output: escaped like task text), with a
+    muted line saying when, by which model and at what cost; or where to make one."""
+    _, d = _gitops.latest_journal(eid)
+    if not d:
+        return f'<p class=muted>no journal entry yet: <code>ergon journal {esc(eid)}</code></p>'
+    cost = d.get("cost")
+    return (f'<div class=journal>{markdown(d["body"], tasks)}</div>'
+            f'<p class=muted>journal generated {esc(d.get("generated"))} by {esc(d.get("model"))}'
+            + (f' · {money(cost)}' if isinstance(cost, (int, float)) and not isinstance(cost, bool) else "") + "</p>")
+
+
 def epic_page(eid, nonce, now=None):
     epics = _tasks.load(_config.EPICS)
     e = epics.get(eid)
@@ -448,12 +461,15 @@ def epic_page(eid, nonce, now=None):
     tl = _timeline.build(rows, tasks, eid, now or time.time(), tokens)
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
          f'<h1>{esc(eid)} {esc(e.get("title"))}</h1>']
+    jb = journal_block(eid, tasks)
     if not tl["lanes"]:
+        b.append(jb)
         b.append("<p class=muted>no task of this epic has a journal yet</p>")
         return page(f"{eid} · {e.get('title', '')}", "".join(b), nonce)
     human, machine = _timeline.totals(tl)
     total = human + machine
     spent = tl["costs"][-1][3] if tl["costs"] else 0
+    b.append(jb)
     b.append(f'<p>{len(tl["lanes"])} task(s) · {esc(secs(tl["t1"] - tl["t0"]))} end to end · {money(spent)} · '
              f'waiting on a human {esc(secs(human))}'
              + (f' ({round(100 * human / total)}% of lane time)' if total else "") + "</p>")
