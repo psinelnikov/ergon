@@ -122,21 +122,194 @@ class TestSync(Shared):
         self.assertIn("title: Two", self.task(self.b, "T-002").read_text())
         self.assertEqual(sh("git", "rev-parse", "HEAD", cwd=self.b / "tasks").stdout.strip(), self.remote_tip())
 
-    def test_both_sides_changing_one_task_stops_with_a_report(self):
+
+class TestMerge(Shared):
+    """Both clones change T-001 since they last met; A pushes first, B's sync merges (T-018)."""
+
+    def edit(self, where, tid, old, new):
+        f = self.task(where, tid)
+        text = f.read_text()
+        self.assertIn(old, text)
+        f.write_text(text.replace(old, new, 1))
+
+    def settle(self):
+        """Sync both clones until they agree; then they hold the same files, none has a conflict
+        marker, and `ergon check` passes in each."""
+        for where in (self.a, self.b, self.a):
+            self.ergon(where, "sync")
+        files = {}
+        for where in (self.a, self.b):
+            files[where] = {p.relative_to(where / "tasks").as_posix(): p.read_text()
+                            for d in ("items", "epics") for p in sorted((where / "tasks" / d).rglob("*.md"))}
+            for name, text in files[where].items():
+                for marker in ("<<<<<<<", ">>>>>>>", "\n=======\n", "|||||||"):
+                    self.assertNotIn(marker, text, f"{where.name}: {name}")
+            r = self.ergon(where, "check", check=False)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(files[self.a], files[self.b])
+        self.assertEqual(sh("git", "rev-parse", "HEAD", cwd=self.b / "tasks").stdout.strip(), self.remote_tip())
+        return files[self.a]
+
+    def approved_start(self):
+        self.start()
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        self.assertIn("status: ready", self.task(self.b, "T-001").read_text())
+
+    def test_fields_merge_three_way_and_the_remote_wins_a_real_conflict(self):
         self.start()
         self.ergon(self.a, "set", "T-001", "title=From A")
         self.ergon(self.a, "sync")
-        tip = self.remote_tip()
         self.ergon(self.b, "set", "T-001", "title=From B")
+        self.ergon(self.b, "set", "T-001", "tier=sonnet")
         self.ergon(self.b, "new", "task", "Other", "--tier", "haiku")
-        r = self.ergon(self.b, "sync", check=False)
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("sync stopped", r.stderr)
-        self.assertIn("T-001: here edited", r.stderr)
-        self.assertNotIn("T-002", r.stderr)
-        self.assertEqual(self.remote_tip(), tip)  # nothing pushed
-        self.assertIn("title: From B", self.task(self.b, "T-001").read_text())  # nothing merged
+        r = self.ergon(self.b, "sync")
+        self.assertIn("merged: T-001: both sides changed title; kept", r.stdout)
+        self.assertIn("this clone's From B dropped", r.stdout)
+        self.assertIn("pushed ergon-state", r.stdout)
+        text = self.task(self.b, "T-001").read_text()
+        self.assertIn("title: From A", text)
+        self.assertIn("tier: sonnet", text)
+        # a merge commit with both sides as parents, not a rebase
+        parents = sh("git", "log", "-1", "--format=%P", cwd=self.b / "tasks").stdout.split()
+        self.assertEqual(len(parents), 2)
+        self.assertIn("both sides changed title", sh("git", "log", "-1", "--format=%B", cwd=self.b / "tasks").stdout)
+        files = self.settle()
+        self.assertIn("tier: sonnet", next(v for k, v in files.items() if "/T-001-" in k))
+        self.assertTrue(any("/T-002-" in k for k in files))
+
+    def test_status_race_drops_the_second_claim_and_notes_it(self):
+        self.approved_start()
+        self.ergon(self.a, "set", "T-001", "status=doing")
+        self.ergon(self.a, "sync")
+        tip = self.remote_tip()
+        # the second ready->doing, by someone else (the same person in the same second would make
+        # A's very commit, byte for byte, and there would be nothing to merge)
+        dana = clean_env(ERGON_ASK_STDIN="1", GIT_AUTHOR_NAME="Dana", GIT_COMMITTER_NAME="Dana")
+        self.ergon(self.b, "set", "T-001", "status=doing", env=dana)
+        r = self.ergon(self.b, "sync", env=dana)
+        self.assertIn("merged: T-001: dropped this clone's ready->doing", r.stdout)
+        self.assertIn("had moved it to doing first", r.stdout)
+        self.assertNotEqual(self.remote_tip(), tip)  # the Note is published
+        files = self.settle()
+        text = next(v for k, v in files.items() if "/T-001-" in k)
+        self.assertIn("status: doing", text)
+        self.assertRegex(text, r"\n- \d{4}-\d\d-\d\d sync: dropped Dana's ready->doing, remote had moved to doing\n")
+        self.assertIn("approved: ", text)
+
+    def test_a_status_move_after_the_remote_moved_loses_to_it(self):
+        self.approved_start()
+        self.ergon(self.a, "set", "T-001", "status=doing")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "set", "T-001", "status=blocked")
+        self.ergon(self.b, "set", "T-001", "title=Edited on B")
+        r = self.ergon(self.b, "sync")
+        self.assertIn("dropped this clone's ready->blocked", r.stdout)
+        text = next(v for k, v in self.settle().items() if "/T-001-" in k)
+        self.assertIn("status: doing", text)
+        self.assertIn("title: Edited on B", text)  # the rest of B's edit still merges
+        self.assertIn("sync: dropped Tester's ready->blocked, remote had moved to doing", text)
+
+    def test_a_status_move_the_remote_didnt_race_applies(self):
+        self.approved_start()
+        self.ergon(self.a, "set", "T-001", "title=Edited on A")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "set", "T-001", "status=doing")
+        r = self.ergon(self.b, "sync")
+        self.assertNotIn("dropped", r.stdout)
+        text = next(v for k, v in self.settle().items() if "/T-001-" in k)
+        self.assertIn("status: doing", text)
+        self.assertIn("title: Edited on A", text)
+
+    def test_notes_appended_on_both_sides_are_kept(self):
+        self.start()
+        self.edit(self.a, "T-001", "## Notes\n", "## Notes\n- 2026-11-02 A: second\n- 2026-11-04 A: fourth\n")
+        self.ergon(self.a, "sync")
+        self.edit(self.b, "T-001", "## Notes\n", "## Notes\n- 2026-11-01 B: first\n- 2026-11-03 B: third\n"
+                                                 "  wrapped under third\n")
+        r = self.ergon(self.b, "sync")
+        self.assertNotIn("merged:", r.stdout)  # nothing was lost
+        text = next(v for k, v in self.settle().items() if "/T-001-" in k)
+        notes = text.split("## Notes\n", 1)[1]
+        self.assertEqual(notes, "- 2026-11-01 B: first\n- 2026-11-02 A: second\n- 2026-11-03 B: third\n"
+                                "  wrapped under third\n- 2026-11-04 A: fourth\n")
+        # appended again on both sides: still each line once
+        self.edit(self.a, "T-001", "A: fourth\n", "A: fourth\n- 2026-11-05 A: fifth\n")
+        self.edit(self.b, "T-001", "A: fourth\n", "A: fourth\n- 2026-11-05 B: fifth\n")
+        self.ergon(self.a, "sync")
+        text = next(v for k, v in self.settle().items() if "/T-001-" in k)
+        self.assertEqual(text.count("A: fourth"), 1)
+        self.assertTrue(text.endswith("- 2026-11-04 A: fourth\n- 2026-11-05 A: fifth\n- 2026-11-05 B: fifth\n"), text)
+
+    def test_brief_edits_merge_and_a_conflict_keeps_the_remote_and_saves_the_local_copy(self):
+        self.start()
+        self.edit(self.a, "T-001", "## What\n", "## What\nBuild the thing.\n")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        # different sections: both kept
+        self.edit(self.a, "T-001", "Build the thing.\n", "Build the thing well.\n")
+        self.ergon(self.a, "sync")
+        self.edit(self.b, "T-001", "## Done when\n", "## Done when\n- tests pass\n")
+        r = self.ergon(self.b, "sync")
+        self.assertNotIn("merged:", r.stdout)
+        text = next(v for k, v in self.settle().items() if "/T-001-" in k)
+        self.assertIn("Build the thing well.\n", text)
+        self.assertIn("- tests pass\n", text)
+        # the same line: the remote's wins, B's whole file is kept locally
+        self.edit(self.a, "T-001", "Build the thing well.", "Build it in Rust.")
+        self.ergon(self.a, "sync")
+        self.edit(self.b, "T-001", "Build the thing well.", "Build it in Go.")
+        self.edit(self.b, "T-001", "## Notes\n", "## Notes\n- 2026-11-10 B: picked Go\n")
+        r = self.ergon(self.b, "sync")
+        self.assertIn("merged: T-001: both sides changed What / Done when and they conflict", r.stdout)
+        saved = list((self.b / "tasks" / "conflicts").glob("T-001-*.md"))
+        self.assertEqual(len(saved), 1)
+        self.assertIn(f"saved as tasks/conflicts/{saved[0].name}", r.stdout)
+        self.assertIn("Build it in Go.", saved[0].read_text())
+        text = next(v for k, v in self.settle().items() if "/T-001-" in k)
+        self.assertIn("Build it in Rust.", text)
+        self.assertNotIn("Build it in Go.", text)
+        self.assertIn("- 2026-11-10 B: picked Go\n", text)  # Notes still merge
+        self.assertEqual(sh("git", "ls-files", "conflicts", cwd=self.b / "tasks").stdout, "")  # local only
         self.assertEqual(sh("git", "status", "--porcelain", cwd=self.b / "tasks").stdout, "")
+
+    def test_accept_yes_survives(self):
+        self.start()
+        self.ergon(self.a, "set", "T-001", "accept=yes")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "set", "T-001", "title=Edited on B")
+        self.ergon(self.b, "sync")
+        text = next(v for k, v in self.settle().items() if "/T-001-" in k)
+        self.assertIn("accept: yes", text)
+        self.assertIn("title: Edited on B", text)
+        # taken off on one side while the other edits the task: yes sticks
+        self.edit(self.a, "T-001", "accept: yes\n", "")
+        self.ergon(self.a, "set", "T-001", "title=Edited on A")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "set", "T-001", "tier=sonnet")
+        self.ergon(self.b, "sync")
+        text = next(v for k, v in self.settle().items() if "/T-001-" in k)
+        self.assertIn("accept: yes", text)
+        self.assertIn("tier: sonnet", text)
+        self.assertIn("title: Edited on A", text)
+
+    def test_a_task_moved_into_an_epic_on_one_side_and_edited_on_the_other_is_merged(self):
+        self.start()
+        self.ergon(self.a, "new", "epic", "Big")
+        self.ergon(self.a, "set", "T-001", "epic=E-001")
+        self.assertTrue((self.a / "tasks" / "epics" / "E-001-big" / "T-001-one.md").exists())
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "set", "T-001", "tier=sonnet")
+        self.edit(self.b, "T-001", "## What\n", "## What\nEdited on B.\n")
+        r = self.ergon(self.b, "sync")
+        self.assertNotIn("merged:", r.stdout)
+        files = self.settle()
+        self.assertEqual([k for k in files if "T-001" in k], ["epics/E-001-big/T-001-one.md"])
+        text = files["epics/E-001-big/T-001-one.md"]
+        self.assertIn("epic: E-001", text)
+        self.assertIn("tier: sonnet", text)
+        self.assertIn("Edited on B.", text)
 
 
 class TestWhoSyncs(Shared):
