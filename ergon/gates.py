@@ -1369,9 +1369,13 @@ def commit_msg_reason(msg, tasks):
     """Why a commit with this message must not land, or None. Each task it cites must exist, be
     out of `proposed` and carry a human's `approved:` stamp: a proposed task (stamped or not), one
     rejected to dropped, one hand-edited to ready, or an ID nobody filed are all refused. Epic IDs
-    aren't approved, so aren't checked."""
+    aren't approved, so aren't checked. In shared mode the stamp is only a display copy, so the
+    signed approval must verify too (`Approvals.problem`); approvals load once, if a task is cited."""
     bad = []
+    apr = None
     for tid in cited_tasks(msg):
+        if apr is None and _config.SHARED:
+            apr = _gitops.approvals()
         t = tasks.get(tid)
         if not t:
             bad.append(f"{tid}: no such task in this tracker")
@@ -1379,6 +1383,8 @@ def commit_msg_reason(msg, tasks):
             # a proposed task is unapproved whatever its stamp says: a two-person task waiting for
             # its second approver, or a stamp written by hand
             bad.append(f"{tid}: {t.get('status') or 'no status'}, and no human has approved it")
+        elif apr is not None and apr.problem(t):
+            bad.append(f"{tid}: approval doesn't verify: {apr.problem(t)}")
     if not bad:
         return None
     return ("ergon: commit refused. It cites tasks no human has approved:\n  " + "\n  ".join(bad) +
@@ -1400,6 +1406,11 @@ def commit_msg_hook(args):
             pass
         if not args.msgfile:
             raise ValueError("no message file given")
+        # git points GIT_DIR and friends at the repo being committed in; approvals are read from the
+        # state worktree, a different repo, so those must not leak into `git -C <state>`.
+        for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_COMMON_DIR",
+                    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_QUARANTINE_PATH"):
+            os.environ.pop(var, None)
         why = commit_msg_reason(Path(args.msgfile).read_text(errors="replace"), _tasks.load(_config.ITEMS))
     except Exception as err:  # fail open, like the Claude Code hooks
         print(f"ergon commit-msg hook error (ignored): {err}", file=sys.stderr)

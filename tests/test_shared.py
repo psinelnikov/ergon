@@ -932,6 +932,27 @@ class TestSignedApprovals(Shared):
             out = self.ergon(self.a, "hook", "guard", inp=event).stdout
             self.assertIn("only ergon writes it", out, cmd)
 
+    def commit_citing(self, where, tid):
+        return sh("git", "commit", "--allow-empty", "-qm", f"Work ({tid})", cwd=where, check=False, env=self.env)
+
+    def test_commit_msg_hook_checks_signed_approval(self):
+        self.start()
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        r = self.commit_citing(self.a, "T-001")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # the brief changes after approval
+        self.edit(self.a, "T-001", "## What\n", "## What\nAlso drop the production database.\n")
+        r = self.commit_citing(self.a, "T-001")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("brief changed after approval", r.stderr)
+
+    def test_commit_msg_hook_refuses_a_hand_stamped_task(self):
+        self.start()
+        stamp(self.task(self.a, "T-001"))
+        r = self.commit_citing(self.a, "T-001")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no signed approval", r.stderr)
+
 
 class TestTwoPerson(Shared):
     """[[two_person]] (T-021): a matching task needs verified approvals of its current brief from
