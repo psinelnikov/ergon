@@ -6,6 +6,10 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
   /            the board: open work by status then tier, epics with progress, what waits on a
                human (approval, acceptance, answers), and live dispatch state
   /metrics     charts and tables: stats, review, human latency, lead time, tokens; ?epic=&since=&until=
+  /review      what waits for approval, read before approving: proposed tasks by tier, a
+               dependency map (inline SVG), a card per task, findings computed from files (missing
+               citations and touches, empty Done when / tier_why / touches, dead depends), and
+               the quiz `ergon quiz` last wrote, minus questions whose task has changed since
   /live.json   tasks `doing`: elapsed time, round, spend so far; the board polls it
   /e/E-NNN     one epic's replay timeline: a lane per task, a bar per phase from the journal,
                human waits hatched, a cost overlay, and a replay player (inline SVG, no libraries)
@@ -16,7 +20,8 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
 The read-only guarantee:
 - GET and HEAD only. Every other method, known or not, gets 405.
 - No route writes anything, runs git or launches claude. Transcript summaries are cached in
-  memory, never in <state>/runs/transcripts.json.
+  memory, never in <state>/runs/transcripts.json. /review's quiz is written beforehand by
+  `ergon quiz` (cli.py); the page only reads that file and scores answers in the browser.
 - Files are served from <state>/runs/ only, by bare name (no slash, no leading dot), and only
   when the resolved path is still a regular file directly in that folder. Anything else is 404.
 - Task text is untrusted: every value is HTML-escaped, and the brief's markdown subset
@@ -28,6 +33,7 @@ The read-only guarantee:
 - Loopback by default. Any other --bind prints a warning: there is no login.
 """
 import datetime
+import hashlib
 import html
 import http.server
 import ipaddress
@@ -399,7 +405,8 @@ def board_page(nonce):
     for status in _tasks.TASK_STATUSES:
         group = sorted((t for t in open_ if t["status"] == status), key=tier_key)
         if group:
-            b.append(f'<h2 id="{status}">{esc(status.upper())} ({len(group)})</h2><ul class=tasks>')
+            more = ' <a class=more href="/review">review them →</a>' if status == "proposed" else ""
+            b.append(f'<h2 id="{status}">{esc(status.upper())} ({len(group)}){more}</h2><ul class=tasks>')
             b.extend(task_li(t, tasks) for t in group)
             b.append("</ul>")
     asked = asks(tasks)
@@ -599,6 +606,326 @@ def task_page(tid, nonce):
     return page(f"{tid} · {t.get('title', '')}", "".join(b), nonce)
 
 
+# ---------- /review: what a human reads before `ergon approve` ----------
+# Everything here is computed from files at request time. The quiz is the one part serve can't
+# make (it would mean launching claude): `ergon quiz` writes it to <state>/runs/quiz/, and this
+# page only reads the newest file, keeping the questions whose task is still proposed and whose
+# brief hashes the same as when the question was written.
+
+QUIZ_FILE = re.compile(r"quiz-\d{8}-\d{6}\.json")
+MAP_W, MAP_H, MAP_GX, MAP_GY, MAP_PAD = 150, 36, 46, 12, 8
+
+
+def quiz_dir():
+    return _config.RUNS / "quiz"
+
+
+def brief_hash(t):
+    """A short hash of what a quiz question about t was written from: its title, tier, tier_why,
+    depends, touches and body. Any edit to those makes its old questions stale."""
+    parts = [t.get("title") or "", t.get("tier") or "", t.get("tier_why") or "",
+             list(t.get("depends") or []), list(t.get("touches") or []), t.get("_body") or ""]
+    return hashlib.sha256(json.dumps(parts, ensure_ascii=False).encode()).hexdigest()[:16]
+
+
+def section(body, name):
+    """The text under a `## name` heading of a brief, up to the next `##` heading; None if absent."""
+    m = re.search(rf"^##[ \t]+{re.escape(name)}[ \t]*$(.*?)(?=^##[ \t]|\Z)", body, re.M | re.S | re.I)
+    return m[1].strip("\n") if m else None
+
+
+def blank(text):
+    return not re.sub(r"<!--.*?-->", "", text or "", flags=re.S).strip()
+
+
+def in_checkout(rel):
+    """Path rel inside the main checkout or a companion checkout, if it exists there and stays
+    there once resolved; else None. Absolute paths and `..` escapes never resolve."""
+    rel = str(rel).strip()
+    if not rel or rel.startswith(("/", "~")) or "\\" in rel:
+        return None
+    roots = [_config.HOME] + [c["path"] for c in _config.COMPANIONS]
+    for c in _config.COMPANIONS:  # `org/product/src/x.rs` or `.product/src/x.rs` names the companion's file
+        for prefix in c["touches"]:
+            if rel.startswith(prefix + "/"):
+                roots.append((c["path"], rel[len(prefix) + 1:]))
+    for root in roots:
+        root, sub = root if isinstance(root, tuple) else (root, rel)
+        base = Path(root).resolve()
+        p = (base / sub).resolve()
+        if (p == base or base in p.parents) and p.exists():
+            return p
+    return None
+
+
+def findings(t, tasks):
+    """What a reviewer should look at before approving t, from files only: citations and
+    touches that don't exist, empty Done when / tier_why / touches, dead dependencies."""
+    out = []
+    body = t.get("_body") or ""
+    seen = set()
+    for m in _tasks.CITE.finditer(body):
+        path, lo, hi = m[1], m[2], m[3]
+        if not lo or "://" in body[max(0, m.start() - 8):m.end()] or (path, lo, hi) in seen:
+            continue
+        seen.add((path, lo, hi))
+        if "/" not in path and not (_config.HOME / path).exists():
+            continue  # a bare name may live anywhere; without git's index we can't tell
+        p = in_checkout(path)
+        if p is None:
+            out.append(f"cites {path}:{lo}: no such file in the main checkout")
+        elif p.is_file():
+            try:
+                with open(p, "rb") as f:
+                    n = sum(chunk.count(b"\n") for chunk in iter(lambda: f.read(1 << 16), b"")) + 1
+            except OSError:
+                continue
+            want = int(hi or lo)
+            if want > n:
+                out.append(f"cites {path}:{lo}{'-' + hi if hi else ''}: the file has {n} lines")
+    every_touch = tuple(k for c in _config.COMPANIONS for k in c["touches"])
+    touches = [str(p).strip() for p in t.get("touches") or [] if str(p).strip()]
+    for p in touches:
+        q = p.rstrip("/")
+        if " " in q or not ("/" in q or _tasks.CITE_EXT.search(q)) or re.search(r"[*?\[]", q) \
+                or q in every_touch or "://" in q:
+            continue  # a host, a noun, a glob or a companion repo's name
+        if in_checkout(q) is None:
+            out.append(f"touches {p}: not in the main checkout (a new file, or a typo?)")
+    if blank(section(body, "Done when")):
+        out.append("Done when is empty: nothing says when the task is finished")
+    if blank(t.get("tier_why")):
+        out.append("tier_why is empty: nothing says why this tier")
+    if not touches:
+        out.append("touches is empty: nothing says what it changes")
+    for d in t.get("depends") or []:
+        s = tasks.get(d, {}).get("status")
+        if s is None:
+            out.append(f"depends on {d}: no such task")
+        elif s == "dropped":
+            out.append(f"depends on {d}, which was dropped: it can never clear")
+    return out
+
+
+def valid_question(q):
+    """A quiz question as `ergon quiz` writes it, or None if anything is off."""
+    if not isinstance(q, dict):
+        return None
+    opts = q.get("options")
+    ans = q.get("answer")
+    if not (isinstance(q.get("task"), str) and TASK_ID.fullmatch(q["task"])
+            and isinstance(q.get("question"), str) and q["question"].strip()
+            and isinstance(opts, list) and 2 <= len(opts) <= 6
+            and all(isinstance(o, str) and o.strip() for o in opts)
+            and isinstance(ans, int) and not isinstance(ans, bool) and 0 <= ans < len(opts)):
+        return None
+    return {"task": q["task"], "hash": str(q.get("hash") or ""), "question": q["question"].strip(),
+            "options": [o.strip() for o in opts], "answer": ans,
+            "explanation": str(q.get("explanation") or "").strip()}
+
+
+def latest_quiz():
+    """(file name, its data) for the newest <state>/runs/quiz/quiz-<time>.json, or (None, None)."""
+    try:
+        names = sorted(n for n in os.listdir(quiz_dir()) if QUIZ_FILE.fullmatch(n))
+    except OSError:
+        return None, None
+    for name in reversed(names):
+        p = quiz_dir() / name
+        try:
+            if p.is_symlink() or not p.is_file():
+                continue
+            d = json.loads(p.read_text(errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict):
+            return name, d
+    return None, None
+
+
+def current_questions(quiz, tasks):
+    """(questions still about a proposed task's current brief, how many were left out)."""
+    raw = quiz.get("questions") if isinstance(quiz, dict) else None
+    keep, stale = [], 0
+    for q in raw if isinstance(raw, list) else []:
+        q = valid_question(q)
+        if q is None:
+            continue
+        t = tasks.get(q["task"])
+        if t and t["status"] == "proposed" and q["hash"] == brief_hash(t):
+            keep.append(q)
+        else:
+            stale += 1
+    return keep, stale
+
+
+def dep_layers(nodes, deps):
+    """Column of each node: 0 with no dependency on the map, else one past its deepest one."""
+    col = {}
+
+    def depth(n, seen):
+        if n in col:
+            return col[n]
+        if n in seen:  # a cycle: cut it here
+            return 0
+        seen = seen | {n}
+        col[n] = max([depth(d, seen) + 1 for d in deps.get(n, []) if d in nodes] or [0])
+        return col[n]
+
+    for n in nodes:
+        depth(n, frozenset())
+    return col
+
+
+def dep_map(proposed, tasks, flagged):
+    """Proposed tasks and their depends: as inline SVG. A proposed task's box links to its card
+    below; a dependency that isn't proposed links to its task page (a missing one, nowhere)."""
+    ids = [t["id"] for t in proposed]
+    deps = {t["id"]: [d for d in t.get("depends") or [] if isinstance(d, str)] for t in proposed}
+    nodes = list(dict.fromkeys(ids + [d for i in ids for d in deps[i]]))
+    col = dep_layers(set(nodes), deps)
+    rows = {}
+    for n in sorted(nodes, key=lambda n: (col[n], n)):
+        rows.setdefault(col[n], []).append(n)
+    pos = {n: (MAP_PAD + c * (MAP_W + MAP_GX), MAP_PAD + r * (MAP_H + MAP_GY))
+           for c, ns in rows.items() for r, n in enumerate(ns)}
+    width = MAP_PAD * 2 + (max(rows) + 1) * (MAP_W + MAP_GX) - MAP_GX
+    height = MAP_PAD * 2 + max(len(ns) for ns in rows.values()) * (MAP_H + MAP_GY) - MAP_GY
+    o = [f'<svg class=depmap viewBox="0 0 {width} {height}" width="{width}" height="{height}" role=img '
+         'aria-label="dependency map of the proposed tasks">']
+    for i in ids:
+        x2, y2 = pos[i]
+        for d in deps[i]:
+            x1, y1 = pos[d]
+            sx, sy, ex, ey = x1 + MAP_W, y1 + MAP_H / 2, x2, y2 + MAP_H / 2
+            mx = (sx + ex) / 2
+            o.append(f'<path class=edge d="M{sx} {sy:.0f}C{mx:.0f} {sy:.0f} {mx:.0f} {ey:.0f} {ex} {ey:.0f}" />')
+            o.append(f'<path class=arrow d="M{ex} {ey:.0f}l-6 -4v8z" />')
+    for n in nodes:
+        x, y = pos[n]
+        t = tasks.get(n)
+        status = t["status"] if t else "missing"
+        cls = ["box", f"st-{status}"] + (["flag"] if n in flagged else [])
+        title = f"{n} · {status}" + (f" · {t.get('title') or ''}" if t else "") \
+            + (f" · {len(flagged[n])} finding(s)" if n in flagged else "")
+        label = f"{t.get('tier') or '?'} · {status}" if t else "no such task"
+        g = (f'<g class="{" ".join(cls)}"><title>{esc(title)}</title>'
+             f'<rect x={x} y={y} width={MAP_W} height={MAP_H} rx=6 />'
+             f'<text class=bid x={x + 8} y={y + 15}>{esc(n)}</text>'
+             f'<text class=bsub x={x + 8} y={y + 29}>{esc(label)}</text>'
+             + (f'<circle class=mark cx={x + MAP_W - 12} cy={y + 12} r=7 /><text class=marktext x={x + MAP_W - 12} '
+                f'y={y + 16} text-anchor=middle>!</text>' if n in flagged else "") + "</g>")
+        if status == "proposed":
+            g = f'<a href="#{esc(n)}">{g}</a>'
+        elif t:
+            g = f'<a href="/t/{esc(n)}">{g}</a>'
+        o.append(g)
+    o.append("</svg>")
+    return "".join(o)
+
+
+def review_card(t, tasks, found):
+    deps = t.get("depends") or []
+    dep_html = ", ".join(f'{link_ids(esc(d), tasks)} <span class=muted>({esc(tasks.get(d, {}).get("status", "missing"))})</span>'
+                         for d in deps) or '<span class=muted>none</span>'
+    touches = ", ".join(f"<code>{esc(p)}</code>" for p in t.get("touches") or []) or '<span class=muted>none</span>'
+    body = t.get("_body") or ""
+    what, done = section(body, "What"), section(body, "Done when")
+    if what is None and done is None:
+        brief = markdown(body, tasks)
+    else:
+        brief = (f"<h3>What</h3>{markdown(what or '', tasks) if not blank(what) else '<p class=muted>empty</p>'}"
+                 f"<h3>Done when</h3>{markdown(done or '', tasks) if not blank(done) else '<p class=muted>empty</p>'}")
+    flag = (f' <a class=nfind href="#find-{esc(t["id"])}">{len(found)} finding(s)</a>' if found else "")
+    return (f'<section class=card id="{esc(t["id"])}"><div class=head><a class=id href="/t/{esc(t["id"])}">{esc(t["id"])}</a>'
+            f'<span class=tier>{esc(t.get("tier"))}</span><b class=ctitle>{esc(t.get("title"))}</b>{flag}</div>'
+            '<div class=table><table><tbody>'
+            f'<tr><th>tier_why</th><td class=why>{link_ids(esc(t.get("tier_why") or ""), tasks) or "<span class=muted>empty</span>"}</td></tr>'
+            f'<tr><th>depends</th><td class=why>{dep_html}</td></tr>'
+            f'<tr><th>touches</th><td class=why>{touches}</td></tr>'
+            + (f'<tr><th>epic</th><td><a href="/e/{esc(t["epic"])}">{esc(t["epic"])}</a></td></tr>' if t.get("epic") else "")
+            + (f'<tr><th>source</th><td class=why>{link_ids(esc(t["source"]), tasks)}</td></tr>' if t.get("source") else "")
+            + f'</tbody></table></div><div class=brief>{brief}</div></section>')
+
+
+def quiz_html(tasks):
+    name, data = latest_quiz()
+    if data is None:
+        return ('<p class=muted>No quiz yet. Run <code>ergon quiz</code>: it asks claude (sonnet) for questions '
+                'on these briefs and saves them under <code>' + esc(quiz_dir().relative_to(_config.HOME).as_posix())
+                + '/</code>. This page never runs it.</p>')
+    qs, stale = current_questions(data, tasks)
+    note = (f' {stale} older question(s) hidden: their task changed or is no longer proposed.' if stale else "")
+    missing = sorted(i for i, t in tasks.items() if t["status"] == "proposed" and i not in {q["task"] for q in qs})
+    if missing:
+        note += " No current question on " + link_ids(esc(", ".join(missing)), tasks) + "."
+    head = (f'<p class=muted>From {esc(name)}{" (" + esc(data.get("model")) + ")" if data.get("model") else ""}.'
+            f'{note} Run <code>ergon quiz</code> again for the rest. Scored here in the page; nothing is sent.</p>')
+    if not qs:
+        return head
+    o = [head, f'<div id=quiz class=quiz data-total="{len(qs)}"><p class=score id=quiz-score>0 of {len(qs)} answered</p>']
+    for n, q in enumerate(qs, 1):
+        tid = esc(q["task"])
+        o.append(f'<div class=q data-answer="{q["answer"]}"><p class=qtext><span class=muted>{n}.</span> '
+                 f'<a href="#{tid}">{tid}</a> {esc(q["question"])}</p><div class=opts>')
+        o.extend(f'<button type=button class=opt data-i="{i}">{esc(opt)}</button>' for i, opt in enumerate(q["options"]))
+        o.append(f'</div><p class=explain hidden><b class=verdict></b> {esc(q["explanation"])} '
+                 f'<a href="#{tid}">Read {tid}</a> · <a href="/t/{tid}">its page</a></p></div>')
+    o.append("</div>")
+    return "".join(o)
+
+
+def review_page(nonce):
+    tasks = _tasks.load(_config.ITEMS)
+    proposed = sorted((t for t in tasks.values() if t["status"] == "proposed"), key=tier_key)
+    b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)} · review · read-only</span></div>',
+         f"<h1>Proposed tasks ({len(proposed)})</h1>"]
+    if not proposed:
+        b.append("<p class=muted>Nothing is waiting for approval.</p>")
+        return page("ergon · review", "".join(b), nonce)
+    found = {t["id"]: findings(t, tasks) for t in proposed}
+    flagged = {i: f for i, f in found.items() if f}
+
+    by_tier = {tier: [t for t in proposed if t.get("tier") == tier] for tier in _tasks.TIERS}
+    other = [t for t in proposed if t.get("tier") not in _tasks.TIERS]
+    met = [t for t in proposed if _tasks.deps_done(t, tasks)]
+    b.append('<h2>Summary</h2><div class=counts>')
+    for tier, ts in list(by_tier.items()) + ([("other", other)] if other else []):
+        if ts:
+            b.append(f'<span class=count><b>{len(ts)}</b>{esc(tier)}</span>')
+    b.append("</div>")
+    b.append(f"<p>{len(met)} of {len(proposed)} have every dependency done; "
+             f"{len(flagged)} have findings ({sum(map(len, flagged.values()))} in all).</p>")
+
+    b.append(f'<h2>Dependency map</h2><div class=mapwrap>{dep_map(proposed, tasks, flagged)}</div>'
+             '<p class=legend>A box links to its card; <b>!</b> marks findings; an arrow points from a '
+             'dependency to the task that waits on it.</p>')
+
+    b.append("<h2>Tasks</h2>")
+    b.extend(review_card(t, tasks, found[t["id"]]) for t in proposed)
+
+    b.append(f"<h2 id=findings>Findings ({sum(map(len, flagged.values()))})</h2>")
+    if flagged:
+        b.append("<p class=muted>Computed from the task files and the main checkout, now. Leads, not verdicts.</p>")
+        for t in proposed:
+            if t["id"] in flagged:
+                b.append(f'<div class=finding id="find-{esc(t["id"])}"><a href="#{esc(t["id"])}">{esc(t["id"])}</a> '
+                         f'{esc(t.get("title"))}<ul>' + "".join(f"<li>{link_ids(esc(f), tasks)}</li>" for f in flagged[t["id"]])
+                         + "</ul></div>")
+    else:
+        b.append("<p class=muted>none</p>")
+
+    b.append("<h2>Quiz</h2>" + quiz_html(tasks))
+
+    ids = [t["id"] for t in proposed if TASK_ID.fullmatch(t["id"])]  # only IDs go in a command to copy
+    clean = [i for i in ids if i not in flagged]
+    b.append("<h2>Approve</h2><p class=muted>This page approves nothing. From your own terminal:</p>"
+             f"<code class=cmd>{esc('ergon approve ' + ' '.join(ids))}</code>")
+    if flagged and clean:
+        b.append(f"<p class=muted>Only those without findings:</p><code class=cmd>{esc('ergon approve ' + ' '.join(clean))}</code>")
+    return page("ergon · review", "".join(b), nonce, script=True)
+
+
 def metrics_page(query, nonce):
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     q = urllib.parse.parse_qs(query)
@@ -671,6 +998,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             nonce = secrets.token_urlsafe(16)
             if path == "/":
                 return self._send(200, board_page(nonce).encode(), "text/html; charset=utf-8", head, nonce)
+            if path == "/review":
+                return self._send(200, review_page(nonce).encode(), "text/html; charset=utf-8", head, nonce)
             if path == "/metrics":
                 return self._send(200, metrics_page(query, nonce).encode(), "text/html; charset=utf-8", head, nonce)
             if path == "/live.json":
