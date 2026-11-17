@@ -2019,5 +2019,52 @@ class TestPriority(unittest.TestCase):
             self.assertEqual(brief_digest({**t, **extra}), base)
 
 
+class TestPriorityOrder(Project):
+    def setcod(self, tid, cod, pin=None):
+        f = self.task_file(tid)
+        extra = f"cod: {cod}\n" + (f"pin: {pin}\n" if pin else "")
+        f.write_text(f.read_text().replace("\ntier:", "\n" + extra + "tier:", 1))
+
+    def order(self, *cmd):
+        out = self.ergon(*cmd).stdout
+        return re.findall(r"(?:would run  |^  )(T-\d+)", out, flags=re.M)
+
+    def test_next_puts_the_task_that_unblocks_others_first(self):
+        self.ergon("new", "task", "Haiku loose", "--tier", "haiku")
+        self.ergon("new", "task", "Sonnet root", "--tier", "sonnet")
+        self.ergon("new", "task", "Dep one", "--tier", "opus")
+        self.ergon("new", "task", "Dep two", "--tier", "opus")
+        for i in (1, 2, 3, 4):
+            stamp(self.task_file(f"T-00{i}"))
+        for i in (3, 4):
+            f = self.task_file(f"T-00{i}")
+            f.write_text(re.sub(r"^depends:.*$", "depends: [T-002]", f.read_text(), flags=re.M))
+        self.setcod("T-001", 10)  # sonnet beats haiku only while cod < 25: (c+2*25)/3 > c
+        self.setcod("T-002", 10)
+        out = self.ergon("next").stdout
+        self.assertEqual(self.order("next")[:2], ["T-002", "T-001"], out)
+        self.assertIn("unblocks 2", out)
+        self.assertIn("p=", out)
+
+    def test_dry_run_uses_sort_key_order(self):
+        self.ergon("new", "task", "Low", "--tier", "haiku")
+        self.ergon("new", "task", "High", "--tier", "haiku")
+        self.ergon("new", "task", "Last", "--tier", "haiku")
+        for i in (1, 2, 3):
+            stamp(self.task_file(f"T-00{i}"))
+        self.setcod("T-001", 10)
+        self.setcod("T-002", 90)
+        self.setcod("T-003", 100, "last")
+        self.assertEqual(self.order("dispatch", "--dry-run"), ["T-002", "T-001", "T-003"])
+        self.assertIn("pinned last", self.ergon("next").stdout)
+
+    def test_ungraded_keeps_old_order_within_tier_and_cheaper_tiers_first(self):
+        for title, tier in (("O", "opus"), ("S1", "sonnet"), ("H1", "haiku"), ("S2", "sonnet"), ("H2", "haiku")):
+            self.ergon("new", "task", title, "--tier", tier)
+        for i in range(1, 6):
+            stamp(self.task_file(f"T-00{i}"))
+        self.assertEqual(self.order("next"), ["T-003", "T-005", "T-002", "T-004", "T-001"])
+
+
 if __name__ == "__main__":
     unittest.main()
