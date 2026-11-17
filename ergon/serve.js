@@ -1,7 +1,42 @@
 // Live dispatch state for the board: polls /live.json and redraws the LIVE table and the counts.
-// Every value from the server goes in through textContent, never as HTML.
+// On /review it runs the quiz instead. Every value from the server goes in through textContent,
+// never as HTML.
 (function () {
   "use strict";
+
+  // The /review quiz: one try per question, then the explanation. The score stays in the page.
+  function quiz(box) {
+    var total = +box.getAttribute("data-total") || 0, answered = 0, right = 0;
+    var score = document.getElementById("quiz-score");
+    [].slice.call(box.querySelectorAll(".q")).forEach(function (q) {
+      var answer = +q.getAttribute("data-answer");
+      var opts = [].slice.call(q.querySelectorAll("button.opt"));
+      opts.forEach(function (b) {
+        b.addEventListener("click", function () {
+          if (q.classList.contains("done")) return;
+          q.classList.add("done");
+          var ok = +b.getAttribute("data-i") === answer;
+          opts.forEach(function (o) {
+            o.disabled = true;
+            if (+o.getAttribute("data-i") === answer) o.classList.add("right");
+          });
+          if (!ok) b.classList.add("wrong");
+          answered += 1;
+          if (ok) right += 1;
+          var v = q.querySelector(".verdict");
+          if (v) v.textContent = ok ? "Right." : "Not quite.";
+          var ex = q.querySelector(".explain");
+          if (ex) ex.hidden = false;
+          if (score) score.textContent = right + " right of " + answered + " answered (" + total + " in all)";
+        });
+      });
+    });
+  }
+
+  var box = document.getElementById("quiz");
+  if (box) quiz(box);
+  if (!document.getElementById("live-body")) return;  // the rest is the board's
+
   var POLL_MS = 4000;
   var skew = 0;  // server clock minus ours, seconds
   var rows = [];

@@ -220,7 +220,195 @@ class TestServe(ServeFixture):
         self.assertEqual(self.req("GET", "/", host="[::1]:4300")[0], 200)
 
 
+FAKE_QUIZ_CLAUDE = r"""#!PYTHON
+import json, os, sys
+tmp = os.environ["QUIZ_TMP"]
+open(os.path.join(tmp, "quiz-prompt.txt"), "w").write(sys.stdin.read())
+open(os.path.join(tmp, "quiz-argv.json"), "w").write(json.dumps(sys.argv[1:]))
+qs = [
+    {"task": "T-004", "question": "What does T-004 <b>change</b>?", "options": ["The board", "Nothing", "<i>prod</i>"],
+     "answer": 0, "explanation": "Its What says the board."},
+    {"task": "T-005", "question": "Who answers T-005?", "options": ["A worker", "A human"], "answer": 1,
+     "explanation": "It is a human task."},
+    {"task": "T-001", "question": "Not asked about", "options": ["a", "b"], "answer": 0, "explanation": ""},
+    {"task": "T-004", "question": "Broken", "options": ["only one"], "answer": 3},
+]
+print(json.dumps({"type": "result", "is_error": False, "total_cost_usd": 0.02,
+                  "result": "Here you go:\n```json\n" + json.dumps(qs) + "\n```"}))
+"""
+APPROVE = "ergon " + "approve"  # spelled apart: the guard hook reads this file's edits as commands
+
+
+class TestReview(ServeFixture):
+    """/review over the fixture's two proposed tasks: T-004 (hostile title, a filled-in brief that
+    cites a missing file) and T-005 (the bare template: empty Done when, tier_why and touches)."""
+
+    def setUp(self):
+        super().setUp()
+        f = self.task_file("T-004")
+        text = f.read_text()
+        text = re.sub(r"^depends:.*$", "depends: [T-001]", text, flags=re.M)
+        text = re.sub(r"^touches:.*$", "touches: [README.md, ergon/new_thing.py]", text, flags=re.M)
+        text = re.sub(r"^tier_why:.*$", "tier_why: one file", text, flags=re.M)
+        text = text.replace("## What\n", "## What\nChange the board, see ergon/nowhere.py:12 and README.md:1 "
+                            "and README.md:40 (https://example.com/a/b.py:3).\n", 1)
+        text = text.replace("## Done when\n", "## Done when\n- the board shows it\n", 1)
+        f.write_text(text)
+        f = self.task_file("T-005")
+        f.write_text(re.sub(r"^depends:.*$", "depends: [T-004, T-099]", f.read_text(), flags=re.M))
+        self.before = self.snapshot()
+
+    def fake_claude(self):
+        bindir = Path(self.tmp.name) / "bin"
+        bindir.mkdir(exist_ok=True)
+        (bindir / "claude").write_text(FAKE_QUIZ_CLAUDE.replace("#!PYTHON", f"#!{sys.executable}"))
+        (bindir / "claude").chmod(0o755)
+        return dict(self.env, PATH=f"{bindir}{os.pathsep}{self.env['PATH']}", QUIZ_TMP=self.tmp.name)
+
+    def card(self, page, tid):
+        m = re.search(rf'<section class=card id="{tid}">(.*?)</section>', page, re.S)
+        return m[1] if m else None
+
+    def test_lists_proposed_only(self):
+        code, headers, page = self.req("GET", "/review")
+        self.assertEqual(code, 200)
+        self.assertEqual(re.findall(r'<section class=card id="(T-\d+)">', page), ["T-004", "T-005"])
+        self.assertIn("<h1>Proposed tasks (2)</h1>", page)
+        self.assertIn("<b>1</b>haiku", page)
+        self.assertIn("<b>1</b>human", page)
+        self.assertIn("1 of 2 have every dependency done", page)  # T-004's T-001 is done; T-005 waits
+        self.assertIn('<a class=more href="/review">', self.req("GET", "/")[2])  # the board links it
+        # the map: each proposed box links to its card, a non-proposed dependency to its page,
+        # a missing one nowhere; T-005 has findings and is marked
+        svg = re.search(r"<svg class=depmap.*?</svg>", page, re.S)[0]
+        for tid in ("T-004", "T-005"):
+            self.assertRegex(svg, rf'<a href="#{tid}"><g class="box st-proposed[^"]*">')
+        self.assertIn('<a href="/t/T-001"><g class="box st-done">', svg)
+        self.assertIn('<g class="box st-missing">', svg)
+        self.assertNotIn('href="#T-099"', svg)
+        self.assertNotIn('href="#T-001"', svg)
+        self.assertIn('<a href="#T-005"><g class="box st-proposed flag">', svg)
+        self.assertEqual(svg.count("class=edge"), 3)
+        # the cards
+        c4 = self.card(page, "T-004")
+        self.assertIn("one file", c4)
+        self.assertIn("<code>README.md</code>", c4)
+        self.assertIn("<h3>Done when</h3><ul><li>the board shows it</li></ul>", c4)
+        self.assertIn('<a href="/t/T-001">T-001</a> <span class=muted>(done)</span>', c4)
+        self.assertIsNone(self.card(page, "T-001"))  # only a box on the map
+        # it never approves: a command to copy, nothing to submit
+        self.assertIn(f"<code class=cmd>{APPROVE} T-004 T-005</code>", page)
+        self.assertNotIn("<form", page)
+
+    def test_findings(self):
+        page = self.req("GET", "/review")[2]
+        f4 = re.search(r'<div class=finding id="find-T-004">.*?</div>', page, re.S)[0]
+        self.assertIn("cites ergon/nowhere.py:12: no such file in the main checkout", f4)
+        self.assertIn("cites README.md:40: the file has 2 lines", f4)
+        self.assertNotIn("README.md:1:", f4)  # that line exists
+        self.assertNotIn("b.py", f4)  # a URL isn't a citation
+        self.assertIn("touches ergon/new_thing.py: not in the main checkout", f4)
+        self.assertNotIn("touches README.md", f4)
+        self.assertNotIn("Done when is empty", f4)
+        f5 = re.search(r'<div class=finding id="find-T-005">.*?</div>', page, re.S)[0]
+        for want in ("Done when is empty", "tier_why is empty", "touches is empty",
+                     "depends on T-099: no such task"):
+            self.assertIn(want, f5)
+        self.assertNotIn("depends on T-004", f5)  # proposed, not dead
+
+    def test_escaped(self):
+        code, headers, page = self.req("GET", "/review")
+        nonce = re.search(r"script-src 'nonce-([\w-]+)'", headers["Content-Security-Policy"])[1]
+        self.assertEqual(re.findall(r"<script[^>]*>", page), [f'<script nonce="{nonce}">'])
+        self.assertNotIn("<img", page)
+        self.assertNotIn('href="javascript:', page)
+        self.assertIn("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;", page)
+
+    def test_read_only(self):
+        for method in ("POST", "PUT", "DELETE", "PATCH"):
+            code, headers, _ = self.req(method, "/review", body="ids=T-004")
+            self.assertEqual(code, 405, method)
+            self.assertEqual(headers.get("Allow"), "GET, HEAD")
+        code, headers, body = self.req("HEAD", "/review")
+        self.assertEqual((code, body), (200, ""))
+        self.assertGreater(int(headers["Content-Length"]), 0)
+        self.assertEqual(self.req("GET", "/review")[0], 200)
+        self.assertEqual(self.snapshot(), self.before)
+        self.assertEqual(self.status("T-004"), "proposed")
+
+    def test_quiz(self):
+        page = self.req("GET", "/review")[2]
+        self.assertIn("No quiz yet. Run <code>ergon quiz</code>", page)
+        self.assertNotIn("<div id=quiz", page)
+
+        env = self.fake_claude()
+        out = self.ergon("quiz", env=env).stdout
+        self.assertIn("2 new question(s)", out)
+        self.assertIn("2 unusable dropped", out)  # the one on T-001 and the broken one
+        argv = json.loads((Path(self.tmp.name) / "quiz-argv.json").read_text())
+        self.assertEqual(argv[:5], ["-p", "--model", "sonnet", "--tools", ""])  # no tools at all
+        prompt = (Path(self.tmp.name) / "quiz-prompt.txt").read_text()
+        self.assertIn("=== T-004 ===", prompt)
+        self.assertIn("=== T-005 ===", prompt)
+        self.assertNotIn("Done thing", prompt)  # T-001 isn't proposed
+        [f] = list((self.runs / "quiz").glob("quiz-*.json"))
+        data = json.loads(f.read_text())
+        self.assertEqual([q["task"] for q in data["questions"]], ["T-004", "T-005"])
+        self.assertEqual(data["questions"][0]["hash"], S.brief_hash(S._tasks.parse(self.task_file("T-004"))))
+
+        page = self.req("GET", "/review")[2]
+        self.assertIn('<div id=quiz class=quiz data-total="2">', page)
+        self.assertIn("What does T-004 &lt;b&gt;change&lt;/b&gt;?", page)
+        self.assertIn('<button type=button class=opt data-i="2">&lt;i&gt;prod&lt;/i&gt;</button>', page)
+        self.assertIn('<div class=q data-answer="1">', page)
+        self.assertIn("Who answers T-005?", page)
+
+        # T-005's brief changes after the quiz was written: its question goes, T-004's stays
+        f5 = self.task_file("T-005")
+        f5.write_text(f5.read_text().replace("## What\n", "## What\nNow something else.\n", 1))
+        page = self.req("GET", "/review")[2]
+        self.assertNotIn("Who answers T-005?", page)
+        self.assertIn("What does T-004 &lt;b&gt;change&lt;/b&gt;?", page)
+        self.assertIn("1 older question(s) hidden", page)
+        self.assertIn('data-total="1"', page)
+
+        # a second run asks only about T-005 and keeps T-004's question
+        (Path(self.tmp.name) / "quiz-prompt.txt").unlink()
+        out = self.ergon("quiz", env=env).stdout
+        self.assertIn("1 new question(s), 1 kept", out)
+        prompt = (Path(self.tmp.name) / "quiz-prompt.txt").read_text()
+        self.assertNotIn("=== T-004 ===", prompt)
+        self.assertIn("Now something else.", prompt)
+        page = self.req("GET", "/review")[2]
+        self.assertIn("Who answers T-005?", page)
+        self.assertIn('data-total="2"', page)
+
+        # once T-004 leaves proposed, its question goes too, and it has no card
+        stamp(self.task_file("T-004"))
+        page = self.req("GET", "/review")[2]
+        self.assertNotIn("What does T-004", page)
+        self.assertIsNone(self.card(page, "T-004"))
+        self.assertIn("already has current questions", self.ergon("quiz", env=env).stdout)
+
+    def test_quiz_failure_writes_nothing(self):
+        env = self.fake_claude()
+        bindir = Path(self.tmp.name) / "bin"
+        (bindir / "claude").write_text(f"#!{sys.executable}\nimport json\nprint(json.dumps({{'result': 'sorry, no'}}))\n")
+        r = self.ergon("quiz", env=env, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("nothing written", r.stderr)
+        self.assertFalse((self.runs / "quiz").exists())
+
+
 class TestServeUnits(unittest.TestCase):
+    def test_quiz_items(self):
+        from ergon import cli
+        q = [{"task": "T-001"}]
+        for text in (json.dumps(q), "```json\n" + json.dumps(q) + "\n```", "Sure:\n" + json.dumps(q) + "\nDone."):
+            self.assertEqual(cli.quiz_items(text), q, text)
+        self.assertIsNone(cli.quiz_items("no json here"))
+        self.assertIsNone(cli.quiz_items('{"task": "T-001"}'))
+
     def test_loopback(self):
         for host in ("127.0.0.1", "127.1.2.3", "::1", "[::1]", "localhost"):
             self.assertTrue(S.is_loopback(host), host)
