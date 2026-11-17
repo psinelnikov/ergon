@@ -135,18 +135,27 @@ def prompt(ask, pairs, fence):
                          pairs="\n".join(f"{a} vs {b}" for a, b in pairs))
 
 
-def reply_object(text):
-    """The JSON object in claude's reply (bare, fenced or with prose around it), or None."""
+def reply_json(text, ok):
+    """The first JSON value in claude's reply that `ok` accepts, or None. The reply may be bare
+    JSON, fenced in ```json, or wrapped in prose: tried in that order, the last as the span from
+    the first opening bracket to the last closing one, array or object. `ergon quiz` reads its
+    reply through here too."""
     text = (text or "").strip()
     m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.S)
-    for cand in ([m[1]] if m else []) + [text, text[text.find("{"):text.rfind("}") + 1]]:
+    spans = [text[text.find(a):text.rfind(b) + 1] for a, b in ("[]", "{}")]
+    for cand in ([m[1]] if m else []) + [text] + spans:
         try:
             got = json.loads(cand)
         except ValueError:
             continue
-        if isinstance(got, dict) and isinstance(got.get("pairs"), list):
+        if ok(got):
             return got
     return None
+
+
+def reply_object(text):
+    """The JSON object with a pairs list in claude's reply, or None."""
+    return reply_json(text, lambda v: isinstance(v, dict) and isinstance(v.get("pairs"), list))
 
 
 def results(rows, pairs):

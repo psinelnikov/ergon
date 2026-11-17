@@ -189,16 +189,7 @@ def quiz_brief(t):
 
 def quiz_items(text):
     """The JSON array in claude's reply (bare, fenced or with prose around it), or None."""
-    text = (text or "").strip()
-    m = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.S)
-    for cand in ([m[1]] if m else []) + [text, text[text.find("["):text.rfind("]") + 1]]:
-        try:
-            got = json.loads(cand)
-        except ValueError:
-            continue
-        if isinstance(got, list):
-            return got
-    return None
+    return _grade.reply_json(text, lambda v: isinstance(v, list))
 
 
 def quiz(args):

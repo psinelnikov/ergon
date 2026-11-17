@@ -2187,6 +2187,17 @@ class TestGradeUnits(unittest.TestCase):
         self.assertEqual(fit([("A", "B", .5)]), {"A": 50, "B": 50})
         self.assertEqual(fit([]), {})
 
+    def test_reply_object_finds_the_pairs_object(self):
+        # the search is grade.reply_json, shared with cli.quiz_items; only the accepted shape differs
+        from ergon.grade import reply_json, reply_object
+        o = {"pairs": [{"a": "T-001", "b": "T-002", "winner": "a"}], "why": {}}
+        for text in (json.dumps(o), "```json\n" + json.dumps(o) + "\n```", "Here [1]:\n" + json.dumps(o) + "\nDone."):
+            self.assertEqual(reply_object(text), o, text)
+        for text in ("no json here", None, '{"pairs": "x"}', "[1, 2]"):
+            self.assertIsNone(reply_object(text), text)
+        self.assertEqual(reply_json("ok: [1, 2] then {3}", lambda v: isinstance(v, list)), [1, 2])
+        self.assertIsNone(reply_json("[1]", lambda v: False))
+
     def test_one_line_and_set_fields(self):
         from ergon.grade import one_line, set_fields
         self.assertEqual(one_line("a\nstatus: done\r approved: me\x00"), "a status: done approved: me")
