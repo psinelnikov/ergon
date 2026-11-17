@@ -3,12 +3,14 @@ import argparse
 import datetime
 import fcntl
 import fnmatch
+import getpass
 import json
 import os
 import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -142,6 +144,35 @@ YES = ("yes", "true", "1")
 def is_asking(t):
     """Is t parked on a worker's question, waiting for a human's `ergon answer`?"""
     return t.get("status") == "blocked" and bool(t.get("asking"))
+
+
+# In shared mode a task dispatch held at `review` has its task/<ID> branch in one clone only (task
+# branches are never pushed). Dispatch's Note names that clone: `held: <user>@<host>`.
+HELD = re.compile(r"^- \d{4}-\d\d-\d\d dispatch: .*?\bheld: ([^\s)]+)", re.M)
+
+
+def clone_id():
+    """This clone as a `held:` Note names it: <user>@<host>."""
+    try:
+        user = getpass.getuser()
+    except Exception:  # no login name anywhere (some containers)
+        user = os.environ.get("USER") or "someone"
+    return f"{user}@{socket.gethostname().split('.')[0] or 'localhost'}"
+
+
+def held_by(t):
+    """The clone dispatch held t's branch on, from its latest `held:` Note, or None."""
+    hits = HELD.findall(t.get("_body") or "")
+    return hits[-1] if hits else None
+
+
+def held_elsewhere(t):
+    """In shared mode, the other clone that holds review task t's branch, or None (local mode,
+    held here, or no clone recorded)."""
+    if not _config.SHARED or t.get("status") != "review":
+        return None
+    who = held_by(t)
+    return who if who and who != clone_id() else None
 
 
 def needs_accept(t, *tiers):
@@ -664,7 +695,9 @@ def lint():
             errs.append(f"{where}: status {t.get('status')!r} not in {TASK_STATUSES}")
         if t.get("status") in NEEDS_APPROVAL and not t.get("approved"):
             errs.append(f"{where}: status {t['status']} without a human `approved:` stamp")
-        if t.get("status") == "review" and not _gitops.branch_exists(_config.TASK_BRANCH + t["id"]):
+        # shared mode: only the clone that holds the branch can tell it's gone
+        if (t.get("status") == "review" and not held_elsewhere(t)
+                and not _gitops.branch_exists(_config.TASK_BRANCH + t["id"])):
             errs.append(f"{where}: in review but branch {_config.TASK_BRANCH}{t['id']} is gone, so there's nothing "
                         f"to accept; a human rejects it back to ready or closes it")
         if t.get("asking") and t.get("status") not in ("blocked", "done", "dropped"):

@@ -15,6 +15,9 @@ a [shared] table in .ergon.toml nothing here runs, and no command touches git fo
   the remote wins a real conflict, which is reported. Ergon computes the merge commit's tree.
 - Only a human syncs: never from an agent shell, never from a task/ branch. The guard refuses
   `ergon sync` and git writes in the state worktree from agents.
+- Dispatch, started by a human, syncs on every scan and claims each task by pushing its
+  ready->doing before the worker launches; a claim the merge drops lost to another dispatcher
+  (dispatch.py, "claims").
 """
 import os
 import re
@@ -137,9 +140,11 @@ def changes(a, b=None):
     return out
 
 
-def commit_pending(label=None):
+def commit_pending(label=None, body=None):
     """Commit what changed in items/ and epics/ (this command's writes and any hand edits) on the
-    state branch. Returns what changed, [] if nothing did. The caller holds state_lock."""
+    state branch. Returns what changed, [] if nothing did. The caller holds state_lock. `body`
+    goes under the subject: dispatch's claims name the clone there, so two clones' claims are
+    never the very same commit."""
     paths = [p for p in ("items", "epics", ".gitignore") if (_config.STATE / p).exists()]
     git("add", "-A", "--", *paths)
     git("rm", "-q", "--cached", "--ignore-unmatch", "--", "items/.lock")  # in case .gitignore went missing
@@ -149,6 +154,8 @@ def commit_pending(label=None):
     label = label or COMMAND or "ergon"
     subject = f"{label}: {', '.join(parts)}"
     msg = subject if len(subject) <= 72 else f"{label}: {len(parts)} changes\n\n" + "\n".join(parts)
+    if body:
+        msg += "\n\n" + body
     # --no-verify: the trunk's commit-msg hook (ergon's own) would refuse a message naming a
     # proposed task, and code hooks have no business with task files. Never signed here.
     git("-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", msg)
@@ -336,7 +343,8 @@ def fmt(v):
 
 def merge_item(key, base, ours, theirs, epic=False):
     """Merge one task or epic file changed on both sides. Returns (text, [what to report],
-    brief_lost): brief_lost means What / Done when conflicted and the remote's was kept."""
+    brief_lost, dropped): brief_lost means What / Done when conflicted and the remote's was kept,
+    dropped that this clone's status move lost to the remote's."""
     keys = _tasks.EPIC_KEYS if epic else _tasks.TASK_KEYS
     b, o, t = (_tasks.parse_text(x, key) for x in (base, ours, theirs))
     said, out, extra_note = [], {}, []
@@ -344,7 +352,8 @@ def merge_item(key, base, ours, theirs, epic=False):
     # If the remote moved too, it pushed first: the local move is dropped, even to the same status
     # (two dispatchers claiming one task both move it ready->doing; the second claim lost).
     moved = o.get("status") != b.get("status")
-    if moved and t.get("status") != b.get("status"):
+    dropped = moved and t.get("status") != b.get("status")
+    if dropped:
         side, move = t, f"{b.get('status')}->{o.get('status')}"
         said.append(f"{key}: dropped this clone's {move}: {remote()} had moved it to {t.get('status')} "
                     f"first (noted in its Notes)")
@@ -380,8 +389,8 @@ def merge_item(key, base, ours, theirs, epic=False):
     same = lambda m: {k: v for k, v in m.items() if v != ""}
     for m, raw in ((t, theirs), (o, ours)):  # no reformatting when the result is one side's file
         if same(meta) == same(m):
-            return raw, said, not clean
-    return _tasks.render(meta, keys), said, not clean
+            return raw, said, not clean, dropped
+    return _tasks.render(meta, keys), said, not clean, dropped
 
 
 def save_conflict(name, text):
@@ -401,14 +410,15 @@ def save_conflict(name, text):
 
 
 def merged_tree(base, ours, theirs):
-    """The merge of three commits' state: ({path: (mode, blob) or (mode, None, text)}, [reports]).
-    Raises Conflict if each side created one ID for a different task (renumber() leaves those)."""
+    """The merge of three commits' state: ({path: (mode, blob) or (mode, None, text)}, [reports],
+    {IDs whose status move here lost to the remote's}). Raises Conflict if each side created one
+    ID for a different task (renumber() leaves those)."""
     tb, to, tt = tree(base), tree(ours), tree(theirs)
     (ib, rb), (io, ro), (it, rt) = split_tree(tb), split_tree(to), split_tree(tt)
     clash = sorted(k for k in (io.keys() & it.keys()) - ib.keys() if to[io[k]][1] != tt[it[k]][1])
     if clash:
         raise Conflict("\n".join(f"  {k}: each side created a different {k}" for k in clash))
-    said = []
+    said, dropped = [], set()
 
     def pick(k):
         """(path, entry, merged fields or None) of ID k in the result, or None if it's gone."""
@@ -426,8 +436,10 @@ def merged_tree(base, ours, theirs):
             return pt, tt[pt], None
         epic = pt.endswith("/" + _config.EPIC_FILE)
         ours_text = cat(to[po][1])
-        text, notes, lost = merge_item(k, cat(tb[pb][1]), ours_text, cat(tt[pt][1]), epic)
+        text, notes, lost, moved_lost = merge_item(k, cat(tb[pb][1]), ours_text, cat(tt[pt][1]), epic)
         said.extend(notes)
+        if moved_lost:
+            dropped.add(k)
         if lost:
             said.append(f"{k}: both sides changed What / Done when and they conflict; kept {remote()}'s, "
                         f"and this clone's file is saved as {save_conflict(k, ours_text)}")
@@ -472,7 +484,7 @@ def merged_tree(base, ours, theirs):
                             f"and this clone's is saved as {saved}")
         if entry:
             result[path] = entry
-    return result, said
+    return result, said, dropped
 
 
 def write_tree(result):
@@ -504,20 +516,20 @@ def write_tree(result):
 
 def merge(theirs):
     """Merge the fetched remote state into the state branch. Returns (what came in, [what the
-    merge had to drop or keep, to report]). Raises Conflict, merging nothing, if each side created
-    one ID for a different task."""
+    merge had to drop or keep, to report], {IDs whose status move here lost to the remote's}).
+    Raises Conflict, merging nothing, if each side created one ID for a different task."""
     ours = git("rev-parse", "HEAD")
     if theirs is None or is_ancestor(theirs, ours):
-        return [], []
+        return [], [], set()
     if is_ancestor(ours, theirs):
         came = changes(ours, theirs)
         git("merge", "-q", "--ff-only", theirs)
-        return [what for what, _ in came.values()], []
+        return [what for what, _ in came.values()], [], set()
     r = run("merge-base", ours, theirs)
     if r.returncode:
         raise _gitops.GitError(f"{remote()} {branch()} shares no history with this clone's: was it made by "
                                f"another `ergon sync --init`? Nothing was merged")
-    result, said = merged_tree(r.stdout.strip(), ours, theirs)
+    result, said, dropped = merged_tree(r.stdout.strip(), ours, theirs)
     msg = f"sync: merge {remote()} {branch()}" + ("\n\n" + "\n".join(said) if said else "")
     # A merge commit whose tree ergon computed, never a rebase: approvals become signed commits,
     # and a rebase would rewrite them. The worktree is clean (sync committed first), so this
@@ -525,7 +537,7 @@ def merge(theirs):
     commit = git("-c", "commit.gpgsign=false", "commit-tree", write_tree(result), "-p", ours, "-p", theirs, "-m", msg)
     came = changes(ours, commit)
     git("merge", "-q", "--ff-only", commit)
-    return [what for what, _ in came.values()], said
+    return [what for what, _ in came.values()], said, dropped
 
 
 def refuse():
@@ -635,50 +647,63 @@ def renumber(theirs):
     return mapping
 
 
-def sync_core():
+def sync_core(say=print, quiet=False):
     """Commit, fetch, renumber collisions, merge and push. Returns {old ID: new ID} for what was
-    renumbered. Raises SystemExit if it can't finish."""
+    renumbered. Raises SystemExit if it can't finish. `say` prints each line (dispatch indents
+    them); `quiet` leaves out "up to date"."""
     if not joined():
         raise SystemExit(f"{_config.STATE} isn't a worktree of {branch()} yet: the first person runs "
                          f"`ergon sync --init`, everyone else `ergon sync --join`")
-    out, renamed = "", {}
     with _gitops.state_lock("sync"):
         mine = commit_pending("sync")
         if mine:
-            print("committed: " + ", ".join(mine))
-        for n in range(1, PUSH_TRIES + 1):
-            try:
-                theirs = fetch()
-                if theirs:
-                    moved = renumber(theirs)
-                    if moved:
-                        renamed.update(moved)
-                        commit_pending("sync")
-                came, said = merge(theirs)
-            except Conflict as c:
-                raise SystemExit(
-                    f"sync stopped: these IDs name different tasks here and on {remote()}:\n{c}\n"
-                    f"Nothing was merged or pushed. Refile or close the local one in {_config.STATE}, "
-                    f"then run `ergon sync` again.")
-            except _gitops.GitError as err:
-                raise SystemExit(f"sync: {err}")
-            if came:
-                print("pulled: " + ", ".join(came))
-            for line in said:
-                print(f"merged: {line}")
-            if theirs and git("rev-parse", "HEAD") == theirs:
-                print(f"{branch()} is up to date with {remote()}")
-                return renamed
-            try:
-                ok, out = push()
-            except _gitops.GitError as err:
-                raise SystemExit(f"sync: {err}")
-            if ok:
-                git("update-ref", remote_ref(), "HEAD")  # a URL remote has no tracking ref: what we pushed is the remote now
-                print(f"pushed {branch()} to {remote()}")
-                return renamed
-            print(f"push rejected: {remote()} {branch()} moved since the fetch; fetching and merging again "
-                  f"({n}/{PUSH_TRIES})")
+            say("committed: " + ", ".join(mine))
+        return push_rounds(say, quiet=quiet)
+
+
+def push_rounds(say=print, dropped=None, quiet=False):
+    """sync_core after its commit: fetch, renumber collisions, merge and push, and again while the
+    push is rejected. The caller holds the state lock and has committed. Returns {old ID: new ID}
+    for what was renumbered; raises SystemExit if it can't finish. Adds to `dropped` (a set) each
+    ID whose status move here lost to the remote's as it goes, so the caller knows that even when
+    a later round raises."""
+    out, renamed = "", {}
+    for n in range(1, PUSH_TRIES + 1):
+        try:
+            theirs = fetch()
+            if theirs:
+                moved = renumber(theirs)
+                if moved:
+                    renamed.update(moved)
+                    commit_pending("sync")
+            came, said, lost = merge(theirs)
+        except Conflict as c:
+            raise SystemExit(
+                f"sync stopped: these IDs name different tasks here and on {remote()}:\n{c}\n"
+                f"Nothing was merged or pushed. Refile or close the local one in {_config.STATE}, "
+                f"then run `ergon sync` again.")
+        except _gitops.GitError as err:
+            raise SystemExit(f"sync: {err}")
+        if dropped is not None:
+            dropped.update(lost)
+        if came:
+            say("pulled: " + ", ".join(came))
+        for line in said:
+            say(f"merged: {line}")
+        if theirs and git("rev-parse", "HEAD") == theirs:
+            if not quiet:
+                say(f"{branch()} is up to date with {remote()}")
+            return renamed
+        try:
+            ok, out = push()
+        except _gitops.GitError as err:
+            raise SystemExit(f"sync: {err}")
+        if ok:
+            git("update-ref", remote_ref(), "HEAD")  # a URL remote has no tracking ref: what we pushed is the remote now
+            say(f"pushed {branch()} to {remote()}")
+            return renamed
+        say(f"push rejected: {remote()} {branch()} moved since the fetch; fetching and merging again "
+            f"({n}/{PUSH_TRIES})")
     raise SystemExit(f"sync: the push was still rejected after {PUSH_TRIES} tries; your commits are kept "
                      f"locally, run `ergon sync` again.\n{out[:400]}")
 

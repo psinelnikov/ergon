@@ -364,6 +364,16 @@ def accept(args):
     todo = [t for t in targets(args.ids, tasks, epics, "review") if t["status"] == "review"]
     if not todo:
         raise SystemExit("nothing in `review` among those ids")
+    # shared mode: task branches are never pushed, so only the clone dispatch held it on can land it
+    away = {t["id"]: who for t in todo
+            if (who := _tasks.held_elsewhere(t)) and not _gitops.branch_exists(_config.TASK_BRANCH + t["id"])}
+    if away:
+        todo = [t for t in todo if t["id"] not in away]
+        said = "\n".join(f"refused: {tid} is held on {who}: its branch {_config.TASK_BRANCH}{tid} is in that "
+                         f"clone, so accept it there" for tid, who in away.items())
+        if not todo:
+            raise SystemExit(said)
+        print(said)
     for t in todo:
         print(_tasks.line(t, tasks) + f"  [{_config.TASK_BRANCH}{t['id']}]")
     if not human_gate(f"Accept and land these {len(todo)} task(s) as {approver()}?"):
@@ -404,7 +414,7 @@ def accept(args):
                     _gitops.finish_epic(e["id"])
                 except _gitops.GitError as err:
                     print(f"  {e['id']} is complete but not merged: {err}")
-    if failed:
+    if failed or away:
         sys.exit(1)
 
 

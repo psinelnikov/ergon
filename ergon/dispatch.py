@@ -23,6 +23,7 @@ from . import gitops as _gitops
 from . import history as _history
 from . import limits as _limits
 from . import report as _report
+from . import shared as _shared
 from . import tasks as _tasks
 
 
@@ -34,7 +35,7 @@ from . import tasks as _tasks
 # blocked (worktree and branch kept for you) on anything else, a merge conflict included.
 # A task whose touches: names a companion repo also gets its own worktree of that repo's
 # checkout, on a task/<ID> branch there too, which lands on the companion's local trunk first.
-# Nothing is ever pushed.
+# No code is ever pushed. In shared mode the state branch is, to claim tasks (see "claims").
 
 WORKER_PROMPT = """You are dispatched on {id}.
 
@@ -113,6 +114,75 @@ def put_status(tid, status, note=None, who="dispatch", drop=()):
     if note:
         add_note(t, note, who)
     _tasks.dump(t, _tasks.TASK_KEYS)
+
+
+# ---------- claims (shared mode) ----------
+# docs/shared-state.md, "Dispatch claims". With [shared], other clones dispatch from the same
+# queue. Every scan syncs the state branch first (which is also how --watch sees a teammate's
+# approval). Then each task is claimed before its worker launches: ready -> doing in a local commit
+# that names this clone, pushed. A rejected push fetches and merges, and status merges as
+# compare-and-set: if another dispatcher moved the task first, this clone's move is dropped and the
+# task isn't launched. done, blocked, asking and review are pushed as each task stops. Task
+# branches stay in the clone that ran them, so a `review` hold's Note names it (`held: <user>@<host>`)
+# and only that clone's `check` and `accept` look for the branch.
+
+def say_sync(line):
+    print(f"  sync     {line}", flush=True)
+
+
+def sync_state():
+    """Shared mode: sync the state branch for dispatch. Returns None, or why it failed (the
+    commits stay local, and the next sync pushes them). Takes the state lock itself."""
+    try:
+        _shared.sync_core(say=say_sync, quiet=True)
+    except SystemExit as err:
+        return str(err)
+    return None
+
+
+def claim(tid):
+    """Shared mode, under the state lock, after the scan's sync: move tid ready -> doing (dropping
+    `answered:`, as every launch does) in a commit naming this clone, and push it. Returns None if
+    this dispatcher holds the task now, else why not: then the task is as the remote has it, or
+    back at ready if the claim couldn't be pushed."""
+    cur = _tasks.load(_config.ITEMS).get(tid)
+    if not cur or cur["status"] != "ready":
+        return f"now {cur['status'] if cur else 'gone'} here, since the scan; not launched"
+    answered = cur.get("answered")
+    put_status(tid, "doing", drop=("answered",))
+    # The body makes each claim its own commit: two clones claiming from the same tip in the same
+    # second would otherwise make the very same commit, and both pushes would "succeed".
+    _shared.commit_pending("dispatch", body=f"Claimed by {_tasks.clone_id()} in {_config.HOME} "
+                                            f"({os.getpid()}-{os.urandom(4).hex()})")
+    dropped = set()
+    try:
+        _shared.push_rounds(say_sync, dropped, quiet=True)
+    except SystemExit as err:
+        if tid not in dropped:
+            unclaim(tid, answered)
+            return f"couldn't push the claim, so it's back at ready and not launched: {err}"
+    if tid in dropped:
+        now = _tasks.load(_config.ITEMS).get(tid, {}).get("status")
+        return f"another dispatcher claimed it first ({_shared.remote()} has it {now}); not launched"
+    return None
+
+
+def unclaim(tid, answered=None, push=False):
+    """Undo this clone's claim on tid: back to ready, with its `answered:` mark if it had one, in a
+    commit; pushed if `push` (best effort). Caller holds the state lock."""
+    cur = _tasks.load(_config.ITEMS).get(tid)
+    if not cur or cur["status"] != "doing":
+        return
+    cur["status"] = "ready"
+    if answered:
+        cur["answered"] = answered
+    _tasks.dump(cur, _tasks.TASK_KEYS)
+    _shared.commit_pending("dispatch")
+    if push:
+        try:
+            _shared.push_rounds(say_sync, quiet=True)
+        except SystemExit as err:
+            say_sync(f"{tid} back at ready, not pushed yet: {err}")
 
 
 # ---------- questions ----------
@@ -860,6 +930,13 @@ def dispatch(args):
         args.max = float("inf") if args.watch else 6
     if _config.REPO != _config.HOME and not args.dry_run:  # a dry run only reads, so any checkout will do
         raise SystemExit(f"run dispatch from the main checkout ({_config.HOME})")
+    claims = bool(_config.SHARED) and not args.dry_run  # a dry run reads local state and pushes nothing
+    if claims and _gates.in_agent_shell():
+        raise SystemExit("refused: running inside an agent shell. In shared mode dispatch claims tasks by "
+                         "pushing the team's queue, so a human starts it from their own terminal.")
+    if claims and not _shared.joined():
+        raise SystemExit(f"{_config.STATE} isn't a worktree of {_shared.branch()} yet, so dispatch can't claim "
+                         f"tasks: run `ergon sync --join` (or `ergon sync --init`) first")
     if not shutil.which("claude") and not args.dry_run:
         raise SystemExit("no `claude` on PATH")
     if not args.dry_run:
@@ -1057,7 +1134,9 @@ def dispatch(args):
             # (dropping `accept:`, retiering) lets the branch skip a human's acceptance.
             if verdict == "done" and _tasks.needs_accept(t, *([up] if up else [])):
                 verdict, why = "review", (f"waits for a human: `ergon accept {t['id']}` lands it, `ergon reject "
-                                          f"{t['id']} --reason R` sends it back. {kept_note(wt, branch, pubs)}")
+                                          f"{t['id']} --reason R` sends it back. {kept_note(wt, branch, pubs)}"
+                                          # the branch is in this clone only: the Note says which
+                                          + (f" (held: {_tasks.clone_id()})" if claims else ""))
                 _history.record("review_hold", t, branch=branch, base=base)
             elif verdict == "done":
                 verdict, why = land(t, base, wt, branch, pubs)
@@ -1096,6 +1175,10 @@ def dispatch(args):
             if verdict == "blocked" and info.get("asked"):
                 hid, title = file_human(t, why, epics)
                 print(f"  proposed {hid}  (human, {t['id']} now depends on it)  {title}")
+        if claims:  # publish where it stopped (and what it filed) now, not at the next scan
+            failed = sync_state()
+            if failed:
+                say_sync(f"{t['id']} {verdict} not pushed yet ({failed}); the next sync pushes it")
         return t, verdict, why, info
 
     def shared(a, b):
@@ -1197,11 +1280,16 @@ def dispatch(args):
                 while True:
                     stopping = bool(stops)
                     if scan and not stopping:
+                        # shared mode: see what the team did (approvals, claims) before choosing
+                        unsynced = sync_state() if claims and launched < args.max and not capped else None
+                        if unsynced:
+                            say_sync(f"failed, so nothing launches this scan: {unsynced}")
                         # the lock is held only for the scan, so `approve` works between scans
                         with _gitops.state_lock():
                             if cap is not None and spent() >= cap:
                                 capped = True
-                            queue = [] if launched >= args.max or capped else list(eligible(_tasks.load(_config.ITEMS)))
+                            queue = [] if launched >= args.max or capped or unsynced else \
+                                list(eligible(_tasks.load(_config.ITEMS)))
                             while queue and len(running) < args.jobs and launched < args.max:
                                 t = queue.pop(0)
                                 behind = next((o for o in active.values() if shared(t, o)), None)
@@ -1211,15 +1299,25 @@ def dispatch(args):
                                         _history.record("held", t, behind=behind["id"], touches=shared(t, behind))
                                     continue
                                 tried.add(t["id"])
+                                # An answered question rides along to the worker; the mark goes with
+                                # the launch, so a retry after this run starts over.
+                                answered = t.get("answered") or None
+                                if claims:  # pushed ready -> doing before anything else
+                                    lost = claim(t["id"])
+                                    if lost:
+                                        skipped[t["id"]] = lost
+                                        print(f"  claimed  {t['id']}  {lost}", flush=True)
+                                        continue
+                                    t = _tasks.load(_config.ITEMS)[t["id"]]  # as the sync merged it
                                 try:
                                     base, wt, branch, pubs = prepare(t, epics)
                                 except _gitops.GitError as err:
                                     skipped[t["id"]] = f"couldn't make a worktree: {err}"
+                                    if claims:
+                                        unclaim(t["id"], answered, push=True)
                                     continue
-                                # An answered question rides along to the worker; the mark goes with
-                                # the launch, so a retry after this run starts over.
-                                answered = t.get("answered") or None
-                                put_status(t["id"], "doing", drop=("answered",))
+                                if not claims:
+                                    put_status(t["id"], "doing", drop=("answered",))
                                 _history.record("dispatched", t, tier=t["tier"], model=agents[f"task-{t['tier']}"]["model"],
                                                 base=base, branch=branch, worktree=wt,
                                                 companions=[c["name"] for c, _ in pubs],

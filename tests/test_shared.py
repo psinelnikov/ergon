@@ -6,13 +6,16 @@ import json
 import os
 import re
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
-from test_ergon import ERGON, clean_env, git_init, sh, stamp
+from test_ergon import ERGON, FAKE_CLAUDE, clean_env, git_init, sh, stamp
 
 SHARED_CONFIG = """\
 trunk = "main"
@@ -508,3 +511,158 @@ class TestIdAllocation(Shared):
         self.assertIn("renumbered: E-001 → E-002", r.stdout)
         self.assertTrue(list((self.b / "tasks" / "epics").glob("E-002-epic-b/EPIC.md")))
         self.assertIn("epic: E-002", self.task(self.b, "T-002").read_text())
+
+
+class TestDispatchClaims(Shared):
+    """Dispatch claims a task by pushing ready -> doing before its worker launches (T-019). Two
+    clones, the fake `claude` on PATH, and each clone a different person (`held:` names them)."""
+
+    def setUp(self):
+        super().setUp()
+        base = Path(self.tmp.name)
+        bindir = base / "bin"
+        bindir.mkdir()
+        (bindir / "claude").write_text(FAKE_CLAUDE.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
+        (bindir / "claude").chmod(0o755)
+        self.seen = base / "seen.jsonl"
+        common = dict(ERGON_ASK_STDIN="1", PATH=f"{bindir}:{os.environ['PATH']}", FAKE_SEEN=str(self.seen))
+        self.env_a = clean_env(USER="ann", LOGNAME="ann", **common)
+        self.env_b = clean_env(USER="dana", LOGNAME="dana", **common)
+        self.host = socket.gethostname().split(".")[0]
+
+    def workers(self):
+        """The task each worker launched (from either clone) was dispatched on."""
+        if not self.seen.exists():
+            return []
+        rows = [json.loads(l) for l in self.seen.read_text().splitlines() if l.strip()]
+        return [re.search(r"dispatched on (T-\d+)", r["prompt"]).group(1) for r in rows if r["agent"] != "REVIEW"]
+
+    def status(self, where, tid):
+        return re.search(r"^status: (\S+)", self.task(where, tid).read_text(), re.M).group(1)
+
+    def ready_in_both(self):
+        self.start()
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        self.assertEqual(self.status(self.b, "T-001"), "ready")
+
+    def test_two_dispatchers_racing_for_one_task_launch_one_worker(self):
+        self.ready_in_both()
+        # A's whole dispatch runs between B's fetch and B's push of its claim
+        mark, a_out = Path(self.tmp.name) / "raced", Path(self.tmp.name) / "a-dispatch.txt"
+        hook = self.b / ".git" / "hooks" / "pre-push"
+        hook.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            [ -e "{mark}" ] && exit 0
+            touch "{mark}"
+            unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
+            cd "{self.a}" && USER=ann LOGNAME=ann "{sys.executable}" "{ERGON}" dispatch > "{a_out}" 2>&1
+            exit 0
+            """))
+        hook.chmod(0o755)
+        r = self.ergon(self.b, "dispatch", env=self.env_b)
+        self.assertTrue(mark.exists())
+        a = a_out.read_text()
+        self.assertIn("doing    T-001", a)
+        self.assertIn("done     T-001", a)
+        self.assertEqual(self.workers(), ["T-001"])  # one worker: A's
+        self.assertIn("push rejected", r.stdout)
+        self.assertIn("claimed  T-001  another dispatcher claimed it first (", r.stdout)
+        self.assertIn("has it done); not launched", r.stdout)
+        self.assertNotIn("doing    T-001", r.stdout)
+        self.assertFalse((self.b / ".claude" / "worktrees" / "T-001").exists())  # B made nothing for it
+        self.assertEqual(self.status(self.b, "T-001"), "done")
+        # A pushed done as it landed; B's lost claim is noted, not applied
+        path = self.task(self.b, "T-001").relative_to(self.b / "tasks").as_posix()
+        text = sh("git", "show", f"ergon-state:{path}", cwd=self.remote).stdout
+        self.assertIn("status: done", text)
+        self.assertRegex(text, r"sync: dropped \S+'s ready->doing, remote had moved to done")
+        self.assertEqual(sh("git", "rev-parse", "HEAD", cwd=self.b / "tasks").stdout.strip(), self.remote_tip())
+        # each claim commit names the clone that made it
+        log = sh("git", "log", "--format=%B", "ergon-state", cwd=self.remote).stdout
+        self.assertIn(f"Claimed by ann@{self.host} in {self.a}", log)
+        self.assertIn(f"Claimed by dana@{self.host} in {self.b}", log)
+
+    def test_two_dispatchers_started_together_launch_one_worker(self):
+        self.ready_in_both()
+        procs = [subprocess.Popen([sys.executable, str(ERGON), "dispatch"], cwd=where, env=dict(env, FAKE_SLEEP="1"),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for where, env in ((self.a, self.env_a), (self.b, self.env_b))]
+        outs = [p.communicate(timeout=120) for p in procs]
+        for p, (out, err) in zip(procs, outs):
+            self.assertEqual(p.returncode, 0, out + err)
+        self.assertEqual(self.workers(), ["T-001"], outs)
+        self.assertEqual(sum("doing    T-001" in out for out, _ in outs), 1, outs)
+        for where in (self.a, self.b):
+            self.ergon(where, "sync")
+        self.assertEqual(self.status(self.a, "T-001"), "done")
+        self.assertEqual(self.status(self.b, "T-001"), "done")
+
+    def test_watch_picks_up_a_teammates_approval_after_a_sync(self):
+        self.start()
+        p = subprocess.Popen([sys.executable, str(ERGON), "dispatch", "--watch", "--budget-total", "5",
+                              "--interval", "0.5", "--max", "1"], cwd=self.a, env=self.env_a,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(2)  # a few scans with nothing ready
+            self.assertIsNone(p.poll())
+            self.assertEqual(self.workers(), [])
+            self.ergon(self.b, "approve", "T-001", inp="y\n", env=self.env_b)
+            self.ergon(self.b, "sync", env=self.env_b)
+            out, err = p.communicate(timeout=60)  # --max 1: it stops once T-001 is through
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertEqual(p.returncode, 0, out + err)
+        self.assertIn("pulled: T-001 proposed->ready", out)
+        self.assertIn("doing    T-001", out)
+        self.assertEqual(self.workers(), ["T-001"])
+        self.assertEqual(self.status(self.a, "T-001"), "done")
+        self.ergon(self.b, "sync", env=self.env_b)
+        self.assertEqual(self.status(self.b, "T-001"), "done")  # pushed as it landed
+
+    def test_a_review_hold_names_its_clone_for_check_and_accept(self):
+        self.start()
+        self.ergon(self.a, "set", "T-001", "accept=yes")
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        r = self.ergon(self.a, "dispatch", env=self.env_a)
+        self.assertIn("review   T-001", r.stdout)
+        self.assertIn(f"(held: ann@{self.host})", self.task(self.a, "T-001").read_text())
+        self.ergon(self.b, "sync", env=self.env_b)  # A pushed the hold as it stopped
+        self.assertEqual(self.status(self.b, "T-001"), "review")
+        # B has no task/T-001 branch, and isn't meant to: its check passes
+        r = self.ergon(self.b, "check", check=False, env=self.env_b)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # B's accept refuses and says where the branch is
+        r = self.ergon(self.b, "accept", "T-001", check=False, inp="y\n", env=self.env_b)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(f"T-001 is held on ann@{self.host}: its branch task/T-001 is in that clone", r.stderr)
+        self.assertEqual(self.status(self.b, "T-001"), "review")
+        # the holding clone still checks its own branch
+        self.assertEqual(self.ergon(self.a, "check", check=False, env=self.env_a).returncode, 0)
+        sh("git", "worktree", "remove", "--force", str(self.a / ".claude" / "worktrees" / "T-001"), cwd=self.a)
+        sh("git", "branch", "-D", "task/T-001", cwd=self.a)
+        r = self.ergon(self.a, "check", check=False, env=self.env_a)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("in review but branch task/T-001 is gone", r.stdout)
+        self.assertEqual(self.ergon(self.b, "check", check=False, env=self.env_b).returncode, 0)
+
+    def test_accept_lands_on_the_holding_clone(self):
+        self.start()
+        self.ergon(self.a, "set", "T-001", "accept=yes")
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.ergon(self.a, "dispatch", env=self.env_a)
+        r = self.ergon(self.a, "accept", "T-001", inp="y\n", env=self.env_a)
+        self.assertIn("done     T-001", r.stdout)
+        self.assertEqual(self.status(self.a, "T-001"), "done")
+
+    def test_refused_in_an_agent_shell(self):
+        self.ready_in_both()
+        agent = dict(self.env_a, CLAUDECODE="1")
+        r = self.ergon(self.a, "dispatch", check=False, env=agent)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("agent shell", r.stderr)
+        self.assertEqual(self.workers(), [])
+        self.assertEqual(self.status(self.a, "T-001"), "ready")
+        self.assertIn("would run  T-001", self.ergon(self.a, "dispatch", "--dry-run", env=agent).stdout)
