@@ -621,6 +621,31 @@ class TestDispatch(DispatchProject):
                     self.assertIn(f"title: {title}", text)
                 self.assertIn("2 proposed", out)
 
+    def test_found_lines_keep_code_spans(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="`ergon dispatch` filing tasks — `[[two_person]]`, the flow"
+                                   "|**Fix alpha** — it breaks"
+                                   "|`Fix beta — wrapped whole`")
+        out = self.ergon("dispatch").stdout
+        self.assertIn("3 proposed", out)
+        text = self.task_file("T-002").read_text()
+        self.assertIn("title: `ergon dispatch` filing tasks\n", text)
+        self.assertIn("## What\n`[[two_person]]`, the flow\n", text)
+        text = self.task_file("T-003").read_text()
+        self.assertIn("title: Fix alpha\n", text)
+        self.assertIn("## What\nit breaks\n", text)
+        text = self.task_file("T-004").read_text()
+        self.assertIn("title: Fix beta\n", text)
+        self.assertIn("## What\nwrapped whole\n", text)
+
+    def test_md_trim(self):
+        from ergon.dispatch import md_trim
+        for raw, want in (("`a` b", "`a` b"), ("a `b`", "a `b`"), ("`a`", "a"), ("**a**", "a"),
+                          ("**`a` b**", "`a` b"), ("a`", "a"), ("`a", "a"), ("`a` and `b`", "`a` and `b`"),
+                          (" * ", ""), ("", "")):
+            self.assertEqual(md_trim(raw), want, raw)
+
     def test_escalate_retries_one_tier_up(self):
         blocked = "RESULT: blocked \u2014 too hard"
         cases = [("haiku", "--escalate", {"FAKE_RESULT_HAIKU": blocked}, "done", "sonnet", 2),

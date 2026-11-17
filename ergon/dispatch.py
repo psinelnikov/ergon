@@ -453,6 +453,18 @@ def worker_prompt(t, base, wt, branch, pubs, veto=None, lines=None):
                                 text=t["_path"].read_text())
 
 
+def md_trim(s):
+    """A FOUND or POLICY title or why without the markdown wrapped around it: spaces and bold at
+    the ends, a stray backtick left by a code span around the whole line, or one code span that is
+    the whole text. A code span that only starts or ends the text keeps both its backticks."""
+    s = (s or "").strip(" *")
+    if s.count("`") % 2:
+        s = s[:-1] if s.endswith("`") else s[1:] if s.startswith("`") else s
+    if len(s) > 1 and s[0] == s[-1] == "`" and s.count("`") == 2:
+        s = s[1:-1]
+    return s.strip(" *")
+
+
 def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
     # A resumed session gets the same agent, permission mode and guard hook as a fresh one.
     cmd = ["claude", "-p", "--agents", json.dumps(agents), "--agent", f"task-{t['tier']}",
@@ -481,10 +493,10 @@ def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
     text = d.get("result") or ""
     if d.get("is_error"):
         return "blocked", f"worker errored ({d.get('subtype') or d.get('terminal_reason')}): {text[:200]}", info
-    info["found"] = [(m[0].strip(" *`"), m[1].strip(" *`")) for m in
-                     re.findall(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if m[0].strip(" *`")]
-    info["policy"] = [(m[0].strip(" *`"), m[1].strip(" *`")) for m in
-                      re.findall(r"^\W*POLICY:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if m[0].strip(" *`")]
+    info["found"] = [(md_trim(m[0]), md_trim(m[1])) for m in
+                     re.findall(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if md_trim(m[0])]
+    info["policy"] = [(md_trim(m[0]), md_trim(m[1])) for m in
+                      re.findall(r"^\W*POLICY:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if md_trim(m[0])]
     found = re.findall(r"^\W*RESULT:\s*(done|blocked|asking)\b[\s—:–-]*(.*)$", text, re.M)
     if not found:
         return "blocked", "worker ended without a RESULT line", info
