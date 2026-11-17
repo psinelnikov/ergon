@@ -669,13 +669,74 @@ def _program(word):
     return word.rstrip("/").rsplit("/", 1)[-1]
 
 
+# git's global options that take the next word as their value (git -C dir, git -c key=value).
+GIT_OPT_ARG = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env",
+               "--attr-source"}
+
+
+def git_commands(words):
+    """The command lines a git call among words runs from its own arguments, which the lexer saw
+    as data: each value of rebase's --exec / -x, and each alias it defines (`git -c alias.x=...`,
+    `git config alias.x ...`), a `!` alias as shell text and any other as the git call it expands
+    to. A later `git x` names no verb, so an alias is checked where it is defined."""
+    out = []
+
+    def alias(key, val):
+        if key.lower().startswith("alias."):
+            out.append(val[1:] if val.startswith("!") else "git " + val)
+
+    for k, w in enumerate(words):
+        if _program(w) != "git":
+            continue
+        i = k + 1
+        while i < len(words) and words[i].startswith("-"):
+            if words[i] in GIT_OPT_ARG and i + 1 < len(words):
+                if words[i] == "-c":
+                    key, eq, val = words[i + 1].partition("=")
+                    if eq:
+                        alias(key, val)
+                i += 1
+            i += 1
+        sub, rest = (words[i], words[i + 1:]) if i < len(words) else ("", [])
+        if sub == "config":
+            for j, a in enumerate(rest[:-1]):
+                if "=" not in a:
+                    alias(a, rest[j + 1])
+        elif sub == "rebase":
+            j = 0
+            while j < len(rest):
+                a, j = rest[j], j + 1
+                if a == "--":
+                    break
+                if m := re.fullmatch(r"--ex(?:ec?)?(?:=(.*))?", a, re.S):  # --ex and --exe abbreviate --exec
+                    if m.group(1) is not None:
+                        out.append(m.group(1))
+                    elif j < len(rest):
+                        out.append(rest[j])
+                        j += 1
+                elif re.match(r"-[^-]", a):  # a cluster of short options: -x cmd, -xcmd, -ix cmd
+                    for p, c in enumerate(a[1:], 2):
+                        if c == "x":
+                            if a[p:]:
+                                out.append(a[p:])
+                            elif j < len(rest):
+                                out.append(rest[j])
+                                j += 1
+                            break
+                        if c in "sXCS":  # takes the rest of the word as its value
+                            break
+    return out
+
+
 def human_cmd(cmd):
     """Whether a shell command runs a human-only ergon command: approve, reject, close, accept,
     answer, sync, or the interactive review. Only a real call counts: `ergon` (ergon.py, the package's
     folder or __main__.py) as a word of a simple command followed by the verb, wherever that
     command sits (after &&, inside $(...), behind sudo or xargs, in a heredoc fed to a shell). The
     verbs inside a quoted grep pattern or commit message are data and pass. Strings given to a
-    program that runs them as code are checked as text, as is anything that can't be split."""
+    program that runs them as code are checked as text, as is anything that can't be split. The
+    commands git runs from its own arguments (rebase --exec, an alias it defines) are checked as
+    commands."""
     try:
         cmds = shell_commands(cmd)[0]
     except (ValueError, RecursionError):
@@ -685,6 +746,8 @@ def human_cmd(cmd):
             if any(HUMAN_CMD.search(t) or (t != cmd and human_cmd(t)) for t in words + [d for d, _ in docs]):
                 return True
         if any(expands and re.search(r"\$\(|`", d) and HUMAN_CMD.search(d) for d, expands in docs):
+            return True
+        if any(human_cmd(t) for t in git_commands(words)):
             return True
         for k, w in enumerate(words):
             if _program(w) not in ("ergon", "ergon.py") and not w.endswith("ergon/__main__.py"):

@@ -289,6 +289,28 @@ class TestBasics(Project):
                     "cat <<EOF\n$(ergon approve T-1)\nEOF", "diff <(ergon accept T-1) x", "ls; ergon approve T-1 &"]:
             self.assertTrue(human_cmd(cmd), cmd)
 
+    def test_guard_human_cmd_git_runs_its_arguments(self):
+        """T-054: git runs rebase's --exec value and a `!` alias as shell commands, and a plain alias
+        as a git call; the verb in them is a real call. An alias is refused where it's defined."""
+        from ergon.gates import human_cmd
+        for verb in ["approve", "reject", "close", "accept", "answer", "sync"]:
+            for cmd in [f'git rebase --exec "ergon {verb} T-1"', f'git rebase -x "ergon {verb} T-1"',
+                        f"git rebase --exec='ergon {verb} T-1' main", f"git rebase -i -x'ergon {verb} T-1' main",
+                        f"git rebase -ix 'ergon {verb} T-1'", f"git rebase --exe 'ergon {verb} T-1'",
+                        f'git -c alias.x="!ergon {verb} T-1" x', f"git config alias.x '!ergon {verb} T-1'",
+                        f"git -c alias.x=\"!sh -c 'ergon {verb} T-1'\" x",
+                        f"git config --global alias.x \"!sh -c 'ergon {verb} T-1'\"",
+                        f"git -C . -c ALIAS.X='rebase --exec \"ergon {verb} T-1\"' x",
+                        f"git config alias.x 'rebase -x \"ergon {verb} T-1\"'"]:
+                self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["git rebase -x 'ergon review -i'", "cd x && git -c 'alias.y=!ergon review --interactive' y"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ['git commit -m "ergon approve T-1"', 'git log --grep "ergon accept"', 'git rebase --exec "make test"',
+                    "git config alias.st status", "git rebase -s ours -X theirs main", "git cherry-pick -x abc",
+                    "git config alias.l '!git log --grep \"ergon approve\"'", "git -c user.name='ergon close' commit",
+                    "git -c alias.x commit -m 'ergon approve'", "git config --get alias.st", "git rebase -- -x"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+
     def test_stop_hook_blocks_on_lint_failure(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")
