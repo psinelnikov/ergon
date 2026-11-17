@@ -140,25 +140,32 @@ def changes(a, b=None):
     return out
 
 
-def commit_pending(label=None, body=None):
+def commit_pending(label=None, body=None, trailers=None):
     """Commit what changed in items/ and epics/ (this command's writes and any hand edits) on the
     state branch. Returns what changed, [] if nothing did. The caller holds state_lock. `body`
     goes under the subject: dispatch's claims name the clone there, so two clones' claims are
-    never the very same commit."""
+    never the very same commit. With `trailers` (a human's decision: `Ergon-Approve: T-NNN
+    sha256:…` and the like) the commit is made even if nothing changed, SSH-signed, with the
+    trailers as its last paragraph; a failure to sign raises GitError and commits nothing."""
     paths = [p for p in ("items", "epics", ".gitignore") if (_config.STATE / p).exists()]
     git("add", "-A", "--", *paths)
     git("rm", "-q", "--cached", "--ignore-unmatch", "--", "items/.lock")  # in case .gitignore went missing
     parts = [what for what, _ in changes("HEAD").values()]
-    if not parts:
+    if not parts and not trailers:
         return []
     label = label or COMMAND or "ergon"
-    subject = f"{label}: {', '.join(parts)}"
-    msg = subject if len(subject) <= 72 else f"{label}: {len(parts)} changes\n\n" + "\n".join(parts)
+    said = parts or [t.split(":", 1)[1].strip() for t in trailers]
+    subject = f"{label}: {', '.join(said)}"
+    msg = subject if len(subject) <= 72 else f"{label}: {len(said)} changes\n\n" + "\n".join(said)
     if body:
         msg += "\n\n" + body
     # --no-verify: the trunk's commit-msg hook (ergon's own) would refuse a message naming a
-    # proposed task, and code hooks have no business with task files. Never signed here.
-    git("-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", msg)
+    # proposed task, and code hooks have no business with task files.
+    if trailers:
+        git("-c", "gpg.format=ssh", "commit", "-q", "--no-verify", "--allow-empty", "-S",
+            "-m", msg + "\n\n" + "\n".join(trailers))
+    else:
+        git("-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", msg)
     return parts
 
 
@@ -213,8 +220,8 @@ NOTES = "## Notes"
 # Fields written together with a status move: approve stamps a task ready, dispatch's asking:
 # parks it blocked, `ergon answer` leaves answered: on a ready task. They come from whichever
 # side's status wins, never mixed, so a merge can't pair one side's status with the other's stamp.
-# That is also how `approved:` is "not merged as text": once approvals are verified signed commits
-# (T-020), it is recomputed from those instead.
+# After the merge, restamp() recomputes `approved:` of every open task from the verified signed
+# approvals (gitops.approvals), so it is never merged as text.
 STATUS_BOUND = ("approved", "asking", "answered")
 DATED = re.compile(r"^- (\d{4}-\d{2}-\d{2})\b")
 
@@ -658,7 +665,53 @@ def sync_core(say=print, quiet=False):
         mine = commit_pending("sync")
         if mine:
             say("committed: " + ", ".join(mine))
+        fetch_trunk(say)
         return push_rounds(say, quiet=quiet)
+
+
+def fetch_trunk(say=print):
+    """Fetch the trunk from the remote into refs/ergon/trunk, where the approvers file is read
+    (gitops.approvals). If the remote has no trunk the ref goes, so nothing verifies. On any other
+    failure the last fetch stands, and that is said."""
+    r = run("fetch", "--quiet", "--no-tags", remote(), f"+refs/heads/{_config.MAIN}:{_gitops.TRUNK_REF}",
+            cwd=_config.HOME)
+    if r.returncode == 0:
+        return True
+    if "couldn't find remote ref" in (r.stderr + r.stdout).lower():
+        run("update-ref", "-d", _gitops.TRUNK_REF, cwd=_config.HOME)
+        say(f"{remote()} has no {_config.MAIN} branch, so there is no approvers file and no approval verifies")
+    else:
+        say(f"couldn't fetch {_config.MAIN} from {remote()} for the approvers file; using the last fetch: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
+    return False
+
+
+def restamp(say=print):
+    """Rewrite each open task's `approved:` from what verifies (gitops.approvals): the signer and
+    date of its approval and the digest, or empty when its approval doesn't verify. Done and
+    dropped tasks are history and keep theirs. Changes nothing when no approval can be verified at
+    all (no approvers file yet, say), which is reported. The caller holds the state lock; commits."""
+    apr = _gitops.approvals()
+    if apr is None:
+        return []
+    if apr.error:
+        say(f"approvals not checked: {apr.error}; approved: stamps left as they are")
+        return []
+    changed = []
+    for t in _tasks.load(_config.ITEMS).values():
+        if t.get("status") not in _gitops.GATED:
+            continue
+        want = apr.stamp(t) or ""
+        if (t.get("approved") or "") != want:
+            t["approved"] = want
+            _tasks.dump(t, _tasks.TASK_KEYS)
+            changed.append(f"{t['id']} approved: {want}" if want else
+                           f"{t['id']} approved: cleared ({apr.problem(t)})")
+    if changed:
+        commit_pending("sync")
+        for c in changed:
+            say(f"restamped: {c}")
+    return changed
 
 
 def push_rounds(say=print, dropped=None, quiet=False):
@@ -686,6 +739,7 @@ def push_rounds(say=print, dropped=None, quiet=False):
             raise SystemExit(f"sync: {err}")
         if dropped is not None:
             dropped.update(lost)
+        restamp(say)  # approved: is a copy of what verifies, never merged as text
         if came:
             say("pulled: " + ", ".join(came))
         for line in said:
@@ -898,6 +952,7 @@ def init():
         fetch(cwd=_config.HOME)
         attach(checkout=False)
         exclude_state()
+        fetch_trunk()
         stray = git("status", "--porcelain", "--", "items", "epics", raw=True)
         if stray.strip():
             print(f"warning: {_config.STATE} differs from what was pushed:\n{stray}")
@@ -928,6 +983,7 @@ def join():
                 git("branch", b, theirs, cwd=_config.HOME)
             attach(checkout=True)
             exclude_state()
+            fetch_trunk()
         except _gitops.GitError as err:
             raise SystemExit(f"sync --join: {err}")
     print(f"joined: {_config.STATE} is a worktree of {b} ({len(task_files())} task and epic files). "

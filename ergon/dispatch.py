@@ -962,12 +962,17 @@ def dispatch(args):
 
     def eligible(tasks):
         epics.update(_tasks.load(_config.EPICS))  # another run or session may have closed one
+        apr = _gitops.approvals()  # shared mode: verified now, after the scan's sync; None otherwise
         for t in sorted(tasks.values(), key=lambda t: (_tasks.TIERS.index(t["tier"]), t["id"])):
             if (t["id"] in tried or t["status"] != "ready" or not _tasks.deps_done(t, tasks)
                     or (ids and t["id"] not in ids) or (args.tier and t["tier"] != args.tier)
                     or (args.epic and t.get("epic") != args.epic)):
                 continue
             if t["tier"] == "human":
+                continue
+            why = apr.problem(t) if apr else None
+            if why:
+                skipped[t["id"]] = f"approval doesn't verify: {why}"
                 continue
             nested = nested_touch(t, links)
             if nested:
@@ -1309,6 +1314,13 @@ def dispatch(args):
                                         print(f"  claimed  {t['id']}  {lost}", flush=True)
                                         continue
                                     t = _tasks.load(_config.ITEMS)[t["id"]]  # as the sync merged it
+                                    # the claim's merge may have brought in an edit to the brief
+                                    why = _gitops.approvals().problem(t)
+                                    if why:
+                                        skipped[t["id"]] = f"approval doesn't verify: {why}"
+                                        print(f"  skipped  {t['id']}  approval doesn't verify", flush=True)
+                                        unclaim(t["id"], answered, push=True)
+                                        continue
                                 try:
                                     base, wt, branch, pubs = prepare(t, epics)
                                 except _gitops.GitError as err:

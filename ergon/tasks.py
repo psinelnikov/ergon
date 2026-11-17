@@ -4,6 +4,7 @@ import datetime
 import fcntl
 import fnmatch
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -121,6 +122,60 @@ def today():
     return datetime.date.today().isoformat()
 
 
+# ---------- what an approval approves (shared mode) ----------
+# docs/shared-state.md, "Trusting approval stamps". An approval covers the brief: id, title, tier,
+# touches, accept and the What and Done when sections. status, depends, epic and Notes are left
+# out: dispatch moves status and adds dependencies to blocked tasks, and Notes are scratch.
+
+DIGEST_SECTIONS = ("what", "done when")
+HEADING = re.compile(r"^#{1,2}\s+(.*?)\s*$")
+
+
+def sections(body, name):
+    """The text under every `## <name>` heading of a body (matched case-insensitively), up to the
+    next # or ## heading, joined. Every one counts, so a second `## What` lower down is covered too."""
+    out, on = [], False
+    for l in body.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        m = HEADING.match(l)
+        if m:
+            on = m.group(1).strip().lower() == name
+            if on:
+                out.append("")
+            continue
+        if on:
+            out.append(l)
+    return "\n".join(out)
+
+
+def normalised(text):
+    """Text with trailing spaces, runs of blank lines and blank lines at either end taken out."""
+    lines, blank = [], False
+    for l in (x.rstrip() for x in text.split("\n")):
+        if not l:
+            blank = bool(lines)
+            continue
+        if blank:
+            lines.append("")
+        lines.append(l)
+        blank = False
+    return "\n".join(lines)
+
+
+def brief_digest(t):
+    """sha256 (hex) of what approving t approves. Notes, status, depends and epic don't change it."""
+    body = t.get("_body") or ""
+    doc = {
+        "id": str(t.get("id") or "").strip(),
+        "title": " ".join(str(t.get("title") or "").split()),
+        "tier": str(t.get("tier") or "").strip(),
+        "touches": sorted({str(x).strip().strip("/") for x in t.get("touches") or [] if str(x).strip()}),
+        "accept": "yes" if str(t.get("accept") or "").strip().lower() in YES else "",
+    }
+    for name in DIGEST_SECTIONS:
+        doc[name] = normalised(sections(body, name))
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
 # ---------- views ----------
 
 def deps_done(t, tasks):
@@ -226,10 +281,16 @@ def nxt(args):
     tasks = load(_config.ITEMS)
     ok = [t for t in tasks.values() if t["status"] == "ready" and deps_done(t, tasks)
           and (not args.tier or t["tier"] == args.tier)]
+    apr = _gitops.approvals()  # shared mode: only tasks whose signed approval verifies
+    hidden = [t for t in ok if apr and apr.problem(t)]
+    ok = [t for t in ok if t not in hidden]
     for t in sorted(ok, key=lambda t: (TIERS.index(t["tier"]), t["id"])):
         print(line(t, tasks))
     if not ok:
         print("nothing approved and unblocked" + (f" for {args.tier}" if args.tier else ""))
+    if hidden:
+        print(f"({len(hidden)} ready task(s) left out because their approval doesn't verify: "
+              f"{', '.join(sorted(t['id'] for t in hidden))}; `ergon check` says why)")
 
 
 def review(args):
@@ -668,6 +729,7 @@ def tidy(args):
 
 def lint():
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
+    apr = _gitops.approvals()  # None outside shared mode
     errs = []
     for p in _config.EPICS.glob("*.md"):
         errs.append(f"{p.name}: an epic belongs in its own folder; run `ergon tidy`")
@@ -693,7 +755,12 @@ def lint():
             errs.append(f"{where}: tier {t.get('tier')!r} not in {TIERS}")
         if t.get("status") not in TASK_STATUSES:
             errs.append(f"{where}: status {t.get('status')!r} not in {TASK_STATUSES}")
-        if t.get("status") in NEEDS_APPROVAL and not t.get("approved"):
+        # shared mode: an open task's approval must verify (a signed commit from an approver
+        # approving its current brief); the approved: stamp is only a copy
+        why = apr.problem(t) if apr and t.get("status") in _gitops.GATED else None
+        if why:
+            errs.append(f"{where}: {t['status']}, but its approval doesn't verify: {why}")
+        elif t.get("status") in NEEDS_APPROVAL and not t.get("approved"):
             errs.append(f"{where}: status {t['status']} without a human `approved:` stamp")
         # shared mode: only the clone that holds the branch can tell it's gone
         if (t.get("status") == "review" and not held_elsewhere(t)

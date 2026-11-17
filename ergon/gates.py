@@ -134,25 +134,81 @@ def targets(ids, tasks, epics, status="proposed"):
     return out
 
 
+def signing():
+    """Shared mode, joined: human decisions are SSH-signed state commits. Refuses (SystemExit)
+    if this clone can't sign, saying how to set it up. Returns whether to sign."""
+    if not _shared.joined():
+        return False
+    why = _gitops.signing_problem()
+    if why:
+        raise SystemExit(f"refused: {why}")
+    return True
+
+
+def approve_ready():
+    """Shared mode: refuse (SystemExit) unless an approval made here would verify: the state is
+    a worktree, signing is set up, and the approvers file on the remote's trunk lists this key."""
+    if not _config.SHARED:
+        return
+    if _shared.joined():
+        _shared.fetch_trunk()  # see the approvers file as the remote has it now
+    why = _gitops.approve_problem()
+    if why:
+        raise SystemExit(f"refused: {why}")
+
+
+def stamp_approved(todo):
+    """Approve `todo`: proposed tasks move to ready, and each gets `approved: <name> <date>`. In
+    shared mode the stamp also names its brief digest, and the stamps go in one SSH-signed state
+    commit with an `Ergon-Approve: <ID> sha256:<digest>` trailer per task, which is what makes
+    them count. If signing fails, nothing is approved (SystemExit). Takes the state lock."""
+    shared = _config.SHARED is not None
+    with _gitops.state_lock():
+        if shared:
+            _shared.commit_pending()  # hand edits go in a commit of their own, not the signed one
+        trailers, stamp = [], f"{approver()} {_tasks.today()}"
+        for t in todo:
+            digest = _tasks.brief_digest(t)
+            if t["status"] == "proposed":
+                t["status"] = "ready"
+            t["approved"] = f"{stamp} sha256:{digest[:8]}" if shared else stamp
+            _tasks.dump(t, _tasks.TASK_KEYS)
+            trailers.append(f"{_gitops.APPROVE_TRAILER}: {t['id']} sha256:{digest}")
+        if shared:
+            _gitops.sign_state("approve", trailers, [t["_path"] for t in todo])
+        for t in todo:
+            _history.record("approved", t, by=approver(), tier=t["tier"])
+    if shared:  # e.g. a key user.signingkey didn't name, so approve_ready couldn't check it
+        apr = _gitops.approvals()
+        for t in todo:
+            why = apr.problem(t)
+            if why:
+                print(f"warning: {t['id']}'s approval doesn't verify: {why}")
+
+
 def approve(args):
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
-    todo = [t for t in targets(args.ids, tasks, epics) if t["status"] == "proposed"]
+    approve_ready()
+    named = targets(args.ids, tasks, epics)
+    todo = [t for t in named if t["status"] == "proposed"]
+    # shared mode: an approved task whose approval no longer verifies (its brief was edited, or it
+    # was stamped by hand) is approved again by naming it; its status stays
+    apr = _gitops.approvals()
+    again = {t["id"]: why for t in named if apr and t["id"] in args.ids and t["status"] in ("ready", "blocked")
+             and (why := apr.problem(t))}
+    todo += [t for t in named if t["id"] in again]
     if not todo:
-        raise SystemExit("nothing in `proposed` among those ids")
+        raise SystemExit("nothing in `proposed` among those ids" + (
+            ", nor an approved task whose approval doesn't verify" if apr else ""))
     # shared mode: an unpublished ID can still be renumbered, so sync first (or refuse)
     _shared.ensure_published([t["id"] for t in todo] + [i for i in args.ids if i in epics])
     tasks = _tasks.load(_config.ITEMS)
     todo = [tasks[t["id"]] for t in todo]
     for t in todo:
-        print(_tasks.line(t, tasks))
+        print(_tasks.line(t, tasks) + (f"  (approve again: {again[t['id']]})" if t["id"] in again else ""))
     if not human_gate(f"Approve these {len(todo)} task(s) as {approver()}?"):
         raise SystemExit("aborted")
-    stamp = f"{approver()} {_tasks.today()}"
-    with _gitops.state_lock():  # in shared mode, commits the approvals on the state branch
-        for t in todo:
-            t["status"], t["approved"] = "ready", stamp
-            _tasks.dump(t, _tasks.TASK_KEYS)
-            _history.record("approved", t, by=approver(), tier=t["tier"])
+    stamp_approved(todo)
     print(f"approved {len(todo)}")
 
 
@@ -213,7 +269,6 @@ def review_interactive(args):
     queue += sorted((t for t in tasks.values() if vetoed(t) and not _tasks.is_asking(t) and pick(t)), key=order)
     if not queue:
         raise SystemExit("nothing awaiting approval or an answer")
-    stamp = f"{approver()} {_tasks.today()}"
     tally = {"approved": 0, "dropped": 0, "answered": 0, "skipped": 0, "policies": 0}
     for i, t in enumerate(queue, 1):
         if _tasks.is_asking(t):
@@ -262,19 +317,30 @@ def review_interactive(args):
                 print(f"\n(waits on {', '.join(waits)})")
             choice = ask(f"\n{t['id']} [{t['tier']}]  [a]pprove  [r]eject  [t]ier  [e]dit  [s]kip  [q]uit > ").lower()
             if choice == "a":
-                with _gitops.state_lock():
-                    t["status"], t["approved"] = "ready", stamp
-                    _tasks.dump(t, _tasks.TASK_KEYS)
-                    _history.record("approved", t, by=approver(), tier=t["tier"])
+                try:  # shared mode: refuses, approving nothing, unless the approval would verify
+                    approve_ready()
+                    stamp_approved([t])
+                except SystemExit as err:
+                    print(err)
+                    continue
                 tally["approved"] += 1
                 break
             if choice == "r":
+                try:
+                    sign = signing()
+                except SystemExit as err:
+                    print(err)
+                    continue
                 reason = ask("reason (optional): ")
                 t["status"] = "dropped"
                 if reason:
                     t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {reason}\n"
                 with _gitops.state_lock():
+                    if sign:
+                        _shared.commit_pending()  # hand edits go in a commit of their own
                     _tasks.dump(t, _tasks.TASK_KEYS)
+                    if sign:
+                        _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {t['id']}"], [t["_path"]])
                 _history.record("rejected", t, by=approver(), reason=reason or None, **{"from": "proposed", "to": "dropped"})
                 tally["dropped"] += 1
                 break
@@ -315,23 +381,31 @@ def reject(args):
         raise SystemExit("nothing in `proposed` or `review` among those ids")
     if back and not args.reason:
         raise SystemExit("rejecting work in `review` needs --reason: it's what the next worker is told to fix")
+    sign = signing()
     for t in todo + back:
         print(_tasks.line(t, tasks) + ("  (review -> ready)" if t in back else ""))
     what = " and ".join(x for x in (f"drop {len(todo)} proposed" if todo else "",
                                     f"send {len(back)} in review back to ready" if back else "") if x)
     if not human_gate(f"{what[0].upper() + what[1:]}?"):
         raise SystemExit("aborted")
-    with _gitops.state_lock():  # in shared mode, commits the change on the state branch
+    with _gitops.state_lock():  # in shared mode, commits the change on the state branch, signed
+        if sign:
+            _shared.commit_pending()  # hand edits go in a commit of their own, not the signed one
         for t in todo:
             t["status"] = "dropped"
             if args.reason:
                 t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {args.reason}\n"
             _tasks.dump(t, _tasks.TASK_KEYS)
-            _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "proposed", "to": "dropped"})
         for t in back:
             t["status"] = "ready"
             _dispatch.add_note(t, f"rejected by {approver()}: {args.reason}", who="review")
             _tasks.dump(t, _tasks.TASK_KEYS)
+        if sign:
+            _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {t['id']}" for t in todo + back],
+                               [t["_path"] for t in todo + back])
+        for t in todo:
+            _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "proposed", "to": "dropped"})
+        for t in back:
             _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "review", "to": "ready"})
     print(", ".join(x for x in (f"dropped {len(todo)}" if todo else "",
                                 f"sent {len(back)} back to ready" if back else "") if x))
@@ -374,6 +448,7 @@ def accept(args):
         if not todo:
             raise SystemExit(said)
         print(said)
+    sign = signing()
     for t in todo:
         print(_tasks.line(t, tasks) + f"  [{_config.TASK_BRANCH}{t['id']}]")
     if not human_gate(f"Accept and land these {len(todo)} task(s) as {approver()}?"):
@@ -407,6 +482,8 @@ def accept(args):
                 failed += 1
                 continue
             _dispatch.put_status(tid, "done", f"accepted by {who}: {why}", who="accept")
+            if sign:  # landed already, so a failure to sign only warns
+                _gitops.sign_state("accept", [f"{_gitops.ACCEPT_TRAILER}: {tid}"], undo=False)
             print(f"  done     {tid}  {why}")
             e = epics.get(t.get("epic"))
             if e and e["status"] == "open" and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
@@ -498,16 +575,23 @@ def close(args):
         todo.append(t)
     if not todo:
         raise SystemExit("nothing to close")
+    sign = signing()
     for t in todo:
         print(_tasks.line(t, tasks))
     if not human_gate(f"Close these {len(todo)} task(s) as {args.as_}?"):
         raise SystemExit("aborted")
+    if sign:  # the CLI holds the state lock around close
+        _shared.commit_pending()  # hand edits go in a commit of their own, not the signed one
     for t in todo:
         t["status"] = args.as_
         t.pop("asking", None)
         t.pop("answered", None)
         t["_body"] = t["_body"].rstrip() + f"\n\nClosed {_tasks.today()} as {args.as_}: {args.reason}\n"
         _tasks.dump(t, _tasks.TASK_KEYS)
+    if sign:
+        _gitops.sign_state("close", [f"{_gitops.CLOSE_TRAILER}: {t['id']} {args.as_}" for t in todo],
+                           [t["_path"] for t in todo])
+    for t in todo:
         _history.record("closed", t, by=approver(), reason=args.reason, **{"as": args.as_})
     print(f"closed {len(todo)} as {args.as_}")
     for eid in sorted({t["epic"] for t in todo if t.get("epic") in epics}):
@@ -919,6 +1003,9 @@ def state_git_reason(cmd, cwd=None):
         verb, rest = words[i], words[i + 1:]
         if inside(d) or aimed or any(names_branch.search(w) for w in rest):
             return why
+        if any("refs/ergon/" in w for w in rest):  # e.g. the trunk the approvers file is read from
+            return ("refs/ergon/ holds what ergon fetched from the shared remote (the trunk the approvers "
+                    "file is read from, the state branch as last fetched); only ergon writes it")
         if verb == "worktree" and any(inside(d / os.path.expanduser(w)) for w in rest if not w.startswith("-")):
             return why
     return None

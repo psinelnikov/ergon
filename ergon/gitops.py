@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -253,3 +254,216 @@ def finish(args):
         finish_epic(args.id)
     except GitError as err:
         raise SystemExit(str(err))
+
+
+# ---------- signed approvals (shared mode) ----------
+# docs/shared-state.md, "Trusting approval stamps". In shared mode a task counts as approved only
+# if a commit on the state branch with a good SSH signature from a key in the approvers file
+# carries an `Ergon-Approve: <ID> sha256:<digest>` trailer for the task's current brief digest
+# (tasks.brief_digest). The approvers file is a git allowed_signers file read from the trunk as
+# fetched from the [shared] remote (refs/ergon/trunk, which `ergon sync` and `approve` refresh),
+# never from the working tree, so a change to it counts only once it is merged upstream. The
+# `approved:` field is a display copy: sync rewrites it from what verifies, and editing it does
+# nothing. Every failure here fails closed: no approvers file, no state worktree, no ssh-keygen,
+# a git error all mean nothing verifies. Nothing turns verification off but removing [shared].
+
+APPROVE_TRAILER = "Ergon-Approve"
+ACCEPT_TRAILER, REJECT_TRAILER, CLOSE_TRAILER = "Ergon-Accept", "Ergon-Reject", "Ergon-Close"
+TRUNK_REF = "refs/ergon/trunk"  # the trunk as last fetched from the [shared] remote
+GATED = ("ready", "doing", "review", "blocked")  # open statuses whose approval must verify
+APPROVE_VALUE = re.compile(r"^(T-\d{3,})\s+sha256:([0-9a-f]{64})$")
+
+
+def approvers_path():
+    """Where the approvers file sits in the trunk ([shared] approvers, default .ergon/approvers)."""
+    p = str(((_config.CFG.get("shared") or {}).get("approvers")) or ".ergon/approvers").strip().strip("/")
+    if not p or p.startswith(".git/") or ".." in p.split("/"):
+        raise SystemExit(f"{_config.CONFIG_FILE}: [shared] approvers must be a path inside the repo, like .ergon/approvers")
+    return p
+
+
+def where():
+    """The remote and branch the approvers file is read from, for messages."""
+    return f"{_config.SHARED['remote']} {_config.MAIN}"
+
+
+def approvers_text():
+    """The approvers file as last fetched from the trunk on the [shared] remote, or None."""
+    r = subprocess.run(["git", "-C", str(_config.HOME), "show", f"{TRUNK_REF}:{approvers_path()}"],
+                       capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 and r.stdout.strip() else None
+
+
+def ssh_keygen():
+    return shutil.which("ssh-keygen")
+
+
+def signing_howto():
+    return (f"To sign in shared mode, set up SSH commit signing (git 2.34+) in this clone:\n"
+            f"  git config gpg.format ssh\n"
+            f"  git config user.signingkey ~/.ssh/id_ed25519.pub   # your public key, or key::ssh-ed25519 AAAA...\n"
+            f"Then add your key to {approvers_path()} on {_config.MAIN} as an allowed_signers line\n"
+            f"  you@example.com namespaces=\"git\" ssh-ed25519 AAAA...\n"
+            f"and have it reviewed, merged and pushed to {where()}. Ergon reads it from there, never "
+            f"from this checkout. Use a key that needs a touch or a confirmation (a hardware key, "
+            f"`ssh-add -c`), so an agent in your shell can't sign for you.")
+
+
+def config_value(key):
+    r = subprocess.run(["git", "-C", str(_config.HOME), "config", "--get", key], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def signing_problem():
+    """Why this clone can't make an SSH-signed state commit, with how to set it up; None if it can."""
+    if not ssh_keygen():
+        return "no ssh-keygen on PATH, so nothing can be signed or verified.\n" + signing_howto()
+    if config_value("gpg.format") != "ssh":
+        return "SSH commit signing isn't set up here (gpg.format isn't ssh).\n" + signing_howto()
+    if not (config_value("user.signingkey") or config_value("gpg.ssh.defaultKeyCommand")):
+        return "no signing key: user.signingkey isn't set.\n" + signing_howto()
+    return None
+
+
+def own_key():
+    """The public key blob (base64) this clone signs with, if user.signingkey says without asking
+    for a passphrase; else None."""
+    key = config_value("user.signingkey")
+    if key.startswith("key::"):
+        key = key[5:]
+    elif not re.match(r"^(ssh-|sk-|ecdsa-)", key):
+        path = Path(os.path.expanduser(key)) if key else None
+        if not path:
+            return None
+        pub = path if path.suffix == ".pub" else path.with_name(path.name + ".pub")
+        try:
+            key = pub.read_text()
+        except OSError:
+            return None
+    parts = key.split()
+    return parts[1] if len(parts) >= 2 else None
+
+
+def listed(blob, text):
+    """Is the key blob on a line of an allowed_signers text?"""
+    return any(blob in l.split() for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#"))
+
+
+def approve_problem():
+    """Why approving from this clone can't make an approval that verifies, or None. Shared mode."""
+    if not _shared.joined():
+        return (f"{_config.STATE} isn't a worktree of {_shared.branch()}, so an approval can't be signed: "
+                f"run `ergon sync --join` (or `ergon sync --init`) first")
+    why = signing_problem()
+    if why:
+        return why
+    text = approvers_text()
+    if text is None:
+        return (f"there is no approvers file {approvers_path()} on {where()} (as of the last fetch), so no "
+                f"approval would count.\n" + signing_howto())
+    blob = own_key()
+    if blob and not listed(blob, text):
+        return (f"your signing key ({config_value('user.signingkey')}) isn't in {approvers_path()} on "
+                f"{where()}, so your approval wouldn't count.\n" + signing_howto())
+    return None
+
+
+class Approvals:
+    """What the state branch's signed commits approve, verified against the approvers file."""
+
+    def __init__(self, error=None, good=None, seen=None):
+        self.error = error  # why nothing verifies, or None
+        self.good = good or {}  # {task ID: {digest: (signer name, date)}}, newest approval first
+        self.seen = seen or set()  # task IDs some Ergon-Approve trailer names, signed or not
+
+    def problem(self, t):
+        """Why t's approval doesn't verify, or None if it does."""
+        if self.error:
+            return self.error
+        tid, d = t["id"], _tasks.brief_digest(t)
+        mine = self.good.get(tid) or {}
+        if d in mine:
+            return None
+        if mine:
+            old = next(iter(mine))
+            return (f"brief changed after approval (approved sha256:{old[:8]}, now sha256:{d[:8]}): "
+                    f"a human re-approves it with `ergon approve {tid}`")
+        if tid in self.seen:
+            return (f"approval not signed by an approver: no good signature from a key in "
+                    f"{approvers_path()} on {where()}")
+        return ("no signed approval: its approved: stamp was written by hand, or before approvals were "
+                f"signed; a human approves it with `ergon approve {tid}`")
+
+    def stamp(self, t):
+        """The approved: stamp t's verified approval makes, or None if it doesn't verify."""
+        if self.problem(t):
+            return None
+        name, date = self.good[t["id"]][_tasks.brief_digest(t)]
+        return f"{name} {date} sha256:{_tasks.brief_digest(t)[:8]}"
+
+
+def approvals():
+    """Approvals verified now; None outside shared mode. Never raises: a failure is its error."""
+    if not _config.SHARED:
+        return None
+    if not _shared.joined():
+        return Approvals(error=f"{_config.STATE} isn't a worktree of {_shared.branch()}, so no approval "
+                               f"can be verified: run `ergon sync --join`")
+    keygen = ssh_keygen()
+    if not keygen:
+        return Approvals(error="no ssh-keygen on PATH, so no approval signature can be verified")
+    try:
+        text = approvers_text()
+    except SystemExit as err:
+        return Approvals(error=str(err))
+    if text is None:
+        return Approvals(error=f"no approvers file {approvers_path()} on {where()} as of the last "
+                               f"`ergon sync`, so no approval can be verified")
+    with tempfile.TemporaryDirectory(prefix="ergon-approvers-") as d:
+        allowed = Path(d) / "allowed_signers"
+        allowed.write_text(text)
+        # Every setting that decides a verdict is given here, so no config (a repo's, say) can
+        # swap the verifier or the signers list.
+        r = subprocess.run(
+            ["git", "-C", str(_config.STATE), "-c", f"gpg.ssh.allowedSignersFile={allowed}",
+             "-c", f"gpg.ssh.program={keygen}", "-c", "log.showSignature=false",
+             "log", f"--grep=^{APPROVE_TRAILER}:", f"refs/heads/{_shared.branch()}",
+             f"--format=%G?%x1f%an%x1f%as%x1f%(trailers:key={APPROVE_TRAILER},valueonly,separator=%x1e)%x1d"],
+            capture_output=True, text=True)
+    if r.returncode:
+        return Approvals(error=f"reading approvals failed: {(r.stderr or r.stdout).strip()[:300]}")
+    good, seen = {}, set()
+    for rec in r.stdout.split("\x1d"):
+        fields = rec.strip("\n").split("\x1f")
+        if len(fields) != 4:
+            continue
+        status, name, date, values = fields
+        for v in values.split("\x1e"):
+            m = APPROVE_VALUE.match(v.strip())
+            if not m:
+                continue
+            seen.add(m.group(1))
+            if status == "G":
+                good.setdefault(m.group(1), {}).setdefault(m.group(2), (name, date))
+    return Approvals(good=good, seen=seen)
+
+
+def sign_state(label, trailers, paths=(), undo=True):
+    """Shared mode, under the state lock: commit what changed (normally just this command's writes)
+    on the state branch, SSH-signed, with `trailers`. If signing fails and `undo`, put `paths` back
+    as the branch has them and raise SystemExit; otherwise warn and leave the change for the next
+    commit, unsigned."""
+    if not _shared.joined():
+        return
+    try:
+        _shared.commit_pending(label, trailers=trailers)
+    except GitError as err:
+        if not undo:
+            print(f"warning: couldn't sign the state commit ({err}); the change is committed unsigned "
+                  f"as the lock is released", file=sys.stderr)
+            return
+        rel = [str(Path(p).resolve().relative_to(_config.STATE.resolve())) for p in paths]
+        if rel:
+            subprocess.run(["git", "-C", str(_config.STATE), "checkout", "HEAD", "--", *rel], capture_output=True)
+        raise SystemExit(f"refused: signing the state commit failed, so nothing was changed: {err}\n"
+                         + signing_howto())

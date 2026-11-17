@@ -39,10 +39,27 @@ class Shared(unittest.TestCase):
         git_init(self.a)
         self.ergon(self.a, "init", "--hooks")  # the commit-msg hook must not refuse state commits
         (self.a / ".ergon.toml").write_text(SHARED_CONFIG.format(remote=self.remote))
+        # Approvals are SSH-signed (T-020): a throwaway key per clone, both listed in the approvers
+        # file on the remote's trunk, and one more key nobody listed.
+        self.keys = base / "keys"
+        self.keys.mkdir()
+        for name in ("a", "b", "x"):
+            sh("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"{name}@example.com",
+               "-f", str(self.keys / name), cwd=base)
+        (self.a / ".ergon").mkdir()
+        (self.a / ".ergon" / "approvers").write_text("".join(
+            f'{n}@example.com namespaces="git" {(self.keys / (n + ".pub")).read_text().strip()}\n' for n in ("a", "b")))
         sh("git", "add", "-A", cwd=self.a)
         sh("git", "commit", "-qm", "ergon", cwd=self.a)
+        sh("git", "push", "-q", str(self.remote), "main", cwd=self.a)
         self.b = base / "b"
         sh("git", "clone", "-q", str(self.a), str(self.b), cwd=base)
+        for where, key in ((self.a, "a"), (self.b, "b")):
+            self.signing(where, key)
+
+    def signing(self, where, key):
+        sh("git", "config", "gpg.format", "ssh", cwd=where)
+        sh("git", "config", "user.signingkey", str(self.keys / key), cwd=where)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -206,24 +223,24 @@ class TestMerge(Shared):
         self.ergon(self.a, "set", "T-001", "status=doing")
         self.ergon(self.a, "sync")
         self.ergon(self.b, "set", "T-001", "status=blocked")
-        self.ergon(self.b, "set", "T-001", "title=Edited on B")
+        self.ergon(self.b, "set", "T-001", "tier_why=Edited on B")
         r = self.ergon(self.b, "sync")
         self.assertIn("dropped this clone's ready->blocked", r.stdout)
         text = next(v for k, v in self.settle().items() if "/T-001-" in k)
         self.assertIn("status: doing", text)
-        self.assertIn("title: Edited on B", text)  # the rest of B's edit still merges
+        self.assertIn("tier_why: Edited on B", text)  # the rest of B's edit still merges (outside the brief, so the approval holds)
         self.assertIn("sync: dropped Tester's ready->blocked, remote had moved to doing", text)
 
     def test_a_status_move_the_remote_didnt_race_applies(self):
         self.approved_start()
-        self.ergon(self.a, "set", "T-001", "title=Edited on A")
+        self.ergon(self.a, "set", "T-001", "tier_why=Edited on A")
         self.ergon(self.a, "sync")
         self.ergon(self.b, "set", "T-001", "status=doing")
         r = self.ergon(self.b, "sync")
         self.assertNotIn("dropped", r.stdout)
         text = next(v for k, v in self.settle().items() if "/T-001-" in k)
         self.assertIn("status: doing", text)
-        self.assertIn("title: Edited on A", text)
+        self.assertIn("tier_why: Edited on A", text)
 
     def test_notes_appended_on_both_sides_are_kept(self):
         self.start()
@@ -666,3 +683,184 @@ class TestDispatchClaims(Shared):
         self.assertEqual(self.workers(), [])
         self.assertEqual(self.status(self.a, "T-001"), "ready")
         self.assertIn("would run  T-001", self.ergon(self.a, "dispatch", "--dry-run", env=agent).stdout)
+
+
+class TestSignedApprovals(Shared):
+    """Approvals are SSH-signed state commits, verified against the approvers file on the remote's
+    trunk (T-020). Each failing case is left out by `next`, reported by `check` and skipped by
+    dispatch."""
+
+    def digest(self, where, tid):
+        from ergon import tasks as T
+        return T.brief_digest(T.parse_text(self.task(where, tid).read_text()))
+
+    def edit(self, where, tid, old, new):
+        f = self.task(where, tid)
+        self.assertIn(old, f.read_text())
+        f.write_text(f.read_text().replace(old, new, 1))
+
+    def counts(self, where, tid):
+        """next lists tid, check passes and dispatch would run it."""
+        self.assertIn(f"  {tid}  ", self.ergon(where, "next").stdout)
+        r = self.ergon(where, "check", check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"would run  {tid}", self.ergon(where, "dispatch", "--dry-run").stdout)
+
+    def doesnt_count(self, where, tid, why):
+        """next leaves tid out, check reports it with `why`, dispatch skips it."""
+        r = self.ergon(where, "next")
+        self.assertNotIn(f"  {tid}  ", r.stdout)
+        self.assertIn(f"left out because their approval doesn't verify: {tid}", r.stdout)
+        r = self.ergon(where, "check", check=False)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(f"{tid}: ready, but its approval doesn't verify: {why}", r.stdout)
+        r = self.ergon(where, "dispatch", "--dry-run")
+        self.assertNotIn(f"would run  {tid}", r.stdout)
+        self.assertIn(f"skipped  {tid}  approval doesn't verify: {why}", r.stdout)
+
+    def signed_by_hand(self, where, tid, key):
+        """A stamp plus a commit signed with `key` whose trailer approves tid's current brief."""
+        stamp(self.task(where, tid))
+        sh("git", "-C", "tasks", "-c", "gpg.format=ssh", "-c", f"user.signingkey={self.keys / key}",
+           "commit", "-qa", "-S", "--no-verify", "-m",
+           f"approve by hand\n\nErgon-Approve: {tid} sha256:{self.digest(where, tid)}", cwd=where)
+
+    def head(self, where, fmt="%B"):
+        return sh("git", "-C", "tasks", "log", "-1", f"--format={fmt}", cwd=where).stdout
+
+    def signed(self, where):
+        return "-----BEGIN SSH SIGNATURE-----" in sh("git", "-C", "tasks", "cat-file", "commit", "HEAD", cwd=where).stdout
+
+    def test_a_signed_approval_verifies_here_and_in_the_other_clone(self):
+        self.start()
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        d = self.digest(self.a, "T-001")
+        self.assertRegex(self.task(self.a, "T-001").read_text(), rf"\napproved: Tester \d{{4}}-\d\d-\d\d sha256:{d[:8]}\n")
+        self.assertIn(f"\n\nErgon-Approve: T-001 sha256:{d}\n", self.head(self.a))
+        self.assertTrue(self.signed(self.a))
+        self.counts(self.a, "T-001")
+        self.ergon(self.a, "sync")
+        r = self.ergon(self.b, "sync")
+        self.assertNotIn("restamped", r.stdout)  # the stamp approve wrote is what verifies
+        self.counts(self.b, "T-001")
+
+    def test_a_stamp_written_by_hand_doesnt_count(self):
+        self.start()
+        stamp(self.task(self.a, "T-001"))
+        self.doesnt_count(self.a, "T-001", "no signed approval")
+        # approved: is a copy of what verifies: sync clears it, and the other clone doesn't run it
+        r = self.ergon(self.a, "sync")
+        self.assertIn("restamped: T-001 approved: cleared (no signed approval", r.stdout)
+        self.assertIn("\napproved:\n", self.task(self.a, "T-001").read_text())
+        self.ergon(self.b, "sync")
+        self.doesnt_count(self.b, "T-001", "no signed approval")
+
+    def test_an_approval_signed_by_an_unlisted_key_doesnt_count(self):
+        self.start()
+        self.signing(self.a, "x")
+        r = self.ergon(self.a, "approve", "T-001", check=False, inp="y\n")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("isn't in .ergon/approvers", r.stderr)
+        self.assertIn("status: proposed", self.task(self.a, "T-001").read_text())
+        self.signed_by_hand(self.a, "T-001", "x")  # what approve refused to make
+        self.doesnt_count(self.a, "T-001", "approval not signed by an approver")
+
+    def test_an_approval_of_a_brief_edited_afterwards_doesnt_count(self):
+        self.start()
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.edit(self.a, "T-001", "## What\n", "## What\nAlso drop the production database.\n")
+        self.doesnt_count(self.a, "T-001", "brief changed after approval")
+        r = self.ergon(self.a, "approve", "T-001", inp="y\n")  # approving it again makes it count; it stays ready
+        self.assertIn("(approve again: brief changed after approval", r.stdout)
+        self.counts(self.a, "T-001")
+        # an edit made on the other clone, merged in by sync, is caught the same way
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        self.ergon(self.b, "set", "T-001", "tier=opus")
+        r = self.ergon(self.b, "sync")
+        self.assertIn("restamped: T-001 approved: cleared (brief changed after approval", r.stdout)
+        self.assertIn("tier: opus", self.task(self.b, "T-001").read_text())
+        self.ergon(self.a, "sync")
+        self.doesnt_count(self.a, "T-001", "brief changed after approval")
+
+    def test_an_approvers_file_only_in_the_working_tree_doesnt_count(self):
+        self.start()
+        # the remote's trunk loses the file; A still has it checked out, and committed on its own main
+        sh("git", "rm", "-q", ".ergon/approvers", cwd=self.b)
+        sh("git", "commit", "-qm", "no approvers", cwd=self.b)
+        sh("git", "push", "-q", str(self.remote), "main", cwd=self.b)
+        self.assertTrue((self.a / ".ergon" / "approvers").exists())
+        r = self.ergon(self.a, "approve", "T-001", check=False, inp="y\n")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("there is no approvers file .ergon/approvers on", r.stderr)
+        self.assertIn("status: proposed", self.task(self.a, "T-001").read_text())
+        self.signed_by_hand(self.a, "T-001", "a")  # a listed key, but listed only here
+        self.doesnt_count(self.a, "T-001", "no approvers file .ergon/approvers on")
+        # sync changes no stamp while nothing can verify, and says so
+        r = self.ergon(self.a, "sync")
+        self.assertIn("approvals not checked: no approvers file", r.stdout)
+        self.assertIn("approved: Tester 2026-01-01", self.task(self.a, "T-001").read_text())
+
+    def test_notes_status_and_depends_dont_invalidate_an_approval(self):
+        self.start()
+        self.ergon(self.a, "new", "task", "Two", "--tier", "haiku")
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        before = self.digest(self.a, "T-001")
+        self.edit(self.a, "T-001", "## Notes\n", "## Notes\n- 2026-11-17 dispatch: a note\n")
+        self.ergon(self.a, "set", "T-001", "status=blocked")
+        self.ergon(self.a, "set", "T-001", "depends=T-002")
+        r = self.ergon(self.a, "check", check=False)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.ergon(self.a, "set", "T-001", "status=ready")
+        self.ergon(self.a, "set", "T-001", "depends=")
+        self.assertEqual(self.digest(self.a, "T-001"), before)
+        self.counts(self.a, "T-001")
+        self.assertNotIn("restamped", self.ergon(self.a, "sync").stdout)
+
+    def test_approve_refuses_without_signing_and_approves_nothing_when_signing_fails(self):
+        self.start()
+        bare = clean_env(ERGON_ASK_STDIN="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        sh("git", "config", "--unset", "gpg.format", cwd=self.a)
+        r = self.ergon(self.a, "approve", "T-001", check=False, env=bare, inp="y\n")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("SSH commit signing isn't set up", r.stderr)
+        self.assertIn("git config gpg.format ssh", r.stderr)
+        self.assertIn("status: proposed", self.task(self.a, "T-001").read_text())
+        # set up, but with a key git can't sign with
+        self.signing(self.a, "a")
+        sh("git", "config", "user.signingkey", str(self.keys / "gone"), cwd=self.a)
+        tip = self.head(self.a, "%H")
+        r = self.ergon(self.a, "approve", "T-001", check=False, env=bare, inp="y\n")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("signing the state commit failed, so nothing was changed", r.stderr)
+        self.assertIn("status: proposed", self.task(self.a, "T-001").read_text())
+        self.assertEqual(self.head(self.a, "%H"), tip)
+        self.assertEqual(sh("git", "-C", "tasks", "status", "--porcelain", cwd=self.a).stdout, "")
+
+    def test_sync_rewrites_an_approved_stamp_edited_by_hand(self):
+        self.start()
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        good = re.search(r"\napproved: (.*)\n", self.task(self.a, "T-001").read_text()).group(1)
+        self.edit(self.a, "T-001", f"approved: {good}", "approved: Mallory 2026-01-01 sha256:00000000")
+        self.counts(self.a, "T-001")  # the stamp never counted for anything
+        r = self.ergon(self.a, "sync")
+        self.assertIn(f"restamped: T-001 approved: {good}", r.stdout)
+        self.assertIn(f"\napproved: {good}\n", self.task(self.a, "T-001").read_text())
+
+    def test_reject_and_close_are_signed_with_their_trailers(self):
+        self.start()
+        self.ergon(self.a, "new", "task", "Two", "--tier", "haiku")
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.ergon(self.a, "close", "T-001", "--as", "dropped", "--reason", "moot", inp="y\n")
+        self.assertIn("\n\nErgon-Close: T-001 dropped\n", self.head(self.a))
+        self.assertTrue(self.signed(self.a))
+        self.ergon(self.a, "reject", "T-002", inp="y\n")
+        self.assertIn("\n\nErgon-Reject: T-002\n", self.head(self.a))
+        self.assertTrue(self.signed(self.a))
+
+    def test_agents_cant_move_the_ref_the_approvers_file_is_read_from(self):
+        self.start()
+        for cmd in ["git update-ref refs/ergon/trunk HEAD", "git fetch . main:refs/ergon/trunk"]:
+            event = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(self.a)})
+            out = self.ergon(self.a, "hook", "guard", inp=event).stdout
+            self.assertIn("only ergon writes it", out, cmd)
