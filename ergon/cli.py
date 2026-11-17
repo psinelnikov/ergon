@@ -67,6 +67,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                read-only web board, task pages (brief, runs, reviews, logs, resume
                                commands) and live dispatch state. GET/HEAD only; writes nothing.
                                Any --bind other than loopback warns: there is no login
+  ergon sync [--init | --join] HUMAN ONLY, with [shared] in .ergon.toml (docs/shared-state.md):
+                               commit pending state edits, fetch, merge and push the state branch.
+                               --init creates it from local state (first person), --join checks
+                               it out into <state>/ on another clone. Stops if both sides changed
+                               one task. Never from an agent shell or a task/ branch
   ergon hook guard|stop        Claude Code hooks (the plugin wires them); not for humans
   ergon hook commit-msg FILE   the git hook `init --hooks` installs; not for humans
 """
@@ -94,6 +99,7 @@ from . import gates as _gates
 from . import gitops as _gitops
 from . import report as _report
 from . import serve as _serve
+from . import shared as _shared
 from . import tasks as _tasks
 
 
@@ -206,6 +212,10 @@ def main():
                     help="address to listen on (default 127.0.0.1); anything but loopback warns: no login")
     sub.add_parser("check")
     sub.add_parser("tidy")
+    sy = sub.add_parser("sync", help="HUMAN ONLY: commit, fetch, merge and push the shared state branch")
+    once = sy.add_mutually_exclusive_group()
+    once.add_argument("--init", action="store_true", help="create the state branch from local state and push it")
+    once.add_argument("--join", action="store_true", help="make <state>/ a worktree of the remote's state branch")
     d = sub.add_parser("dispatch")
     d.add_argument("--tier", choices=_config.WORKER_TIERS)
     d.add_argument("--epic")
@@ -244,6 +254,7 @@ def main():
         return init(args)
     _config.ITEMS.mkdir(parents=True, exist_ok=True)
     _config.EPICS.mkdir(parents=True, exist_ok=True)
+    _shared.COMMAND = args.cmd
     if args.cmd in (None, "board"):
         if args.cmd is None:
             args.tier = args.epic = None
@@ -256,7 +267,7 @@ def main():
     else:  # dispatch takes the lock itself, around each step (it runs for hours)
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "accept": _gates.accept, "answer": _gates.answer,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
-         "import": _tasks.import_issue, "serve": _serve.serve}[args.cmd](args)
+         "import": _tasks.import_issue, "serve": _serve.serve, "sync": _shared.sync}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from . import dispatch as _dispatch
 from . import gates as _gates
 from . import gitops as _gitops
 from . import history as _history
+from . import shared as _shared
 
 
 TIERS = ["haiku", "sonnet", "opus", "human"]
@@ -497,7 +498,7 @@ def audit(args):
     open_ = {i: t for i, t in tasks.items() if t["status"] not in ("done", "dropped")
              and (not args.epic or t.get("epic") == args.epic)}
     cited = {}
-    for row in _gitops.git("log", "--all", "--format=%h %s", raw=True).splitlines():
+    for row in _gitops.git("log", *_shared.log_all(), "--format=%h %s", raw=True).splitlines():
         for tid in set(re.findall(r"\bT-\d{3,}\b", row)):
             cited.setdefault(tid, []).append(row)
     log_lines = (_config.REPO / _config.LOG).read_text().count("\n") + 1 if _config.LOG and (_config.REPO / _config.LOG).exists() else 0

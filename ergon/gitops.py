@@ -19,6 +19,7 @@ from pathlib import Path
 
 from . import config as _config
 from . import history as _history
+from . import shared as _shared
 from . import tasks as _tasks
 
 
@@ -33,11 +34,16 @@ class GitError(Exception):
 
 
 @contextmanager
-def state_lock():
-    """Exclusive across processes and threads (each call opens its own descriptor). Not reentrant."""
+def state_lock(label=None):
+    """Exclusive across processes and threads (each call opens its own descriptor). Not reentrant.
+    In shared mode, what the holder wrote (and any hand edits) is committed on the state branch
+    before the lock is released; `label` (default: the command) heads the commit message. A
+    holder that raises leaves its writes for the next command to commit."""
     with open(_config.LOCK, "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         yield
+        if _config.SHARED:
+            _shared.commit_on_release(label)
 
 
 def git(*args, raw=False, cwd=None):

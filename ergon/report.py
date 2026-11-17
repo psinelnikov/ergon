@@ -21,6 +21,7 @@ from . import config as _config
 from . import dispatch as _dispatch
 from . import gitops as _gitops
 from . import limits as _limits
+from . import shared as _shared
 from . import tasks as _tasks
 
 
@@ -130,7 +131,7 @@ def report(args):
         since = mark.read_text().strip() if mark.exists() else None
     cited = {}
     try:
-        rows = _gitops.git("log", "--all", "--format=%h %s", *([f"--since={since}"] if since else []), raw=True)
+        rows = _gitops.git("log", *_shared.log_all(), "--format=%h %s", *([f"--since={since}"] if since else []), raw=True)
     except _gitops.GitError:
         rows = ""
     for row in rows.splitlines():

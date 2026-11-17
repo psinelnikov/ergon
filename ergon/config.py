@@ -72,6 +72,13 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # forbid_tracker_ids = true     # refuse to land commits there that cite T-/E- IDs
 # policy = "docs/boundary.md"   # cited to workers as the reason
 
+# Share the task queue with a team (docs/shared-state.md): <state>/ becomes a worktree of an
+# orphan branch on this remote, kept in step by `ergon sync`. Every brief and Note is published:
+# use a private repo if this one is public. Without this table task state stays local.
+# [shared]
+# remote = "origin"             # a remote name or URL
+# branch = "ergon-state"
+
 # Paths or nouns no task below a tier may touch; `check` fails an open task that does.
 # [[protect]]
 # touches = ["server/auth/**", "prod-db"]   # fnmatch patterns against a task's touches:
@@ -80,6 +87,7 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 """
 
 
+SHARED = None  # [shared]: {remote, branch}, or None for local-only state
 PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
 ACCEPT = []  # [[accept]] rules: {tiers, touches}
 
@@ -164,7 +172,7 @@ def configure(start=None, need_config=True):
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, \
-        REVIEW_ROUNDS, VERIFY_ROUNDS, RESUME_SECS, RESUME_TOKENS
+        REVIEW_ROUNDS, VERIFY_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -221,6 +229,20 @@ def configure(start=None, need_config=True):
             "trunk": c.get("trunk", "main"),
             "touches": tuple(t.strip("/") for t in c.get("touches") or [name, c["path"]]),
             "forbid_ids": bool(c.get("forbid_tracker_ids", False)), "policy": c.get("policy", "")})
+    # Opt-in shared task state (docs/shared-state.md): <state>/ becomes a git worktree of an
+    # orphan branch that `ergon sync` fetches, merges and pushes. None: state is local-only, and
+    # nothing touches git for it.
+    SHARED = None
+    sh = CFG.get("shared")
+    if sh is not None:
+        if not isinstance(sh, dict) or not isinstance(sh.get("remote"), str) or not sh["remote"].strip():
+            raise NotConfigured(f"{CONFIG_FILE}: [shared] needs remote, a remote name or URL")
+        branch = sh.get("branch", "ergon-state")
+        if (not isinstance(branch, str) or not re.fullmatch(r"[\w.-]+(?:/[\w.-]+)*", branch)
+                or branch == MAIN or branch.startswith((TASK_BRANCH, "epic/"))):
+            raise NotConfigured(f"{CONFIG_FILE}: [shared] branch must be a plain branch name of its own, "
+                                f"not the trunk, task/… or epic/…")
+        SHARED = {"remote": sh["remote"].strip(), "branch": branch}
     PROTECT.clear()
     for n, pr in enumerate(CFG.get("protect") or [], 1):
         if pr.get("min_tier") not in _tasks.TIERS or not pr.get("touches"):

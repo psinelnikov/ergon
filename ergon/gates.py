@@ -143,10 +143,11 @@ def approve(args):
     if not human_gate(f"Approve these {len(todo)} task(s) as {approver()}?"):
         raise SystemExit("aborted")
     stamp = f"{approver()} {_tasks.today()}"
-    for t in todo:
-        t["status"], t["approved"] = "ready", stamp
-        _tasks.dump(t, _tasks.TASK_KEYS)
-        _history.record("approved", t, by=approver(), tier=t["tier"])
+    with _gitops.state_lock():  # in shared mode, commits the approvals on the state branch
+        for t in todo:
+            t["status"], t["approved"] = "ready", stamp
+            _tasks.dump(t, _tasks.TASK_KEYS)
+            _history.record("approved", t, by=approver(), tier=t["tier"])
     print(f"approved {len(todo)}")
 
 
@@ -242,9 +243,10 @@ def review_interactive(args):
                 print(f"\n(waits on {', '.join(waits)})")
             choice = ask(f"\n{t['id']} [{t['tier']}]  [a]pprove  [r]eject  [t]ier  [e]dit  [s]kip  [q]uit > ").lower()
             if choice == "a":
-                t["status"], t["approved"] = "ready", stamp
-                _tasks.dump(t, _tasks.TASK_KEYS)
-                _history.record("approved", t, by=approver(), tier=t["tier"])
+                with _gitops.state_lock():
+                    t["status"], t["approved"] = "ready", stamp
+                    _tasks.dump(t, _tasks.TASK_KEYS)
+                    _history.record("approved", t, by=approver(), tier=t["tier"])
                 tally["approved"] += 1
                 break
             if choice == "r":
@@ -252,7 +254,8 @@ def review_interactive(args):
                 t["status"] = "dropped"
                 if reason:
                     t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {reason}\n"
-                _tasks.dump(t, _tasks.TASK_KEYS)
+                with _gitops.state_lock():
+                    _tasks.dump(t, _tasks.TASK_KEYS)
                 _history.record("rejected", t, by=approver(), reason=reason or None, **{"from": "proposed", "to": "dropped"})
                 tally["dropped"] += 1
                 break
@@ -263,10 +266,12 @@ def review_interactive(args):
                     continue
                 t["tier"] = tier
                 t["tier_why"] = ask(f"tier_why (enter keeps {t.get('tier_why')!r}): ") or t.get("tier_why", "")
-                _tasks.dump(t, _tasks.TASK_KEYS)
+                with _gitops.state_lock():
+                    _tasks.dump(t, _tasks.TASK_KEYS)
             elif choice == "e":
                 subprocess.run([os.environ.get("EDITOR", "vi"), str(t["_path"])])
-                t = _tasks.parse(t["_path"])
+                with _gitops.state_lock():  # shared mode: commits the edit
+                    t = _tasks.parse(t["_path"])
                 if t["status"] != "proposed":
                     print(f"{t['id']} is now {t['status']}; moving on")
                     break
@@ -297,17 +302,18 @@ def reject(args):
                                     f"send {len(back)} in review back to ready" if back else "") if x)
     if not human_gate(f"{what[0].upper() + what[1:]}?"):
         raise SystemExit("aborted")
-    for t in todo:
-        t["status"] = "dropped"
-        if args.reason:
-            t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {args.reason}\n"
-        _tasks.dump(t, _tasks.TASK_KEYS)
-        _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "proposed", "to": "dropped"})
-    for t in back:
-        t["status"] = "ready"
-        _dispatch.add_note(t, f"rejected by {approver()}: {args.reason}", who="review")
-        _tasks.dump(t, _tasks.TASK_KEYS)
-        _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "review", "to": "ready"})
+    with _gitops.state_lock():  # in shared mode, commits the change on the state branch
+        for t in todo:
+            t["status"] = "dropped"
+            if args.reason:
+                t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {args.reason}\n"
+            _tasks.dump(t, _tasks.TASK_KEYS)
+            _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "proposed", "to": "dropped"})
+        for t in back:
+            t["status"] = "ready"
+            _dispatch.add_note(t, f"rejected by {approver()}: {args.reason}", who="review")
+            _tasks.dump(t, _tasks.TASK_KEYS)
+            _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "review", "to": "ready"})
     print(", ".join(x for x in (f"dropped {len(todo)}" if todo else "",
                                 f"sent {len(back)} back to ready" if back else "") if x))
 
@@ -495,8 +501,8 @@ SHELL_WRITE = re.compile(r"\bsed\s+(-\w+\s+)*-i|\bperl\s+-\w*i|(?<![0-9&>])>(?!\
                          r"\btee\b|\b(mv|cp|rm|truncate|install)\s|python[0-9.]*\s+-c|<<")
 # The human-only commands as plain text. human_cmd falls back to it for text it can't split into
 # words and for strings handed to a program that runs them as code (bash -c, python -c, ssh, ...).
-HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept|answer)\b|\breview\s+(-i|--interactive)\b")
-HUMAN_VERBS = {"approve", "reject", "close", "accept", "answer"}
+HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept|answer|sync)\b|\breview\s+(-i|--interactive)\b")
+HUMAN_VERBS = {"approve", "reject", "close", "accept", "answer", "sync"}
 # Programs that run a string argument or their stdin as code: what's quoted for them is a command.
 CODE_RUNNER = re.compile(r"(?:ba|da|z|k|mk|c|tc|fi|a)?sh|busybox|eval|env|ssh|su|watch|script|tmux|screen|"
                          r"parallel|flock|expect|osascript|python[0-9.]*|pypy[0-9.]*|perl|ruby|node|nodejs|"
@@ -665,7 +671,7 @@ def _program(word):
 
 def human_cmd(cmd):
     """Whether a shell command runs a human-only ergon command: approve, reject, close, accept,
-    answer, or the interactive review. Only a real call counts: `ergon` (ergon.py, the package's
+    answer, sync, or the interactive review. Only a real call counts: `ergon` (ergon.py, the package's
     folder or __main__.py) as a word of a simple command followed by the verb, wherever that
     command sits (after &&, inside $(...), behind sudo or xargs, in a heredoc fed to a shell). The
     verbs inside a quoted grep pattern or commit message are data and pass. Strings given to a
@@ -755,16 +761,90 @@ def is_runs(path):
         return bool(_config.RUNS_PATH.search(p.as_posix()))
 
 
-def guard_reason(tool, inp, worker=False):
-    """Why this tool call must not run, or None."""
+# git subcommands that change a repository, its refs or a worktree (state_git_reason).
+STATE_GIT_WRITES = {"add", "commit", "checkout", "switch", "reset", "restore", "merge", "rebase", "cherry-pick",
+                    "revert", "stash", "apply", "am", "pull", "push", "fetch", "branch", "tag", "worktree", "clean",
+                    "update-ref", "commit-tree", "notes", "gc", "prune", "rm", "mv", "symbolic-ref", "replace",
+                    "filter-branch", "filter-repo", "read-tree", "update-index", "write-tree", "mktree"}
+
+
+def state_git_reason(cmd, cwd=None):
+    """In shared mode, why a shell command must not run because it is a git write in the state
+    worktree (run there, pointed at it with -C, --git-dir or --work-tree, or after a `cd` into
+    it), names the state branch, or adds, moves or removes the state worktree. Only ergon commits
+    on the state branch, and only a human publishes it. None without [shared]."""
+    if not _config.SHARED:
+        return None
+    state, branch = _config.STATE.resolve(), _config.SHARED["branch"]
+    why = (f"{_config.STATE.relative_to(_config.HOME)}/ is the shared state worktree (branch {branch}): only "
+           "ergon commits there, and only a human publishes it. Use `ergon new` / `ergon set` (Edit for a "
+           "task's body), and ask the user to sync")
+    names_branch = re.compile(rf"(?:^|[:/+^]){re.escape(branch)}(?:$|[:~^@])")
+
+    def inside(p):
+        try:
+            p.resolve().relative_to(state)
+            return True
+        except (ValueError, OSError):
+            return False
+
+    try:
+        cmds = shell_commands(cmd)[0]
+    except (ValueError, RecursionError):
+        rel = re.escape(_config.STATE.relative_to(_config.HOME).as_posix())
+        hit = re.search(rf"(?:^|[\s/\"'=]){rel}(?:/|\b)", cmd) or names_branch.search(cmd)
+        return why if hit and GIT_WRITE.search(cmd) else None
+    here = Path(cwd or _config.HOME)
+    for words, docs in cmds:
+        if any(CODE_RUNNER.fullmatch(_program(w)) for w in words):  # bash -c "...", a heredoc fed to sh
+            if any(t != cmd and state_git_reason(t, str(here)) for t in words + [d for d, _ in docs]):
+                return why
+        k = next((i for i, w in enumerate(words) if _program(w) in ("git", "cd", "pushd")), None)
+        if k is None:
+            continue
+        if _program(words[k]) in ("cd", "pushd"):
+            target = next((w for w in words[k + 1:] if not w.startswith("-")), None)
+            here = here / os.path.expanduser(target) if target else _config.HOME
+            continue
+        aimed = any(inside(here / os.path.expanduser(w.partition("=")[2])) for w in words[:k]
+                    if w.startswith(("GIT_DIR=", "GIT_WORK_TREE=")))
+        d, i = here, k + 1
+        while i < len(words) and words[i].startswith("-"):
+            w = words[i]
+            if w == "-C" and i + 1 < len(words):
+                d, i = d / os.path.expanduser(words[i + 1]), i + 2
+                continue
+            name, eq, val = w.partition("=")
+            if name in ("--git-dir", "--work-tree"):
+                if not eq and i + 1 < len(words):
+                    val, i = words[i + 1], i + 1
+                aimed = aimed or inside(d / os.path.expanduser(val))
+            elif w in ("-c", "--namespace", "--exec-path", "--super-prefix", "--config-env") and i + 1 < len(words):
+                i += 1
+            i += 1
+        if i >= len(words) or words[i] not in STATE_GIT_WRITES:
+            continue
+        verb, rest = words[i], words[i + 1:]
+        if inside(d) or aimed or any(names_branch.search(w) for w in rest):
+            return why
+        if verb == "worktree" and any(inside(d / os.path.expanduser(w)) for w in rest if not w.startswith("-")):
+            return why
+    return None
+
+
+def guard_reason(tool, inp, worker=False, cwd=None):
+    """Why this tool call must not run, or None. cwd: where a Bash command runs (the event's)."""
     if worker:
         why = shared_companion_reason(tool, inp)
         if why:
             return why
     if tool == "Bash":
         cmd = inp.get("command", "")
+        why = state_git_reason(cmd, cwd)
+        if why:
+            return why
         if human_cmd(cmd):
-            return ("approve / reject / close / accept / answer / review -i are human-only; ask the user to run "
+            return ("approve / reject / close / accept / answer / sync / review -i are human-only; ask the user to run "
                     "them in their own terminal")
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
                      r"\b(CLAUDECODE|AI_AGENT)=", cmd):
@@ -818,7 +898,7 @@ def hook(args):
         except _config.NotConfigured:
             sys.exit(0)  # not an ergon project
         if args.event == "guard":
-            why = guard_reason(event.get("tool_name"), event.get("tool_input") or {}, args.worker)
+            why = guard_reason(event.get("tool_name"), event.get("tool_input") or {}, args.worker, event.get("cwd"))
             if why:
                 print(json.dumps({"hookSpecificOutput": {
                     "hookEventName": "PreToolUse", "permissionDecision": "deny",
