@@ -2264,6 +2264,93 @@ class TestGrade(Project):
         self.assertFalse((self.runs / "grade").exists())
         self.assertFalse([r for r in self.events() if r["event"] == "graded"])
 
+    def grade_all(self):
+        env = dict(self.env, GRADE_RANK="T-003,T-001,T-002,T-004,T-005")
+        self.ergon("grade", "--all", "--per", "4", env=env)
+        return env
+
+    def asked(self):
+        prompt = (Path(self.tmp.name) / "grade-prompt.txt").read_text()
+        return set(re.findall(r"^<<<brief (T-\d+) ", prompt, re.M))
+
+    def test_incremental_keeps_unchanged_regrades_changed(self):
+        env = self.grade_all()
+        before = self.snapshot()
+        (Path(self.tmp.name) / "grade-prompt.txt").unlink()
+        self.ergon("grade", env=env)  # T-005 got no grade: ungraded, so stale
+        self.assertTrue(self.fields("T-001")["graded"])
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("## What\n", "## What\nNow it matters far more.\n", 1))
+        changed = self.snapshot()
+        self.ergon("grade", "--per", "3", env=dict(env, GRADE_RANK="T-001,T-003,T-002,T-004,T-005"))
+        after = self.snapshot()
+        self.assertIn("T-001", self.asked())
+        for name in ("T-002", "T-003", "T-004"):
+            f = [k for k in after if k.startswith(name)][0]
+            self.assertEqual(after[f], changed[f], name)  # byte for byte
+        self.assertIn(f"{time.strftime('%Y-%m-%d')} ", self.fields("T-001")["graded"])
+        from ergon.tasks import brief_digest, parse
+        self.assertTrue(self.fields("T-001")["graded"].endswith(brief_digest(parse(self.task_file("T-001")))[:12]))
+        self.assertEqual(self.fields("T-001")["cod"], "100")  # now beats the anchors
+        self.assertEqual(before.keys(), after.keys())
+
+    def test_nothing_stale_asks_nothing(self):
+        env = self.grade_all()
+        for tid in ("T-005",):
+            f = self.task_file(tid)
+            from ergon.tasks import brief_digest, parse
+            f.write_text(f.read_text().replace("\n---\n", f"\ncod: 40\ngraded: 2026-01-01 {brief_digest(parse(f))[:12]}\n---\n", 1))
+        (Path(self.tmp.name) / "grade-prompt.txt").unlink()
+        before = self.snapshot()
+        out = self.ergon("grade", env=env).stdout
+        self.assertIn("nothing to do", out)
+        self.assertFalse((Path(self.tmp.name) / "grade-prompt.txt").exists())
+        self.assertEqual(self.snapshot(), before)
+
+    def test_fewer_than_three_graded_falls_back_to_a_full_grade(self):
+        f = self.task_file("T-001")
+        from ergon.tasks import brief_digest, parse
+        f.write_text(f.read_text().replace("\n---\n", f"\ncod: 40\ngraded: 2026-01-01 {brief_digest(parse(f))[:12]}\n---\n", 1))
+        env = dict(self.env, GRADE_RANK="T-003,T-001,T-002,T-004,T-005")
+        out = self.ergon("grade", "--per", "4", env=env).stdout
+        self.assertIn("1 graded task(s), fewer than 3", out)
+        self.assertEqual(self.asked(), {"T-001", "T-002", "T-003", "T-004", "T-005"})
+        self.assertEqual(self.fields("T-003")["cod"], "100")
+
+    def test_anchors_are_spread_across_the_range_and_held_fixed(self):
+        from ergon.grade import pick_anchors, fit
+        cods = {f"T-{n:03d}": n * 10 for n in range(1, 10)}  # 10..90
+        self.assertEqual([cods[i] for i in pick_anchors(cods, 5)], [10, 30, 50, 70, 90])
+        self.assertEqual([cods[i] for i in pick_anchors(cods, 2)], [10, 90])
+        self.assertEqual([cods[i] for i in pick_anchors(cods, 1)], [50])
+        self.assertEqual(len(pick_anchors({"A": 1, "B": 2}, 5)), 2)
+        # a new task beating the top anchor lands above it, one losing to the bottom below it
+        up = fit([("N", "H", 1.0), ("N", "M", 1.0), ("N", "L", 1.0)], fixed={"H": 90, "M": 50, "L": 10})
+        down = fit([("N", "H", 0.0), ("N", "M", 0.0), ("N", "L", 0.0)], fixed={"H": 90, "M": 50, "L": 10})
+        mid = fit([("N", "H", 1.0), ("N", "M", 0.5), ("N", "L", 0.0)], fixed={"H": 90, "M": 50, "L": 10})
+        self.assertEqual(set(up), {"N"})
+        self.assertGreater(up["N"], 90)
+        self.assertLess(down["N"], 10)
+        self.assertAlmostEqual(mid["N"], 50, delta=3)
+
+    def test_incremental_asks_stale_against_spread_anchors(self):
+        for n in range(6, 10):
+            self.ergon("new", "task", f"Extra {n}", "--tier", "sonnet")
+        env = dict(self.env, GRADE_RANK=",".join(f"T-00{n}" for n in range(1, 10)))
+        self.ergon("grade", "--all", "--per", "4", env=env)
+        self.assertTrue(self.fields("T-001")["graded"])
+        self.ergon("new", "task", "Late", "--tier", "sonnet")  # T-010, stale
+        env["GRADE_RANK"] += ",T-010"
+        out = self.ergon("grade", "--per", "3", env=env).stdout
+        asked = self.asked()
+        self.assertIn("T-010", asked)
+        self.assertEqual(len(asked), 4)  # the stale task and 3 anchors
+        cods = {i: int(self.fields(i)["cod"]) for i in asked - {"T-010"}}
+        self.assertEqual(min(cods.values()), min(int(self.fields(f"T-00{n}")["cod"]) for n in range(1, 10)))
+        self.assertEqual(max(cods.values()), max(int(self.fields(f"T-00{n}")["cod"]) for n in range(1, 10)))
+        self.assertIn("graded 1 task(s)", out)
+        self.assertEqual(self.fields("T-010")["cod"], "0")
+
     def test_epic_limits_the_tasks(self):
         self.ergon("new", "epic", "E")
         for tid in ("T-001", "T-003"):

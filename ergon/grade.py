@@ -1,5 +1,10 @@
 """`ergon grade`: cost-of-delay grades (`cod:` 0-100) from pairwise judgements by claude.
 
+By default only stale tasks (no `graded:`, or one whose hash no longer matches the brief) are
+graded: each is set against `--per` anchors, current graded tasks spread across the cod range, and
+the fit holds the anchors at their cod so nothing nobody looked at moves. With fewer than 3 graded
+tasks, or `--all`, every open task is graded:
+
 Each open task (proposed, ready or blocked) is set against `--per` others, picked from a seed made
 of the sorted IDs, so a rerun over the same tasks asks the same pairs. One `claude -p` with no
 tools, run like `quiz` from an empty folder, says for each pair which task costs more to leave
@@ -35,6 +40,8 @@ OPEN = ("proposed", "ready", "blocked")
 TIMEOUT = 600
 WHY_MAX = 120
 PRIOR_GAMES = 1  # virtual games, each a tie, against a fixed reference player (see fit)
+SPAN = 6.0  # log-strength spread of the 0-100 scale when anchors are held fixed (see fit)
+MIN_ANCHORS = 3  # fewer graded tasks than this and grade() falls back to a full grade
 
 PROMPT = """You are helping order a project's backlog by cost of delay. Below are {n} task briefs, \
 then a list of pairs of them. For each pair, decide which costs more to leave undone for another \
@@ -86,6 +93,35 @@ def pick_pairs(ids, per):
     return out
 
 
+def current(t):
+    """True when the task's `graded:` stamp carries the hash of its brief as it is now."""
+    stamp = str(t.get("graded") or "").split()
+    return len(stamp) == 2 and stamp[1] == _tasks.brief_digest(t)[:12]
+
+
+def cod_of(t):
+    try:
+        return max(0, min(100, int(str(t.get("cod")).strip())))
+    except ValueError:
+        return None
+
+
+def pick_anchors(anchors, per):
+    """`per` of the graded tasks {id: cod}, spread across the cod range: lowest, highest and
+    evenly between (quartiles for 5). One means the median. Ties in cod break by ID."""
+    order = sorted(anchors, key=lambda i: (anchors[i], i))
+    per = min(per, len(order))
+    if per < 1:
+        return []
+    if per == 1:
+        return [order[len(order) // 2]]
+    return [order[round(k * (len(order) - 1) / (per - 1))] for k in range(per)]
+
+
+def anchor_pairs(stale, chosen):
+    return [(i, a) for i in sorted(stale) for a in chosen]
+
+
 def brief(t, fence):
     keys = ("title", "tier", "status", "epic", "depends", "touches")
     head = "\n".join(f"{k}: {', '.join(t[k]) if isinstance(t.get(k), list) else t.get(k) or ''}" for k in keys)
@@ -129,15 +165,40 @@ def results(rows, pairs):
     return kept, dropped
 
 
-def fit(kept, iters=10000, tol=1e-10):
+def fit(kept, iters=10000, tol=1e-10, fixed=None):
     """Bradley-Terry strengths by MM iteration (Hunter 2004), scaled to 0-100 by log-strength.
     A tie is half a win each way. A task that won (or lost) every game has no finite maximum-
     likelihood strength, so each also plays PRIOR_GAMES virtual tied games against a reference
     player of strength 1; that keeps every strength finite and pulls thin records toward the
-    middle. Only tasks in `kept` get a score."""
+    middle. Only tasks in `kept` get a score.
+
+    With `fixed` ({id: cod}), those tasks keep their strength, the cod mapped back through the
+    scale (log-strength = (cod - 50) / 100 * SPAN, so 50 is the reference player) and only the
+    others are solved for and returned, scaled with the same map and clamped to 0-100."""
+    fixed = fixed or {}
     ids = sorted({x for a, b, _ in kept for x in (a, b)})
     if not ids:
         return {}
+    free = [i for i in ids if i not in fixed]
+    if fixed:
+        if not free:
+            return {}
+        wins = dict.fromkeys(ids, PRIOR_GAMES / 2)
+        games = {i: {} for i in ids}
+        for a, b, s in kept:
+            wins[a] += s
+            wins[b] += 1 - s
+            games[a][b] = games[a].get(b, 0) + 1
+            games[b][a] = games[b].get(a, 0) + 1
+        p = {i: math.exp((fixed[i] - 50) / 100 * SPAN) if i in fixed else 1.0 for i in ids}
+        for _ in range(iters):
+            new = {i: wins[i] / (PRIOR_GAMES / (p[i] + 1.0) + sum(n / (p[i] + p[j]) for j, n in games[i].items()))
+                   for i in free}
+            moved = max(abs(math.log(new[i] / p[i])) for i in free)
+            p.update(new)
+            if moved < tol:
+                break
+        return {i: min(100, max(0, round(50 + 100 * math.log(p[i]) / SPAN))) for i in free}
     wins = dict.fromkeys(ids, PRIOR_GAMES / 2)
     games = {i: {} for i in ids}
     for a, b, s in kept:
@@ -232,9 +293,25 @@ def grade(args):
         print(f"ergon grade: {len(ask)} open task(s){f' in {args.epic}' if args.epic else ''}: "
               f"nothing to compare (proposed, ready and blocked tasks are graded)")
         return
-    pairs = pick_pairs(ask, args.per)
+    fixed, chosen, scope = {}, [], ask  # scope: the tasks whose grades may be written
+    if not args.all:
+        anchors = {i: c for i, t in ask.items() if current(t) and (c := cod_of(t)) is not None}
+        stale = {i: t for i, t in ask.items() if i not in anchors}
+        if len(anchors) < MIN_ANCHORS:
+            if anchors:
+                print(f"ergon grade: {len(anchors)} graded task(s), fewer than {MIN_ANCHORS}: grading all {len(ask)}")
+        elif not stale:
+            print("ergon grade: every open task is graded and its brief unchanged; nothing to do (--all regrades)")
+            return
+        else:
+            chosen = pick_anchors(anchors, args.per)
+            fixed = {a: anchors[a] for a in chosen}
+            scope = stale
+            ask = {i: ask[i] for i in sorted(set(stale) | set(chosen))}
+    pairs = anchor_pairs(scope, chosen) if fixed else pick_pairs(ask, args.per)
     if args.dry_run:
-        print(f"would ask {args.model} about {len(pairs)} pair(s) among {len(ask)} task(s):")
+        print(f"would ask {args.model} about {len(pairs)} pair(s) among {len(ask)} task(s)"
+              + (f" ({len(scope)} to grade against anchors {' '.join(chosen)})" if fixed else "") + ":")
         for a, b in pairs:
             print(f"  {a} vs {b}  ({ask[a]['title']}  |  {ask[b]['title']})")
         return
@@ -246,7 +323,7 @@ def grade(args):
         raise SystemExit(f"ergon grade: claude's reply wasn't a JSON object with a pairs list; nothing written:\n"
                          f"{str(d.get('result'))[:500]}")
     kept, dropped = results(got["pairs"], pairs)
-    scores = fit(kept)
+    scores = fit(kept, fixed=fixed)
     whys = got.get("why") if isinstance(got.get("why"), dict) else {}
     cost = d.get("total_cost_usd")
     graded, skipped = {}, []
@@ -265,12 +342,12 @@ def grade(args):
                     "cod": scores[i], "cod_why": why, "graded": f"{stamp_day} {digests[i][:12]}"}))
                 graded[i] = scores[i]
     record = write_record({
-        "generated": _history.now(), "model": args.model, "cost": cost, "epic": args.epic, "per": args.per,
+        "generated": _history.now(), "model": args.model, "cost": cost, "epic": args.epic, "per": args.per, "anchors": fixed,
         "pairs": [list(p) for p in pairs], "kept": [list(k) for k in kept], "dropped": dropped,
         "scores": scores, "written": graded, "skipped": skipped,
         "digests": {i: digests[i] for i in scores}, "reply": d.get("result")})
     _history.record("graded", None, tasks=sorted(graded), model=args.model, cost=cost, dropped=dropped)
-    ungraded = [i for i in ask if i not in scores]
+    ungraded = [i for i in scope if i not in scores]
     print(f"graded {len(graded)} task(s): " + (", ".join(f"{i} {s}" for i, s in graded.items()) or "none")
           + f"; {dropped} reply row(s) dropped"
           + (f"; ${float(cost):.2f}" if isinstance(cost, (int, float)) else ""))

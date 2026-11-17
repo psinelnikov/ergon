@@ -72,11 +72,13 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                one `claude -p` (no tools) writes a multiple-choice quiz on the
                                proposed briefs to <state>/runs/quiz/, for /review. Keeps the
                                questions still current in the newest quiz; --all asks afresh
-  ergon grade [--epic E] [--per 4] [--model sonnet] [--budget USD] [--dry-run]
+  ergon grade [--all] [--epic E] [--per 4] [--model sonnet] [--budget USD] [--dry-run]
                                one `claude -p` (no tools) compares open tasks (proposed, ready,
                                blocked) in pairs by cost of delay; a Bradley-Terry fit writes
                                cod: 0-100, cod_why: and graded: (nothing else; the brief digest,
                                so a signed approval, is unchanged). Record in <state>/runs/grade/.
+                               Only new and changed tasks are graded, against --per anchors
+                               spread over the graded ones (all, with under 3 graded, or --all).
                                --dry-run lists the pairs and asks nothing
   ergon sync [--init | --join] HUMAN ONLY, with [shared] in .ergon.toml (docs/shared-state.md):
                                commit pending state edits, fetch, merge and push the state branch.
@@ -353,6 +355,7 @@ def main():
     gr.add_argument("--per", type=int, default=4, metavar="N", help="comparisons per task (default 4)")
     gr.add_argument("--model", default="sonnet", help="default sonnet")
     gr.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
+    gr.add_argument("--all", action="store_true", help="regrade every open task, not only new and changed ones")
     gr.add_argument("--dry-run", action="store_true", help="print the pairs; ask nothing, write nothing")
     sub.add_parser("check")
     sub.add_parser("tidy")
