@@ -90,6 +90,19 @@ accept: yes             # optional: dispatch holds the finished branch at `revie
 
 The body sections stay short. Cite `file:line`. Don't restate the spec.
 
+## Epic or task?
+
+**A task is one change or one human action.** It has one tier, one Done when that can be checked, and a branch that can land by itself: dispatch merges each task branch into its base as soon as verify and review pass. If a piece of work needs two tiers (a human step and a code step, say), it is two tasks linked with `depends:`. If one worker can't finish it in one session, or its Done when lists unrelated outcomes, split it.
+
+**An epic is a goal that takes several tasks that should land together.** Its tasks merge into the epic branch, and that branch reaches the trunk only when every task is done or dropped. Make an epic when:
+- a half-done state shouldn't reach the trunk (a schema change and the code that reads it, a feature that is useless until its last piece lands), or
+- the work needs a Goal, Out of scope or Constraints that every task's worker should respect, or
+- you want to approve, track and later read about the work as one thing (`ergon approve E-NNN`, the merge message, the journal entry).
+
+**A task with no epic** (in `items/`) is a change that makes sense on the trunk by itself: a bug fix, a doc-drift pass, a config fix. Several such tasks that only share a theme don't need an epic. Grouping them would hold every fix back until the last one lands.
+
+The quick test: if the work fits one tier and one Done when, and could merge to the trunk alone, it's a task. If it takes several of those that only make sense together, it's an epic. By convention a human writes the epic (nothing enforces it), since its Goal and scope are the human's call. An agent that finds work too big for one task proposes the tasks it can see and tells the human an epic may be needed, rather than creating one.
+
 ## Epics → tasks
 
 1. A human writes the epic: `ergon new epic "Title"`, then fills in Goal / Out of scope / Constraints.
