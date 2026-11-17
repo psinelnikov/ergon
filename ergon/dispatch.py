@@ -1096,6 +1096,10 @@ def dispatch(args):
             print(f"  would run  {t['id']}  {t['tier']:<6}  on {_gitops.epic_branch(e) if e else _config.MAIN}"
                   + also(t) + (f", reviewed by {reviewer_tier(t['tier'])} ({rounds})"
                                if t["tier"] in _config.REVIEW else "")
+                  + (f", up to {_config.VERIFY_ROUNDS} verify fix round{'s' if _config.VERIFY_ROUNDS != 1 else ''}"
+                     if _config.VERIFY_ROUNDS and (t.get("verify") or _config.CFG.get("verify")) else "")
+                  + (f", escalates to {_config.WORKER_TIERS[_config.WORKER_TIERS.index(t['tier']) + 1]} if blocked"
+                     if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1] else "")
                   + (", held for your accept" if _tasks.needs_accept(t) else "")
                   + (", resumes with your answer" if t.get("answered") else "") + f"  {t['title']}")
         if not plan:
