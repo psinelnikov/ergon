@@ -72,6 +72,12 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                one `claude -p` (no tools) writes a multiple-choice quiz on the
                                proposed briefs to <state>/runs/quiz/, for /review. Keeps the
                                questions still current in the newest quiz; --all asks afresh
+  ergon grade [--epic E] [--per 4] [--model sonnet] [--budget USD] [--dry-run]
+                               one `claude -p` (no tools) compares open tasks (proposed, ready,
+                               blocked) in pairs by cost of delay; a Bradley-Terry fit writes
+                               cod: 0-100, cod_why: and graded: (nothing else; the brief digest,
+                               so a signed approval, is unchanged). Record in <state>/runs/grade/.
+                               --dry-run lists the pairs and asks nothing
   ergon sync [--init | --join] HUMAN ONLY, with [shared] in .ergon.toml (docs/shared-state.md):
                                commit pending state edits, fetch, merge and push the state branch.
                                --init creates it from local state (first person), --join checks
@@ -104,6 +110,7 @@ from . import config as _config
 from . import dispatch as _dispatch
 from . import gates as _gates
 from . import gitops as _gitops
+from . import grade as _grade
 from . import report as _report
 from . import serve as _serve
 from . import shared as _shared
@@ -341,6 +348,12 @@ def main():
                     help="questions per task (1-5, default 2)")
     qz.add_argument("--all", action="store_true", help="ask about every proposed task, not only those without current questions")
     qz.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
+    gr = sub.add_parser("grade", help="grade open tasks' cost of delay by pairwise comparison (runs claude -p)")
+    gr.add_argument("--epic")
+    gr.add_argument("--per", type=int, default=4, metavar="N", help="comparisons per task (default 4)")
+    gr.add_argument("--model", default="sonnet", help="default sonnet")
+    gr.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
+    gr.add_argument("--dry-run", action="store_true", help="print the pairs; ask nothing, write nothing")
     sub.add_parser("check")
     sub.add_parser("tidy")
     sy = sub.add_parser("sync", help="HUMAN ONLY: commit, fetch, merge and push the shared state branch")
@@ -395,10 +408,11 @@ def main():
         with _gitops.state_lock():
             {"new": _tasks.new, "set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish, "close": _gates.close,
              "tidy": _tasks.tidy}[args.cmd](args)
-    else:  # dispatch takes the lock itself, around each step (it runs for hours)
+    else:  # dispatch takes the lock itself, around each step (it runs for hours); grade around its
+        # writes only, not the minutes claude takes to answer
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
-         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "sync": _shared.sync}[args.cmd](args)
+         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "sync": _shared.sync}[args.cmd](args)
 
 
 if __name__ == "__main__":
