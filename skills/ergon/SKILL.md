@@ -11,6 +11,13 @@ The `epic:` field decides the folder. `ergon set T-NNN epic=E-NNN` moves the fil
 
 **Task state is local.** `items/`, `epics/` and `runs/` are gitignored (`ergon init` adds the lines). Git keeps the record of what was done: every commit for a task cites its ID (`… (T-128)`), and an epic's merge commit lists its goal, each task, and the commits that cite it. Anything that should outlive your machine goes in a commit message, not in a task file.
 
+**Exception: shared mode.** With `[shared]` in `.ergon.toml` the task files are a worktree of an orphan state branch (`ergon-state`) that a team keeps in step with `ergon sync`. Everything above still holds on each machine, and in this mode the state branch is the one thing ergon pushes (never code). Rules for agents:
+- **Never run `ergon sync`, and never push.** Only a human syncs, plus dispatch for its claims. `sync` and git writes in the state worktree are refused in an agent shell and on a `task/` branch. Your `ergon new` / `set` is committed locally on the state branch and goes out at the human's next sync.
+- **IDs of unpublished tasks can change.** If a teammate took the same ID, sync renumbers the local task that was never published (and its `depends:` / `source:` links). Approving or starting a task syncs it first, so an ID cited in a commit never changes. Don't cite a `proposed` task's ID anywhere durable.
+- **Approvals are signed.** A human's `approve` makes an SSH-signed commit whose trailer names the brief's digest. A task counts as approved only if a key in `.ergon/approvers` (read from the remote's trunk) signed its current brief, so editing an approved brief un-approves it, and writing `status: ready` or an `approved:` stamp yourself does nothing. `next`, `check` and dispatch verify it.
+- **Two-person rule.** A task matching a `[[two_person]]` rule needs two different approvers. After the first it stays `proposed` with a Note (`1 of 2`); `ergon review` shows who is still needed.
+- **Concurrent status moves lose to the remote.** If someone else moved the task first, your move is dropped and a Note says so. A task dispatch holds at `review` is accepted only from the clone that holds its branch (`held: user@host`).
+
 The project's own rules (tier signals that are specific to it, hosts that need a human, what workers must never touch) live in its `CLAUDE.md`/`AGENTS.md` and in `worker_rules` (`ergon rules` prints them). Read them before working a task.
 
 ## The one rule: humans approve, agents execute

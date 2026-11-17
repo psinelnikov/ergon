@@ -2,11 +2,11 @@
 
 A task tracker for repos where AI agents do much of the work. **Humans approve, agents execute.**
 
-- One markdown file per task and per epic. Frontmatter is the state; the body is the brief. The files are local and gitignored, and the commits that cite task IDs are the permanent record.
+- One markdown file per task and per epic. Frontmatter is the state; the body is the brief. The files are local and gitignored by default (a team can [share them](#shared-task-state-for-teams)), and the commits that cite task IDs are the permanent record.
 - Every task is sized by the cheapest model tier that can do it: `haiku`, `sonnet`, `opus` or `human`.
 - Agents can propose tasks, but only a human can approve one. This is enforced by the CLI, by a lint, by a Claude Code hook and, if you opt in, by a git hook that covers every other agent too (see [Agents other than Claude Code](#agents-other-than-claude-code)). It's a speed bump, not a security boundary.
 - Each epic gets its own branch, worked in its own git worktree. When its last task closes, the branch merges back with a message listing every task and the commits that cite it.
-- `ergon dispatch` runs approved tasks headless, in parallel: one worktree, one `task/<ID>` branch and one `claude -p` worker per task. Finished branches merge into their epic. Nothing is ever pushed. `ergon dispatch --watch --budget-total USD [--interval SEC]` keeps running and picks up tasks you approve meanwhile, until the cap is reached or Ctrl-C (running workers finish; a second Ctrl-C kills them and marks them blocked). With `review` set, a reviewer one tier up must pass each branch before it lands; on a fail, dispatch hands the findings back to the worker (resuming its session while the prompt cache is warm, else a fresh one) and reviews again, up to `review_rounds` times (default 2), before it blocks the task with every round's reason in Notes. A worker that needs a decision ends with `QUESTION:` lines (and optional `OPTIONS:`) and `RESULT: asking`. Dispatch keeps its branch and worktree and parks the task `blocked` under AWAITING ANSWER. You reply with `ergon answer <ID>` (human only, like `approve`), and the next dispatch resumes that worker with your answer.
+- `ergon dispatch` runs approved tasks headless, in parallel: one worktree, one `task/<ID>` branch and one `claude -p` worker per task. Finished branches merge into their epic. No code is ever pushed; the only thing ergon pushes is the task state branch, and only in opt-in [shared mode](#shared-task-state-for-teams). `ergon dispatch --watch --budget-total USD [--interval SEC]` keeps running and picks up tasks you approve meanwhile, until the cap is reached or Ctrl-C (running workers finish; a second Ctrl-C kills them and marks them blocked). With `review` set, a reviewer one tier up must pass each branch before it lands; on a fail, dispatch hands the findings back to the worker (resuming its session while the prompt cache is warm, else a fresh one) and reviews again, up to `review_rounds` times (default 2), before it blocks the task with every round's reason in Notes. A worker that needs a decision ends with `QUESTION:` lines (and optional `OPTIONS:`) and `RESULT: asking`. Dispatch keeps its branch and worktree and parks the task `blocked` under AWAITING ANSWER. You reply with `ergon answer <ID>` (human only, like `approve`), and the next dispatch resumes that worker with your answer.
 - `ergon import gh#123` turns a GitHub issue into a `proposed` task (see [Importing issues](#importing-issues)). When its epic merges, ergon prints the `gh issue comment` / `gh issue close` commands for you to run after you push. It never runs them.
 - `ergon serve` is a read-only web board for a browser or a phone: open work, what waits on you, live dispatch state, and each task's runs, reviews, costs and logs (see [Web board](#web-board-ergon-serve)). Loopback only unless you `--bind` elsewhere.
 - **Companion repos**: a separate repo checked out inside this one (say, a public product repo inside a private install). Each task that touches it gets its own worktree of that repo too. You can also refuse commits there that cite tracker IDs.
@@ -100,6 +100,46 @@ note = "signing keys live here"    # optional, shown in the error
 
 To override a worker agent for one project, put your own `.claude/agents/task-<tier>.md` in the main checkout. Dispatch uses it instead of the plugin's.
 
+## Shared task state for teams
+
+By default task state is local: each person has their own queue and their own `T-001`. A team can opt in to one shared queue. Add `[shared]` to `.ergon.toml`:
+
+```toml
+[shared]
+remote = "origin"            # a remote name or URL
+branch = "ergon-state"       # orphan branch holding items/ and epics/
+# approvers = ".ergon/approvers"
+```
+
+`<state>/` then becomes a git worktree of that branch, so every command still reads and writes the same files. Every command that changes state makes a local commit there. `ergon sync` fetches, merges and pushes. **No code is ever pushed; the state branch is the only thing ergon pushes.** The design and its reasons are in [docs/shared-state.md](docs/shared-state.md).
+
+**Setup.**
+
+1. One person runs `ergon sync --init`. It warns if the remote is the trunk's own remote or can be read without logging in, shows how many files it will publish and asks before pushing. Then commit `[shared]` to the trunk.
+2. Everyone else pulls and runs `ergon sync --join`. It needs an `<state>/` with no task files (it refuses otherwise: move them out, join, and file them again with `ergon new`).
+3. Each approver sets up SSH commit signing in their clone (git 2.34+): `git config gpg.format ssh` and `git config user.signingkey ~/.ssh/id_ed25519.pub`. Use a key that needs a touch or a confirmation (a hardware key, `ssh-add -c`, an agent that prompts). A key sitting unlocked in an `ssh-agent` lets an agent in your shell sign for you, and then the signature proves nothing.
+4. Add `.ergon/approvers` to the trunk: a git `allowed_signers` file, one line per approver (`you@example.com namespaces="git" ssh-ed25519 AAAA…`). Ergon reads it from the remote's trunk, never from your working tree, so a change to it has to be merged upstream first. Protect it with a rule so no task below `human` can touch it:
+
+   ```toml
+   [[protect]]
+   touches = [".ergon/approvers"]
+   min_tier = "human"
+   ```
+
+**Privacy.** Syncing publishes every brief and every Note. If the code repo is public, an `ergon-state` branch on the same remote is public too. Set `remote` to the URL of a separate private repo.
+
+**Who syncs.** Only humans and the dispatcher. `ergon sync` refuses inside an agent shell and on a `task/` branch, and the guard blocks git writes in the state worktree. An agent's `new` or `set` is committed locally and goes out at your next sync. `approve`, `accept`, `reject` and `close` sync before and after. Run logs (`runs/`) stay local, so `stats` and `report` are per machine.
+
+**IDs.** A new task gets the next ID over local and last-fetched remote state. If two people filed the same ID offline, sync renumbers the one that was never published (file name, `id:`, `depends:`, `source:`) and prints each change, plus any map card or log line that names the old ID. `approve` and `start` sync an unpublished task first and refuse if its ID changed, so an ID that a commit cites never changes. An approved task whose ID collides is reported and left for you to resolve.
+
+**Concurrent edits.** Merging is per task and per field. `status` is compare-and-set: if the remote already moved the task, the remote wins and your move is dropped with a Note. `## Notes` merge as a union of lines. Other fields and the brief merge three-way; on a real conflict the remote wins and your version is saved to `<state>/conflicts/`. Every loss is printed. Dispatch claims a task by pushing `ready → doing` before it launches a worker, so two dispatchers never run the same one. A task held at `review` has its `task/<ID>` branch in one clone only, and the Note says which (`held: user@host`); only that clone can `accept` it.
+
+**Signed approvals.** In shared mode `approve` makes an SSH-signed commit with an `Ergon-Approve: T-NNN sha256:…` trailer, and the digest covers the brief. A task counts as approved only if a commit signed by a key in `.ergon/approvers` approves its current digest. Editing an approved brief means approving it again. `dispatch`, `next` and `check` verify this; the `approved:` field is a display copy that `sync` rewrites. This stops a teammate's agent or a compromised clone from pushing `status: ready` with a made-up stamp. It doesn't stop an agent that can use your signing key, which is why the key should need a touch.
+
+**Two-person rule.** `[[two_person]]` rules (`tiers` and/or `touches`, matched like `[[accept]]`) need signed approvals of the current brief from two different people in the approvers file before a task leaves `proposed`. One person with two keys counts once. The first approval adds a Note (`approved by Pavel (1 of 2)`) and the task stays `proposed`; `ergon review` shows who is still needed. It needs `[shared]`.
+
+Epic branches are code and still move through your normal git flow, so `set`'s check that an epic's status changes only from its branch can only see local branches.
+
 ## Importing issues
 
 ```bash
@@ -114,7 +154,7 @@ The design choices:
 - **It shells out to `gh` and doesn't call the API with `urllib`.** Both would keep ergon standard-library only. `gh` already holds your login, so ergon never reads or stores a token. It also knows GitHub Enterprise hosts and which repo this checkout's remote points at. Like `git` and `claude`, it's a tool on `PATH`, not a Python dependency. Without it, `import` exits with a pointer to `gh auth login`.
 - **GitHub only for now.** Linear has no official CLI, so supporting it would mean handling an API key inside ergon. `linear:ABC-12` is refused with a hint to use `ergon new task … --source linear:ABC-12`.
 - **The tier is not guessed.** An imported task gets `tier: human` unless you pass `--tier`, and `tier_why` says it's unsized. An issue body is text from outside the repo that anyone can write. Dispatch skips `human` tasks, so even approving a whole epic at once can't send an unread issue to a headless worker. To make it worker-ready, give it a tier with `ergon set T-NNN tier=…` or `review -i`.
-- **Nothing is closed or commented on automatically.** Ergon never pushes, so when an epic merges the fix isn't public yet. A closed issue pointing at a commit nobody can see would be wrong. Printing the commands keeps that step with whoever pushes.
+- **Nothing is closed or commented on automatically.** Ergon never pushes code, so when an epic merges the fix isn't public yet. A closed issue pointing at a commit nobody can see would be wrong. Printing the commands keeps that step with whoever pushes.
 
 ## Web board: `ergon serve`
 
