@@ -2036,6 +2036,30 @@ class TestPolicies(TestReview):
                          ("echo x > ../README.md", tasks)):
             self.assertIsNone(self.guard("Bash", {"command": cmd}, "--worker", cwd=cwd), cmd)
 
+    def test_guard_runs_rule_follows_cd(self):
+        """A write that names a runs file relative to a `cd` into tasks/runs is still refused (T-090)."""
+        why = "runs/"
+        tasks = self.root / "tasks"
+        (tasks / "runs").mkdir(parents=True, exist_ok=True)
+        for cmd in ("cd tasks && echo x > runs/T-001-x.log",
+                    "cd tasks && echo x > runs/history.jsonl",
+                    "cd tasks/runs && echo x > T-001-x.log",
+                    "cd ./tasks/ && cd runs && echo x > T-001-x.log",
+                    "cd tasks/runs && printf '%s\\n' '{}' >> history.jsonl"):
+            self.assertIn(why, self.guard("Bash", {"command": cmd}, "--worker") or "", cmd)
+        self.assertIn(why, self.guard("Bash", {"command": "echo x > T-001-x.log"}, "--worker",
+                                      cwd=tasks / "runs") or "")
+        # Reads from inside the runs dir, and writes elsewhere, still pass.
+        for cmd, cwd in (("cd tasks/runs && cat history.jsonl", None),
+                         ("cd docs && echo x > runs.md", None),
+                         ("cd tasks && echo x > notes.md", None),
+                         ("echo x > T-001-x.log", tasks)):
+            self.assertIsNone(self.guard("Bash", {"command": cmd}, "--worker", cwd=cwd), cmd)
+        # Heredoc data that names history.jsonl after a cd into the state dir still passes (T-084).
+        test = "hist = root / 'history.jsonl'\nassert 'history.jsonl' in out\n"
+        self.assertIsNone(self.guard(
+            "Bash", {"command": f"cd tasks && cat > tests/test_x.py <<'EOF'\n{test}EOF"}, "--worker"))
+
     def test_worker_policy_line_becomes_note(self):
         self.ergon("new", "task", "Reviewed", "--tier", "haiku")
         stamp(self.task_file("T-001"))

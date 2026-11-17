@@ -1188,7 +1188,7 @@ def guard_reason(tool, inp, worker=False, cwd=None):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
         if SHELL_WRITE.search(cmd) and names_outside_data(cmd, re.compile(re.escape(_config.POLICIES.name))):
             return POLICY_MSG
-        if SHELL_WRITE.search(cmd) and names_outside_data(cmd, _config.RUNS_IN_CMD):
+        if SHELL_WRITE.search(cmd) and names_outside_data(cmd, _config.RUNS_IN_CMD, cwd or str(_config.HOME)):
             return RUNS_MSG
         if SHELL_WRITE.search(cmd) and names_outside_data(cmd, _config.TASK_DIR_IN_CMD, cwd or str(_config.HOME)):
             return ("don't write task files from the shell: use `ergon new` / `ergon set` for state, "
