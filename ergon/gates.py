@@ -716,6 +716,7 @@ def close(args):
 # Shell writes: in-place editors, redirects (not to /dev/null or another fd), tee, mv/cp/rm.
 SHELL_WRITE = re.compile(r"\bsed\s+(-\w+\s+)*-i|\bperl\s+-\w*i|(?<![0-9&>])>(?!\s*/dev/null|&)|"
                          r"\btee\b|\b(mv|cp|rm|truncate|install)\s|python[0-9.]*\s+-c|<<")
+TAR_WRITE = re.compile(r"\btar\s+[xcru]|\btar\s[^;&|]*(\s-\w*[xcru]|--(extract|create|append|update|get))")
 # The human-only commands as plain text. human_cmd falls back to it for text it can't split into
 # words and for strings handed to a program that runs them as code (bash -c, python -c, ssh, ...).
 HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept|answer|sync|pin)\b|\breview\s+(-i|--interactive)\b")
@@ -1064,6 +1065,27 @@ def names_outside_data(cmd, pattern, cwd=None):
 MAX_CWDS = 256  # directories _names_outside_data follows before it gives up and counts the text as a match
 
 
+def _chdir_targets(words):
+    """Directories that `env -C/--chdir`, `make -C`, `tar -C` and `git -C` in a command's words
+    start their command in."""
+    out = []
+    for k, w in enumerate(words):
+        prog = _program(w)
+        if prog not in ("env", "make", "gmake", "tar", "git"):
+            continue
+        rest = words[k + 1:]
+        for i, a in enumerate(rest):
+            if a.startswith("--chdir=") and prog == "env":
+                out.append(a[8:])
+            elif a.startswith("--directory=") and prog in ("make", "gmake", "tar"):
+                out.append(a[12:])
+            elif a in ("-C", "--chdir", "--directory") and i + 1 < len(rest):
+                out.append(rest[i + 1])
+            elif a.startswith("-C") and len(a) > 2 and prog in ("make", "gmake", "tar"):
+                out.append(a[2:])
+    return out
+
+
 def _names_outside_data(cmd, pattern, dirs):
     try:
         cmds = shell_commands(cmd)[0]
@@ -1071,9 +1093,11 @@ def _names_outside_data(cmd, pattern, dirs):
         return bool(pattern.search(cmd))
     dirs = set(dirs)
 
+    def names_in(t, ds):
+        return any(pattern.search(os.path.normpath(os.path.join(d, os.path.expanduser(t)))) for d in ds)
+
     def names(t):
-        return bool(pattern.search(t)) or any(
-            pattern.search(os.path.normpath(os.path.join(d, os.path.expanduser(t)))) for d in dirs)
+        return bool(pattern.search(t)) or names_in(t, dirs)
 
     for words, docs in cmds:
         runs = any(CODE_RUNNER.fullmatch(_program(w)) for w in words)
@@ -1081,6 +1105,20 @@ def _names_outside_data(cmd, pattern, dirs):
         live = [d for d, expands in docs if code or (expands and re.search(r"\$\(|`", d))]
         if any(names(t) for t in words + live):
             return True
+        # env -C tasks sh -c '...', make -C tasks, tar -C tasks -x...: the command and the text it runs
+        # start in another directory. tar and make write into the directory itself, so probe its children.
+        moved = _chdir_targets(words)
+        if moved and dirs:
+            inner = {os.path.normpath(os.path.join(d, t)) for d in dirs for t in moved}
+            if len(dirs | inner) > MAX_CWDS:
+                return True
+            if any(pattern.search(os.path.join(d, sub)) for d in inner for sub in ("items", "epics", "runs")
+                   if any(_program(w) == "tar" for w in words)):
+                return True
+            if any(names_in(t, inner) for t in words + live) or any(
+                    t != cmd and _names_outside_data(t, pattern, inner)
+                    for t in (words if runs else []) + live):
+                return True
         # bash -c 'cd tasks && ...', a heredoc fed to sh, or one whose $(...) runs a command
         if dirs and any(t != cmd and _names_outside_data(t, pattern, dirs) for t in (words if runs else []) + live):
             return True
@@ -1188,9 +1226,9 @@ def guard_reason(tool, inp, worker=False, cwd=None):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
         if SHELL_WRITE.search(cmd) and names_outside_data(cmd, re.compile(re.escape(_config.POLICIES.name))):
             return POLICY_MSG
-        if SHELL_WRITE.search(cmd) and names_outside_data(cmd, _config.RUNS_IN_CMD, cwd or str(_config.HOME)):
+        if (SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd)) and names_outside_data(cmd, _config.RUNS_IN_CMD, cwd or str(_config.HOME)):
             return RUNS_MSG
-        if SHELL_WRITE.search(cmd) and names_outside_data(cmd, _config.TASK_DIR_IN_CMD, cwd or str(_config.HOME)):
+        if (SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd)) and names_outside_data(cmd, _config.TASK_DIR_IN_CMD, cwd or str(_config.HOME)):
             return ("don't write task files from the shell: use `ergon new` / `ergon set` for state, "
                     "Edit for a task's body")
         return None

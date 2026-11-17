@@ -2036,6 +2036,22 @@ class TestPolicies(TestReview):
                          ("echo x > ../README.md", tasks)):
             self.assertIsNone(self.guard("Bash", {"command": cmd}, "--worker", cwd=cwd), cmd)
 
+    def test_guard_task_dir_rule_follows_other_chdirs(self):
+        """env -C, make -C, tar -C and git -C move a command's directory like cd (T-091)."""
+        why = "task files"
+        for cmd in ("env -C tasks sh -c 'echo x > items/T-001.md'",
+                    "env --chdir=tasks sh -c 'echo x > items/T-001.md'",
+                    "env --chdir tasks bash -c 'rm epics/E-001/T-002.md'",
+                    "tar -C tasks -xf a.tar",
+                    "tar -Ctasks -xf a.tar",
+                    "tar xf a.tar --directory=tasks",
+                    "env -C tasks sh -c 'cd items && echo x > T-001.md'"):
+            # tar into the state dir can reach runs/ too, which the runs rule words differently
+            self.assertRegex(self.guard("Bash", {"command": cmd}, "--worker") or "", "task files|runs/", cmd)
+        for cmd in ("env -C src make", "make -C docs", "tar -C docs -xf a.tar", "env -C docs sh -c 'echo x > notes.md'",
+                    "git -C docs commit -m x"):
+            self.assertIsNone(self.guard("Bash", {"command": cmd}, "--worker"), cmd)
+
     def test_guard_runs_rule_follows_cd(self):
         """A write that names a runs file relative to a `cd` into tasks/runs is still refused (T-090)."""
         why = "runs/"
