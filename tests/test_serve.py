@@ -176,6 +176,25 @@ class TestServe(ServeFixture):
         self.assertEqual(self.req("GET", "/t/T-999")[0], 404)
         self.assertEqual(self.req("GET", "/t/E-001")[0], 404)
 
+    def test_priority_on_board_and_task_page(self):
+        f = self.task_file("T-004")
+        t = f.read_text()
+        t = t.replace("\ntier:", '\ncod: 80\ncod_why: "<b>x</b> see T-001"\ngraded: Tester 2026-11-17\npin: first\ntier:', 1)
+        f.write_text(t)
+        _, _, board = self.req("GET", "/")
+        li = re.search(r'<li><a class=id href="/t/T-004">.*?</li>', board, re.S)[0]
+        self.assertIn('class="score"', li)
+        self.assertIn("pin: first", li)
+        _, _, page = self.req("GET", "/t/T-004")
+        self.assertIn("<h2>Priority</h2>", page)
+        self.assertIn("cod 80, unblocks 0, size 1", page)
+        self.assertIn("&lt;b&gt;x&lt;/b&gt; see", page)
+        self.assertNotIn("<b>x</b>", page)
+        self.assertIn('<a href="/t/T-001">T-001</a>', page.split("cod_why")[1])
+        self.assertIn("Tester 2026-11-17", page)
+        _, _, page = self.req("GET", "/t/T-005")
+        self.assertIn("not graded (neutral 50)", page)
+
     def test_task_body_is_escaped(self):
         code, _, page = self.req("GET", "/t/T-004")
         self.assertEqual(code, 200)
@@ -268,6 +287,22 @@ class TestReview(ServeFixture):
     def card(self, page, tid):
         m = re.search(rf'<section class=card id="{tid}">(.*?)</section>', page, re.S)
         return m[1] if m else None
+
+    def test_independent_ordered_by_score_and_ungraded_finding(self):
+        # T-004 and T-005 are linked; add two independent tasks, the cheaper-per-size one graded higher
+        self.ergon("new", "task", "Big", "--tier", "opus", "--epic", "E-001")
+        self.ergon("new", "task", "Small", "--tier", "haiku", "--epic", "E-001")
+        for tid, cod in (("T-006", 100), ("T-007", 20)):
+            f = self.task_file(tid)
+            f.write_text(f.read_text().replace("\ntier:", f"\ncod: {cod}\ntier:", 1))
+        _, _, page = self.req("GET", "/review")
+        cards = re.findall(r'<section class=card id="(T-\d+)">', page)
+        self.assertLess(cards.index("T-007"), cards.index("T-006"))  # 20/1 beats 100/8
+        self.assertEqual(cards[:2], ["T-004", "T-005"])  # the chain stays first, in dependency order
+        find = re.search(r'<div class=finding id="find-T-005">.*?</div>', page, re.S)[0]
+        self.assertIn("not graded", find)
+        self.assertNotIn("not graded", re.search(r'<div class=finding id="find-T-006">.*?</div>', page, re.S)[0]
+                         if 'id="find-T-006"' in page else "")
 
     def test_lists_proposed_only(self):
         code, headers, page = self.req("GET", "/review")

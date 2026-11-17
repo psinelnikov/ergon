@@ -53,6 +53,7 @@ from pathlib import Path
 from . import config as _config
 from . import history as _history
 from . import metrics as _metrics
+from . import priority as _priority
 from . import report as _report
 from . import tasks as _tasks
 from . import timeline as _timeline
@@ -114,6 +115,21 @@ def host_ok(header):
 def tier_key(t):
     tier = t.get("tier")
     return (_tasks.TIERS.index(tier) if tier in _tasks.TIERS else len(_tasks.TIERS), t["id"])
+
+
+def prio_key(t, tasks):
+    """_priority.sort_key, falling back to tier order for a task whose tier has no size."""
+    try:
+        return _priority.sort_key(t, tasks)
+    except (KeyError, ValueError):
+        return (3, 0, *tier_key(t))
+
+
+def prio_score(t, tasks):
+    try:
+        return _priority.score(t, tasks)
+    except KeyError:
+        return None
 
 
 def parse_at(at):
@@ -366,6 +382,13 @@ def task_li(t, tasks, extra=""):
         waits = [d for d in t.get("depends") or [] if tasks.get(d, {}).get("status") != "done"]
         flags.append("waits on " + link_ids(esc(",".join(waits)), tasks))
     tail = f' <span class=flags>({"; ".join(flags)})</span>' if flags else ""
+    sc = prio_score(t, tasks)
+    if sc is not None:
+        n = _priority.unblocks(t, tasks)
+        pin = str(t.get("pin") or "").strip()
+        tail += (f' <span class="score" title="priority score">{sc:.0f}</span>'
+                 + (f' <span class=flags>unblocks {n}</span>' if n > 0 else "")
+                 + (f' <span class="pin">pin: {esc(pin)}</span>' if pin else ""))
     return (f'<li><a class=id href="/t/{esc(t["id"])}">{esc(t["id"])}</a>'
             f'<span class=tier>{esc(t.get("tier"))}</span><span class=title>{esc(t.get("title"))}{tail}{extra}</span></li>')
 
@@ -403,7 +426,7 @@ def board_page(nonce):
              f'<tbody id=live-body>{live_rows(lv, now)}</tbody></table></div>')
     open_ = [t for t in tasks.values() if t["status"] not in ("done", "dropped")]
     for status in _tasks.TASK_STATUSES:
-        group = sorted((t for t in open_ if t["status"] == status), key=tier_key)
+        group = sorted((t for t in open_ if t["status"] == status), key=lambda t: prio_key(t, tasks))
         if group:
             more = ' <a class=more href="/review">review them →</a>' if status == "proposed" else ""
             b.append(f'<h2 id="{status}">{esc(status.upper())} ({len(group)}){more}</h2><ul class=tasks>')
@@ -537,6 +560,25 @@ def task_page(tid, nonce):
          f'<h1>{esc(tid)} {esc(t.get("title"))}</h1>',
          f'<p><span class="status st-{esc(t["status"])}">{esc(t["status"])}</span> · '
          f'<span class=tier>{esc(t.get("tier"))}</span></p>']
+
+    # priority
+    sc = prio_score(t, tasks)
+    if sc is not None:
+        n = _priority.unblocks(t, tasks)
+        size = _priority.SIZE[t.get("tier")]
+        graded = str(t.get("graded") or "").strip()
+        pin = str(t.get("pin") or "").strip()
+        has_cod = t.get("cod") not in (None, "")
+        parts = (f'cod {_priority.cod(t):g}' if has_cod else "not graded (neutral 50)")
+        parts += f", unblocks {n}, size {size}"
+        row_ = [f"<tr><th>score</th><td>{sc:.1f} <span class=muted>({esc(parts)})</span></td></tr>"]
+        if t.get("cod_why"):
+            row_.append(f'<tr><th>cod_why</th><td class=why>{link_ids(esc(str(t["cod_why"])), tasks)}</td></tr>')
+        if graded:
+            row_.append(f"<tr><th>graded</th><td>{esc(graded)}</td></tr>")
+        if pin:
+            row_.append(f"<tr><th>pin</th><td>{esc(pin)}</td></tr>")
+        b.append("<h2>Priority</h2><div class=table><table class=prio><tbody>" + "".join(row_) + "</tbody></table></div>")
 
     # frontmatter
     b.append("<h2>Frontmatter</h2><div class=table><table><tbody>")
@@ -692,6 +734,8 @@ def findings(t, tasks):
             continue  # a host, a noun, a glob or a companion repo's name
         if in_checkout(q) is None:
             out.append(f"touches {p}: not in the main checkout (a new file, or a typo?)")
+    if t.get("status") == "proposed" and t.get("cod") in (None, ""):
+        out.append("not graded: no cod:, so it ranks at the neutral 50")
     if blank(section(body, "Done when")):
         out.append("Done when is empty: nothing says when the task is finished")
     if blank(t.get("tier_why")):
@@ -883,7 +927,7 @@ OPEN_STATUSES = ("proposed", "ready", "doing", "review", "blocked")
 def review_groups(proposed, tasks):
     """(groups, independent). A group is a list of 2+ proposed tasks joined through depends: links,
     each taken both ways, where every task on a link is open. Groups come largest first, then by
-    lowest ID; inside one, dependency layer then ID. The rest are the independent ones, in tier order."""
+    lowest ID; inside one, dependency layer then ID. The rest are the independent ones, by priority score."""
     is_open = lambda i: tasks.get(i, {}).get("status") in OPEN_STATUSES
     parent = {}
 
@@ -911,7 +955,7 @@ def review_groups(proposed, tasks):
         col = dep_layers({t["id"] for t in ts}, {t["id"]: t.get("depends") or [] for t in ts})
         out.append(sorted(ts, key=lambda t: (col[t["id"]], t["id"])))
     out.sort(key=lambda ts: (-len(ts), min(t["id"] for t in ts)))
-    return out, [t for t in proposed if t["id"] not in in_group]
+    return out, sorted((t for t in proposed if t["id"] not in in_group), key=lambda t: prio_key(t, tasks))
 
 
 def group_header(ts, tasks):
