@@ -1158,11 +1158,11 @@ def guard_reason(tool, inp, worker=False, cwd=None):
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
                      r"\b(CLAUDECODE|AI_AGENT)=", cmd):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
-        if _config.POLICIES.name in cmd and SHELL_WRITE.search(cmd):
+        if SHELL_WRITE.search(cmd) and names_outside_data(cmd, re.compile(re.escape(_config.POLICIES.name))):
             return POLICY_MSG
         if SHELL_WRITE.search(cmd) and names_outside_data(cmd, _config.RUNS_IN_CMD):
             return RUNS_MSG
-        if _config.TASK_DIR_IN_CMD.search(cmd) and SHELL_WRITE.search(cmd):
+        if SHELL_WRITE.search(cmd) and names_outside_data(cmd, _config.TASK_DIR_IN_CMD):
             return ("don't write task files from the shell: use `ergon new` / `ergon set` for state, "
                     "Edit for a task's body")
         return None

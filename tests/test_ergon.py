@@ -1981,6 +1981,30 @@ class TestPolicies(TestReview):
                     "cat <<EOF > x 'open quote\ntasks/runs/history.jsonl\nEOF"):
             self.assertIn("runs/", self.guard("Bash", {"command": cmd}, "--worker") or "", cmd)
 
+    def test_guard_policies_and_task_dir_rules_let_heredoc_data_through(self):
+        """A heredoc that only names policies.md or tasks/items/ in its text is data, not a write (T-087)."""
+        test = ("pol = root / 'tasks/policies.md'\nf = root / 'tasks/items/T-001.md'\n"
+                "assert 'tasks/epics/E-001' in out\n")
+        for cmd in (f"cat > tests/test_x.py <<'EOF'\n{test}EOF",
+                    f"cat <<EOF > tests/test_x.py\n{test}EOF\npython3 -m pytest tests/test_x.py",
+                    f"cat <<'A' > a.py && cat <<'B' > b.py\n{test}A\n{test}B",
+                    f"cat <<'EOF' | tee tests/test_x.py\n{test}EOF",
+                    "git commit -F - <<'EOF'\nStop writing tasks/policies.md and tasks/items/T-001.md by hand\nEOF"):
+            self.assertIsNone(self.guard("Bash", {"command": cmd}, "--worker"), cmd)
+        for target, why in (("tasks/policies.md", "policies file"), ("tasks/items/T-001.md", "task files"),
+                            ("tasks/epics/E-001/T-002.md", "task files")):
+            for cmd in (f"cat <<'EOF' > {target}\nx\nEOF",
+                        f"cat > x <<'EOF' && cp x {target}\nx\nEOF",
+                        f"python3 - <<'EOF'\nopen('{target}', 'a').write('x')\nEOF",
+                        f"bash <<'EOF'\necho x >> {target}\nEOF",
+                        f"cat <<'EOF' | sh\necho x >> {target}\nEOF",
+                        f"cat <<'EOF' |& bash\necho x >> {target}\nEOF",
+                        f"cat <<'EOF' | xargs rm\n{target}\nEOF",
+                        f"cat > notes.md <<EOF\n$(rm {target})\nEOF",
+                        f"cat > notes.md <<EOF\n`echo x >> {target}`\nEOF",
+                        f"cat <<EOF > x 'open quote\n{target}\nEOF"):
+                self.assertIn(why, self.guard("Bash", {"command": cmd}, "--worker") or "", cmd)
+
     def test_worker_policy_line_becomes_note(self):
         self.ergon("new", "task", "Reviewed", "--tier", "haiku")
         stamp(self.task_file("T-001"))
