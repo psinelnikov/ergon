@@ -1,6 +1,6 @@
 # Shared task state for teams (design)
 
-Status: proposal, from T-015. Nothing here is built yet. The follow-up tasks at the end build it.
+Status: built (T-016 to T-021). Written as a proposal in T-015; where the build departed from it, the text says so. The README's "Shared task state for teams" is the user-facing summary.
 
 ## The problem
 
@@ -9,7 +9,7 @@ Task state is local on purpose. `<state>/items`, `<state>/epics` and `<state>/ru
 This note designs an **opt-in** shared mode. A project that doesn't turn it on behaves exactly as today. It covers:
 
 1. where shared state lives and how it moves between machines,
-2. allocating IDs without collisions (`next_id`, now `ergon.py:344`; it takes `max + 1` over local files only),
+2. allocating IDs without collisions (`next_id` in `ergon/tasks.py`; it takes `max + 1` over local files only),
 3. concurrent, conflicting edits to the same task,
 4. how one person's approval stamp is trusted on another person's machine,
 5. an optional two-person rule for opus or security-sensitive tasks.
@@ -62,7 +62,7 @@ touches = ["server/auth/**"]
 
 - `<state>/` (default `tasks/`) stays gitignored on the trunk and becomes a git worktree of `ergon-state`, so `ITEMS`, `EPICS` and `parse`/`dump` don't change. It sits inside the main checkout the way `.claude/worktrees/` already does.
 - The state branch has its own `.gitignore` for `runs/`, `items/.lock` and `conflicts/`. Run logs hold transcripts and costs per machine, so they stay local. `stats` and `report` stay per machine.
-- **Privacy.** Publishing the queue publishes every brief and every Note. If the code repo is public, an `ergon-state` branch on the same remote is public too. `remote` can be the URL of a separate private repo, and `sync --init` warns when the remote is the same one the trunk tracks.
+- **Privacy.** Publishing the queue publishes every brief and every Note. If the code repo is public, an `ergon-state` branch on the same remote is public too. `remote` can be the URL of a separate private repo, and `sync --init` warns when the remote is the same one the trunk tracks or can be read without logging in, and asks before pushing.
 - Turning it off: remove `[shared]`. The worktree stays as plain files, and ergon reads it as local state again.
 
 ### Sync, and what gets pushed
@@ -71,7 +71,7 @@ touches = ["server/auth/**"]
 - `ergon sync`: under the lock, commit any pending edits, `git fetch <remote> <branch>`, merge (next sections), push. If the push is rejected because someone pushed in between, it fetches and merges again, a few times at most. It prints what the merge changed and anything it had to refuse.
 - **It merges, never rebases.** Approvals are signed commits, and a rebase would rewrite them and drop the signatures. The merge commit's tree is computed by ergon. It is not git's text merge.
 - **Who pushes.** `sync` refuses inside agent shells (`CLAUDECODE` / `AI_AGENT`, like `approve`) and on a `task/` branch. An interactive agent's `new` or `set` is committed locally and published at the human's next `sync`. Nothing an agent does leaves the machine until a human syncs. `approve`, `accept`, `reject` and `close` sync before and after, since they already run only in a human's terminal. Dispatch syncs for its claims. That means dispatch in shared mode must be started by a human, which is how it is used today anyway. The guard gains two refusals: `ergon sync` from an agent, and git writes inside the state worktree.
-- The README line "Nothing is ever pushed" becomes "No code is ever pushed; in shared mode ergon pushes the state branch".
+- The README now says "No code is ever pushed; in shared mode ergon pushes the state branch".
 
 ### ID allocation
 
@@ -162,7 +162,7 @@ tiers = ["opus"]                 # and/or touches = [...]; both given means both
 
 | Command | Shared-mode change |
 |---|---|
-| `init` | unchanged. New: `sync --init` creates the orphan branch from current local state and pushes it. On a fresh clone, `sync --join` makes the worktree, renumbering local unpublished tasks |
+| `init` | unchanged. New: `sync --init` creates the orphan branch from current local state and pushes it. On a fresh clone, `sync --join` makes the worktree. **Built differently:** it refuses if `<state>/` already holds task files (folding them in with renumbering isn't built); move them out, join, and refile |
 | `new`, `import`, `set`, `tidy` | commit locally; IDs over local ∪ remote |
 | `approve`, `review -i` | sync, refuse unpublished, sign, check the two-person rule, sync |
 | `accept`, `reject`, `close` | sync, sign, sync |
@@ -177,7 +177,7 @@ tiers = ["opus"]                 # and/or touches = [...]; both given means both
 1. One person runs `ergon sync --init`. It warns if the remote is public or is the trunk's own remote, and asks for confirmation.
 2. They add `[shared]` and `.ergon/approvers` in a normal reviewed commit.
 3. Teammates pull, run `ergon sync --join`, and set up SSH commit signing.
-4. Approved local tasks that collide with published IDs are reported, not renumbered. Their IDs may already be in commits, so a human resolves them with `close` or by refiling.
+4. **Built differently:** `--join` refuses a `<state>/` that already has task files. Approved local tasks that collide with published IDs are reported, not renumbered. Their IDs may already be in commits, so a human resolves them with `close` or by refiling.
 
 ## Open questions
 

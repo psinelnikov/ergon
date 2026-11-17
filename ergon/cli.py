@@ -75,8 +75,9 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon sync [--init | --join] HUMAN ONLY, with [shared] in .ergon.toml (docs/shared-state.md):
                                commit pending state edits, fetch, merge and push the state branch.
                                --init creates it from local state (first person), --join checks
-                               it out into <state>/ on another clone. Stops if both sides changed
-                               one task. Never from an agent shell or a task/ branch
+                               it out into <state>/ on another clone (which must hold no task
+                               files). The state branch is the only thing ergon ever pushes, never
+                               code. Never from an agent shell or a task/ branch
   ergon hook guard|stop        Claude Code hooks (the plugin wires them); not for humans
   ergon hook commit-msg FILE   the git hook `init --hooks` installs; not for humans
 """
