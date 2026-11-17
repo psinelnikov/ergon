@@ -21,6 +21,7 @@ from . import config as _config
 from . import gates as _gates
 from . import gitops as _gitops
 from . import history as _history
+from . import limits as _limits
 from . import report as _report
 from . import tasks as _tasks
 
@@ -833,6 +834,23 @@ def land(t, base, wt, branch, pubs=(), accepted=None):
     return "done", f"merged into {base}" + "".join(f" and {c['name']} {c['trunk']}" for c, _ in pubs) + left
 
 
+def print_limit(results, window):
+    """Each task's cost as a share of the 5-hour limit, at the pooled rate (limits.rate()), after
+    this run's own reading of the window. Nothing before any measurement (an API key, probes off)."""
+    per, runs = _limits.rate()
+    if window:
+        moved = round(100 * (window["after"] - window["before"]))
+        print(f"5-hour limit: {100 * window['before']:.0f}% → {100 * window['after']:.0f}% over this run"
+              + (f" (+{moved} points, with anything else on your plan meanwhile)" if window["same"]
+                 else " (the window reset during the run, so this run gives no rate)"))
+    if per is None:
+        return
+    print(f"each task's share at {per:.1f}% per $ (measured over {runs} run{'s' if runs != 1 else ''}):")
+    for t, verdict, _, info in sorted(results, key=lambda r: -r[3].get("cost", 0)):
+        cost = info.get("cost", 0)
+        print(f"  {t['id']}  {verdict:<8}{'$%.2f' % cost:>8}  ≈ {_limits.pct(cost, per):>6} of the 5-hour limit  {t['title']}")
+
+
 def dispatch(args):
     if args.watch and not args.budget_total:
         raise SystemExit("--watch needs --budget-total (a cap on spend, so an unattended watch can't run away)")
@@ -858,6 +876,8 @@ def dispatch(args):
     tried, skipped, results = set(), {}, []
     cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
     capped = stopped = False
+    probing = not args.dry_run and _limits.enabled()  # the 5-hour window, read before and after
+    window = None
 
     def spent():
         return sum(r[3].get("cost", 0) for r in results)
@@ -1169,6 +1189,7 @@ def dispatch(args):
                 print("\n  interrupt: killing running workers", flush=True)
                 kill_workers()
             stop_evt.set()
+        before = _limits.probe() if probing else None
         old_handler = signal.signal(signal.SIGINT, on_sigint)
         next_scan, scan = 0.0, True
         try:
@@ -1230,6 +1251,8 @@ def dispatch(args):
         finally:
             signal.signal(signal.SIGINT, old_handler)
         stopped = bool(stops)
+        if before and results and not KILL_ALL.is_set():
+            window = _limits.measure(before, _limits.probe(), spent())
     for tid, why in sorted(skipped.items()):
         print(f"  skipped  {tid}  {why}")
     if results:
@@ -1242,6 +1265,7 @@ def dispatch(args):
               + (f", {asking} asking you a question" if asking else "")
               + f", ${cost:.2f}" + (f" (reviews ${rcost:.2f} of it)" if rcost else "")
               + f". Logs in {_config.RUNS.relative_to(_config.HOME)}/")
+        print_limit(results, window)
         filed = [f for r in results for f in r[3].get("filed", [])]
         if filed:
             print(f"{len(filed)} proposed from workers' FOUND lines: {', '.join(filed)}")

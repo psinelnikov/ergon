@@ -20,6 +20,7 @@ from pathlib import Path
 from . import config as _config
 from . import dispatch as _dispatch
 from . import gitops as _gitops
+from . import limits as _limits
 from . import tasks as _tasks
 
 
@@ -90,16 +91,22 @@ def aggregate_stats(runs_dir, tasks, since=None, epic=None, until=None):
 def stats(args):
     tasks = _tasks.load(_config.ITEMS)
     r = aggregate_stats(_config.RUNS, tasks, since=args.since, epic=args.epic)
-    print(f"{'tier':<8}{'runs':>5}{'done':>6}{'blocked':>8}{'block%':>8}{'cost':>10}{'mean':>9}{'timeouts':>9}")
+    per, measured = _limits.rate()  # percentage points of the 5-hour limit per $, once dispatch has measured it
+    print(f"{'tier':<8}{'runs':>5}{'done':>6}{'blocked':>8}{'block%':>8}{'cost':>10}{'mean':>9}{'timeouts':>9}"
+          + (f"{'5h%':>8}{'5h%/run':>9}" if per is not None else ""))
     for tier in [*_tasks.TIERS, *(k for k in r["tiers"] if k not in _tasks.TIERS)]:
         row = r["tiers"].get(tier)
         if not row:
             continue
         n = row["runs"] or 1  # only reviews: their worker run fell outside --since
         print(f"{tier:<8}{row['runs']:>5}{row['done']:>6}{row['blocked']:>8}{100 * row['blocked'] / n:>7.0f}%"
-              f"{'$%.2f' % row['cost']:>10}{'$%.2f' % (row['cost'] / n):>9}{row['timeouts']:>9}")
+              f"{'$%.2f' % row['cost']:>10}{'$%.2f' % (row['cost'] / n):>9}{row['timeouts']:>9}"
+              + (f"{_limits.pct(row['cost'], per):>8}{_limits.pct(row['cost'] / n, per):>9}" if per is not None else ""))
     if not r["tiers"]:
         print("(no runs)")
+    if per is not None and r["tiers"]:
+        print(f"\n5h%: share of the 5-hour limit at {per:.1f}% per $, measured by dispatch over its last "
+              f"{measured} run{'s' if measured != 1 else ''} (an upper bound: other use of the plan counts too)")
     if r["repeat"]:
         print("\nblocked more than once:")
         for tid, n in r["repeat"].items():

@@ -79,6 +79,7 @@ policies = "tasks/policies.md"      # settled review findings, human-written in 
 review_rounds = 2                  # a review fail goes back to the worker, then review again, this many times; then the task blocks (0: at once)
 review_resume_secs = 3300          # a fix round resumes the worker's session only if its last request is younger than this
 review_resume_tokens = 80000       # and its context smaller than this; otherwise a fresh worker on the same branch
+limit_probe = true                 # read the plan's 5-hour window around each dispatch to show each task's share of it
 
 [[companion]]                      # repeatable
 name = "org/product"               # how tasks name it in touches:

@@ -53,6 +53,8 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 #                               # again, up to this many times; then block (0: block on the first fail)
 # review_resume_secs = 3300     # resume the worker's own session only if its last request is younger
 # review_resume_tokens = 80000  # and its context smaller than these; else a fresh worker on the branch
+# limit_probe = true            # read the plan's 5-hour window before and after each dispatch (two
+#                               # tiny haiku calls) to show each task's cost as a % of the limit
 
 # Tasks whose finished branch waits at status `review` for a human `ergon accept` instead of landing.
 # A task matches a rule if its tier is in tiers (when given) and a touches: entry matches (when

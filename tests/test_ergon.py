@@ -25,8 +25,24 @@ nth verdict, the last repeating) and appends its model and prompt to $FAKE_SEEN.
 $FAKE_TRANSCRIPT_AGE set, a worker leaves a transcript under $CLAUDE_CONFIG_DIR/projects (default
 $HOME/.claude/projects, as Claude Code does) whose last request is that many seconds old and
 holds $FAKE_CONTEXT tokens (default 1000). With $FAKE_ASK set, a worker whose prompt carries no
-answer yet commits, then ends with $FAKE_ASK (QUESTION lines) and RESULT: asking."""
+answer yet commits, then ends with $FAKE_ASK (QUESTION lines) and RESULT: asking. Called
+without --agent it is dispatch's 5-hour-window probe: it counts itself in $FAKE_PROBES and, with
+$FAKE_FIVE_HOUR set (|-separated utilizations, the nth probe the nth, the last repeating), streams
+a rate_limit_event; without it, no window, as on an API key."""
 import json, os, re, subprocess, sys, time
+if "--agent" not in sys.argv:
+    n = 0
+    if os.environ.get("FAKE_PROBES"):
+        n = len(open(os.environ["FAKE_PROBES"]).read()) if os.path.exists(os.environ["FAKE_PROBES"]) else 0
+        open(os.environ["FAKE_PROBES"], "a").write("p")
+    seq = [x for x in os.environ.get("FAKE_FIVE_HOUR", "").split("|") if x]
+    if seq:
+        u, resets = float(seq[min(n, len(seq) - 1)]), int(os.environ.get("FAKE_RESETS_" + str(n), "1794935400"))
+        print(json.dumps({"type": "system", "subtype": "init"}))
+        print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "unifiedWindows": {
+            "five_hour": {"utilization": u, "resetsAt": resets, "status": "allowed"}}}}))
+    print(json.dumps({"type": "result", "result": "ok", "total_cost_usd": 0}))
+    sys.exit()
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 prompt = sys.argv[-1]
 tier = sys.argv[sys.argv.index("--agent") + 1].replace("task-", "").upper()
@@ -1458,6 +1474,70 @@ class TestStats(Project):
         self.assertEqual(rows["haiku"], ["haiku", "2", "1", "1", "50%", "$0.25", "$0.12", "1"])
         self.assertIn("T-001 x2", out)
         self.assertIn("skipped 2", out)
+
+
+class TestLimits(DispatchProject):
+    def test_parse_reads_the_five_hour_window(self):
+        from ergon import limits
+        out = "\n".join(json.dumps(x) for x in (
+            {"type": "system"},
+            {"type": "rate_limit_event", "rate_limit_info": {"unifiedWindows": {
+                "five_hour": {"utilization": 0.16, "resetsAt": 5}, "seven_day": {"utilization": 0.5, "resetsAt": 9}}}},
+            {"type": "result", "total_cost_usd": 0.003}))
+        self.assertEqual(limits.parse(out), {"utilization": 0.16, "resets_at": 5, "cost": 0.003})
+        self.assertIsNone(limits.parse('{"type": "result", "total_cost_usd": 0.003}'))  # an API key: no window
+        self.assertIsNone(limits.parse("not json"))
+
+    def test_rate_pools_same_window_runs(self):
+        from ergon import limits
+        w = lambda b, a, cost, same=True: {"event": "window", "before": b, "after": a, "cost": cost, "same": same}
+        self.assertEqual(limits.rate([]), (None, 0))
+        per, n = limits.rate([w(0.10, 0.20, 2.0), w(0.20, 0.22, 0.5), w(0.5, 0.01, 3.0, same=False)])
+        self.assertAlmostEqual(per, 12 / 2.5)  # (10 + 2) points over $2.50; the reset run gives no rate
+        self.assertEqual(n, 2)
+
+    def test_dispatch_prints_each_tasks_share_of_the_window(self):
+        for n in "AB":
+            self.ergon("new", "task", f"Job {n}", "--tier", "sonnet")
+            stamp(self.task_file("T-001" if n == "A" else "T-002"))
+        self.env.update(FAKE_FIVE_HOUR="0.10|0.14", FAKE_PROBES=str(Path(self.tmp.name) / "probes"))
+        out = self.ergon("dispatch").stdout
+        self.assertIn("5-hour limit: 10% → 14% over this run (+4 points", out)
+        self.assertIn("200.0% per $ (measured over 1 run)", out)  # 4 points over 2 x $0.01
+        self.assertRegex(out, r"T-001  done\s+\$0\.01  ≈   2\.0% of the 5-hour limit  Job A")
+        rows = [r for r in history(self.root) if r["event"] == "window"]
+        self.assertEqual([(r["before"], r["after"], r["cost"], r["same"]) for r in rows], [(0.10, 0.14, 0.02, True)])
+        self.assertEqual((Path(self.tmp.name) / "probes").read_text(), "pp")  # one before, one after
+        stats = self.ergon("stats").stdout
+        self.assertIn("5h%", stats)
+        self.assertRegex(stats, r"sonnet .* 4\.0%\s+2\.0%")
+
+    def test_a_reset_window_gives_no_rate(self):
+        self.ergon("new", "task", "Job", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FIVE_HOUR="0.90|0.02", FAKE_RESETS_1="1794953400",
+                        FAKE_PROBES=str(Path(self.tmp.name) / "probes"))
+        out = self.ergon("dispatch").stdout
+        self.assertIn("the window reset during the run", out)
+        self.assertNotIn("per $", out)
+
+    def test_no_window_or_probes_off_prints_nothing(self):
+        self.ergon("new", "task", "Job", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        probes = Path(self.tmp.name) / "probes"
+        self.env.update(FAKE_PROBES=str(probes))
+        out = self.ergon("dispatch").stdout  # no FAKE_FIVE_HOUR: an API key
+        self.assertNotIn("5-hour", out)
+        self.assertEqual(probes.read_text(), "p")  # no window before, so no probe after
+        cfg = self.root / ".ergon.toml"  # top level: appended, it would land in [[companion]]
+        cfg.write_text("limit_probe = false\n" + cfg.read_text())
+        self.ergon("new", "task", "Job 2", "--tier", "sonnet")
+        stamp(self.task_file("T-002"))
+        self.env.update(FAKE_FIVE_HOUR="0.10|0.14")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-002"), "done", out)
+        self.assertNotIn("5-hour", out)
+        self.assertEqual(probes.read_text(), "p")
 
 
 class TestReport(Project):
