@@ -1958,5 +1958,66 @@ class TestPolicies(TestReview):
                                    rf"- \*\*Examples:\*\* T-001: .*no shims for old callers.*\n- \*\*Decided:\*\* Tester \d{{4}}-\d\d-\d\d\n")
 
 
+class TestPriority(unittest.TestCase):
+    @staticmethod
+    def mk(*specs):
+        return {s["id"]: {"tier": "sonnet", "status": "ready", **s} for s in specs}
+
+    def test_unblocks_chain_and_diamond(self):
+        from ergon.priority import unblocks
+        ts = self.mk({"id": "A"}, {"id": "B", "depends": ["A"]}, {"id": "C", "depends": ["B"]})
+        self.assertEqual(unblocks(ts["A"], ts), 2)
+        ts = self.mk({"id": "A"}, {"id": "B", "depends": ["A"]}, {"id": "C", "depends": ["A"]},
+                     {"id": "D", "depends": ["B", "C"]})
+        self.assertEqual(unblocks(ts["A"], ts), 3)
+
+    def test_unblocks_skips_closed(self):
+        from ergon.priority import unblocks
+        ts = self.mk({"id": "A"}, {"id": "B", "depends": ["A"], "status": "done"},
+                     {"id": "C", "depends": ["A"], "status": "dropped"}, {"id": "D", "depends": ["A"]})
+        self.assertEqual(unblocks(ts["A"], ts), 1)
+
+    def test_unblocks_cycle_terminates(self):
+        from ergon.priority import unblocks
+        ts = self.mk({"id": "A", "depends": ["B"]}, {"id": "B", "depends": ["A"]})
+        self.assertEqual(unblocks(ts["A"], ts), 1)
+
+    def test_cod_neutral_and_clamped(self):
+        from ergon.priority import cod
+        for v in (None, "", "junk", "nan"):
+            self.assertEqual(cod({"cod": v}), 50)
+        self.assertEqual(cod({}), 50)
+        self.assertEqual(cod({"cod": "80"}), 80)
+        self.assertEqual(cod({"cod": 150}), 100)
+        self.assertEqual(cod({"cod": "-5"}), 0)
+
+    def test_score(self):
+        from ergon.priority import score
+        ts = self.mk({"id": "A", "cod": "30"}, {"id": "B", "depends": ["A"]})
+        self.assertEqual(score(ts["A"], ts), (30 + 25) / 3)
+
+    def test_pin_buckets(self):
+        from ergon.priority import sort_key
+        ts = self.mk({"id": "T-1", "pin": "last", "cod": 100}, {"id": "T-2", "cod": 10},
+                     {"id": "T-3", "pin": "first", "cod": 0}, {"id": "T-4", "pin": "bogus", "cod": 40})
+        order = sorted(ts.values(), key=lambda t: sort_key(t, ts))
+        self.assertEqual([t["id"] for t in order], ["T-3", "T-4", "T-2", "T-1"])
+
+    def test_equal_score_tie_breaks_on_tier_then_id(self):
+        from ergon.priority import sort_key
+        # haiku cod 20 -> 20; sonnet cod 60 -> 20
+        ts = self.mk({"id": "T-9", "tier": "haiku", "cod": 20}, {"id": "T-2", "cod": 60},
+                     {"id": "T-1", "cod": 60})
+        order = sorted(ts.values(), key=lambda t: sort_key(t, ts))
+        self.assertEqual([t["id"] for t in order], ["T-9", "T-1", "T-2"])
+
+    def test_digest_ignores_priority_fields(self):
+        from ergon.tasks import brief_digest
+        t = {"id": "T-1", "title": "x", "tier": "sonnet", "touches": ["a"], "_body": "## What\n\nx\n"}
+        base = brief_digest(t)
+        for extra in ({"cod": "90"}, {"cod_why": "because"}, {"graded": "2026-11-17 abc"}, {"pin": "first"}):
+            self.assertEqual(brief_digest({**t, **extra}), base)
+
+
 if __name__ == "__main__":
     unittest.main()
