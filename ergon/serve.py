@@ -704,6 +704,8 @@ def findings(t, tasks):
             out.append(f"depends on {d}: no such task")
         elif s == "dropped":
             out.append(f"depends on {d}, which was dropped: it can never clear")
+        elif s == "proposed":
+            out.append(f"depends on proposed {d}: approving this alone leaves it waiting.")
     return out
 
 
@@ -875,6 +877,70 @@ def quiz_html(tasks):
     return "".join(o)
 
 
+OPEN_STATUSES = ("proposed", "ready", "doing", "review", "blocked")
+
+
+def review_groups(proposed, tasks):
+    """(groups, independent). A group is a list of 2+ proposed tasks joined through depends: links,
+    each taken both ways, where every task on a link is open. Groups come largest first, then by
+    lowest ID; inside one, dependency layer then ID. The rest are the independent ones, in tier order."""
+    is_open = lambda i: tasks.get(i, {}).get("status") in OPEN_STATUSES
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for t in tasks.values():
+        if t["status"] not in OPEN_STATUSES:
+            continue
+        find(t["id"])
+        for d in t.get("depends") or []:
+            if is_open(d):
+                parent[find(t["id"])] = find(d)
+    comps = {}
+    for t in proposed:
+        comps.setdefault(find(t["id"]), []).append(t)
+    groups = [ts for ts in comps.values() if len(ts) >= 2]
+    in_group = {t["id"] for ts in groups for t in ts}
+    out = []
+    for ts in groups:
+        col = dep_layers({t["id"] for t in ts}, {t["id"]: t.get("depends") or [] for t in ts})
+        out.append(sorted(ts, key=lambda t: (col[t["id"]], t["id"])))
+    out.sort(key=lambda ts: (-len(ts), min(t["id"] for t in ts)))
+    return out, [t for t in proposed if t["id"] not in in_group]
+
+
+def group_header(ts, tasks):
+    ids = {t["id"] for t in ts}
+    col = dep_layers(ids, {t["id"]: t.get("depends") or [] for t in ts})
+    layers = {}
+    for t in ts:
+        layers.setdefault(col[t["id"]], []).append(t["id"])
+    chain = " → ".join(", ".join(sorted(v)) for _, v in sorted(layers.items()))
+    h = [f'<h3 class=ghead id="g-{esc(min(ids))}">{link_ids(esc(chain), tasks)}</h3>']
+    waits = sorted({d for t in ts for d in t.get("depends") or []
+                    if d not in ids and tasks.get(d, {}).get("status") in OPEN_STATUSES})
+    notes = []
+    if waits:
+        notes.append("waits on " + ", ".join(f'{link_ids(esc(d), tasks)} ({esc(tasks[d]["status"])})' for d in waits))
+    epics = {t.get("epic") for t in ts}
+    epic = epics.pop() if len(epics) == 1 else None
+    if epic:
+        notes.append(f'epic <a href="/e/{esc(epic)}">{esc(epic)}</a>')
+    elif len(ts) >= 3:
+        notes.append(f"{len(ts)} linked tasks, no epic")
+    if notes:
+        h.append(f'<p class=muted>{"; ".join(notes)}</p>')
+    cmd = " ".join(i for i in sorted(ids) if TASK_ID.fullmatch(i))
+    if cmd:
+        h.append(f'<p class=muted>For this group:</p><code class=cmd>{esc("ergon approve " + cmd)}</code>')
+    return "".join(h)
+
+
 def review_page(nonce):
     tasks = _tasks.load(_config.ITEMS)
     proposed = sorted((t for t in tasks.values() if t["status"] == "proposed"), key=tier_key)
@@ -902,7 +968,14 @@ def review_page(nonce):
              'dependency to the task that waits on it.</p>')
 
     b.append("<h2>Tasks</h2>")
-    b.extend(review_card(t, tasks, found[t["id"]]) for t in proposed)
+    groups, alone = review_groups(proposed, tasks)
+    for ts in groups:
+        b.append(group_header(ts, tasks))
+        b.extend(review_card(t, tasks, found[t["id"]]) for t in ts)
+    if alone:
+        if groups:
+            b.append("<h3 class=ghead id=g-independent>Independent</h3>")
+        b.extend(review_card(t, tasks, found[t["id"]]) for t in alone)
 
     b.append(f"<h2 id=findings>Findings ({sum(map(len, flagged.values()))})</h2>")
     if flagged:

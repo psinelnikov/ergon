@@ -600,3 +600,71 @@ class TestMetricsEmpty(Project):
         self.assertTrue(m["empty"])
         body = metrics.render(m, S.esc, S.money, {"epic": None, "since": None, "until": None, "epics": []})
         self.assertIn("No runs yet", body)
+
+
+class TestReviewGroups(ServeFixture):
+    """Grouping of proposed tasks by depends: T-004 and T-005 start out unlinked."""
+
+    def setUp(self):
+        super().setUp()
+        for n in range(4):
+            self.ergon("new", "task", f"Extra {n}", "--tier", "sonnet")  # T-006..T-009
+
+    def link(self, tid, deps, status=None):
+        f = self.task_file(tid)
+        text = re.sub(r"^depends:.*$", f"depends: [{', '.join(deps)}]", f.read_text(), flags=re.M)
+        if status:
+            text = re.sub(r"^status: \w+$", f"status: {status}", text, flags=re.M)
+        f.write_text(text)
+
+    def order(self, page):
+        return re.findall(r'<section class=card id="(T-\d+)">', page)
+
+    def region(self, page, low):
+        m = re.search(rf'<h3 class=ghead id="g-{low}">.*?(?=<h3 class=ghead|<h2)', page, re.S)
+        return m[0] if m else None
+
+    def test_chain_independent_and_done_base(self):
+        # T-006 <- T-007 <- T-008 chain; T-004 independent; T-009 depends on done T-001
+        self.link("T-007", ["T-006"])
+        self.link("T-008", ["T-007"])
+        self.link("T-009", ["T-001"])
+        page = self.req("GET", "/review")[2]
+        order = self.order(page)
+        self.assertEqual(order[:3], ["T-006", "T-007", "T-008"])
+        self.assertEqual(sorted(order[3:]), ["T-004", "T-005", "T-009"])
+        g = self.region(page, "T-006")
+        self.assertIn("T-006</a> → <a", g)
+        self.assertIn("3 linked tasks, no epic", g)
+        self.assertIn(f"<code class=cmd>{APPROVE} T-006 T-007 T-008</code>", g)
+        self.assertIn("Independent", page)
+        self.assertEqual(page.count("<h3 class=ghead"), 2)
+        self.assertNotIn('class=card id="T-001"', page)
+
+    def test_shared_ready_joins_shared_done_does_not(self):
+        self.link("T-006", ["T-002"], "proposed")  # T-002 is doing
+        self.link("T-007", ["T-002"])
+        page = self.req("GET", "/review")[2]
+        g = self.region(page, "T-006")
+        self.assertIn("waits on", g)
+        self.assertIn("T-002</a> (doing)", g)
+        self.assertIn(f"<code class=cmd>{APPROVE} T-006 T-007</code>", g)
+        self.link("T-006", ["T-001"])
+        self.link("T-007", ["T-001"])
+        page = self.req("GET", "/review")[2]
+        self.assertNotIn("<h3 class=ghead", page)
+        self.assertEqual(len(self.order(page)), 6)
+
+    def test_finding_cycle_and_hostile(self):
+        self.link("T-006", ["T-007"])
+        self.link("T-007", ["T-006"])
+        code, _, page = self.req("GET", "/review")
+        self.assertEqual(code, 200)
+        self.assertEqual(self.order(page).count("T-006"), 1)
+        self.assertEqual(self.order(page).count("T-007"), 1)
+        self.assertRegex(page, r'depends on proposed <a href="/t/T-007">T-007</a>: approving this alone leaves it waiting\.')
+        self.link("T-004", ["T-006"])  # the hostile title sits in a group
+        page = self.req("GET", "/review")[2]
+        self.assertIn(f"<code class=cmd>{APPROVE} T-004 T-006 T-007</code>", self.region(page, "T-004") or self.region(page, "T-006"))
+        self.assertNotIn("<img", page)
+        self.assertIn("&lt;script&gt;alert(&quot;x&quot;)", page)

@@ -144,3 +144,4 @@ svg.depmap a:hover rect { fill: var(--code); }
 .quiz button.opt.wrong { border-color: var(--bad); color: var(--bad); opacity: 1; }
 .quiz .explain { margin: 8px 0 4px; }
 .quiz .score { font-weight: 600; }
+.ghead { margin: 18px 0 4px; overflow-wrap: anywhere; }
