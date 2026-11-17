@@ -22,6 +22,7 @@ from . import dispatch as _dispatch
 from . import gitops as _gitops
 from . import history as _history
 from . import report as _report
+from . import shared as _shared
 from . import tasks as _tasks
 
 
@@ -138,6 +139,10 @@ def approve(args):
     todo = [t for t in targets(args.ids, tasks, epics) if t["status"] == "proposed"]
     if not todo:
         raise SystemExit("nothing in `proposed` among those ids")
+    # shared mode: an unpublished ID can still be renumbered, so sync first (or refuse)
+    _shared.ensure_published([t["id"] for t in todo] + [i for i in args.ids if i in epics])
+    tasks = _tasks.load(_config.ITEMS)
+    todo = [tasks[t["id"]] for t in todo]
     for t in todo:
         print(_tasks.line(t, tasks))
     if not human_gate(f"Approve these {len(todo)} task(s) as {approver()}?"):
@@ -187,7 +192,21 @@ def review_interactive(args):
     their worker's question (offering `a`: answer it, as `ergon answer` does), then tasks whose
     review vetoed them (offering `p`: save the finding as a policy). Every answer lands immediately."""
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
-    pick = lambda t: ((not args.epic or t.get("epic") == args.epic) and (not args.tier or t["tier"] == args.tier))
+    held = _shared.unpublished([t["id"] for t in tasks.values() if t["status"] == "proposed"]
+                               + [t["epic"] for t in tasks.values() if t["status"] == "proposed" and t.get("epic")])
+    if held:  # sync first, then look at the queue again (IDs may have changed)
+        print(f"{', '.join(held)} not published yet: syncing first")
+        try:
+            _shared.sync_core()
+        except SystemExit as err:
+            print(f"sync failed ({err}); unpublished tasks are left out of this review")
+        tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
+        held = set(_shared.unpublished(list(tasks) + list(epics)))
+        if held:
+            print(f"refused, not published to {_shared.remote()}: {', '.join(sorted(held))}")
+    else:
+        held = set()
+    pick = lambda t: (t["id"] not in held and (not args.epic or t.get("epic") == args.epic) and (not args.tier or t["tier"] == args.tier))
     order = lambda t: (t.get("epic") or "~", t["id"])
     queue = sorted((t for t in tasks.values() if t["status"] == "proposed" and pick(t)), key=order)
     queue += sorted((t for t in tasks.values() if _tasks.is_asking(t) and pick(t)), key=order)

@@ -244,3 +244,94 @@ class TestLocalOnly(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIdAllocation(Shared):
+    def test_offline_collision_renumbers_the_second_clone_and_its_dependants(self):
+        self.start()
+        self.ergon(self.a, "new", "task", "From A", "--tier", "haiku")  # T-002 in both
+        self.ergon(self.b, "new", "task", "From B", "--tier", "haiku")
+        self.ergon(self.b, "new", "task", "Needs B", "--tier", "haiku")  # T-003
+        self.ergon(self.b, "set", "T-003", "depends=T-002")
+        self.ergon(self.b, "new", "task", "Filed from B", "--tier", "haiku", "--source", "T-002")  # T-004
+        self.ergon(self.a, "sync")
+        r = self.ergon(self.b, "sync")
+        self.assertIn("renumbered: T-002 → T-005", r.stdout)
+        self.assertIn("title: From A", self.task(self.b, "T-002").read_text())
+        self.assertIn("title: From B", self.task(self.b, "T-005").read_text())
+        self.assertIn("depends: [T-005]", self.task(self.b, "T-003").read_text())
+        self.assertIn("source: T-005", self.task(self.b, "T-004").read_text())
+        self.assertIn("pushed ergon-state", r.stdout)
+        self.ergon(self.a, "sync")
+        self.assertIn("title: From B", self.task(self.a, "T-005").read_text())
+        self.assertEqual(self.ergon(self.b, "sync").stdout.count("renumbered"), 0)
+
+    def test_map_cards_and_log_hits_are_printed(self):
+        self.start()
+        (self.b / "map").mkdir()
+        (self.b / ".ergon.toml").write_text((self.b / ".ergon.toml").read_text() + 'map = "map"\nlog = "TODO.md"\n')
+        # options sit above [shared]: rewrite so they stay top-level
+        (self.b / ".ergon.toml").write_text(SHARED_CONFIG.format(remote=self.remote).replace(
+            "[shared]", 'map = "map"\nlog = "TODO.md"\n\n[shared]'))
+        (self.b / "map" / "x.md").write_text("gap → task T-002\n")
+        (self.b / "TODO.md").write_text("see T-002 here\nT-0021 is other\n")
+        self.ergon(self.a, "new", "task", "From A", "--tier", "haiku")
+        self.ergon(self.b, "new", "task", "From B", "--tier", "haiku")
+        self.ergon(self.a, "sync")
+        r = self.ergon(self.b, "sync")
+        self.assertIn("map/x.md:1 names T-002", r.stdout)
+        self.assertIn("TODO.md:1 names T-002", r.stdout)
+        self.assertNotIn("TODO.md:2", r.stdout)
+
+    def test_approving_an_unpublished_task_syncs_first(self):
+        self.start()
+        self.ergon(self.b, "new", "task", "Two", "--tier", "haiku")
+        tip = self.remote_tip()
+        r = self.ergon(self.b, "approve", "T-002", inp="y\n")
+        self.assertIn("syncing first", r.stdout)
+        self.assertNotEqual(self.remote_tip(), tip)
+        self.assertIn("status: ready", self.task(self.b, "T-002").read_text())
+
+    def test_approving_refuses_when_the_sync_renumbered_it(self):
+        self.start()
+        self.ergon(self.a, "new", "task", "From A", "--tier", "haiku")
+        self.ergon(self.b, "new", "task", "From B", "--tier", "haiku")
+        self.ergon(self.a, "sync")
+        r = self.ergon(self.b, "approve", "T-002", check=False, inp="y\n")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("renumbered", r.stderr + r.stdout)
+        self.assertIn("status: proposed", self.task(self.b, "T-002").read_text())
+        self.assertIn("status: proposed", self.task(self.b, "T-003").read_text())
+
+    def test_approving_refuses_when_the_sync_fails(self):
+        self.start()
+        self.ergon(self.b, "new", "task", "Two", "--tier", "haiku")
+        sh("git", "-C", "tasks", "remote", "add", "x", "/nonexistent", cwd=self.b)
+        shutil.move(str(self.remote), str(self.remote) + ".gone")
+        r = self.ergon(self.b, "approve", "T-002", check=False, inp="y\n")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("refused", r.stderr + r.stdout)
+        self.assertIn("status: proposed", self.task(self.b, "T-002").read_text())
+
+    def test_a_colliding_approved_task_is_reported_and_left_alone(self):
+        self.start()
+        self.ergon(self.a, "new", "task", "From A", "--tier", "haiku")
+        self.ergon(self.b, "new", "task", "From B", "--tier", "haiku")
+        t = self.task(self.b, "T-002")
+        t.write_text(t.read_text().replace("status: proposed", "status: ready").replace("approved: ", "approved: Dana 2026-11-17", 1))
+        self.ergon(self.a, "sync")
+        r = self.ergon(self.b, "sync", check=False)
+        self.assertIn("collision: T-002 is approved here", r.stdout)
+        self.assertNotIn("renumbered:", r.stdout)
+        self.assertIn("title: From B", self.task(self.b, "T-002").read_text())
+
+    def test_an_epic_collision_renumbers_its_folder_and_tasks(self):
+        self.start()
+        self.ergon(self.a, "new", "epic", "Epic A")
+        self.ergon(self.b, "new", "epic", "Epic B")
+        self.ergon(self.b, "new", "task", "In B", "--tier", "haiku", "--epic", "E-001")
+        self.ergon(self.a, "sync")
+        r = self.ergon(self.b, "sync")
+        self.assertIn("renumbered: E-001 → E-002", r.stdout)
+        self.assertTrue(list((self.b / "tasks" / "epics").glob("E-002-epic-b/EPIC.md")))
+        self.assertIn("epic: E-002", self.task(self.b, "T-002").read_text())

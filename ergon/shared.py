@@ -236,16 +236,107 @@ def refuse():
                          f"nothing to sync (docs/shared-state.md)")
 
 
-def sync(args):
-    refuse()
-    if args.init:
-        return init()
-    if args.join:
-        return join()
+def tree_ids(rev):
+    """{ID: path} of every task and epic file at rev."""
+    out = git("ls-tree", "-r", "--name-only", rev, "--", "items", "epics", raw=True)
+    return {item_id(p): p for p in out.splitlines() if ID_IN_PATH.search(p)}
+
+
+def remote_paths():
+    """{ID: path} of every task and epic in the remote's state branch as last fetched ({} if never)."""
+    if not _config.SHARED or not joined() or run("rev-parse", "-q", "--verify", remote_ref()).returncode:
+        return {}
+    return tree_ids(remote_ref())
+
+
+def remote_ids(prefix):
+    return [i for i in remote_paths() if i.startswith(prefix + "-")]
+
+
+def collisions(theirs):
+    """Local tasks and epics that are new here (not in the merge base) whose ID the remote has
+    taken for a different task. Returns the IDs."""
+    ours = git("rev-parse", "HEAD")
+    r = run("merge-base", ours, theirs)
+    if r.returncode:
+        return []
+    taken = tree_ids(theirs)
+    out = []
+    for key, (what, path) in sorted(changes(r.stdout.strip(), ours).items()):
+        if what.split(" ", 1)[-1].startswith("new") and key in taken and path \
+                and blob(ours, path) != blob(theirs, taken[key]):
+            out.append(key)
+    return out
+
+
+def references(old):
+    """Lines in the map cards and the log that name `old`: (path, line number, text)."""
+    pat = re.compile(rf"\b{re.escape(old)}(?!\d)")
+    files = []
+    if _config.MAP and _config.MAP.is_dir():
+        files += sorted(_config.MAP.rglob("*.md"))
+    if _config.LOG and (_config.REPO / _config.LOG).is_file():
+        files.append(_config.REPO / _config.LOG)
+    return [(f.relative_to(_config.REPO), n, text.strip()) for f in files
+            for n, text in enumerate(f.read_text(errors="replace").splitlines(), 1) if pat.search(text)]
+
+
+def renumber(theirs):
+    """Give each colliding unpublished task or epic the next free ID, rewriting its file name and
+    `id:`, `depends:` and `source:` in local tasks that name it (and `epic:` for an epic). An
+    approved task is reported and left alone. Returns {old: new}. The caller holds the state lock."""
+    tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
+    moving = []
+    for key in collisions(theirs):
+        t = tasks.get(key)
+        if t and (t.get("approved") or t.get("status") != "proposed"):
+            print(f"collision: {key} is approved here, and a different {key} is on {remote()}; "
+                  f"not renumbered, so resolve it by hand in {_config.STATE}")
+        elif t or key in epics:
+            moving.append(key)
+    if not moving:
+        return {}
+    used = set(tasks) | set(epics) | set(tree_ids(theirs))
+    mapping = {}
+    for key in moving:
+        n = max((int(i.split("-")[1]) for i in used if i[0] == key[0]), default=0) + 1
+        mapping[key] = f"{key[0]}-{n:03d}"
+        used.add(mapping[key])
+    for old, new in mapping.items():
+        if old in epics:  # the folder moves with the tasks filed in it
+            src = epics[old]["_path"].parent
+            src.rename(src.with_name(src.name.replace(old, new, 1)))
+            e = _tasks.parse(src.with_name(src.name.replace(old, new, 1)) / _config.EPIC_FILE)
+            e["id"] = new
+            _tasks.dump(e, _tasks.EPIC_KEYS)
+    for t in _tasks.load(_config.ITEMS).values():
+        was, changed = t["_path"], False
+        if t["id"] in mapping:
+            t["id"], changed = mapping[t["id"]], True
+            t["_path"] = was.with_name(re.sub(r"^T-\d+", t["id"], was.name))
+        for field in ("depends", "source", "epic"):
+            v = t.get(field)
+            new = [mapping.get(d, d) for d in v] if isinstance(v, list) else mapping.get(v, v)
+            if new != v:
+                t[field], changed = new, True
+        if changed:
+            _tasks.dump(t, _tasks.TASK_KEYS)
+            if t["_path"] != was:
+                was.unlink()
+    for old, new in mapping.items():
+        print(f"renumbered: {old} → {new} ({old} is taken on {remote()}, and this one was never published)")
+        for path, n, text in references(old):
+            print(f"  {path}:{n} names {old}, which is now {new}: {text}")
+    return mapping
+
+
+def sync_core():
+    """Commit, fetch, renumber collisions, merge and push. Returns {old ID: new ID} for what was
+    renumbered. Raises SystemExit if it can't finish."""
     if not joined():
         raise SystemExit(f"{_config.STATE} isn't a worktree of {branch()} yet: the first person runs "
                          f"`ergon sync --init`, everyone else `ergon sync --join`")
-    out = ""
+    out, renamed = "", {}
     with _gitops.state_lock("sync"):
         mine = commit_pending("sync")
         if mine:
@@ -253,6 +344,11 @@ def sync(args):
         for n in range(1, PUSH_TRIES + 1):
             try:
                 theirs = fetch()
+                if theirs:
+                    moved = renumber(theirs)
+                    if moved:
+                        renamed.update(moved)
+                        commit_pending("sync")
                 came = merge(theirs)
             except Conflict as c:
                 raise SystemExit(
@@ -266,18 +362,58 @@ def sync(args):
                 print("pulled: " + ", ".join(came))
             if theirs and git("rev-parse", "HEAD") == theirs:
                 print(f"{branch()} is up to date with {remote()}")
-                return
+                return renamed
             try:
                 ok, out = push()
             except _gitops.GitError as err:
                 raise SystemExit(f"sync: {err}")
             if ok:
+                git("update-ref", remote_ref(), "HEAD")  # a URL remote has no tracking ref: what we pushed is the remote now
                 print(f"pushed {branch()} to {remote()}")
-                return
+                return renamed
             print(f"push rejected: {remote()} {branch()} moved since the fetch; fetching and merging again "
                   f"({n}/{PUSH_TRIES})")
     raise SystemExit(f"sync: the push was still rejected after {PUSH_TRIES} tries; your commits are kept "
                      f"locally, run `ergon sync` again.\n{out[:400]}")
+
+
+def sync(args):
+    refuse()
+    if args.init:
+        return init()
+    if args.join:
+        return join()
+    sync_core()
+
+
+def unpublished(ids):
+    """The IDs among `ids` the remote doesn't have (as last fetched). [] in local mode."""
+    if not _config.SHARED or not joined():
+        return []
+    have = remote_paths()
+    return [i for i in sorted(set(ids)) if i not in have]
+
+
+def ensure_published(ids):
+    """For the commands that approve or start work, in shared mode: an ID that might still be
+    renumbered can't be approved or started. If any of `ids` isn't on the remote yet, sync first.
+    Refuses if the sync renumbered one of them (the caller's ID may now name a different task),
+    failed, or left one unpublished."""
+    todo = unpublished(ids)
+    if not todo:
+        return
+    print(f"{', '.join(todo)} not published yet: syncing first")
+    try:
+        moved = sync_core()
+    except SystemExit as err:
+        raise SystemExit(f"refused: {', '.join(todo)} isn't published, and syncing failed: {err}")
+    hit = [f"{o} is now {moved[o]}" for o in ids if o in moved]
+    if hit:
+        raise SystemExit(f"refused: the sync renumbered {'; '.join(hit)}. Check the new IDs, then run the command again.")
+    left = unpublished(ids)
+    if left:
+        raise SystemExit(f"refused: {', '.join(left)} still isn't published to {remote()}; fix what "
+                         f"`ergon sync` reports, then try again")
 
 
 # ---------- --init and --join ----------

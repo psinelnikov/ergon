@@ -99,6 +99,9 @@ def slug(title):
 def next_id(kind, prefix):
     nums = [int(m.group(1)) for p in files(kind)
             if (m := re.match(rf"{prefix}-(\d+)", p.parent.name if kind == _config.EPICS else p.name))]
+    if _config.SHARED:  # also past what the remote had at the last fetch, so offline clones collide less
+        from . import shared as _shared
+        nums += [int(i.split("-")[1]) for i in _shared.remote_ids(prefix)]
     return f"{prefix}-{max(nums, default=0) + 1:03d}"
 
 

@@ -181,6 +181,7 @@ def start(args):
         raise SystemExit(f"no such epic: {args.id}")
     if e["status"] != "open":
         raise SystemExit(f"{args.id} is {e['status']}")
+    _shared.ensure_published([args.id])  # shared mode: an unpublished epic ID can still be renumbered
     try:
         where = open_epic(e)
     except GitError as err:
