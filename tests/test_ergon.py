@@ -2076,6 +2076,18 @@ class TestPolicies(TestReview):
         self.assertIsNone(self.guard(
             "Bash", {"command": f"cd tasks && cat > tests/test_x.py <<'EOF'\n{test}EOF"}, "--worker"))
 
+    def test_guard_commit_message_is_data(self):
+        """`git commit -m` text that quotes a runs path is data; $(...) inside it still runs (T-092)."""
+        text = "cd tasks/runs && echo x > T-001-x.log"
+        for cmd in (f"git commit -m '{text}'", f"git commit --message='{text}'", f"git commit --message '{text}'",
+                    f"git commit -am '{text}'", f"git tag -m '{text}' v1", f"git notes add -m '{text}'",
+                    f"git commit -F - <<'EOF'\n{text}\nEOF"):
+            self.assertIsNone(self.guard("Bash", {"command": cmd}, "--worker"), cmd)
+        for cmd in ('git commit -m "$(echo x > tasks/runs/a.log)"',
+                    'git commit --message="$(echo x > tasks/runs/a.log)"',
+                    'git commit -m "`echo x > tasks/runs/a.log`"'):
+            self.assertIn("runs/", self.guard("Bash", {"command": cmd}, "--worker") or "", cmd)
+
     def test_worker_policy_line_becomes_note(self):
         self.ergon("new", "task", "Reviewed", "--tier", "haiku")
         stamp(self.task_file("T-001"))

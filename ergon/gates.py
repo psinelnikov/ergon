@@ -1086,6 +1086,30 @@ def _chdir_targets(words):
     return out
 
 
+_MSG_SHORT = re.compile(r"-[A-Za-z]*m$")
+
+
+def _without_messages(words):
+    """The words of a command minus the values of `git commit/tag/notes -m` and `--message[=]`, which are
+    text, not paths. A value with $(...) or backticks may run a command, so it stays."""
+    k = next((i for i, w in enumerate(words) if _program(w) == "git"), None)
+    if k is None or not any(w in ("commit", "tag", "notes") for w in words[k + 1:]):
+        return words
+    live = re.compile(r"\$\(|`")
+    out, skip = [], False
+    for w in words:
+        if skip:
+            skip = False
+            if not live.search(w):
+                continue
+        elif w == "--message" or _MSG_SHORT.match(w):
+            skip = True
+        elif w.startswith("--message=") and not live.search(w):
+            continue
+        out.append(w)
+    return out
+
+
 def _names_outside_data(cmd, pattern, dirs):
     try:
         cmds = shell_commands(cmd)[0]
@@ -1100,6 +1124,7 @@ def _names_outside_data(cmd, pattern, dirs):
         return bool(pattern.search(t)) or names_in(t, dirs)
 
     for words, docs in cmds:
+        words = _without_messages(words)
         runs = any(CODE_RUNNER.fullmatch(_program(w)) for w in words)
         code = runs or any(_program(w) == "xargs" for w in words)
         live = [d for d, expands in docs if code or (expands and re.search(r"\$\(|`", d))]
