@@ -493,11 +493,206 @@ def close(args):
 # Shell writes: in-place editors, redirects (not to /dev/null or another fd), tee, mv/cp/rm.
 SHELL_WRITE = re.compile(r"\bsed\s+(-\w+\s+)*-i|\bperl\s+-\w*i|(?<![0-9&>])>(?!\s*/dev/null|&)|"
                          r"\btee\b|\b(mv|cp|rm|truncate|install)\s|python[0-9.]*\s+-c|<<")
+# The human-only commands as plain text. human_cmd falls back to it for text it can't split into
+# words and for strings handed to a program that runs them as code (bash -c, python -c, ssh, ...).
 HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept|answer)\b|\breview\s+(-i|--interactive)\b")
+HUMAN_VERBS = {"approve", "reject", "close", "accept", "answer"}
+# Programs that run a string argument or their stdin as code: what's quoted for them is a command.
+CODE_RUNNER = re.compile(r"(?:ba|da|z|k|mk|c|tc|fi|a)?sh|busybox|eval|env|ssh|su|watch|script|tmux|screen|"
+                         r"parallel|flock|expect|osascript|python[0-9.]*|pypy[0-9.]*|perl|ruby|node|nodejs|"
+                         r"deno|bun|php|lua|tclsh|[gmn]?awk")
 GUARD_TOOLS = "Edit|Write|MultiEdit|Bash"
 GIT_WRITE = re.compile(r"\bgit\b[^;&|]*\s(add|commit|checkout|switch|reset|restore|merge|rebase|"
                        r"cherry-pick|revert|stash|apply|am|pull|push|fetch|branch|tag|worktree|"
                        r"clean|update-ref|commit-tree|notes|gc|prune)\b")
+
+
+def shell_commands(s, i=0, close=None):
+    """Split shell text into simple commands, each (its words after quote removal, its heredoc
+    bodies as (text, expands)). The commands inside $(...), `...` and (...) come out as commands of
+    their own; a word holding a substitution keeps its source text. Returns (commands, the index
+    after `close`). Raises ValueError on text it can't split (an open quote, an unclosed paren)."""
+    cmds, words, docs, word, pending, n = [], [], [], [], [], len(s)
+    inword = False
+
+    def end_word():
+        nonlocal inword
+        if inword:
+            words.append("".join(word))
+        word.clear()
+        inword = False
+
+    def end_cmd():
+        nonlocal words, docs
+        end_word()
+        if words:
+            cmds.append((words, docs))
+        words, docs = [], []
+
+    def sub(i):  # s[i:] starts with "$(": the commands up to its ")" are commands too
+        found, j = shell_commands(s, i + 2, ")")
+        cmds.extend(found)
+        word.append(s[i:j])
+        return j
+
+    def tick(i):  # s[i] opens a `...` substitution
+        j = i + 1
+        while j < n and s[j] != "`":
+            j += 2 if s[j] == "\\" else 1
+        if j >= n:
+            raise ValueError("open backtick")
+        cmds.extend(shell_commands(re.sub(r"\\([`$\\\"])", r"\1", s[i + 1:j]))[0])
+        word.append(s[i:j + 1])
+        return j + 1
+
+    def dquote(i):  # s[i] is the char after an opening "
+        while i < n and s[i] != '"':
+            if s[i] == "\\" and i + 1 < n:
+                if s[i + 1] in '$`"\\':
+                    word.append(s[i + 1])
+                elif s[i + 1] != "\n":
+                    word.append(s[i:i + 2])
+                i += 2
+            elif s.startswith("$(", i):
+                i = sub(i)
+            elif s[i] == "`":
+                i = tick(i)
+            else:
+                word.append(s[i])
+                i += 1
+        if i >= n:
+            raise ValueError("open double quote")
+        return i + 1
+
+    def heredoc(i):  # s[i] is the char after "<<"
+        strip = s.startswith("-", i)
+        i += strip
+        while i < n and s[i] in " \t":
+            i += 1
+        j = i
+        while j < n and s[j] not in " \t\n;&|<>()":
+            j += 1
+        delim = re.sub(r"[\"'\\]", "", s[i:j])
+        if not delim:
+            raise ValueError("heredoc without a delimiter")
+        pending.append((delim, delim == s[i:j], strip, docs))
+        return j
+
+    def bodies(i):  # s[i] starts the line after one that opened heredocs
+        while pending:
+            delim, expands, strip, into = pending.pop(0)
+            lines = []
+            while True:
+                if i >= n:
+                    raise ValueError("open heredoc")
+                j = s.find("\n", i)
+                j = n if j < 0 else j
+                line, i = s[i:j], j + 1
+                if (line.lstrip("\t") if strip else line) == delim:
+                    break
+                lines.append(line)
+            into.append(("\n".join(lines), expands))
+        return i
+
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            if not s.startswith("\n", i + 1):
+                word.append(s[i + 1:i + 2])
+                inword = True
+            i += 2
+        elif c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                raise ValueError("open single quote")
+            word.append(s[i + 1:j])
+            inword, i = True, j + 1
+        elif s.startswith("$'", i):
+            j = i + 2
+            while j < n and s[j] != "'":
+                j += 2 if s[j] == "\\" else 1
+            if j >= n:
+                raise ValueError("open $' quote")
+            word.append(s[i + 2:j])
+            inword, i = True, j + 1
+        elif c == '"':
+            inword, i = True, dquote(i + 1)
+        elif s.startswith("$(", i):
+            inword, i = True, sub(i)
+        elif c == "`":
+            inword, i = True, tick(i)
+        elif c == "#" and not inword:
+            j = s.find("\n", i)
+            i = n if j < 0 else j
+        elif c in " \t":
+            end_word()
+            i += 1
+        elif c == "\n":
+            end_cmd()
+            i = bodies(i + 1)
+        elif c in ";&|":
+            end_cmd()
+            i += 1
+        elif c == "(":
+            end_cmd()
+            found, i = shell_commands(s, i + 1, ")")
+            cmds.extend(found)
+        elif c == ")":
+            if close != ")" or pending:
+                raise ValueError("unmatched )")
+            end_cmd()
+            return cmds, i + 1
+        elif c in "<>":
+            end_word()
+            if s.startswith("<<", i) and not s.startswith("<<<", i):
+                i = heredoc(i + 2)
+            else:
+                i += 1
+                while i < n and s[i] in "<>&|":
+                    i += 1
+        else:
+            word.append(c)
+            inword, i = True, i + 1
+    if close or pending:
+        raise ValueError("unclosed " + (close or "heredoc"))
+    end_cmd()
+    return cmds, i
+
+
+def _program(word):
+    return word.rstrip("/").rsplit("/", 1)[-1]
+
+
+def human_cmd(cmd):
+    """Whether a shell command runs a human-only ergon command: approve, reject, close, accept,
+    answer, or the interactive review. Only a real call counts: `ergon` (ergon.py, the package's
+    folder or __main__.py) as a word of a simple command followed by the verb, wherever that
+    command sits (after &&, inside $(...), behind sudo or xargs, in a heredoc fed to a shell). The
+    verbs inside a quoted grep pattern or commit message are data and pass. Strings given to a
+    program that runs them as code are checked as text, as is anything that can't be split."""
+    try:
+        cmds = shell_commands(cmd)[0]
+    except (ValueError, RecursionError):
+        return bool(HUMAN_CMD.search(cmd))
+    for words, docs in cmds:
+        if any(CODE_RUNNER.fullmatch(_program(w)) for w in words):
+            if any(HUMAN_CMD.search(t) or (t != cmd and human_cmd(t)) for t in words + [d for d, _ in docs]):
+                return True
+        if any(expands and re.search(r"\$\(|`", d) and HUMAN_CMD.search(d) for d, expands in docs):
+            return True
+        for k, w in enumerate(words):
+            if _program(w) not in ("ergon", "ergon.py") and not w.endswith("ergon/__main__.py"):
+                continue
+            rest = words[k + 1:]
+            at = next((m for m, a in enumerate(rest) if not a.startswith("-")), None)
+            if at is None:
+                continue
+            if rest[at] in HUMAN_VERBS:
+                return True
+            if rest[at] == "review" and any(a == "-i" or (a.startswith("--i") and "--interactive".startswith(a))
+                                            for a in rest[at + 1:]):
+                return True
+    return False
 
 
 def frontmatter(text):
@@ -568,7 +763,7 @@ def guard_reason(tool, inp, worker=False):
             return why
     if tool == "Bash":
         cmd = inp.get("command", "")
-        if HUMAN_CMD.search(cmd):
+        if human_cmd(cmd):
             return ("approve / reject / close / accept / answer / review -i are human-only; ask the user to run "
                     "them in their own terminal")
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"

@@ -248,6 +248,31 @@ class TestBasics(Project):
         self.assertIn("shell", self.guard("Bash", {"command": f"sed -i '' s/a/b/ {f}"}))
         self.assertIsNone(self.guard("Bash", {"command": "cat tasks/items/*.md"}))
 
+    def test_guard_human_cmd_only_real_calls(self):
+        """T-044: a human-only verb in a grep pattern or a commit message is data; a real call is
+        refused wherever it sits in the command."""
+        self.assertIsNone(self.guard("Bash", {"command": r'grep -n "accept\|approve\`\|review -i\|AWAITING" README.md'}))
+        self.assertIn("human-only", self.guard("Bash", {"command": "cd x && ergon review --tier opus -i"}))
+        from ergon.gates import human_cmd
+        for cmd in ["grep -n 'ergon approve' README.md", 'git log --grep "ergon accept"',
+                    "git commit -m \"$(cat <<'EOF'\nDocument ergon approve and ergon review -i\nEOF\n)\"",
+                    "rg 'review --interactive' docs/ | head", 'echo "ergon close T-1" | wc -c',
+                    "ergon review", "ergon review --tier opus", "ergon show T-1 && ergon board",
+                    "cat <<EOF > /tmp/x\nergon approve T-1\nEOF", "ls # ergon approve T-1",
+                    "git diff main 2>/dev/null >&2"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+        for cmd in ["ergon review -i", "ergon review --tier opus --interactive", "ergon review --inter",
+                    'bash -c "ergon approve T-1"', "sh -c 'ergon answer T-1 yes'",
+                    'bash -c "grep -n x; ergon \\\n approve T-1"', 'echo "$(ergon approve T-1)"',
+                    "echo `ergon reject T-1`", "python3 -m ergon close T-1 --as done --reason x",
+                    "python3 path/to/ergon/ answer T-1", "python3 ergon/__main__.py approve T-1",
+                    '"ergon" approve T-1', "'ergon' 'approve' T-1", "bash <<EOF\nergon approve T-1\nEOF",
+                    "ergon \\\n approve T-1", 'ergon approve T-1 "unterminated', "xargs ergon approve <<< T-1",
+                    "(ergon approve T-1)", "sudo ergon accept T-1", "FOO=1 ~/bin/ergon reject T-1 --reason x",
+                    "python3 -c \"import os; os.system('ergon approve T-1')\"", "ssh host 'ergon approve T-1'",
+                    "cat <<EOF\n$(ergon approve T-1)\nEOF", "diff <(ergon accept T-1) x", "ls; ergon approve T-1 &"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+
     def test_stop_hook_blocks_on_lint_failure(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")
