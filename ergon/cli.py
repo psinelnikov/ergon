@@ -60,7 +60,7 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                or Ctrl-C (stop launching, let workers finish; a second kills them)
                                A reviewer's fail (`review` in .ergon.toml) goes back to the worker
                                and is reviewed again, up to review_rounds times, then blocks
-  ergon stats [--since DATE] [--epic E]
+  ergon stats [--since DATE] [--epic E] [--approver NAME | --approvers]
                                read-only: per tier, runs / done / blocked / block rate / cost /
                                timeouts from <state>/runs/*.json, and tasks that blocked twice+
   ergon serve [--port 4300] [--bind 127.0.0.1]
@@ -365,6 +365,10 @@ def main():
     ss = sub.add_parser("stats")
     ss.add_argument("--since", metavar="DATE", help="YYYY-MM-DD: runs started that day or later")
     ss.add_argument("--epic")
+    ss.add_argument("--approver", metavar="NAME", help="show this approver's record, not yours")
+    ss.add_argument("--approvers", action="store_true",
+                    help="show every approver on one table (by default each person sees only their own record: "
+                         "it's for judging your own briefs, not a league table)")
     rp = sub.add_parser("report")
     rp.add_argument("--since", metavar="DATE|last", help="YYYY-MM-DD, or `last` for the previous report")
     sv = sub.add_parser("serve", help="read-only web board and task pages")

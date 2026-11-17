@@ -1502,6 +1502,87 @@ class TestStats(Project):
         self.assertIn("skipped 2", out)
 
 
+class TestApproverSignals(Project):
+    def rows(self):
+        def r(day, tid, event, **kw):
+            return {"at": f"{day}T10:00:00+00:00", "task": tid, "epic": None, "event": event, **kw}
+        ap = lambda tid, by, tier, **kw: r("2026-11-02", tid, "approved", by=by, tier=tier, **kw)
+        return [
+            ap("T-001", "Tester", "sonnet"), r("2026-11-03", "T-001", "landed"),
+            ap("T-002", "Tester", "haiku", approvers=["Tester", "Bob"]), r("2026-11-03", "T-002", "landed"),
+            ap("T-003", "Tester", "haiku"),
+            r("2026-11-03", "T-003", "escalated", **{"from": "haiku", "to": "sonnet"}),
+            r("2026-11-04", "T-003", "landed"),
+            ap("T-004", "Bob", "opus"), r("2026-11-03", "T-004", "review", verdict="fail"),
+            r("2026-11-03", "T-004", "review", verdict="fail"), r("2026-11-04", "T-004", "review", verdict="pass"),
+            r("2026-11-04", "T-004", "landed"),
+            ap("T-005", "Tester", "sonnet"), r("2026-11-03", "T-005", "question"),
+            r("2026-11-03", "T-005", "blocked", reason="x", asked=True),
+            ap("T-006", "Tester", "sonnet"),
+            r("2026-11-03", "T-006", "blocked", reason="outside: trunk red", asked=False),
+            ap("T-007", "Bob", "opus"), r("2026-11-03", "T-007", "landed"),
+            r("2026-11-04", "T-007", "rejected", **{"from": "review", "to": "ready"}),
+            r("2026-10-01", "T-009", "approved", by="Bob", tier="human"),  # before --since
+        ]
+
+    def setUp(self):
+        super().setUp()
+        for n in range(1, 9):
+            self.ergon("new", "task", f"Job {n}", "--tier", "haiku")
+        stamp(self.task_file("T-008"))  # approved only through its stamp, no history row
+        f = self.task_file("T-008")
+        f.write_text(f.read_text().replace("Tester 2026-01-01", "Carol 2026-11-05 sha256:abcd1234"))
+        runs = self.root / "tasks" / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        (runs / "history.jsonl").write_text("".join(json.dumps(r) + "\n" for r in self.rows()))
+
+    def stats(self, *a):
+        return self.ergon("stats", "--since", "2026-11-01", *a).stdout
+
+    def line(self, out, name):
+        return [l for l in out.splitlines() if l.startswith(name + " ")][0]
+
+    def test_default_is_own_record(self):
+        out = self.stats()
+        self.assertIn("approver signals (not verdicts", out)
+        row = self.line(out, "Tester").split()
+        # approved landed esc% block% asked% fixes/landed sent-back% mix
+        self.assertEqual(row[1:8], ["5", "3", "20%", "0%", "20%", "0.00", "0%"])
+        self.assertEqual(" ".join(row[8:]), "h 2 / s 3")
+        self.assertNotRegex(out, r"(?m)^(Bob|Carol) ")
+
+    def test_other_approver(self):
+        out = self.stats("--approver", "Bob")
+        self.assertNotRegex(out, r"(?m)^Tester ")
+        row = self.line(out, "Bob").split()
+        self.assertEqual(row[1:8], ["3", "3", "0%", "0%", "0%", "0.67", "33%"])  # the outside: block isn't Bob's
+        self.assertEqual(" ".join(row[8:]), "h 1 / o 2")
+
+    def test_all_approvers_stamp_and_since(self):
+        out = self.stats("--approvers")
+        for name in ("Tester", "Bob", "Carol"):
+            self.assertRegex(out, rf"(?m)^{name} ")
+        self.assertEqual(self.line(out, "Carol").split()[1:3], ["1", "0"])  # from its stamp
+        self.assertNotIn("hu 1", out)  # the October row is out of range
+        self.assertRegex(out, r"2026-W45  landed 3  esc 33%")
+        self.assertNotIn("(n<3)", out)
+
+    def test_unknown_approver(self):
+        f = self.task_file("T-007")
+        f.write_text(f.read_text().replace("approved: ", "approved: ???? ", 1))
+        with (self.root / "tasks" / "runs" / "history.jsonl").open("a") as h:
+            h.write(json.dumps({"at": "2026-11-03T10:00:00+00:00", "task": "T-010", "epic": None,
+                                "event": "approved", "tier": "haiku"}) + "\n")
+        self.assertRegex(self.stats("--approvers"), r"(?m)^\(unknown\) +1 ")
+
+    def test_no_approvals_no_section(self):
+        (self.root / "tasks" / "runs" / "history.jsonl").write_text("")
+        f = self.task_file("T-008")
+        f.write_text(re.sub(r"^approved:.*$", "approved:", f.read_text(), flags=re.M))
+        self.assertNotIn("approver signals", self.ergon("stats").stdout)
+        self.assertNotIn("approver signals", self.ergon("stats", "--approvers").stdout)
+
+
 class TestLimits(DispatchProject):
     def test_parse_reads_the_five_hour_window(self):
         from ergon import limits

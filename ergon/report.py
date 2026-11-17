@@ -20,6 +20,7 @@ from pathlib import Path
 from . import config as _config
 from . import dispatch as _dispatch
 from . import gitops as _gitops
+from . import history as _history
 from . import limits as _limits
 from . import shared as _shared
 from . import tasks as _tasks
@@ -114,6 +115,45 @@ def stats(args):
             print(f"  {tid} x{n}  {tasks[tid].get('title', '')}")
     if r["skipped"]:
         print(f"\nskipped {r['skipped']} unreadable or unmatched log(s)")
+    approver_section(tasks, args)
+
+
+MIX = {"haiku": "h", "sonnet": "s", "opus": "o", "human": "hu"}
+
+
+def _mix(tiers):
+    order = [*_tasks.TIERS, *(k for k in tiers if k not in _tasks.TIERS)]
+    return " / ".join(f"{MIX.get(k, k)} {tiers[k]}" for k in order if tiers.get(k)) or "-"
+
+
+def approver_section(tasks, args):
+    """Print each approver's signals (own record by default). Prints nothing without approvals."""
+    from . import gates as _gates  # gates imports this module
+    sig = _history.approver_signals(tasks, _history.read(), since=args.since, epic=args.epic)
+    if not getattr(args, "approvers", False):
+        name = getattr(args, "approver", None) or _gates.approver()
+        sig = {name: sig[name]} if name in sig else {}
+    if not sig:
+        return
+    pc = lambda n, d: f"{100 * n / d:.0f}%" if d else "-"
+    print("\napprover signals (not verdicts: a block or veto can come from the environment, the code "
+          "or the worker, not only the brief)")
+    w = max(8, *(len(n) for n in sig)) + 2
+    print(f"{'approver':<{w}}{'approved':>9}{'landed':>7}{'esc%':>6}{'block%':>8}{'asked%':>8}"
+          f"{'fixes/landed':>13}{'sent back%':>11}  tier mix")
+    for name, a in sorted(sig.items()):
+        n = a["approved"]
+        print(f"{name:<{w}}{n:>9}{a['landed']:>7}{pc(a['escalated'], n):>6}{pc(a['blocked'], n):>8}"
+              f"{pc(a['asked'], n):>8}{(a['fails'] / a['landed'] if a['landed'] else 0):>13.2f}"
+              f"{pc(a['sent_back'], n):>11}  {_mix(a['tiers'])}")
+    for name, a in sorted(sig.items()):
+        if not a["weeks"]:
+            continue
+        print(f"\n{name}, by ISO week of landing")
+        for wk, v in sorted(a["weeks"].items()):
+            print(f"  {wk}  landed {v['landed']}  esc {pc(v['escalated'], v['landed'])}  "
+                  f"fixes/landed {v['fails'] / v['landed']:.2f}  {_mix(v['tiers'])}"
+                  + ("  (n<3)" if v["landed"] < 3 else ""))
 
 
 def last_note(t):
