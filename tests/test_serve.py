@@ -146,6 +146,19 @@ class TestServe(ServeFixture):
         self.assertEqual(re.findall(r"<script[^>]*>", page), [f'<script nonce="{nonce}">'])
         self.assertIn("&lt;script&gt;", page)  # T-004's title, escaped
 
+    def test_limited_and_asking_marks(self):
+        f = self.task_file("T-002")
+        f.write_text(re.sub(r"^status: \w+$", "status: blocked\nlimited: 2030-01-01T09:30:00Z worker",
+                            f.read_text(), flags=re.M))
+        f = self.task_file("T-003")
+        f.write_text(re.sub(r"^status: \w+$", "status: blocked\nasking: sess-1", f.read_text(), flags=re.M))
+        want = S._limits.clock(S._tasks.limited_mark("2030-01-01T09:30:00Z worker")[0])
+        self.assertIn(f"limited until {want}", self.req("GET", "/")[2])
+        self.assertIn(f"limited until {want}", self.req("GET", "/t/T-002")[2])
+        self.assertIn("<span class=park>asking</span>", self.req("GET", "/")[2])
+        self.assertIn("<span class=park>asking</span>", self.req("GET", "/t/T-003")[2])
+        self.assertNotIn("class=park", self.req("GET", "/t/T-001")[2])
+
     def test_live_json(self):
         code, headers, body = self.req("GET", "/live.json")
         self.assertEqual(code, 200)
