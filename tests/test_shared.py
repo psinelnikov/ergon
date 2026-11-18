@@ -231,6 +231,23 @@ class TestMerge(Shared):
         self.assertIn("tier_why: Edited on B", text)  # the rest of B's edit still merges (outside the brief, so the approval holds)
         self.assertIn("sync: dropped Tester's ready->blocked, remote had moved to doing", text)
 
+    def test_limited_stays_with_its_status(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from ergon import shared
+        self.assertIn("limited", shared.STATUS_BOUND)
+        def doc(status, limited=None):
+            mark = f"limited: {limited}\n" if limited else ""
+            return f"---\nid: T-001\ntitle: One\ntier: haiku\nstatus: {status}\n{mark}---\n\n## What\nx\n"
+        base = doc("blocked", "2026-01-01T00:00:00Z")
+        ours = doc("doing")  # the claim moved it and cleared the mark
+        theirs = doc("blocked", "2026-02-02T00:00:00Z")  # the remote only re-marked it
+        from unittest import mock
+        with mock.patch.object(shared, "remote", lambda: "origin"), \
+                mock.patch.object(shared, "local_name", lambda: "Tester"):
+            text = shared.merge_item("T-001", base, ours, theirs)[0]
+        self.assertIn("status: doing", text)
+        self.assertNotIn("limited:", text)
+
     def test_a_status_move_the_remote_didnt_race_applies(self):
         self.approved_start()
         self.ergon(self.a, "set", "T-001", "tier_why=Edited on A")

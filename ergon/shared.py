@@ -218,11 +218,11 @@ def is_ancestor(a, b):
 
 NOTES = "## Notes"
 # Fields written together with a status move: approve stamps a task ready, dispatch's asking:
-# parks it blocked, `ergon answer` leaves answered: on a ready task. They come from whichever
+# parks it blocked, `ergon answer` leaves answered: on a ready task, a usage-limit stop marks a blocked task limited:. They come from whichever
 # side's status wins, never mixed, so a merge can't pair one side's status with the other's stamp.
 # After the merge, restamp() recomputes `approved:` of every open task from the verified signed
 # approvals (gitops.approvals), so it is never merged as text.
-STATUS_BOUND = ("approved", "asking", "answered")
+STATUS_BOUND = ("approved", "asking", "answered", "limited")
 # An epic's `breakdown:` is dispatch's claim on breaking it down (dispatch.py, "breakdown
 # claims"). It merges three-way like any field, which makes it compare-and-set: every claim is a
 # value of its own, so a field both sides changed means two claims, and the remote's stands.
