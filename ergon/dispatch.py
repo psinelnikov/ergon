@@ -553,7 +553,10 @@ def file_found(t, found, epics):
     made = []
     for title, why, extra in found:
         tid = _tasks.next_id(_config.ITEMS, "T")
-        what = (why[:1].upper() + why[1:] + " " if why else "") + \
+        why = why[:1].upper() + why[1:] if why else ""
+        if why and why[-1] not in ".!?":
+            why += "."
+        what = (why + " " if why else "") + \
             f"Found by {t['id']} while working it ({extra.get('log') or 'no log'})."
         body = _tasks.TASK_BODY.replace("## What\n", f"## What\n{what}\n", 1)
         if extra.get("done"):

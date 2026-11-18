@@ -741,7 +741,7 @@ class TestDispatch(DispatchProject):
         self.assertIn("## Done when\n- z holds\n- w too\n", text)
         self.assertIn("tier: haiku\n", text)
         self.assertIn("tier_why: one line\n", text)
-        self.assertIn("## What\nY breaks Found by T-001 while working it (", text)
+        self.assertIn("## What\nY breaks. Found by T-001 while working it (", text)
         text = self.task_file("T-003").read_text()
         self.assertIn("tier: opus\n", text)
         self.assertIn("tier_why: tier of the task that found it (T-001); size it before approving", text)
@@ -754,7 +754,7 @@ class TestDispatch(DispatchProject):
         text = self.task_file("T-002").read_text()
         self.assertIn("tier: sonnet\n", text)
         self.assertIn("touches: []", text)
-        self.assertIn("Y Found by T-001 while working it (", text)
+        self.assertIn("Y. Found by T-001 while working it (", text)
         self.assertIn("tier_why: tier of the task that found it (T-001); size it before approving", text)
 
     def test_found_lines_keep_code_spans(self):
@@ -767,13 +767,13 @@ class TestDispatch(DispatchProject):
         self.assertIn("3 proposed", out)
         text = self.task_file("T-002").read_text()
         self.assertIn("title: `ergon dispatch` filing tasks\n", text)
-        self.assertIn("## What\n`[[two_person]]`, the flow Found by T-001", text)
+        self.assertIn("## What\n`[[two_person]]`, the flow. Found by T-001", text)
         text = self.task_file("T-003").read_text()
         self.assertIn("title: Fix alpha\n", text)
-        self.assertIn("## What\nIt breaks Found by T-001", text)
+        self.assertIn("## What\nIt breaks. Found by T-001", text)
         text = self.task_file("T-004").read_text()
         self.assertIn("title: Fix beta\n", text)
-        self.assertIn("## What\nWrapped whole Found by T-001", text)
+        self.assertIn("## What\nWrapped whole. Found by T-001", text)
 
     def test_md_trim(self):
         from ergon.dispatch import md_trim
