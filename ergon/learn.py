@@ -357,7 +357,9 @@ def file_class(c, inc):
 
 def join(t, ids, inc):
     """Add incidents to a proposed harden task's `harden:` and a line to its Notes; every
-    other byte stays. Neither is in the brief digest, so an approval in progress still holds.
+    other byte stays. `harden:` is in the brief digest, so the join changes the task's digest: an
+    approval in progress goes stale (a first of two approvals). Only proposed tasks are joined, so
+    an approved task's digest never changes this way.
     Returns the ids actually added. Caller holds the state lock."""
     have = _dispatch.harden_ids(t)
     add = [i for i in ids if i not in have]
