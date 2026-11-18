@@ -2887,6 +2887,7 @@ def dispatch(args):
     breaks, broken = [], set()  # this run's breakdowns (their info), and the epics they ran on
     bheld = {}  # shared mode: epic id -> the other dispatcher's breakdown claim last reported
     learns, learn_asked = [], set()  # this run's learn runs (their info), and the incidents they sent
+    first_ready = None  # ids ready at the run's first scan; a launch of any other says it was approved meanwhile
     cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
     capped = stopped = False
     paused = 0.0
@@ -3668,6 +3669,8 @@ def dispatch(args):
                             if cap is not None and spent() >= cap:
                                 capped = True
                             queue = [] if capped or unsynced or limit_wait else list(eligible(_tasks.load(_config.ITEMS)))
+                            if first_ready is None and not unsynced and not limit_wait:
+                                first_ready = {t["id"] for t in queue}
                             while queue and len(running) < args.jobs:
                                 t = queue.pop(0)
                                 # an auto-approved follow-up isn't one of the --max, but follow_ups bounds them
@@ -3725,7 +3728,8 @@ def dispatch(args):
                                                 **({"after": "limit", "step": lim[1]} if lim else {}))
                                 print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
                                       + also(t) + (f"  (after the usage limit: {limit_step_text(lim[1])})" if lim else "")
-                                      + f"  {t['title']}")
+                                      + f"  {t['title']}"
+                                      + ("" if follow or lim or t["id"] in first_ready else "  (approved during this run)"))
                                 row = (limited_row(t) or {"step": lim[1]}) if lim else None
                                 running[pool.submit(one, t, base, wt, branch, pubs, answered, row)] = t["id"]
                                 active[t["id"]] = t
@@ -3788,7 +3792,7 @@ def dispatch(args):
                                       f"{_limits.clock(paused)}" + ("; --watch waits for it" if args.watch else
                                                                     "; running workers finish"), flush=True)
                         scan = True
-                    if args.watch and time.monotonic() >= next_scan:
+                    if (args.watch or running) and time.monotonic() >= next_scan:
                         scan = True
         finally:
             signal.signal(signal.SIGINT, old_handler)

@@ -1089,6 +1089,29 @@ class TestDispatch(DispatchProject):
         self.assertEqual(self.status("T-003"), "done", out)
         self.assertIn("budget cap", out)
 
+    def test_non_watch_run_launches_tasks_approved_mid_run_beside_it(self):
+        for n, touches in (("A", "a.txt"), ("B", "b.txt"), ("C", "a.txt")):
+            self.ergon("new", "task", f"Job {n}", "--tier", "sonnet", "--touches", touches)
+        stamp(self.task_file("T-001"))
+        self.env["FAKE_SLEEP"] = "6"
+        p = subprocess.Popen([sys.executable, str(ERGON), "dispatch", "--interval", "0.2", "--jobs", "3"],
+                             cwd=self.root, env=self.env, text=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
+        self.wait_status("T-001", "doing", p)
+        stamp(self.task_file("T-002"))  # disjoint: launches beside T-001
+        stamp(self.task_file("T-003"))  # shares a.txt with T-001: held
+        self.wait_status("T-002", "doing", p)
+        self.assertEqual(self.status("T-001"), "doing")
+        import time
+        time.sleep(1)
+        self.assertEqual(self.status("T-003"), "ready")
+        out = p.communicate(timeout=60)[0]
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.status("T-003"), "done", out)  # launched once T-001 landed
+        self.assertRegex(out, r"doing\s+T-002.*\(approved during this run\)")
+        self.assertRegex(out, r"doing\s+T-003.*\(approved during this run\)")
+        self.assertNotRegex(out, r"doing\s+T-001.*approved during")
+
     def test_watch_ctrl_c_lets_workers_finish_and_second_kills(self):
         import signal, time
         for n in "AB":
