@@ -23,6 +23,7 @@ The project's own rules (tier signals that are specific to it, hosts that need a
 ## The one rule: humans approve, agents execute
 
 - Every task an agent creates starts `status: proposed`. That includes tasks from breaking down an epic.
+- **Epics are gated the same way.** Agents may propose epics: `ergon new epic` writes `status: proposed`. Only a human's `ergon approve E-NNN` approves the brief (Goal / Out of scope / Constraints), stamps `approved:` and opens the epic. Until then `next`, `start`, `set … status=doing` and dispatch leave its tasks alone, even approved ones. Once it's open, `ergon approve E-NNN` approves its proposed tasks, as before. In shared mode the epic's approval is signed over its brief's digest like a task's, so editing an approved Goal un-approves the epic: its tasks stop being offered, `check` fails, and a human approves it again. Epics from before this rule (open or done with no `approved:`) count as approved. `set` won't move an epic into or out of `proposed`, and the guard refuses agent edits of an epic file's `status:` or `approved:`, and a new `EPIC.md` that isn't `proposed`.
 - Only a human moves a task to `ready`: either `ergon approve <ID|E-ID>` from their own terminal (it refuses inside agent shells and asks for confirmation), or by hand-editing `status: ready` + `approved: <name> <date>`.
 - **Agents never write `approved:`, never set `status: ready` on a proposed task, and never work a task that isn't `ready`.** `ergon set` enforces this, and `ergon check` fails on any task past `proposed` that has no stamp. The plugin's PreToolUse hook (`ergon hook guard`) also refuses agent edits that change a task file's `status:`, `approved:`, `asking:`, `answered:` or `pin:`, shell writes to task files, any write to `<state>/runs/` (`history.jsonl` and the run logs), `approve`/`reject`/`close`/`accept`/`answer`/`pin`/`review -i`, and touching `CLAUDECODE`/`AI_AGENT`.
   Its Stop hook runs `check` once before a session ends. All of it is a speed bump, not security. Bypassing it breaks this rule. (The guard refuses edits to `pin:` as well.)
@@ -123,13 +124,13 @@ The body sections stay short. Cite `file:line`. Don't restate the spec.
 
 **A task with no epic** (in `items/`) is a change that makes sense on the trunk by itself: a bug fix, a doc-drift pass, a config fix. Several such tasks that only share a theme don't need an epic. Grouping them would hold every fix back until the last one lands.
 
-The quick test: if the work fits one tier and one Done when, and could merge to the trunk alone, it's a task. If it takes several of those that only make sense together, it's an epic. By convention a human writes the epic (nothing enforces it), since its Goal and scope are the human's call. An agent that finds work too big for one task proposes the tasks it can see and tells the human an epic may be needed, rather than creating one.
+The quick test: if the work fits one tier and one Done when, and could merge to the trunk alone, it's a task. If it takes several of those that only make sense together, it's an epic. Its Goal and scope are the human's call, so an agent may propose one but never opens it: an agent that finds work too big for one task runs `ergon new epic "Title"` (it starts `proposed`), fills in Goal / Out of scope / Constraints, files the tasks it can see under it with `--epic`, and tells the human. Nothing in the epic runs until a human approves its brief with `ergon approve E-NNN`.
 
 ## Epics → tasks
 
-1. A human writes the epic: `ergon new epic "Title"`, then fills in Goal / Out of scope / Constraints.
+1. A human or an agent writes the epic: `ergon new epic "Title"` (it starts `proposed`), then fills in Goal / Out of scope / Constraints. A human approves the brief with `ergon approve E-00N`, which opens it. `ergon review` lists proposed epics under EPICS AWAITING APPROVAL.
 2. When asked to "break down E-00N", an agent (opus) reads the epic and the source. It then creates tasks with `ergon new task … --epic E-00N`, one change or one human action each. It fills in What / Done when / `tier`/`tier_why`/`depends`/`touches` and **stops**. It doesn't start any of them.
-3. The human runs `ergon review`, edits or rejects what's wrong, and runs `ergon approve E-00N` to approve the rest at once.
+3. The human runs `ergon review`, edits or rejects what's wrong, and runs `ergon approve E-00N` to approve the rest at once. On an epic that is still `proposed`, that first approves only the brief; running it again approves the tasks.
 4. When every task is done or dropped, the epic closes and its branch merges into the trunk (see below).
 
 Re-breaking an epic later only adds new `proposed` tasks. It never edits approved ones.

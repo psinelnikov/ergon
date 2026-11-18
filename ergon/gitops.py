@@ -214,7 +214,11 @@ def start(args):
     if not e:
         raise SystemExit(f"no such epic: {args.id}")
     if e["status"] != "open":
-        raise SystemExit(f"{args.id} is {e['status']}")
+        raise SystemExit(f"{args.id} is {e['status']}" + (
+            f": a human approves its brief first with `ergon approve {args.id}`" if e["status"] == "proposed" else ""))
+    why = _tasks.epic_problem(e, approvals())
+    if why:
+        raise SystemExit(f"refused: {why}")
     _shared.ensure_published([args.id])  # shared mode: an unpublished epic ID can still be renumbered
     try:
         where = open_epic(e)
@@ -466,7 +470,7 @@ APPROVE_TRAILER = "Ergon-Approve"
 ACCEPT_TRAILER, REJECT_TRAILER, CLOSE_TRAILER = "Ergon-Accept", "Ergon-Reject", "Ergon-Close"
 TRUNK_REF = "refs/ergon/trunk"  # the trunk as last fetched from the [shared] remote
 GATED = ("ready", "doing", "review", "blocked")  # open statuses whose approval must verify
-APPROVE_VALUE = re.compile(r"^(T-\d{3,})\s+sha256:([0-9a-f]{64})$")
+APPROVE_VALUE = re.compile(r"^([TE]-\d{3,})\s+sha256:([0-9a-f]{64})$")  # a task's brief, or an epic's
 
 
 def approvers_path():

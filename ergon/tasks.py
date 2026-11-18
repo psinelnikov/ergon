@@ -30,7 +30,8 @@ from . import shared as _shared
 
 TIERS = ["haiku", "sonnet", "opus", "human"]
 TASK_STATUSES = ["proposed", "ready", "doing", "review", "blocked", "done", "dropped"]
-EPIC_STATUSES = ["open", "done", "dropped"]
+# An epic starts proposed; a human's `approve E-NNN` approves its brief and opens it.
+EPIC_STATUSES = ["proposed", "open", "done", "dropped"]
 # Statuses a task can only reach after a human approved it.
 NEEDS_APPROVAL = {"ready", "doing", "review", "blocked", "done"}
 # Transitions `set` allows. proposed -> ready is approve's job, not set's. Only dispatch moves a
@@ -42,7 +43,7 @@ AGENT_MOVES = {
 }
 TASK_KEYS = ["id", "title", "tier", "status", "epic", "depends", "touches", "source",
              "created", "approved", "tier_why"]
-EPIC_KEYS = ["id", "title", "status", "created"]
+EPIC_KEYS = ["id", "title", "status", "created", "approved"]
 
 
 # ---------- file format ----------
@@ -126,8 +127,10 @@ def today():
 # docs/shared-state.md, "Trusting approval stamps". An approval covers the brief: id, title, tier,
 # touches, accept and the What and Done when sections. status, depends, epic and Notes are left
 # out: dispatch moves status and adds dependencies to blocked tasks, and Notes are scratch.
+# An epic's approval covers its id, title and the Goal, Out of scope and Constraints sections.
 
 DIGEST_SECTIONS = ("what", "done when")
+EPIC_DIGEST_SECTIONS = ("goal", "out of scope", "constraints")
 HEADING = re.compile(r"^#{1,2}\s+(.*?)\s*$")
 
 
@@ -161,9 +164,20 @@ def normalised(text):
     return "\n".join(lines)
 
 
+def is_epic(item):
+    return str(item.get("id") or "").startswith("E-")
+
+
 def brief_digest(t):
-    """sha256 (hex) of what approving t approves. Notes, status, depends and epic don't change it."""
+    """sha256 (hex) of what approving t (a task or an epic) approves. Notes, status, depends and
+    epic don't change it."""
     body = t.get("_body") or ""
+    if is_epic(t):
+        doc = {"kind": "epic", "id": str(t.get("id") or "").strip(),
+               "title": " ".join(str(t.get("title") or "").split())}
+        for name in EPIC_DIGEST_SECTIONS:
+            doc[name] = normalised(sections(body, name))
+        return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     doc = {
         "id": str(t.get("id") or "").strip(),
         "title": " ".join(str(t.get("title") or "").split()),
@@ -174,6 +188,33 @@ def brief_digest(t):
     for name in DIGEST_SECTIONS:
         doc[name] = normalised(sections(body, name))
     return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+# ---------- is an epic approved? ----------
+# An epic is filed `proposed`; a human's `approve E-NNN` stamps `approved:` and opens it. Epics
+# from before epics were approved (open or done, with no stamp) are grandfathered: they count as
+# approved. Nothing makes a new one: `new epic` writes proposed, `set` won't move an epic out of
+# proposed, and the guard refuses an agent's status edit or a new EPIC.md that isn't proposed.
+# In shared mode a stamp counts only if a signed approval of the brief verifies, as a task's does.
+
+def epic_problem(e, apr=None):
+    """Why tasks of epic e mustn't be offered or started (its brief isn't approved), or None.
+    apr: gitops.approvals() in shared mode. None for no epic (a task without one)."""
+    if not e:
+        return None
+    eid, status = e["id"], e.get("status")
+    if status == "proposed":
+        return f"epic {eid} is proposed: a human approves its brief with `ergon approve {eid}`"
+    if status == "dropped":
+        return f"epic {eid} is dropped"
+    if not e.get("approved"):
+        return None  # grandfathered
+    why = apr.problem(e) if apr else None
+    return f"epic {eid}'s approval doesn't verify: {why}" if why else None
+
+
+def epic_of(t, epics):
+    return epics.get(t.get("epic")) if t.get("epic") else None
 
 
 # ---------- views ----------
@@ -267,7 +308,7 @@ def two_person(t):
     """Does t need approvals from two different approvers ([[two_person]], shared mode only)? It is
     matched against the task as it is now, so retiering it into or out of a rule changes the answer
     (and its digest, so earlier approvals stop counting either way)."""
-    return bool(_config.SHARED) and any(rule_hit(rule, t) for rule in _config.TWO_PERSON)
+    return bool(_config.SHARED) and not is_epic(t) and any(rule_hit(rule, t) for rule in _config.TWO_PERSON)
 
 
 def board(args):
@@ -293,20 +334,23 @@ def board(args):
             pending = sum(t["status"] == "proposed" for t in kids)
             note = f", {pending} awaiting approval" if pending else ""
             note += "  <- needs breakdown" if not kids and e["status"] == "open" else ""
+            note += "  <- brief awaiting approval" if e["status"] == "proposed" else ""
             note += f"  on {_gitops.epic_branch(e)}" if e["status"] == "open" and _gitops.branch_exists(_gitops.epic_branch(e)) else ""
-            print(f"  {e['id']}  {e['status']:<7} {done}/{len(kids)} done{note}  {e['title']}")
+            print(f"  {e['id']}  {e['status']:<8} {done}/{len(kids)} done{note}  {e['title']}")
     counts = {tier: sum(t["tier"] == tier and t["status"] not in ("done", "dropped")
                         for t in tasks.values()) for tier in TIERS}
     print("\nOPEN BY TIER  " + "  ".join(f"{k}:{v}" for k, v in counts.items()))
 
 
 def nxt(args):
-    tasks = load(_config.ITEMS)
+    tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     ok = [t for t in tasks.values() if t["status"] == "ready" and deps_done(t, tasks)
           and (not args.tier or t["tier"] == args.tier)]
     apr = _gitops.approvals()  # shared mode: only tasks whose signed approval verifies
     hidden = [t for t in ok if apr and apr.problem(t)]
     ok = [t for t in ok if t not in hidden]
+    waiting = [t for t in ok if epic_problem(epic_of(t, epics), apr)]  # its epic's brief isn't approved
+    ok = [t for t in ok if t not in waiting]
     from . import priority as _pri
     for t in sorted(ok, key=lambda t: _pri.sort_key(t, tasks)):
         print(line(t, tasks))
@@ -315,6 +359,12 @@ def nxt(args):
     if hidden:
         print(f"({len(hidden)} ready task(s) left out because their approval doesn't verify: "
               f"{', '.join(sorted(t['id'] for t in hidden))}; `ergon check` says why)")
+    if waiting:
+        why = {}
+        for t in waiting:
+            why.setdefault(epic_problem(epic_of(t, epics), apr), []).append(t["id"])
+        for w, ids in sorted(why.items()):
+            print(f"({len(ids)} ready task(s) left out because {w}: {', '.join(sorted(ids))})")
 
 
 def review(args):
@@ -322,6 +372,13 @@ def review(args):
         return _gates.review_interactive(args)
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     waiting = [t for t in tasks.values() if t["status"] == "proposed"]
+    briefs = sorted((e for e in epics.values() if e.get("status") == "proposed"), key=lambda e: e["id"])
+    if briefs:
+        print(f"\nEPICS AWAITING APPROVAL ({len(briefs)}): approving one approves its brief "
+              f"(Goal, Out of scope, Constraints) and opens it; its tasks wait until then")
+        for e in briefs:
+            kids = sum(t.get("epic") == e["id"] and t["status"] != "dropped" for t in tasks.values())
+            print(f"  {e['id']}  {e['title']}  ({kids} task(s))")
     by_epic = {}
     for t in waiting:
         by_epic.setdefault(t.get("epic") or "", []).append(t)
@@ -335,7 +392,7 @@ def review(args):
                 print(f"         why {t['tier']}: {t['tier_why']}")
             if apr and two_person(t):
                 print(f"         two-person: {apr.tally(t)}")
-    if not waiting:
+    if not waiting and not briefs:
         print("nothing awaiting approval")
     else:
         print("\napprove from your own terminal:  ergon approve <ID|E-ID> ...")
@@ -443,7 +500,7 @@ def new(args):
         eid = next_id(_config.EPICS, "E")
         home = _config.EPICS / f"{eid}-{slug(args.title)}"
         home.mkdir()
-        meta = {"id": eid, "title": args.title, "status": "open", "created": today(),
+        meta = {"id": eid, "title": args.title, "status": "proposed", "created": today(), "approved": "",
                 "_path": home / _config.EPIC_FILE, "_body": EPIC_BODY}
         dump(meta, EPIC_KEYS)
         _history.record("created", meta, title=args.title, by="new")
@@ -834,6 +891,11 @@ def lint():
     for e in epics.values():
         if e.get("status") not in EPIC_STATUSES:
             errs.append(f"{e['id']}: status {e.get('status')!r} not in {EPIC_STATUSES}")
+        # shared mode: an open epic's stamp must verify (a signed approval of its current brief).
+        # An open epic with no stamp is from before epics were approved, and counts as approved.
+        why = apr.problem(e) if apr and e.get("status") == "open" and e.get("approved") else None
+        if why:
+            errs.append(f"{e['id']}: open, but its approval doesn't verify: {why}")
     # Map cards link gaps to tasks with a trailing "→ task T-012[, T-013]".
     for card in sorted(_config.MAP.rglob("*.md")) if _config.MAP and _config.MAP.is_dir() else []:
         for n, text in enumerate(card.read_text().splitlines(), 1):

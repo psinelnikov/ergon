@@ -690,7 +690,9 @@ def restamp(say=print):
     """Rewrite each open task's `approved:` from what verifies (gitops.approvals): the signer and
     date of its approval and the digest, or empty when its approval doesn't verify. Done and
     dropped tasks are history and keep theirs. Changes nothing when no approval can be verified at
-    all (no approvers file yet, say), which is reported. The caller holds the state lock; commits."""
+    all (no approvers file yet, say), which is reported. The caller holds the state lock; commits.
+    Epics are left alone: an open epic with an empty stamp counts as approved (grandfathered), so
+    clearing one whose approval doesn't verify would approve it. `check` reports those instead."""
     apr = _gitops.approvals()
     if apr is None:
         return []

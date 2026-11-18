@@ -63,6 +63,13 @@ def setf(args):
             raise SystemExit(f"tier must be one of {_tasks.TIERS}")
         if not is_task and key == "status" and val not in _tasks.EPIC_STATUSES:
             raise SystemExit(f"epic status must be one of {_tasks.EPIC_STATUSES}")
+        if not is_task and key == "status" and "proposed" in (val, item.get("status")) and val != item.get("status"):
+            raise SystemExit(f"{args.id}: {item.get('status')} -> {val} not allowed via set: a proposed epic is "
+                             f"opened by a human's `ergon approve {args.id}` (dropping one is a human's edit too)")
+        if is_task and key == "status" and val == "doing":
+            why = _tasks.epic_problem(epic, _gitops.approvals())
+            if why:
+                raise SystemExit(f"{args.id} can't start: {why}")
         if key in ("depends", "touches"):
             val = [v for v in val.split(",") if v]
         item[key] = val
@@ -182,16 +189,17 @@ def stamp_approved(todo):
             trailers.append(f"{_gitops.APPROVE_TRAILER}: {t['id']} sha256:{digest}")
             if t["id"] in two:
                 continue
+            epic = _tasks.is_epic(t)  # an epic's brief: proposed -> open
             if t["status"] == "proposed":
-                t["status"] = "ready"
+                t["status"] = "open" if epic else "ready"
             t["approved"] = f"{stamp} sha256:{digest[:8]}" if shared else stamp
-            _tasks.dump(t, _tasks.TASK_KEYS)
+            _tasks.dump(t, _tasks.EPIC_KEYS if epic else _tasks.TASK_KEYS)
         if shared:
             _gitops.sign_state("approve", trailers, [t["_path"] for t in todo if t["id"] not in two])
         apr = _gitops.approvals() if shared else None
         for t in todo:
             if t["id"] not in two:
-                _history.record("approved", t, by=approver(), tier=t["tier"])
+                _history.record("approved", t, by=approver(), tier=t.get("tier") or None)
                 continue
             # the files change after the signed commit, from what it verifies as: committed
             # unsigned as the lock is released, like sync's restamp, since they grant nothing
@@ -225,6 +233,14 @@ def stamp_approved(todo):
     return waiting
 
 
+def brief_due(e, apr):
+    """Does approving epic e mean approving its brief? It's proposed, or (shared mode) open with
+    an approved: stamp that doesn't verify. An open epic with no stamp is grandfathered."""
+    if e.get("status") == "proposed":
+        return True
+    return bool(apr and e.get("status") == "open" and e.get("approved") and apr.problem(e))
+
+
 def approve(args):
     approve_ready()
     # With [[two_person]] rules, sync before and after: whether a task matches a rule, and whose
@@ -233,35 +249,58 @@ def approve(args):
     if count:
         sync_for_count(args.ids)
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
-    named = targets(args.ids, tasks, epics)
+    apr = _gitops.approvals()
+    # An epic ID whose brief needs a human's approval (proposed, or in shared mode open with a
+    # stamp that doesn't verify) approves the brief alone: its tasks are approved by naming the
+    # epic again once it's open, so each approval is of something the human has read.
+    briefs = [epics[i] for i in dict.fromkeys(args.ids) if i in epics and brief_due(epics[i], apr)]
+    named = targets([i for i in args.ids if i not in {e["id"] for e in briefs}], tasks, epics)
     todo = [t for t in named if t["status"] == "proposed"]
     # shared mode: an approved task whose approval no longer verifies (its brief was edited, or it
     # was stamped by hand) is approved again by naming it; its status stays
-    apr = _gitops.approvals()
     again = {t["id"]: why for t in named if apr and t["id"] in args.ids and t["status"] in ("ready", "blocked")
              and (why := apr.problem(t))}
+    again.update((e["id"], apr.problem(e)) for e in briefs if e["status"] == "open")
     todo += [t for t in named if t["id"] in again]
+    todo = briefs + todo
     if not todo:
         raise SystemExit("nothing in `proposed` among those ids" + (
-            ", nor an approved task whose approval doesn't verify" if apr else ""))
+            ", nor an approved task or epic whose approval doesn't verify" if apr else ""))
     # shared mode: an unpublished ID can still be renumbered, so sync first (or refuse)
     _shared.ensure_published([t["id"] for t in todo] + [i for i in args.ids if i in epics])
-    tasks = _tasks.load(_config.ITEMS)
-    gone = [t["id"] for t in todo if tasks[t["id"]]["status"] != t["status"]]  # a sync moved it on
+    tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
+    now = lambda t: (epics if _tasks.is_epic(t) else tasks).get(t["id"], {})
+    gone = [t["id"] for t in todo if now(t).get("status") != t["status"]]  # a sync moved it on
     if gone:
         print(f"left out, their status changed in the sync: {', '.join(gone)}")
-    todo = [tasks[t["id"]] for t in todo if t["id"] not in gone]
+    todo = [now(t) for t in todo if t["id"] not in gone]
     if not todo:
         raise SystemExit("nothing left to approve")
     apr = _gitops.approvals() if count else apr
     for t in todo:
+        if _tasks.is_epic(t):
+            print(f"  {t['id']}  epic    {t['title']}  (its brief: Goal, Out of scope, Constraints)"
+                  + (f"  (approve again: {again[t['id']]})" if t["id"] in again else ""))
+            for name in _tasks.EPIC_DIGEST_SECTIONS:
+                text = _tasks.normalised(_tasks.sections(t.get("_body") or "", name))
+                print(f"      {name.capitalize()}: " + ("\n        ".join(text.split("\n")) if text else "(empty)"))
+            continue
         print(_tasks.line(t, tasks) + (f"  (approve again: {again[t['id']]})" if t["id"] in again else "")
               + (f"  (two-person: {apr.tally(t)})" if _tasks.two_person(t) else ""))
-    if not human_gate(f"Approve these {len(todo)} task(s) as {approver()}?"):
+    n_epics = sum(map(_tasks.is_epic, todo))
+    what = " and ".join(x for x in (f"{n_epics} epic brief(s)" if n_epics else "",
+                                    f"{len(todo) - n_epics} task(s)" if len(todo) > n_epics else "") if x)
+    if not human_gate(f"Approve these {what} as {approver()}?"):
         raise SystemExit("aborted")
     waiting = stamp_approved(todo)
     print(f"approved {len(todo) - len(waiting)}"
           + (f"; {len(waiting)} wait for another approver: {', '.join(waiting)}" if waiting else ""))
+    tasks = _tasks.load(_config.ITEMS)
+    for e in (t for t in todo if _tasks.is_epic(t)):
+        left = sum(t.get("epic") == e["id"] and t["status"] == "proposed" for t in tasks.values())
+        if left:
+            print(f"{e['id']} is {e['status']}; its {left} proposed task(s) aren't approved yet: "
+                  f"`ergon approve {e['id']}` again approves them")
     if count:  # publish, so the other approvers see this approval
         sync_for_count([t["id"] for t in todo], after=True)
 
@@ -1253,6 +1292,16 @@ def state_git_reason(cmd, cwd=None):
     return None
 
 
+def is_flat_epic(path):
+    """Is path an epic file written flat in the state's epics/ (`ergon tidy` would move it into a
+    folder as EPIC.md), so the guard's status and approved: rules cover it too?"""
+    try:
+        p = Path(path).resolve()
+        return p.suffix == ".md" and p.parent == _config.EPICS.resolve()
+    except (OSError, ValueError):
+        return False
+
+
 def guard_reason(tool, inp, worker=False, cwd=None):
     """Why this tool call must not run, or None. cwd: where a Bash command runs (the event's)."""
     if worker:
@@ -1283,7 +1332,7 @@ def guard_reason(tool, inp, worker=False, cwd=None):
         return POLICY_MSG
     if is_runs(path):
         return RUNS_MSG
-    if not _config.TASK_FILE.search(path):
+    if not (_config.TASK_FILE.search(path) or is_flat_epic(path)):
         return None
     p = Path(path)
     before = p.read_text() if p.exists() else ""
@@ -1297,9 +1346,14 @@ def guard_reason(tool, inp, worker=False, cwd=None):
     fb, fa = frontmatter(before), frontmatter(after)
     if fb.get("approved", "") != fa.get("approved", ""):
         return "`approved:` is written by a human only (the one rule: `ergon guide`)"
-    if fb.get("status", "") != fa.get("status", "") and not (not before and fa.get("status") in ("proposed", "open")):
+    # A new task or epic file starts proposed: an open epic with no stamp would count as approved
+    # (grandfathered), so an agent's new EPIC.md can't be open.
+    if fb.get("status", "") != fa.get("status", "") and not (not before and fa.get("status") == "proposed"):
         if fb.get("status") == "review":
             return "a task in review leaves it only by a human's `ergon accept` or `ergon reject`, run in their own terminal"
+        if (p.name == _config.EPIC_FILE or is_flat_epic(path)) and (not before or "proposed" in (fb.get("status"), fa.get("status"))):
+            return ("an epic leaves `proposed` only by a human's `ergon approve E-NNN` (it approves the brief); "
+                    "agents file epics with `ergon new epic`, which writes proposed")
         return "change status with `ergon set ID status=…` (it enforces the allowed moves), not by editing the file"
     if fb.get("pin", "") != fa.get("pin", ""):
         return "`pin:` is written by a human's `ergon pin` only"

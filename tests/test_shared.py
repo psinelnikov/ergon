@@ -865,6 +865,61 @@ class TestSignedApprovals(Shared):
         self.ergon(self.a, "sync")
         self.doesnt_count(self.a, "T-001", "brief changed after approval")
 
+    def test_an_epic_brief_approval_is_signed_and_editing_its_goal_unapproves_it(self):
+        self.start()
+        agent = clean_env(CLAUDECODE="1")
+        self.ergon(self.a, "new", "epic", "Big", env=agent)
+        self.ergon(self.a, "new", "task", "Part", "--tier", "haiku", "--epic", "E-001", env=agent)
+        epic = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        epic.write_text(epic.read_text().replace("## Goal\n", "## Goal\nShip the big thing.\n"))
+        self.ergon(self.a, "approve", "T-002", inp="y\n")  # the task, but not its epic's brief
+        r = self.ergon(self.a, "next")
+        self.assertNotIn("  T-002  ", r.stdout)
+        self.assertIn("left out because epic E-001 is proposed", r.stdout)
+        self.assertIn("skipped  T-002  epic E-001 is proposed", self.ergon(self.a, "dispatch", "--dry-run").stdout)
+        r = self.ergon(self.a, "approve", "E-001", inp="y\n")
+        self.assertIn("approved 1", r.stdout)
+        from ergon import tasks as T
+        d = T.brief_digest(T.parse(epic))
+        self.assertIn(f"\n\nErgon-Approve: E-001 sha256:{d}\n", self.head(self.a))
+        self.assertTrue(self.signed(self.a))
+        self.assertRegex(epic.read_text(), rf"\nstatus: open\n(.*\n)*approved: Tester \d{{4}}-\d\d-\d\d sha256:{d[:8]}\n")
+        self.counts(self.a, "T-002")
+        # Notes and status aren't the brief; the Goal is
+        epic.write_text(epic.read_text() + "\n## Notes\n- a note\n")
+        self.counts(self.a, "T-002")
+        epic.write_text(epic.read_text().replace("Ship the big thing.", "Also drop the production database."))
+        r = self.ergon(self.a, "next")
+        self.assertNotIn("  T-002  ", r.stdout)
+        self.assertIn("left out because epic E-001's approval doesn't verify: brief changed after approval", r.stdout)
+        r = self.ergon(self.a, "check", check=False)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("E-001: open, but its approval doesn't verify: brief changed after approval", r.stdout)
+        r = self.ergon(self.a, "dispatch", "--dry-run")
+        self.assertIn("skipped  T-002  epic E-001's approval doesn't verify: brief changed", r.stdout)
+        # sync doesn't clear an epic's stamp (an open epic with none counts as approved)
+        self.assertNotIn("restamped: E-001", self.ergon(self.a, "sync").stdout)
+        self.assertIn("sha256:", epic.read_text())
+        r = self.ergon(self.a, "approve", "E-001", inp="y\n")  # approving it again makes it count
+        self.assertIn("(approve again: brief changed after approval", r.stdout)
+        self.counts(self.a, "T-002")
+        # and it verifies in the other clone too
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        self.counts(self.b, "T-002")
+
+    def test_an_epic_stamp_written_by_hand_doesnt_count(self):
+        self.start()
+        self.ergon(self.a, "new", "epic", "Big")
+        self.ergon(self.a, "new", "task", "Part", "--tier", "haiku", "--epic", "E-001")
+        self.ergon(self.a, "approve", "T-002", inp="y\n")
+        epic = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        epic.write_text(epic.read_text().replace("status: proposed", "status: open")
+                        .replace("approved:", "approved: Tester 2026-01-01"))
+        r = self.ergon(self.a, "check", check=False)
+        self.assertIn("E-001: open, but its approval doesn't verify: no signed approval", r.stdout)
+        self.assertNotIn("  T-002  ", self.ergon(self.a, "next").stdout)
+
     def test_an_approvers_file_only_in_the_working_tree_doesnt_count(self):
         self.start()
         # the remote's trunk loses the file; A still has it checked out, and committed on its own main

@@ -481,6 +481,7 @@ class TestMapAndAudit(Project):
 class TestEpicBranch(Project):
     def test_epic_lifecycle(self):
         self.ergon("new", "epic", "Big thing")
+        approve_epic(self)  # a human approves the brief, which opens it (T-098)
         self.ergon("new", "task", "Part one", "--tier", "sonnet", "--epic", "E-001")
         stamp(self.task_file("T-001"))
         r = self.ergon("set", "T-001", "status=doing", check=False)
@@ -498,6 +499,99 @@ class TestEpicBranch(Project):
         self.assertIn("status: done", (self.root / "tasks/epics").glob("E-001-*/EPIC.md").__next__().read_text())
         branches = sh("git", "branch", "--list", "epic/*", cwd=self.root).stdout
         self.assertEqual(branches.strip(), "")
+
+
+def approve_epic(test, eid="E-001"):
+    """What a human does: approve the epic's brief from their own terminal, which opens it."""
+    r = test.ergon("approve", eid, env=clean_env(ERGON_ASK_STDIN="1"), inp="y\n")
+    test.assertIn("approved 1", r.stdout)
+    return r
+
+
+class TestEpicApproval(Project):
+    """Epics start proposed; a human's `approve E-NNN` approves the brief and opens them (T-098)."""
+
+    def epic_file(self, eid="E-001"):
+        return next((self.root / "tasks" / "epics").glob(f"{eid}-*/EPIC.md"))
+
+    def test_an_agents_epic_is_proposed_and_its_tasks_wait_until_a_human_approves_it(self):
+        agent = clean_env(CLAUDECODE="1")
+        self.ergon("new", "epic", "Big thing", env=agent)
+        text = self.epic_file().read_text()
+        self.assertIn("\nstatus: proposed\n", text)
+        self.assertIn("\napproved:\n", text)
+        self.ergon("new", "task", "Part one", "--tier", "haiku", "--epic", "E-001", env=agent)
+        self.ergon("new", "task", "Part two", "--tier", "haiku", "--epic", "E-001", env=agent)
+        stamp(self.task_file("T-001"))  # a human approved the task, but not its epic's brief
+        self.ergon("check")  # a proposed epic is a fine state to be in
+        self.assertIn("EPICS AWAITING APPROVAL (1)", self.ergon("review").stdout)
+        self.assertIn("E-001  proposed", self.ergon("board").stdout)
+        r = self.ergon("next")
+        self.assertNotIn("  T-001  ", r.stdout)
+        self.assertIn("left out because epic E-001 is proposed", r.stdout)
+        r = self.ergon("dispatch", "--dry-run")
+        self.assertNotIn("would run  T-001", r.stdout)
+        self.assertIn("skipped  T-001  epic E-001 is proposed", r.stdout)
+        r = self.ergon("set", "T-001", "status=doing", check=False, env=agent)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("T-001 can't start: epic E-001 is proposed", r.stderr)
+        r = self.ergon("start", "E-001", check=False, env=agent)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("E-001 is proposed", r.stderr)
+        r = self.ergon("set", "E-001", "status=open", check=False, env=agent)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("proposed -> open not allowed via set", r.stderr)
+        r = self.ergon("approve", "E-001", check=False, env=agent, inp="y\n")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("refused", r.stderr)
+        self.assertIn("status: proposed", self.epic_file().read_text())
+        # the human approves the brief: the epic opens, and only the brief is approved
+        r = approve_epic(self)
+        self.assertIn("E-001  epic    Big thing", r.stdout)
+        self.assertIn("Goal:", r.stdout)
+        self.assertIn("its 1 proposed task(s) aren't approved yet", r.stdout)
+        text = self.epic_file().read_text()
+        self.assertIn("\nstatus: open\n", text)
+        self.assertRegex(text, r"\napproved: Tester \d{4}-\d\d-\d\d\n")
+        self.assertEqual(self.status("T-002"), "proposed")
+        self.assertIn("  T-001  ", self.ergon("next").stdout)
+        self.assertIn("would run  T-001", self.ergon("dispatch", "--dry-run").stdout)
+        # on an open epic, approve E-NNN approves its proposed tasks, as before
+        r = self.ergon("approve", "E-001", env=clean_env(ERGON_ASK_STDIN="1"), inp="y\n")
+        self.assertIn("approved 1", r.stdout)
+        self.assertEqual(self.status("T-002"), "ready")
+        self.assertIn("approved", [e["event"] for e in history(self.root) if e.get("epic") == "E-001" and not e.get("task")])
+        self.ergon("check")
+
+    def test_epics_from_before_approval_count_as_approved(self):
+        home = self.root / "tasks" / "epics" / "E-001-old"
+        home.mkdir(parents=True)
+        (home / "EPIC.md").write_text("---\nid: E-001\ntitle: Old\nstatus: open\ncreated: 2026-01-01\n---\n\n## Goal\nG\n")
+        self.ergon("new", "task", "Part", "--tier", "haiku", "--epic", "E-001")
+        stamp(self.task_file("T-001"))
+        r = self.ergon("check")
+        self.assertNotIn("E-001", r.stdout)
+        self.assertIn("  T-001  ", self.ergon("next").stdout)
+        self.assertIn("would run  T-001", self.ergon("dispatch", "--dry-run").stdout)
+
+    def test_guard_refuses_agent_edits_of_an_epics_status_and_stamp(self):
+        self.ergon("new", "epic", "Big thing")
+        f = str(self.epic_file())
+        why = self.guard("Edit", {"file_path": f, "old_string": "status: proposed", "new_string": "status: open"})
+        self.assertIn("an epic leaves `proposed` only by a human's `ergon approve E-NNN`", why)
+        why = self.guard("Edit", {"file_path": f, "old_string": "approved:", "new_string": "approved: Tester 2026-01-01"})
+        self.assertIn("`approved:` is written by a human only", why)
+        self.assertIsNone(self.guard("Edit", {"file_path": f, "old_string": "## Goal\n", "new_string": "## Goal\nShip.\n"}))
+        approve_epic(self)
+        why = self.guard("Edit", {"file_path": f, "old_string": "status: open", "new_string": "status: dropped"})
+        self.assertIn("change status with `ergon set", why)
+        # a new epic file can't be written open (it would count as approved), only proposed
+        new = str(self.root / "tasks" / "epics" / "E-002-x" / "EPIC.md")
+        body = "---\nid: E-002\ntitle: X\nstatus: {}\ncreated: 2026-01-01\n---\n"
+        self.assertIn("ergon approve E-NNN", self.guard("Write", {"file_path": new, "content": body.format("open")}))
+        self.assertIsNone(self.guard("Write", {"file_path": new, "content": body.format("proposed")}))
+        flat = str(self.root / "tasks" / "epics" / "E-002-x.md")  # `ergon tidy` would file it as EPIC.md
+        self.assertIn("ergon approve E-NNN", self.guard("Write", {"file_path": flat, "content": body.format("open")}))
 
 
 
@@ -531,6 +625,7 @@ class TestImport(Project):
 
     def test_import_then_epic_finish_prints_never_runs_close(self):
         self.ergon("new", "epic", "Fix widgets")
+        approve_epic(self)  # a human approves the brief, which opens it (T-098)
         out = self.ergon("import", "gh#123", "--epic", "E-001").stdout
         self.assertIn("T-001, proposed, tier human", out)
         text = self.task_file("T-001").read_text()
@@ -2119,6 +2214,7 @@ class TestAccept(DispatchProject):
 
     def test_review_holds_then_accept_lands_and_closes_epic(self):
         self.ergon("new", "epic", "Big thing")
+        approve_epic(self)  # a human approves the brief, which opens it (T-098)
         self.ergon("new", "task", "Risky", "--tier", "opus", "--epic", "E-001", "--touches", "r.py")
         self.ergon("new", "task", "Routine", "--tier", "sonnet", "--epic", "E-001", "--touches", "q.py")
         for t in ("T-001", "T-002"):
@@ -2281,6 +2377,7 @@ class TestHistory(DispatchProject):
 
     def test_done_blocked_and_reviewed_sequences(self):
         self.ergon("new", "epic", "Small epic")
+        approve_epic(self)  # a human approves the brief, which opens it (T-098)
         self.ergon("new", "task", "Plain", "--tier", "sonnet", "--epic", "E-001", "--touches", "p.py")
         self.ergon("new", "task", "Stuck", "--tier", "opus", "--touches", "s.py")
         self.ergon("new", "task", "Checked", "--tier", "haiku", "--source", "TODO.md:3", "--touches", "c.py")
@@ -2298,7 +2395,7 @@ class TestHistory(DispatchProject):
         self.assertEqual(events(self.root, "T-003"),
                          ["created", "approved", "dispatched", "worker_end", "verify", "review", "landed"])
         self.assertEqual(events(self.root, "T-004"), ["created"])  # the human task T-002 asked for
-        self.assertEqual([r["event"] for r in rows if r["task"] is None], ["created", "epic_finished"])
+        self.assertEqual([r["event"] for r in rows if r["task"] is None], ["created", "approved", "epic_finished"])
 
         one = lambda tid, ev: next(r for r in rows if r["task"] == tid and r["event"] == ev)
         for r in rows:
@@ -2423,6 +2520,7 @@ class TestHistory(DispatchProject):
 
         # In an epic: the task's move, then the epic it completed.
         self.ergon("new", "epic", "Big thing")
+        approve_epic(self)  # a human approves the brief, which opens it (T-098)
         self.ergon("new", "task", "Part one", "--tier", "sonnet", "--epic", "E-001")
         stamp(self.task_file("T-002"))
         wt = self.root / ".claude" / "worktrees" / "E-001"
@@ -2434,7 +2532,7 @@ class TestHistory(DispatchProject):
         self.ergon("set", "T-002", "status=done", cwd=wt)
         rows = [r for r in history(self.root) if r["epic"] == "E-001"]
         self.assertEqual([(r["task"], r["event"], r.get("to")) for r in rows],
-                         [(None, "created", None), ("T-002", "created", None), ("T-002", "status", "doing"),
+                         [(None, "created", None), (None, "approved", None), ("T-002", "created", None), ("T-002", "status", "doing"),
                           ("T-002", "status", "done"), (None, "epic_finished", None)])
 
     def test_unwritable_history_never_stops_a_command(self):

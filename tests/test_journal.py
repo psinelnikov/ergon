@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_ergon import Project, stamp  # noqa: E402
+from test_ergon import Project, approve_epic, stamp  # noqa: E402
 from test_serve import ServeFixture, row  # noqa: E402
 
 FAKE_JOURNAL_CLAUDE = r"""#!PYTHON
@@ -121,6 +121,7 @@ class TestJournalFinish(JournalMixin, Project):
 
     def epic_with_task(self, status="done"):
         self.ergon("new", "epic", "Ship it")
+        approve_epic(self)  # a human approves the brief, which opens it (T-098)
         self.ergon("new", "task", "Thing", "--tier", "sonnet", "--epic", "E-001")
         f = self.task_file("T-001")
         stamp(f)

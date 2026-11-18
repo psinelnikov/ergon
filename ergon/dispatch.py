@@ -1826,6 +1826,11 @@ def dispatch(args):
                 skipped[t["id"]] = (f"touches {missing[0]['name']} but there's no checkout at "
                                     f"{missing[0]['path']}: clone the repo there")
                 continue
+            # its epic's brief must be approved: proposed, or (shared mode) a stamp that doesn't verify
+            why = _tasks.epic_problem(_tasks.epic_of(t, epics), apr)
+            if why:
+                skipped[t["id"]] = why
+                continue
             if t.get("epic") and epics.get(t["epic"], {}).get("status") != "open":
                 skipped[t["id"]] = f"epic {t['epic']} isn't open"
                 continue
@@ -2312,10 +2317,16 @@ def dispatch(args):
                                         continue
                                     t = _tasks.load(_config.ITEMS)[t["id"]]  # as the sync merged it
                                     # the claim's merge may have brought in an edit to the brief
-                                    why = _gitops.approvals().problem(t)
+                                    # (or to its epic's)
+                                    now_apr = _gitops.approvals()
+                                    why = now_apr.problem(t)
+                                    why = f"approval doesn't verify: {why}" if why else None
+                                    if not why:
+                                        epics.update(_tasks.load(_config.EPICS))
+                                        why = _tasks.epic_problem(_tasks.epic_of(t, epics), now_apr)
                                     if why:
-                                        skipped[t["id"]] = f"approval doesn't verify: {why}"
-                                        print(f"  skipped  {t['id']}  approval doesn't verify", flush=True)
+                                        skipped[t["id"]] = why
+                                        print(f"  skipped  {t['id']}  {why.split(':')[0]}", flush=True)
                                         unclaim(t["id"], answered, push=True)
                                         continue
                                 try:
