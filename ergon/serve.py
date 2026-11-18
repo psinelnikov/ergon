@@ -114,6 +114,11 @@ def host_ok(header):
         return False
 
 
+def cat_span(t):
+    """The task's category as a badge; empty or unknown reads as feature."""
+    return f'<span class="tier cat">{esc(_tasks.category(t))}</span>'
+
+
 def tier_key(t):
     tier = t.get("tier")
     return (_tasks.TIERS.index(tier) if tier in _tasks.TIERS else len(_tasks.TIERS), t["id"])
@@ -493,7 +498,7 @@ def task_li(t, tasks, extra=""):
                  + (f' <span class=flags>unblocks {n}</span>' if n > 0 else "")
                  + (f' <span class="pin">pin: {esc(pin)}</span>' if pin else ""))
     return (f'<li><a class=id href="/t/{esc(t["id"])}">{esc(t["id"])}</a>'
-            f'<span class=tier>{esc(t.get("tier"))}</span><span class=title>{esc(t.get("title"))}{tail}{extra}</span></li>')
+            f'<span class=tier>{esc(t.get("tier"))}</span>{cat_span(t)}<span class=title>{esc(t.get("title"))}{tail}{extra}</span></li>')
 
 
 def live_rows(rows, now):
@@ -686,7 +691,7 @@ def task_page(tid, nonce):
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
          f'<h1>{esc(tid)} {esc(t.get("title"))}</h1>',
          f'<p><span class="status st-{esc(t["status"])}">{esc(t["status"])}</span> · '
-         f'<span class=tier>{esc(t.get("tier"))}</span></p>']
+         f'<span class=tier>{esc(t.get("tier"))}</span> <span class=tier>{esc(_tasks.category(t))}</span></p>']
 
     # priority
     sc = prio_score(t, tasks)
@@ -1020,7 +1025,7 @@ def review_card(t, tasks, found):
                 + (f'<tr><th>cod_why</th><td class=why>{link_ids(esc(str(t["cod_why"])), tasks)}</td></tr>'
                    if t.get("cod_why") else ""))
     return (f'<section class=card id="{esc(t["id"])}"><div class=head><a class=id href="/t/{esc(t["id"])}">{esc(t["id"])}</a>'
-            f'<span class=tier>{esc(t.get("tier"))}</span><b class=ctitle>{esc(t.get("title"))}</b>{flag}</div>'
+            f'<span class=tier>{esc(t.get("tier"))}</span>{cat_span(t)}<b class=ctitle>{esc(t.get("title"))}</b>{flag}</div>'
             f'<div class=table><table><tbody>{prio}'
             f'<tr><th>tier_why</th><td class=why>{link_ids(esc(t.get("tier_why") or ""), tasks) or "<span class=muted>empty</span>"}</td></tr>'
             f'<tr><th>depends</th><td class=why>{dep_html}</td></tr>'

@@ -29,6 +29,15 @@ from . import shared as _shared
 
 
 TIERS = ["haiku", "sonnet", "opus", "human"]
+# feature: new behaviour a user would notice; bugfix: existing behaviour is wrong (security holes
+# too); refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling.
+# Empty or unknown reads as feature (see category()).
+CATEGORIES = ["feature", "bugfix", "refactor", "chore"]
+
+
+def category(t):
+    c = str(t.get("category") or "").strip().lower()
+    return c if c in CATEGORIES else "feature"
 TASK_STATUSES = ["proposed", "ready", "doing", "review", "blocked", "done", "dropped"]
 EPIC_STATUSES = ["open", "done", "dropped"]
 # Statuses a task can only reach after a human approved it.
@@ -40,7 +49,7 @@ AGENT_MOVES = {
     "doing": {"done", "blocked", "ready"},
     "blocked": {"ready", "doing"},
 }
-TASK_KEYS = ["id", "title", "tier", "status", "epic", "depends", "touches", "source",
+TASK_KEYS = ["id", "title", "tier", "category", "status", "epic", "depends", "touches", "source",
              "created", "approved", "tier_why"]
 EPIC_KEYS = ["id", "title", "status", "created"]
 
@@ -388,6 +397,7 @@ def show(args):
     if args.id in tasks:
         from . import priority as _pri
         t = tasks[args.id]
+        print(f"CATEGORY  {category(t)}" + ("" if t.get("category") else " (not set: reads as feature)"))
         print(f"PRIORITY  cod={t.get('cod', '')}  cod_why={t.get('cod_why', '')}  graded={t.get('graded', '')}"
               f"  unblocks={_pri.unblocks(t, tasks)}  p={_pri.score(t, tasks):.1f}")
         _print_run_usage(args.id)
@@ -421,12 +431,14 @@ def new(args):
     if args.kind == "task":
         if args.tier not in TIERS:
             raise SystemExit(f"--tier must be one of {TIERS}")
+        if args.category and args.category not in CATEGORIES:
+            raise SystemExit(f"--category must be one of {CATEGORIES}")
         epics = load(_config.EPICS)
         if args.epic and args.epic not in epics:
             raise SystemExit(f"no such epic: {args.epic}")
         tid = next_id(_config.ITEMS, "T")
         home = epics[args.epic]["_path"].parent if args.epic else _config.ITEMS
-        meta = {"id": tid, "title": args.title, "tier": args.tier, "status": "proposed",
+        meta = {"id": tid, "title": args.title, "tier": args.tier, "category": args.category or "", "status": "proposed",
                 "epic": args.epic or "", "depends": [], "touches": args.touches.split(",") if args.touches else [],
                 "source": args.source or "", "created": today(), "approved": "", "tier_why": "",
                 "_path": home / f"{tid}-{slug(args.title)}.md", "_body": TASK_BODY}
@@ -499,6 +511,8 @@ def import_issue(args):
         raise SystemExit(f"expected gh#123 or gh:OWNER/REPO#123, got {ref!r}")
     if args.tier and args.tier not in TIERS:
         raise SystemExit(f"--tier must be one of {TIERS}")
+    if args.category and args.category not in CATEGORIES:
+        raise SystemExit(f"--category must be one of {CATEGORIES}")
     def duplicate(tasks):
         dup = next((t["id"] for t in tasks.values() if t.get("source") == ref), None)
         if dup:
@@ -520,7 +534,7 @@ def import_issue(args):
             raise SystemExit(f"no such epic: {args.epic}")
         tid = next_id(_config.ITEMS, "T")
         home = epics[args.epic]["_path"].parent if args.epic else _config.ITEMS
-        meta = {"id": tid, "title": title, "tier": args.tier or "human", "status": "proposed",
+        meta = {"id": tid, "title": title, "tier": args.tier or "human", "category": args.category or "", "status": "proposed",
                 "epic": args.epic or "", "depends": [], "touches": args.touches.split(",") if args.touches else [],
                 "source": ref, "created": today(), "approved": "",
                 "tier_why": "" if args.tier else "imported, not sized: pick the tier before approving",
@@ -778,6 +792,8 @@ def lint():
                 errs.append(f"{where}: missing {k}")
         if t.get("tier") not in TIERS:
             errs.append(f"{where}: tier {t.get('tier')!r} not in {TIERS}")
+        if str(t.get("category") or "").strip() and t["category"] not in CATEGORIES:
+            errs.append(f"{where}: category {t.get('category')!r} not in {CATEGORIES}")
         if t.get("status") not in TASK_STATUSES:
             errs.append(f"{where}: status {t.get('status')!r} not in {TASK_STATUSES}")
         # shared mode: an open task's approval must verify (a signed commit from an approver

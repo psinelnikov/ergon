@@ -61,6 +61,8 @@ def setf(args):
                                  + (" (a human accepts or rejects it)" if item["status"] == "review" else ""))
         if is_task and key == "tier" and val not in _tasks.TIERS:
             raise SystemExit(f"tier must be one of {_tasks.TIERS}")
+        if is_task and key == "category" and val and val not in _tasks.CATEGORIES:
+            raise SystemExit(f"category must be one of {_tasks.CATEGORIES}")
         if not is_task and key == "status" and val not in _tasks.EPIC_STATUSES:
             raise SystemExit(f"epic status must be one of {_tasks.EPIC_STATUSES}")
         if key in ("depends", "touches"):

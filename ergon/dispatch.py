@@ -44,7 +44,7 @@ WORKER_PROMPT = """You are dispatched on {id}.
 Working tree: {wt} (a git worktree of this repo), on branch {branch}, cut from {base}.
 {retry}{nested}{companions}{rules}
 Work you find but don't do: end your final message with one line per item, before the RESULT line,
-`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`). The dispatcher files each as a proposed task.
+`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)). The dispatcher files each as a proposed task.
 
 The task file, read-only to you (it lives in the main checkout):
 
@@ -260,7 +260,7 @@ ANSWER_PROMPT = """A human answered the question(s) you asked on {id}:
 
 {note}
 Carry on with the task on {branch} in {wt}, and commit there citing {id}. End as before: a
-`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`) line for each piece of work you find but don't do, then `RESULT: done`,
+`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)) line for each piece of work you find but don't do, then `RESULT: done`,
 `RESULT: blocked — <why>`, or new `QUESTION:` lines and `RESULT: asking`.
 """
 
@@ -470,10 +470,14 @@ def md_trim(s):
 FOUND_TIERS = ("haiku", "sonnet", "opus", "human")
 
 
+FOUND_CATEGORIES = ("feature", "bugfix", "refactor", "chore")  # tasks.CATEGORIES; a circular import
+
+
 def parse_found(text):
     """[(title, why, extra)] from a worker's FOUND: lines. TOUCHES (once), DONE WHEN (repeatable)
-    and TIER (once) lines directly after a FOUND line fill `extra`: touches, done, tier, tier_why.
-    A line md_trim would empty is ignored, and so is a tier that isn't one."""
+    and TIER and CATEGORY (once each) lines directly after a FOUND line fill `extra`: touches, done,
+    tier, tier_why, category. A line md_trim would empty is ignored, and so is a tier or category
+    that isn't one."""
     out, cur = [], None
     for line in text.splitlines():
         m = re.match(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", line)
@@ -483,7 +487,7 @@ def parse_found(text):
                 cur = {}
                 out.append((md_trim(m[1]), md_trim(m[2]), cur))
             continue
-        m = re.match(r"^\W*(TOUCHES|DONE WHEN|TIER):\s*(.*?)\s*$", line)
+        m = re.match(r"^\W*(TOUCHES|DONE WHEN|TIER|CATEGORY):\s*(.*?)\s*$", line)
         if not m:
             if line.strip():
                 cur = None
@@ -496,6 +500,9 @@ def parse_found(text):
         elif m[1] == "TOUCHES":
             if "touches" not in cur:
                 cur["touches"] = [x for x in (md_trim(x) for x in val.split(",")) if x]
+        elif m[1] == "CATEGORY":
+            if "category" not in cur and val.lower() in FOUND_CATEGORIES:
+                cur["category"] = val.lower()
         elif "tier" not in cur:
             tm = re.match(r"^(\w+)\s*(?:[—–]\s*(.*))?$", val)
             if tm and tm[1].lower() in FOUND_TIERS:
@@ -562,7 +569,8 @@ def file_found(t, found, epics):
         if extra.get("done"):
             body = body.replace("## Done when\n", "## Done when\n" + "".join(f"- {d}\n" for d in extra["done"]), 1)
         sized = extra.get("tier")
-        meta = {"id": tid, "title": title, "tier": sized or t["tier"], "status": "proposed",
+        meta = {"id": tid, "title": title, "tier": sized or t["tier"],
+                "category": extra.get("category") or "", "status": "proposed",
                 "epic": t.get("epic") or "", "depends": [], "touches": extra.get("touches") or [],
                 "source": t["id"], "created": _tasks.today(), "approved": "",
                 "tier_why": (extra.get("tier_why") or "") if sized else
@@ -799,7 +807,7 @@ FIX_PROMPT = """The reviewer vetoed your work on {id} (fix round {n} of {rounds}
 {log}
 Fix what it raised on {branch} in {wt}, and commit there citing {id}. The done checks, verify and
 the review run again when you finish. End as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`,
-`TIER: haiku|sonnet|opus|human — <why>`) line for each
+`TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)) line for each
 piece of work you find but don't do, then `RESULT: done`, `RESULT: blocked — <why>`, or
 `QUESTION:` lines and `RESULT: asking`.
 """
@@ -815,7 +823,7 @@ The full output is in {log}.
 Fix it on {branch} in {wt}, and commit there citing {id}. The done checks and verify run again
 when you finish. If the failure isn't caused by this branch (a flaky test, a broken trunk, a
 missing tool), change nothing and end `RESULT: blocked — outside: <why>`: verify runs once more
-as it is, and this doesn't use up a round. Otherwise end as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`)
+as it is, and this doesn't use up a round. Otherwise end as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling))
 line for each piece of work you find but don't do, then `RESULT: done` or
 `RESULT: blocked — <why>`.
 """
@@ -932,7 +940,7 @@ since the resolution is new code. If you can't reconcile the two sides, don't gu
 CONFLICT_PROMPT = """Your work on {id} conflicts with its base, which moved since you started (conflict round {n} of {rounds}):
 
 {body}
-End as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`) line for each piece of work you find but don't do, then
+End as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)) line for each piece of work you find but don't do, then
 `RESULT: done`, `RESULT: blocked — <why>`, or `QUESTION:` lines and `RESULT: asking`.
 """
 

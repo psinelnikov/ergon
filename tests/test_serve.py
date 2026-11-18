@@ -176,6 +176,18 @@ class TestServe(ServeFixture):
         self.assertEqual(self.req("GET", "/t/T-999")[0], 404)
         self.assertEqual(self.req("GET", "/t/E-001")[0], 404)
 
+    def test_category_shown(self):
+        f = self.task_file("T-004")
+        f.write_text(re.sub(r"(?m)^category:.*$", "category: bugfix", f.read_text()))
+        _, _, board = self.req("GET", "/")
+        self.assertIn("bugfix", re.search(r'<li><a class=id href="/t/T-004">.*?</li>', board, re.S)[0])
+        self.assertIn("feature", re.search(r'<li><a class=id href="/t/T-005">.*?</li>', board, re.S)[0])  # unset
+        _, _, page = self.req("GET", "/t/T-004")
+        self.assertIn("<span class=tier>bugfix</span>", page)
+        _, _, review = self.req("GET", "/review")
+        card = re.search(r'<section class=card id="T-004">(.*?)</section>', review, re.S)[1]
+        self.assertIn(">bugfix<", card)
+
     def test_priority_on_board_and_task_page(self):
         f = self.task_file("T-004")
         t = f.read_text()
