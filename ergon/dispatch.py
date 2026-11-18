@@ -1053,6 +1053,15 @@ def added_lines(rng, path, repo=None):
     return lines
 
 
+def _on_base(ref, path):
+    """Is `path` a file at `ref`? (a kept reproduction a branch changes or deletes, T-161)"""
+    try:
+        _gitops.git("cat-file", "-e", f"{ref}:{path}")
+        return True
+    except _gitops.GitError:
+        return False
+
+
 def weakening(t, base, branch, pubs=()):
     """The weakening check on t's branch: [] if it passes, else one finding per file, each naming
     the file as touches: would. `t` is the task as it was at launch; only its touches: entries a
@@ -1073,6 +1082,9 @@ def weakening(t, base, branch, pubs=()):
             note = since if late and not named and names_file(t, path, c, pattern) else ""
             if pattern and not named:
                 found.append(f"{shown} changed (a gate file: protect `{pattern}`){note}")
+                continue
+            if c is None and not named and path.startswith(f"{_config.REPROS}/") and _on_base(trunk, path):
+                found.append(f"{shown} changed or deleted (a kept reproduction on the base; touches: must name it){note}")
                 continue
             if not _config.SUPPRESS or (harden and named):
                 continue

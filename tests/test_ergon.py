@@ -1642,6 +1642,21 @@ class TestWeakening(DispatchProject):
                          ["a.py adds a suppression marker (suppress `# noqa`): `import os  # noqa: F401` "
                           "(touches: names it, but that allows a marker only in a harden task)"])
 
+    def test_a_kept_reproduction_may_not_be_changed_or_deleted_unnamed(self):
+        """T-161: a file under [gates] repros that exists on the base is vetoed unless touches:
+        names it; a new reproduction of a harden task is unaffected."""
+        rp = "tests/harden/T-050-20261101-120000.patch"
+        f = self.root / rp
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("old\n")
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "kept", cwd=self.root)
+        t = {"id": "T-001", "touches": ["a.py"], "harden": ["T-050-20261101-120000"]}
+        veto = [f"{rp} changed or deleted (a kept reproduction on the base; touches: must name it)"]
+        self.assertEqual(self.weakening(t, rp, "edited"), veto)
+        self.assertEqual(self.weakening(dict(t, touches=[rp]), rp, "edited"), [])
+        self.assertEqual(self.weakening(t, "tests/harden/T-051-20261101-120000.patch", "new"), [])
+
     def test_a_harden_task_may_not_add_a_marker_in_an_unnamed_file(self):
         t = {"id": "T-001", "touches": ["a.py"], "harden": ["T-050-20261101-120000"]}
         self.assertEqual(self.weakening(t, "b.py", "@pytest.mark.skip"),
