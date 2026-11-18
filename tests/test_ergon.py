@@ -1068,10 +1068,11 @@ class TestReviewRounds(DispatchProject):
         self.assertIn("review passed in round 2, after 1 fix round(s): round 1: review (sonnet) failed: no test",
                       self.task_file("T-001").read_text())
         self.assertEqual(events(self.root, "T-001"),
-                         ["created", "dispatched", "worker_end", "verify", "review", "resumed",
+                         ["created", "dispatched", "worker_end", "verify", "review", "incident", "resumed",
                           "worker_end", "verify", "review", "landed"])
+        check_incident(self, self.rows("incident")[0], "review", "no test for the empty list")
         self.assertEqual([r.get("round") for r in history(self.root) if r["task"] == "T-001"],
-                         [None] * 5 + [2] * 4 + [None])
+                         [None] * 6 + [2] * 4 + [None])
         self.assertEqual(self.rows("resumed")[0]["session"], "s-1")
         self.assertRegex(self.rows("worker_end")[1]["log"], r"-fix2\.json$")
         self.assertRegex(self.rows("review")[1]["log"], r"-review2\.json$")
@@ -1275,8 +1276,12 @@ class TestVerifyRounds(DispatchProject):
         self.assertIn("verify fix T-001  round 1/2: resumed s-1", out)
         self.assertIn("verify passed after 1 fix round(s)", self.task_file("T-001").read_text())
         self.assertEqual(events(self.root, "T-001"),
-                         ["created", "dispatched", "worker_end", "verify", "resumed", "worker_end", "verify", "landed"])
+                         ["created", "dispatched", "worker_end", "verify", "incident", "resumed", "worker_end", "verify",
+                          "landed"])
         self.assertEqual([r["ok"] for r in self.rows("verify")], [False, True])
+        inc = self.rows("incident")  # the green fix round leaves the incident in place
+        self.assertEqual(len(inc), 1)
+        check_incident(self, inc[0], "runtime", "verify (runtime gate)")
 
     def test_red_every_round_blocks(self):
         self.env["FAKE_FIX_RESULT"] = "tried\nRESULT: done"
@@ -1659,6 +1664,9 @@ class TestAccept(DispatchProject):
         self.assertIn("review: rejected by Tester: no test for the 404 path", self.task_file("T-001").read_text())
         self.assertTrue(self.has_branch("task/T-001"))  # kept for the next attempt
         self.assertFalse((self.root / "T-001.txt").exists())
+        inc = [r for r in history(self.root) if r["event"] == "incident"]
+        self.assertEqual([r["task"] for r in inc], ["T-001"])
+        check_incident(self, inc[0], "reject", "no test for the 404 path")
         rej = history(self.root)[-1]
         self.assertEqual((rej["task"], rej["event"], rej["from"], rej["to"], rej["by"], rej["reason"]),
                          ("T-001", "rejected", "review", "ready", "Tester", "no test for the 404 path"))
@@ -1698,6 +1706,28 @@ def history(root):
         assert isinstance(row, dict) and {"at", "task", "epic", "event"} <= row.keys(), (n, line)
         rows.append(row)
     return rows
+
+
+def check_incident(test, row, layer, reason):
+    """An incident row names a patch that applies cleanly to its `base` and a JSON record of it."""
+    test.assertEqual((row["event"], row["layer"]), ("incident", layer))
+    meta = json.loads((test.root / row["meta"]).read_text())
+    patch = test.root / row["patch"]
+    test.assertEqual(meta["task"], row["task"])
+    test.assertEqual(meta["layer"], layer)
+    test.assertIn(reason, meta["reason"])
+    test.assertTrue(set(meta) >= {"log", "base", "tip", "tier"}, meta)
+    for sha in (meta["base"], meta["tip"]):  # both commits outlive the branch
+        test.assertEqual(subprocess.run(["git", "-C", str(test.root), "cat-file", "-e", sha]).returncode, 0)
+    test.assertTrue(patch.read_text().strip())
+    with tempfile.TemporaryDirectory() as d:  # a clean checkout of `base` takes the patch
+        subprocess.run(["git", "-C", str(test.root), "worktree", "add", "--detach", d, meta["base"]],
+                       check=True, capture_output=True)
+        try:
+            r = subprocess.run(["git", "-C", d, "apply", "--check", str(patch)], capture_output=True, text=True)
+            test.assertEqual(r.returncode, 0, r.stderr)
+        finally:
+            subprocess.run(["git", "-C", str(test.root), "worktree", "remove", "--force", d], capture_output=True)
 
 
 def events(root, tid):
@@ -1788,9 +1818,12 @@ class TestHistory(DispatchProject):
         self.env["FAKE_REVIEW"] = "REVIEW: fail \u2014 no tests"
         out = self.ergon("dispatch").stdout
         self.assertEqual([self.status("T-001"), self.status("T-002")], ["blocked", "blocked"], out)
-        self.assertEqual(events(self.root, "T-001"), ["created", "dispatched", "worker_end", "verify", "blocked"])
+        self.assertEqual(events(self.root, "T-001"), ["created", "dispatched", "worker_end", "verify", "incident", "blocked"])
         self.assertEqual(events(self.root, "T-002"),
-                         ["created", "dispatched", "worker_end", "verify", "review", "blocked"])
+                         ["created", "dispatched", "worker_end", "verify", "review", "incident", "blocked"])
+        for r in history(self.root):
+            if r["event"] == "incident":
+                check_incident(self, r, {"T-001": "runtime", "T-002": "review"}[r["task"]], "")
         rows = history(self.root)
         v = next(r for r in rows if r["task"] == "T-001" and r["event"] == "verify")
         self.assertEqual((v["ok"], v["exit"]), (False, 3))

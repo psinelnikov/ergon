@@ -477,6 +477,12 @@ def reject(args):
                                     f"send {len(back)} in review back to ready" if back else "") if x)
     if not human_gate(f"{what[0].upper() + what[1:]}?"):
         raise SystemExit("aborted")
+    for t in back:  # keep the rejected diff before anything moves; only git diff, offline
+        try:
+            ibase, _wt, ibranch, ipubs = held_branch(t, epics)
+            _dispatch.save_incident(t, "reject", args.reason, ibase, ibranch, ipubs)
+        except _gitops.GitError as err:
+            print(f"ergon: no incident saved for {t['id']}: {err}", file=sys.stderr)
     with _gitops.state_lock():  # in shared mode, commits the change on the state branch, signed
         if sign:
             _shared.commit_pending()  # hand edits go in a commit of their own, not the signed one

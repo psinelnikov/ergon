@@ -586,6 +586,39 @@ def gate_cmds(t):
     return out
 
 
+def save_incident(t, layer, reason, base, branch, pubs=(), log=None, tier=None):
+    """Keep a caught mistake in a form a check can run against: <state>/runs/incidents/<ID>-<time>.patch
+    (`git diff base...branch` now) and .json (task, layer, reason, log, base, tip, tier), and an
+    `incident` history row naming both. A companion's diff goes in <ID>-<time>-<name>.patch. Only
+    git diff, so it is fast and offline; never raises. Layers: runtime, review, weakening, reject."""
+    try:
+        d = _config.RUNS / "incidents"
+        d.mkdir(parents=True, exist_ok=True)
+        stem = f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}"
+        n = 1
+        while (d / f"{stem}.json").exists():
+            n += 1
+            stem = f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-{n}"
+        tip = _gitops.git("rev-parse", branch)
+        base_sha = _gitops.git("rev-parse", base)
+        patch = d / f"{stem}.patch"
+        patch.write_text(_gitops.git("diff", f"{base_sha}...{tip}", raw=True))
+        companions = []
+        for c, _ in pubs:
+            cp = d / f"{stem}-{c['name']}.patch"
+            cp.write_text(_gitops.git("diff", f"{c['trunk']}...{branch}", raw=True, cwd=c["path"]))
+            companions.append({"name": c["name"], "patch": cp.relative_to(_config.HOME).as_posix(),
+                               "base": _gitops.tip(c["trunk"], c["path"]), "tip": _gitops.tip(branch, c["path"])})
+        meta = d / f"{stem}.json"
+        log = _history.row("x", None, log=log)["log"] if log else None  # a Path becomes repo-relative text
+        meta.write_text(json.dumps({"task": t["id"], "layer": layer, "reason": reason, "log": log,
+                                    "base": base_sha, "tip": tip, "tier": tier or t.get("tier"),
+                                    "companions": companions}, indent=2, ensure_ascii=False) + "\n")
+        _history.record("incident", t, layer=layer, reason=reason, patch=patch, meta=meta, tier=tier or t.get("tier"))
+    except Exception as err:  # noqa: BLE001 - an incident is a record, never a reason to stop
+        print(f"ergon: couldn't save an incident for {t['id']}: {err}", file=sys.stderr)
+
+
 def _run_gate(t, wt, layer, cmd, rnd):
     start = time.monotonic()
     try:
@@ -680,6 +713,8 @@ def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None)
     failed, cost, who, fixable = _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log)
     _history.record("review", t, verdict="fail" if failed else "pass", reviewer=who, tier=tier,
                     reason=failed, cost=cost, seconds=round(time.monotonic() - start, 1), log=log, **_round(rnd))
+    if failed and fixable:
+        save_incident(t, "review", failed, base, branch, pubs, log=log, tier=tier)
     return failed, cost, who, fixable
 
 
@@ -774,6 +809,9 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None):
         return f"worker said done but no commit on {branch} cites {t['id']}", 0, False
     failed = run_verify(t, wt, rnd)
     if failed:
+        if "(runtime gate)" in failed:
+            log = re.search(r"\(full output (\S+?)\)\s*$", failed)
+            save_incident(t, "runtime", failed, base, branch, pubs, log=log and log[1], tier=tier)
         return failed, 0, "verify"
     if t["tier"] not in _config.REVIEW and tier not in _config.REVIEW:
         return None, 0, False
