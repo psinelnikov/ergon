@@ -1214,13 +1214,43 @@ def group_header(ts, tasks):
     return "".join(h)
 
 
+EPIC_ID = re.compile(r"E-\d{3,}")
+
+
+def epic_briefs(epics):
+    """Epics whose brief awaits a human: proposed, or (shared mode) open with a stamp that doesn't verify."""
+    apr = _gitops.approvals()  # None outside shared mode; never raises
+    return sorted((e for e in epics.values()
+                   if e.get("status") not in ("dropped", "done") and _tasks.epic_problem(e, apr)
+                   and EPIC_ID.fullmatch(str(e.get("id")))), key=lambda e: e["id"])
+
+
+def epic_cards(briefs):
+    b = [f"<h2 id=epics>Proposed epics ({len(briefs)})</h2>",
+         "<p class=muted>Approving an epic approves its brief and opens it; its tasks wait until then. "
+         "This page approves nothing. From your own terminal:</p>",
+         f"<code class=cmd>{esc('ergon approve ' + ' '.join(e['id'] for e in briefs))}</code>"]
+    for e in briefs:
+        b.append(f'<section class=card id="{esc(e["id"])}"><h3>{esc(e["id"])} {esc(e.get("title"))}'
+                 f' <span class=tier>{esc(e.get("status"))}</span></h3>')
+        for name in ("Goal", "Out of scope", "Constraints"):
+            text = section(e.get("_body") or "", name)
+            b.append(f"<h4>{name}</h4>" + (f"<pre>{esc(text)}</pre>" if text and not blank(text) else "<p class=muted>empty</p>"))
+        b.append("</section>")
+    return b
+
+
 def review_page(nonce):
     tasks = _tasks.load(_config.ITEMS)
+    briefs = epic_briefs(_tasks.load(_config.EPICS))
     proposed = sorted((t for t in tasks.values() if t["status"] == "proposed"), key=tier_key)
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)} · review · read-only</span></div>',
          f"<h1>Proposed tasks ({len(proposed)})</h1>"]
+    if briefs:
+        b.extend(epic_cards(briefs))
     if not proposed:
-        b.append("<p class=muted>Nothing is waiting for approval.</p>")
+        if not briefs:
+            b.append("<p class=muted>Nothing is waiting for approval.</p>")
         return page("ergon · review", "".join(b), nonce)
     found = {t["id"]: findings(t, tasks) for t in proposed}
     flagged = {i: f for i, f in found.items() if f}

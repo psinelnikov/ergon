@@ -237,6 +237,19 @@ class TestServe(ServeFixture):
         card = re.search(r'<section class=card id="T-004">(.*?)</section>', review, re.S)[1]
         self.assertIn(">bugfix<", card)
 
+    def test_review_lists_proposed_epic(self):
+        self.ergon("new", "epic", "Evil epic " + HOSTILE)
+        f = next(p for p in (self.root / "tasks" / "epics").rglob("*.md") if "E-002" in str(p))
+        f.write_text(f.read_text().replace("## Goal\n", f"## Goal\n{HOSTILE}\n", 1))
+        _, _, review = self.req("GET", "/review")
+        sec = review.split("<h2 id=epics>")[1].split("<h2")[0]
+        self.assertIn("E-002", sec)
+        self.assertIn("&lt;script&gt;", sec)
+        self.assertNotIn("<script>alert", sec)
+        self.assertNotIn("<img src=x", sec)
+        self.assertIn("ergon approve E-001 E-002", sec)
+        self.assertNotIn("Nothing is waiting", review)
+
     def test_priority_on_board_and_task_page(self):
         f = self.task_file("T-004")
         t = f.read_text()
