@@ -549,6 +549,13 @@ def board_page(nonce):
             b.extend(task_li(t, tasks, last_review(trails.get(t["id"], [])) if status == "review" else "")
                      for t in group)
             b.append("</ul>")
+    parents = [(t, _tasks.follow_ups(t, tasks)) for t in sorted(tasks.values(), key=lambda t: t["id"])
+               if t["status"] == "done"]
+    parents = [(t, f) for t, f in parents if f]
+    if parents:
+        b.append(f'<h2 id=followups>Done, follow-ups open ({len(parents)})</h2><ul class=tasks>')
+        b.extend(task_li(t, tasks, f' <span class=flags>{esc(_tasks.status_text(t, tasks))}</span>') for t, _ in parents)
+        b.append("</ul>")
     asked = asks(tasks)
     if asked:
         b.append(f'<h2 id=answer>Awaiting answer ({len(asked)})</h2><ul class=tasks>')
@@ -692,6 +699,15 @@ def task_page(tid, nonce):
          f'<h1>{esc(tid)} {esc(t.get("title"))}</h1>',
          f'<p><span class="status st-{esc(t["status"])}">{esc(t["status"])}</span> · '
          f'<span class=tier>{esc(t.get("tier"))}</span> <span class=tier>{esc(_tasks.category(t))}</span></p>']
+
+    fus = _tasks.follow_ups(t, tasks, open_only=False)
+    if fus:
+        b.append(f'<h2>Follow-ups</h2><p>{esc(_tasks.status_text(t, tasks))}</p><ul class=tasks>')
+        for c in fus:
+            b.append(f'<li><a class=id href="/t/{esc(c["id"])}">{esc(c["id"])}</a>'
+                     f'<span class="status st-{esc(c["status"])}">{esc(c["status"])}</span>{cat_span(c)}'
+                     f'<span class=title>{esc(c.get("title"))}</span></li>')
+        b.append("</ul>")
 
     # priority
     sc = prio_score(t, tasks)

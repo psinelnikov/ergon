@@ -1914,7 +1914,7 @@ class TestAutoApprove(DispatchProject):
         self.assertIn(f"\napproved: {self.STAMP}\n", text)
         self.assertIn("tier_why: tier of the task that found it (T-001)\n", text)
         self.assertIn("ready    T-002  (found by T-001, approved by inheritance)  Fix X", out)
-        self.assertIn("1 ready (approved by inheritance) from workers' FOUND lines: T-002", out)
+        self.assertIn("1 auto-approved, left ready: T-002", out)  # --ids names T-001 only
         row = [r for r in history(self.root) if r["task"] == "T-002" and r["event"] == "approved"]
         self.assertEqual(len(row), 1)
         self.assertEqual({k: row[0][k] for k in ("by", "parent", "root", "depth", "category", "tier")},
@@ -1923,6 +1923,57 @@ class TestAutoApprove(DispatchProject):
         self.assertEqual(events(self.root, "T-002"), ["created", "approved"])
         self.ergon("check")
         self.assertIn("would run  T-002", self.ergon("dispatch", "--dry-run").stdout)
+
+    def test_follow_up_runs_in_the_same_run_and_shows_the_tree(self):
+        out = self.found("Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix")  # --ids T-001 only, no --max
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.status("T-002"), "ready")  # --ids doesn't name it: not launched
+        self.setUp()
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix")
+        out = self.ergon("dispatch", "--max", "1").stdout
+        self.assertEqual([self.status("T-001"), self.status("T-002")], ["done", "done"], out)
+        self.assertIn("doing    T-002", out)
+        self.assertIn("auto-approved, worked this run: T-002 (done)", out)
+        self.assertNotIn("left ready", out)
+
+    def test_follow_ups_cap_leaves_the_rest_ready(self):
+        self.write_follow_ups(1)
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="A — a\nTOUCHES: a.py\nCATEGORY: bugfix|B — b\nTOUCHES: b.py\nCATEGORY: bugfix")
+        out = self.ergon("dispatch", "--max", "1").stdout
+        done = [t for t in ("T-002", "T-003") if self.status(t) == "done"]
+        left = [t for t in ("T-002", "T-003") if self.status(t) == "ready"]
+        self.assertEqual((len(done), len(left)), (1, 1), out)
+        self.assertIn(f"auto-approved, worked this run: {done[0]} (done)", out)
+        self.assertIn(f"auto-approved, left ready: {left[0]}", out)
+
+    def test_follow_up_stops_at_the_budget_cap(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="A — a\nTOUCHES: a.py\nCATEGORY: bugfix")
+        out = self.ergon("dispatch", "--max", "1", "--budget-total", "0.01", "--budget-pct", "100").stdout
+        self.assertEqual([self.status("T-001"), self.status("T-002")], ["done", "ready"], out)
+        self.assertIn("budget cap", out)
+
+    def test_dry_run_and_proposed_group(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        out = self.ergon("dispatch", "--dry-run", "--budget", "1", "--budget-total", "5").stdout
+        self.assertIn("auto-approved follow-ups", out)
+        self.assertIn("up to 10 (follow_ups), depth 3 (follow_up_depth)", out)
+        self.assertIn("not counting auto-approved follow-ups", out)
+        self.env.update(FAKE_FOUND="New thing — z\nCATEGORY: feature")
+        out = self.ergon("dispatch", "--max", "1").stdout
+        self.assertIn("1 proposed, need your approval: T-002", out)
+        self.assertIn("T-001", self.ergon("show", "T-001").stdout)
+        self.assertIn("FOLLOW-UPS  done, 1 follow-up open", self.ergon("show", "T-001").stdout)
+
+    def write_follow_ups(self, n):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(f"follow_ups = {n}\n" + cfg.read_text())
 
     def test_refactor_and_chore_too_but_not_from_a_blocked_run(self):
         self.found("A — a\nTOUCHES: a.py\nCATEGORY: refactor|B — b\nTOUCHES: b.py\nCATEGORY: chore")

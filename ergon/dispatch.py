@@ -1569,6 +1569,10 @@ def dispatch(args):
                   + (", resumes with your answer" if t.get("answered") else "") + f"  {t['title']}")
         if not plan:
             print("nothing to dispatch")
+        if _config.FOLLOW_UPS and _config.FOLLOW_UP_DEPTH and not _config.SHARED:
+            print(f"  follow-ups  auto-approved follow-ups (bugfix, refactor, chore) a worker files may run in this "
+                  f"same run, up to {_config.FOLLOW_UPS} (follow_ups), depth {_config.FOLLOW_UP_DEPTH} "
+                  f"(follow_up_depth); they don't count toward --max")
         if cap is not None:
             n = min(len(plan), args.max)
             vr = _config.VERIFY_ROUNDS
@@ -1609,7 +1613,7 @@ def dispatch(args):
                   "no new task launches once finished workers' cost reaches it"
                   + (f"; estimated at most ${sum(calls) * args.budget:.2f} for {n} task(s) at --budget "
                      f"${args.budget:g} per call" + (", counting a task as its worker plus " + ", plus ".join(what)
-                                                     if what else "")
+                                                     if what else "") + ", not counting auto-approved follow-ups, which spend from the same cap"
                      if args.budget else "; no --budget, so no estimate"))
         # Shared touches: whichever lands second (task into epic, or epic into trunk) may conflict,
         # so a task sharing a path with an earlier one is held until that one lands.
@@ -1624,6 +1628,7 @@ def dispatch(args):
                     print(f"  overlap    {a['id']} and {b['id']} ({b['status']}) {why_shared(a, b)}")
     else:
         running, launched, active = {}, 0, {}  # active: running task id -> task
+        fu_launched = 0  # auto-approved follow-ups launched, bounded by follow_ups
         held_on = {}  # task id -> the running task it was last recorded held behind
         stops, tick = [], 0.25
         stop_evt = threading.Event()
@@ -1646,17 +1651,23 @@ def dispatch(args):
                     stopping = bool(stops)
                     if scan and not stopping:
                         # shared mode: see what the team did (approvals, claims) before choosing
-                        unsynced = sync_state() if claims and launched < args.max and not capped else None
+                        unsynced = sync_state() if claims and (launched < args.max or fu_launched < _config.FOLLOW_UPS) \
+                            and not capped else None
                         if unsynced:
                             say_sync(f"failed, so nothing launches this scan: {unsynced}")
                         # the lock is held only for the scan, so `approve` works between scans
                         with _gitops.state_lock():
                             if cap is not None and spent() >= cap:
                                 capped = True
-                            queue = [] if launched >= args.max or capped or unsynced else \
-                                list(eligible(_tasks.load(_config.ITEMS)))
-                            while queue and len(running) < args.jobs and launched < args.max:
+                            queue = [] if capped or unsynced else list(eligible(_tasks.load(_config.ITEMS)))
+                            while queue and len(running) < args.jobs:
                                 t = queue.pop(0)
+                                # an auto-approved follow-up isn't one of the --max, but follow_ups bounds them
+                                follow = _tasks.is_auto(t)
+                                if follow and fu_launched >= _config.FOLLOW_UPS:
+                                    continue
+                                if not follow and launched >= args.max:
+                                    continue
                                 behind = next((o for o in active.values() if shared(t, o)), None)
                                 if behind:  # held: stays eligible, retried when a running task lands
                                     if held_on.get(t["id"]) != behind["id"]:  # once per blocker, not per scan
@@ -1698,9 +1709,13 @@ def dispatch(args):
                                       + also(t) + f"  {t['title']}")
                                 running[pool.submit(one, t, base, wt, branch, pubs, answered)] = t["id"]
                                 active[t["id"]] = t
-                                launched += 1
+                                if follow:
+                                    fu_launched += 1
+                                else:
+                                    launched += 1
                         next_scan = time.monotonic() + args.interval
                     scan = False
+                    # nothing running means no worker can file a follow-up now, and the scan above has launched any ready
                     over = stopping or capped or launched >= args.max
                     if not running and (not args.watch or over):
                         break
@@ -1737,10 +1752,15 @@ def dispatch(args):
               + f". Logs in {_config.RUNS.relative_to(_config.HOME)}/")
         print_limit(results, window)
         filed = [f for r in results for f in r[3].get("filed", [])]
-        for st, what in (("proposed", "proposed"), ("ready", "ready (approved by inheritance)")):
-            ids = [fid for fid, s in filed if s == st]
+        outcome = {r[0]["id"]: r[1] for r in results}
+        now = _tasks.load(_config.ITEMS)
+        worked = [f"{fid} ({outcome[fid]})" for fid, s in filed if s == "ready" and fid in outcome]
+        left = [fid for fid, s in filed if s == "ready" and fid not in outcome]
+        for label, ids in (("auto-approved, worked this run", worked), ("auto-approved, left ready", left),
+                           ("proposed, need your approval",
+                            [fid for fid, s in filed if s == "proposed" and now.get(fid, {}).get("status") == "proposed"])):
             if ids:
-                print(f"{len(ids)} {what} from workers' FOUND lines: {', '.join(ids)}")
+                print(f"{len(ids)} {label}: {', '.join(ids)}")
     if stopped:
         print("\ninterrupted: stopped launching" + ("; killed running workers" if KILL_ALL.is_set() else ""))
     if capped:

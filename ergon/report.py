@@ -194,7 +194,10 @@ def report(args):
     landed = []
     for i, t in sorted(tasks.items()):
         if t["status"] == "done" and (not since or i in cited):
-            landed.append(f"  {i}  {t['title']}")
+            landed.append(f"  {i}  {t['title']}"
+                          + ("" if _tasks.status_text(t, tasks) == "done" else f"  ({_tasks.status_text(t, tasks)})"))
+            landed.extend(f"      {c['id']}  {c['status']:<8}  {_tasks.category(c):<8}  {c['title']}"
+                          for c in _tasks.follow_ups(t, tasks))
             landed.extend(f"      {c}" for c in cited.get(i, [])[:3])
     section("Landed", landed)
     asking, full = [], set()

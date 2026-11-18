@@ -363,6 +363,30 @@ def auto_approval(t, parent, tasks):
     return f"auto {t['category']} follow-up of {parent['id']} (root {root}, {by})", root, depth + 1
 
 
+def follow_ups(t, tasks, open_only=True):
+    """Tasks whose `source:` chain leads to t, nearest first; by default only those not done or
+    dropped (T-137: t is complete when it and every follow-up under it are closed)."""
+    kids, seen, out = {}, {t["id"]}, []
+    for k in sorted(tasks):
+        kids.setdefault(str(tasks[k].get("source") or "").strip(), []).append(tasks[k])
+    todo = [t["id"]]
+    while todo:
+        for c in kids.get(todo.pop(0), []):
+            if c["id"] in seen:
+                continue
+            seen.add(c["id"])
+            todo.append(c["id"])
+            if not open_only or c["status"] not in ("done", "dropped"):
+                out.append(c)
+    return out
+
+
+def status_text(t, tasks):
+    """The task's status; a done one with open follow-ups reads `done, N follow-ups open`."""
+    n = len(follow_ups(t, tasks)) if t["status"] == "done" else 0
+    return f"done, {n} follow-up{'s' if n != 1 else ''} open" if n else t["status"]
+
+
 def board(args):
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     shown = [t for t in tasks.values()
@@ -491,6 +515,11 @@ def show(args):
         print(f"CATEGORY  {category(t)}" + ("" if t.get("category") else " (not set: reads as feature)"))
         print(f"PRIORITY  cod={t.get('cod', '')}  cod_why={t.get('cod_why', '')}  graded={t.get('graded', '')}"
               f"  unblocks={_pri.unblocks(t, tasks)}  p={_pri.score(t, tasks):.1f}")
+        fus = follow_ups(t, tasks, open_only=False)
+        if fus:
+            print(f"FOLLOW-UPS  {status_text(t, tasks)}")
+            for c in fus:
+                print(f"  {c['id']}  {c['status']:<8}  {category(c):<8}  {c['title']}")
         _print_run_usage(args.id)
     if args.id in epics:
         print("TASKS")

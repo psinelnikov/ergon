@@ -64,6 +64,9 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 #                               # ready, approved by inheritance from the task that found it, up to
 #                               # this many follow-ups from a human-approved task (0: off; never in
 #                               # shared mode, where approvals are signed). A feature waits for you
+# follow_ups = 10               # how many such auto-approved follow-ups one dispatch run works itself (they
+#                               # don't count toward --max, they do count toward --budget-total); past it
+#                               # they stay ready for the next run
 
 # Tasks whose finished branch waits at status `review` for a human `ergon accept` instead of landing.
 # A task matches a rule if its tier is in tiers (when given) and a touches: entry matches (when
@@ -108,6 +111,7 @@ PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
 ACCEPT = []  # [[accept]] rules: {tiers, touches}
 TWO_PERSON = []  # [[two_person]] rules: {tiers, touches}; shared mode only
 FOLLOW_UP_DEPTH = 3  # follow_up_depth: see tasks.auto_approval
+FOLLOW_UPS = 10  # follow_ups: auto-approved follow-ups one dispatch run works
 
 
 def protect_hit(touch, pattern):
@@ -191,7 +195,7 @@ def configure(start=None, need_config=True):
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, \
         REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, \
-        FOLLOW_UP_DEPTH
+        FOLLOW_UP_DEPTH, FOLLOW_UPS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -242,6 +246,7 @@ def configure(start=None, need_config=True):
     # How many FOUND follow-ups deep a non-feature follow-up is approved by inheritance (T-136);
     # 0 turns that off. tasks.auto_approval has the rule.
     FOLLOW_UP_DEPTH = count("follow_up_depth", 3)
+    FOLLOW_UPS = count("follow_ups", 10)  # auto-approved follow-ups one dispatch run works (T-137)
     JOURNAL = CFG.get("journal", True)  # write an epic's journal entry (`ergon journal`) when it finishes
     if not isinstance(JOURNAL, bool):
         raise NotConfigured(f"{CONFIG_FILE}: journal is true or false")
