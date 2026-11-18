@@ -1182,6 +1182,13 @@ def run_verify(t, wt, rnd=None):
 # fix round to commit a minimal reproduction, <[gates] repros>/<incident id>.patch, a `git diff`
 # against the branch that the check must flag. The proof replays it in the patch's place, and it
 # lands with the task as the check's test. Only the main repo's patch is replayed, not a companion's.
+# A harden task may change gate files, so one that adds check X can quietly weaken check Y (T-120).
+# So once its own proof holds, every other reproduction kept on the merge-base (<[gates] repros>/
+# *.patch, the tests earlier harden tasks landed) is replayed on the branch with the same gate. Red
+# is caught. Green is a miss, and fails the proof as `harden` naming it, if the gate is red with it
+# on the base (and green on the base alone): the branch stopped catching it. A reproduction that
+# no longer applies is stale, and one the gate never caught on the base (another layer's) is
+# inconclusive: both are reported in the `harden` row, neither fails the proof.
 
 HARDEN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # an incident's file stem, no path in it
 HARDEN_LAYERS = ("static", "runtime")
@@ -1214,6 +1221,19 @@ def repro_path(iid):
     return f"{_config.REPROS}/{iid}.patch"
 
 
+def kept_repros(ref, skip=()):
+    """The incident ids of the reproductions kept at `ref` (<[gates] repros>/<id>.patch, not in a
+    subdirectory), sorted, but those in `skip`."""
+    out = _gitops.git("ls-tree", "-z", ref, "--", f":(literal){_config.REPROS}/", raw=True)
+    ids = []
+    for ent in out.split("\0"):
+        info, _, path = ent.partition("\t")
+        name = path.rsplit("/", 1)[-1]
+        if info.split(" ")[1:2] == ["blob"] and name.endswith(".patch") and HARDEN_ID.fullmatch(name[:-6]):
+            ids.append(name[:-6])
+    return sorted(i for i in set(ids) if i not in set(skip))
+
+
 WORKER_HARDEN = """
 This is a harden task. Turn each incident below into a deterministic check in this project (a lint
 rule, an import boundary, a type, an arch test), never a sentence in a doc or a prompt. Put the
@@ -1226,7 +1246,8 @@ incident, not code already there: don't rewrite existing code to satisfy it here
 If an incident's patch no longer applies, the proof says so. Then commit a minimal reproduction at
 `{repros}/<incident id>.patch`: a `git diff` against this branch that adds code your check must
 flag, and that applies to the base too. The proof replays it in the patch's place, and it lands
-with this task as the check's test.
+with this task as the check's test. Then every other reproduction already in `{repros}/` is
+replayed on this branch with the same gate: each must still go red, so don't weaken an older check.
 """
 
 
@@ -1320,6 +1341,33 @@ def replay(tree, cmd, log, iid, patch, tip, mb):
     return "caught", how, None
 
 
+def replay_kept(tree, cmd, log, iid, patch, tip, mb, base_green):
+    """Replay a kept reproduction (one an earlier harden task landed): (outcome, why). outcome is
+    "caught" (red on the branch), "missed" (green on the branch, red on the base, green on the
+    base alone), "stale" (can't be replayed) or "inconclusive" (the base can't tell: green with it
+    too, or red alone). `base_green()` runs the gate on the base alone, once."""
+    reset_tree(tree, tip)
+    how = apply_patch(tree, patch)
+    if not how:
+        return "stale", "no longer applies to the branch, a 3-way merge included"
+    code = proof_run(tree, cmd, log, f"kept {iid}: branch + reproduction ({how})")
+    if code is None:
+        return "stale", "the gate timed out on the branch with it applied"
+    if code != 0:
+        return "caught", None
+    reset_tree(tree, mb)
+    if not apply_patch(tree, patch):
+        return "stale", "applies to the branch but not to its base"
+    code = proof_run(tree, cmd, log, f"kept {iid}: base + reproduction")
+    if code is None:
+        return "stale", "the gate timed out on the base with it applied"
+    if code == 0:
+        return "inconclusive", "the gate is green with it on the base too, so it never caught it (another layer's?)"
+    if not base_green():
+        return "inconclusive", "the gate is red on the base without it, so red there proves nothing"
+    return "missed", None
+
+
 def gate_file_changes(mb, tip):
     names = _gitops.git("diff", "--name-only", "-z", "--no-renames", mb, tip, raw=True)
     return [p for p in names.split("\0") if p and gate_file_hit(p)]
@@ -1402,12 +1450,37 @@ def run_harden(t, base, branch, rnd=None):
             problems.append(f"the gate isn't green on the base with only the branch's gate-file changes "
                             f"({', '.join(files) or 'none'}) and no patch: the check flags code already there "
                             f"(or the base is red); make it flag the incidents only")
+        kept, kept_why, alone = {}, {}, []
+        if not problems:  # its own proof holds: now the reproductions earlier harden tasks kept
+
+            def base_green():
+                if not alone:
+                    reset_tree(tree, mb)
+                    alone.append(proof_run(tree, cmd, log, "base alone, for the kept reproductions") == 0)
+                return alone[0]
+
+            for iid in kept_repros(mb, skip=ids):
+                rp = log.with_name(f"{log.stem}-kept-{iid}.patch")
+                rp.write_text(_gitops.git("show", f"{mb}:{repro_path(iid)}", raw=True))
+                try:
+                    kept[iid], why = replay_kept(tree, cmd, log, iid, rp, tip, mb, base_green)
+                finally:
+                    rp.unlink(missing_ok=True)  # the base holds it: no copy per proof left in runs/
+                if why:
+                    kept_why[iid] = why
+                if kept[iid] == "missed":
+                    problems.append(f"missed kept reproduction {iid} ({repro_path(iid)} on the base): the {layer} "
+                                    f"gate stayed green with it applied to the branch but goes red with it on the "
+                                    f"base, so this branch stopped catching it; keep the older check flagging it")
     ok = not problems
     _history.record("harden", t, ok=ok, layer=layer, cmd=cmd, incidents=ids, caught=caught, missed=missed,
-                    stale=stale, base_ok=base_ok, via=via, seconds=round(time.monotonic() - start, 1),
-                    log=log, **_round(rnd))
+                    stale=stale, base_ok=base_ok, via=via, kept=kept, kept_why=kept_why,
+                    seconds=round(time.monotonic() - start, 1), log=log, **_round(rnd))
+    tally = {o: sum(1 for v in kept.values() if v == o) for o in ("caught", "missed", "stale", "inconclusive")}
     print(f"  harden   {t['id']}  {layer}: caught {len(caught)} of {len(ids)}"
-          + ("" if base_ok else ", red on the base") + (f" (round {rnd})" if rnd and rnd > 1 else ""), flush=True)
+          + ("" if base_ok else ", red on the base")
+          + ("; kept reproductions: " + ", ".join(f"{n} {o}" for o, n in tally.items() if n) if kept else "")
+          + (f" (round {rnd})" if rnd and rnd > 1 else ""), flush=True)
     if ok:
         return None
     return (f"harden proof ({layer} gate `{cmd}`) failed: {'; '.join(problems)} "
@@ -1788,8 +1861,9 @@ HARDEN_FIX_PROMPT = """The harden proof failed on your work on {id} (fix round {
 
 The full output of each replay is in {log}.
 Fix it on {branch} in {wt}, and commit there citing {id}: make the check flag what it missed,
-commit a minimal reproduction where an incident's patch can't be replayed, and narrow a check that
-flags code already on the base (don't rewrite that code here; say so on a FOUND line). The check
+commit a minimal reproduction where an incident's patch can't be replayed, narrow a check that
+flags code already on the base (don't rewrite that code here; say so on a FOUND line), and keep
+each kept reproduction it names caught (the base's copy is what's replayed). The check
 stays a check, never a sentence in a doc or a prompt. The done checks, the gates and the proof run
 again when you finish. End as before: a `FOUND: <title> — <why>` line for each piece of work you
 find but don't do, then `RESULT: done` or `RESULT: blocked — <why>`.
@@ -1843,8 +1917,8 @@ def harden_lines(failed):
     _tail, log = verify_detail(failed)
     return (f"The harden proof failed on the last attempt: {failed}\nThe full output of each replay is in {log}.\n"
             "Fix it on this branch: make the check flag what it missed, commit a minimal reproduction where an "
-            "incident's patch can't be replayed, and narrow a check that flags code already on the base. The "
-            "proof runs again before this lands.\n")
+            "incident's patch can't be replayed, narrow a check that flags code already on the base, and keep "
+            "each kept reproduction it names caught. The proof runs again before this lands.\n")
 
 
 def weaken_lines(failed):
@@ -3085,6 +3159,14 @@ def dispatch(args):
     def also(t):
         return "".join(f" + {c['name']} {c['trunk']}" for c in _config.COMPANIONS if companion_touch(t, c))
 
+    def n_kept(t, e):
+        """How many kept reproductions t's harden proof would replay besides its own, as of now."""
+        ref = _gitops.epic_branch(e) if e and _gitops.branch_exists(_gitops.epic_branch(e)) else _config.MAIN
+        try:
+            return len(kept_repros(ref, skip=harden_ids(t)))
+        except _gitops.GitError:
+            return 0
+
     if args.dry_run:
         tasks = _tasks.load(_config.ITEMS)
         plan = list(eligible(tasks))
@@ -3103,6 +3185,7 @@ def dispatch(args):
                      if _config.VERIFY_ROUNDS else "")
                   + "".join(f", {layer} gate `{cmd}`" for layer, cmd in gate_cmds(t))
                   + (f", harden proof of {len(harden_ids(t))} incident(s) on the {harden_layer(t)} gate"
+                     f" then {n_kept(t, e)} kept reproduction(s) in {_config.REPROS}/ replayed on it"
                      if harden_ids(t) else "")
                   + (f", red-on-base proof if it changes {', '.join(_config.TESTS)}" if not prove_skip(t) else "")
                   + (f", {crounds} if its branch conflicts" if cr else "")

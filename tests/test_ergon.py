@@ -1964,6 +1964,74 @@ class TestHarden(DispatchProject):
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual(self.rows(), [])
 
+    def keep(self, patches):
+        """Commit reproductions on main as earlier harden tasks would have: {incident id: patch text}."""
+        d = self.root / "tests" / "harden"
+        d.mkdir(parents=True, exist_ok=True)
+        for iid, text in patches.items():
+            (d / f"{iid}.patch").write_text(text)
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "kept reproductions", cwd=self.root)
+
+    @staticmethod
+    def adds(name, line):
+        return (f"diff --git a/{name} b/{name}\nnew file mode 100644\n--- /dev/null\n+++ b/{name}\n"
+                f"@@ -0,0 +1 @@\n+{line}\n")
+
+    def test_a_check_change_that_lets_a_kept_reproduction_pass_fails(self):
+        """T-120: the base keeps I-1's reproduction, which the static gate catches; a harden task for
+        another incident rewrites the rules so I-1 passes. Its own proof holds, the kept replay fails it."""
+        self.incident({"app.py": "x = eval(input())\n"})
+        self.keep({"I-1": self.adds("old.py", "w = 'danger'")})
+        self.task()
+        self.assertIn("harden proof of 1 incident(s) on the static gate then 1 kept reproduction(s) in "
+                      "tests/harden/ replayed on it", self.ergon("dispatch", "--dry-run").stdout)
+        self.env["FAKE_WRITE"] = "rules.txt|eval("  # catches the new incident, drops `danger`
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("kept reproductions: 1 missed", out)
+        miss = ("missed kept reproduction I-1 (tests/harden/I-1.patch on the base): the static gate stayed green "
+                "with it applied to the branch")
+        self.assertIn(miss, self.notes())
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn(miss, calls[1]["prompt"])
+        self.assertIn("each kept reproduction it names caught", calls[1]["prompt"])
+        self.assertIn("every other reproduction already in `tests/harden/`", calls[0]["prompt"])
+        rows = self.rows()
+        self.assertEqual([(r["ok"], r["caught"], r["base_ok"], r["kept"]) for r in rows],
+                         [(False, [self.IID], True, {"I-1": "missed"})] * 2)
+        log = (self.root / rows[0]["log"]).read_text()
+        self.assertIn("kept I-1: branch + reproduction (clean): exit 0", log)
+        self.assertIn("kept I-1: base + reproduction: exit 1", log)
+        self.assertIn("base alone, for the kept reproductions: exit 0", log)
+        self.assertIn("danger", sh("git", "show", "main:rules.txt", cwd=self.root).stdout)  # nothing landed
+        self.scratch_gone()
+
+    def test_a_check_change_that_still_catches_kept_reproductions_lands(self):
+        """T-120: the same with a rule added beside the old one: I-1 is still caught and the task
+        lands. A kept reproduction that no longer applies is stale and one the gate never caught on
+        the base is inconclusive: reported, neither fails it. The task's own reproduction isn't replayed twice."""
+        self.incident({"app.py": "x = eval(input())\n"})
+        self.keep({"I-1": self.adds("old.py", "w = 'danger'"),
+                   "I-3": ("diff --git a/gone.py b/gone.py\n--- a/gone.py\n+++ b/gone.py\n@@ -1 +1 @@\n"
+                           "-a = 1\n+a = 'danger'\n"),
+                   "I-4": self.adds("other.py", "v = 'fine'"),
+                   self.IID: self.adds("own.py", "q = eval('1')")})
+        self.task()
+        self.assertIn("then 3 kept reproduction(s)", self.ergon("dispatch", "--dry-run").stdout)
+        self.env["FAKE_WEAKEN"] = "rules.txt|eval("
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("kept reproductions: 1 caught, 1 stale, 1 inconclusive", out)
+        (row,) = self.rows()
+        self.assertEqual((row["ok"], row["caught"], row["kept"]),
+                         (True, [self.IID], {"I-1": "caught", "I-3": "stale", "I-4": "inconclusive"}))
+        self.assertEqual(row["kept_why"]["I-3"], "no longer applies to the branch, a 3-way merge included")
+        self.assertIn("green with it on the base too", row["kept_why"]["I-4"])
+        self.assertEqual(len(self.calls()), 1)
+        self.scratch_gone()
+
     def test_runtime_layer_and_check(self):
         self.incident({"app.py": "x = eval(input())\n"})
         self.task(extra="\nharden_layer: runtime")
