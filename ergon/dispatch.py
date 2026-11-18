@@ -22,6 +22,7 @@ from . import gates as _gates
 from . import gitops as _gitops
 from . import priority as _priority
 from . import history as _history
+from . import learn as _learn
 from . import limits as _limits
 from . import report as _report
 from . import shared as _shared
@@ -2346,13 +2347,15 @@ def dispatch(args):
     reviewer = review_agent() if _config.REVIEW else None
     tried, skipped, results = set(), {}, []
     breaks, broken = [], set()  # this run's breakdowns (their info), and the epics they ran on
+    learns, learn_asked = [], set()  # this run's learn runs (their info), and the incidents they sent
     cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
     capped = stopped = False
     probing = not args.dry_run and _limits.enabled()  # the 5-hour window, read before and after
     window = None
 
     def spent():
-        return sum(r[3].get("cost", 0) for r in results) + sum(b.get("cost", 0) for b in breaks)
+        return (sum(r[3].get("cost", 0) for r in results) + sum(b.get("cost", 0) for b in breaks)
+                + sum(x.get("cost", 0) for x in learns))
     NO_TOUCHES = "(none declared)"
     every_touch = {k for c in _config.COMPANIONS for k in c["touches"]}
 
@@ -2415,6 +2418,43 @@ def dispatch(args):
         return info
 
     live, live_lock = {}, threading.Lock()  # running task id -> what its calls have cost so far
+
+    def learn_due():
+        """`learn = true` and an uncited incident that neither an earlier learn run nor this
+        dispatch run has sent yet (so a reply that keeps failing isn't asked again every scan)."""
+        if not _config.LEARN or args.dry_run:
+            return False
+        return any(i not in learn_asked for i in _learn.pending()[1])
+
+    def learn_job():
+        """One `ergon learn` run (learn.run), its cost within --budget-total: the call is capped
+        at what's left (and at --budget). Never raises; prints what it filed."""
+        with live_lock:
+            left = None if cap is None else cap - spent() - sum(live.values())
+        budget = args.budget if left is None else min(args.budget, left) if args.budget else left
+        learn_asked.update(_learn.pending()[1])
+        info = {"asked": [], "filed": [], "joined": {}, "skipped": [], "refused": [], "dropped": [],
+                "cost": 0, "ok": False, "warning": None, "record": None}
+        if budget is not None and budget <= 0:
+            print(f"  learn    skipped: the ${cap:.2f} cap is spent", flush=True)
+            return info
+        try:
+            info = _learn.run(budget=budget, by="dispatch")
+        except SystemExit as err:  # the claude call failed: a warning, never a reason to stop
+            info["warning"] = str(err)
+            print(f"  warning: {err}", file=sys.stderr, flush=True)
+            return info
+        except Exception as err:  # noqa: BLE001 - learn never takes dispatch down
+            info["warning"] = f"learn crashed: {err}"
+            print(f"  warning: learn crashed: {err}", file=sys.stderr, flush=True)
+            return info
+        if info["asked"]:
+            _learn.report(info, indent="  ")
+        if claims and (info["filed"] or info["joined"]):
+            failed = sync_state()
+            if failed:
+                say_sync(f"learn's proposals not pushed yet ({failed}); the next sync pushes them")
+        return info
 
     def round_stop(info, round_cost, rnd, kind="fix"):
         """Why no fix round (or `kind` round) may start now, or ''. Not after a Ctrl-C, nor when
@@ -2805,6 +2845,10 @@ def dispatch(args):
             print(f"  would run  breakdown {e['id']}  {bmodel}, read-only in the main checkout, "
                   + (f"estimated at most ${args.budget:g} (one call at --budget)" if args.budget
                      else "no --budget, so no estimate") + f"  {e['title']}")
+        inc, new = _learn.pending() if _config.LEARN else ([], [])
+        if new:
+            print(f"  would run  learn on {len(inc)} uncited incident(s) ({len(new)} new) after the run, "
+                  "one `claude -p` with no tools, only proposing")
         if not plan and not bplan:
             print("nothing to dispatch")
         if cap is not None:
@@ -2952,6 +2996,10 @@ def dispatch(args):
                                 broken.add(e["id"])
                                 print(f"  breakdown {e['id']}  read-only in {_config.HOME}  {e['title']}", flush=True)
                                 running[pool.submit(break_down, e)] = e["id"]
+                            # --watch: new incidents become proposed harden tasks each scan (learn = true)
+                            if (args.watch and not capped and not unsynced and len(running) < args.jobs
+                                    and "learn" not in running.values() and learn_due()):
+                                running[pool.submit(learn_job)] = "learn"
                         next_scan = time.monotonic() + args.interval
                     scan = False
                     over = stopping or capped or launched >= args.max
@@ -2964,6 +3012,10 @@ def dispatch(args):
                         finished = ()
                     for f in finished:
                         tid = running.pop(f)
+                        if tid == "learn":
+                            with live_lock:
+                                learns.append(f.result())
+                            continue
                         if tid.startswith("E-"):  # a breakdown
                             with live_lock:
                                 breaks.append(f.result())
@@ -2981,6 +3033,8 @@ def dispatch(args):
         stopped = bool(stops)
         if before and (results or breaks) and not KILL_ALL.is_set():
             window = _limits.measure(before, _limits.probe(), spent())
+        if not stopped and learn_due():  # the run's incidents, as proposed harden tasks (learn = true)
+            learns.append(learn_job())
     for tid, why in sorted(skipped.items()):
         print(f"  skipped  {tid}  {why}")
     if results:

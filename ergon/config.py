@@ -57,6 +57,8 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # review_resume_tokens = 80000  # and its context smaller than these; else a fresh worker on the branch
 # journal = true                # when an epic finishes, have claude write its journal entry (one `claude -p`
 #                               # call, shown on /e/E-NNN); false: only `ergon journal` writes them
+# learn = true                  # after each dispatch run (and each --watch scan) with a newly caught incident,
+#                               # run `ergon learn`: one `claude -p` proposes harden tasks (under --budget-total)
 # limit_probe = true            # read the plan's 5-hour window before and after each dispatch (two
 #                               # tiny haiku calls) to show each task's cost as a % of the limit
 
@@ -214,7 +216,7 @@ def configure(start=None, need_config=True):
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, EVIDENCE, \
-        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, \
+        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, LEARN, \
         GATE_FILES, SUPPRESS, REPROS, TESTS, PROVE_TIERS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
@@ -294,6 +296,9 @@ def configure(start=None, need_config=True):
     JOURNAL = CFG.get("journal", True)  # write an epic's journal entry (`ergon journal`) when it finishes
     if not isinstance(JOURNAL, bool):
         raise NotConfigured(f"{CONFIG_FILE}: journal is true or false")
+    LEARN = CFG.get("learn", False)  # dispatch runs `ergon learn` when new incidents wait (T-107)
+    if not isinstance(LEARN, bool):
+        raise NotConfigured(f"{CONFIG_FILE}: learn is true or false")
     COMPANIONS = []
     for c in CFG.get("companion") or []:
         if not c.get("path"):
