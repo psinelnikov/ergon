@@ -16,8 +16,8 @@ a [shared] table in .ergon.toml nothing here runs, and no command touches git fo
 - Only a human syncs: never from an agent shell, never from a task/ branch. The guard refuses
   `ergon sync` and git writes in the state worktree from agents.
 - Dispatch, started by a human, syncs on every scan and claims each task by pushing its
-  ready->doing before the worker launches; a claim the merge drops lost to another dispatcher
-  (dispatch.py, "claims").
+  ready->doing before the worker launches, and each epic breakdown by pushing a `breakdown:`
+  field on the epic; a claim the merge drops lost to another dispatcher (dispatch.py, "claims").
 """
 import os
 import re
@@ -223,6 +223,10 @@ NOTES = "## Notes"
 # After the merge, restamp() recomputes `approved:` of every open task from the verified signed
 # approvals (gitops.approvals), so it is never merged as text.
 STATUS_BOUND = ("approved", "asking", "answered")
+# An epic's `breakdown:` is dispatch's claim on breaking it down (dispatch.py, "breakdown
+# claims"). It merges three-way like any field, which makes it compare-and-set: every claim is a
+# value of its own, so a field both sides changed means two claims, and the remote's stands.
+BREAKDOWN_CLAIM = "breakdown"
 DATED = re.compile(r"^- (\d{4}-\d{2}-\d{2})\b")
 
 
@@ -384,7 +388,13 @@ def merge_item(key, base, ours, theirs, epic=False):
         if k in out or k == "id":
             continue
         out[k], clash = three_way(b.get(k), o.get(k), t.get(k))
-        if clash:
+        if clash and epic and k == BREAKDOWN_CLAIM:
+            # a breakdown claim is compare-and-set like status: each claim is a different value,
+            # so two clones claiming from one tip both change it, and the remote's push came first
+            said.append(f"{key}: dropped this clone's breakdown claim: {remote()} "
+                        + (f"has it claimed by {t.get(k)}" if t.get(k) else "had it claimed and released")
+                        + " first")
+        elif clash:
             said.append(f"{key}: both sides changed {k}; kept {remote()}'s {fmt(t.get(k))}, "
                         f"this clone's {fmt(o.get(k))} dropped")
     # the body: Notes are a union of lines, the rest goes through git merge-file

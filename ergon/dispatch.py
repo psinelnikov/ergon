@@ -147,7 +147,8 @@ def put_status(tid, status, note=None, who="dispatch", drop=()):
 # approval). Then each task is claimed before its worker launches: ready -> doing in a local commit
 # that names this clone, pushed. A rejected push fetches and merges, and status merges as
 # compare-and-set: if another dispatcher moved the task first, this clone's move is dropped and the
-# task isn't launched. done, blocked, asking and review are pushed as each task stops. Task
+# task isn't launched. An epic's breakdown is claimed the same way, with a `breakdown:` field on
+# the epic (claim_breakdown, below). done, blocked, asking and review are pushed as each task stops. Task
 # branches stay in the clone that ran them, so a `review` hold's Note names it (`held: <user>@<host>`)
 # and only that clone's `check` and `accept` look for the branch.
 
@@ -208,6 +209,96 @@ def unclaim(tid, answered=None, push=False):
             _shared.push_rounds(say_sync, quiet=True)
         except SystemExit as err:
             say_sync(f"{tid} back at ready, not pushed yet: {err}")
+
+
+# A breakdown has no status to move, so its claim is a field on the epic: `breakdown: <user>@<host>
+# until <UTC deadline> (<nonce>)`, written and pushed before the agent launches, the way claim()
+# pushes a task's ready -> doing. The nonce makes each claim a different value, so when two clones
+# claim from the same tip the merge sees both sides change the field and keeps the remote's
+# (shared.merge_item): the clone whose push landed first holds it, and the other finds its value
+# gone. The claim goes when the breakdown ends, however it ends (filed, blocked, crashed, killed),
+# so a failed run doesn't hold the epic; this clone's `breakdown` history row still keeps its own
+# dispatch from running it again, as in local mode. A dispatcher that dies outright leaves its
+# claim behind, and that claim lapses at its deadline: the call's --timeout plus CLAIM_SLACK.
+# `ergon breakdown E-NNN` by hand neither takes nor checks one.
+
+BREAKDOWN_CLAIM = _shared.BREAKDOWN_CLAIM
+CLAIM_SLACK = 15  # minutes a claim outlives its call's --timeout: filing and pushing after it
+CLAIM_UNTIL = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def breakdown_claim(e, now=None):
+    """The live breakdown claim on epic e (its `breakdown:` value), or None: no claim, one past
+    its deadline, or one that doesn't say until when (so a garbled value never holds an epic)."""
+    v = str((e or {}).get(BREAKDOWN_CLAIM) or "").strip()
+    m = re.search(r"\buntil (\S+)", v)
+    if not m:
+        return None
+    try:
+        until = datetime.datetime.strptime(m[1], CLAIM_UNTIL).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    return v if until > (now or datetime.datetime.now(datetime.timezone.utc)) else None
+
+
+def claim_holder(v):
+    """`dana@laptop until …` from a claim's value, without its nonce."""
+    return re.sub(r"\s*\([0-9a-f]+\)$", "", v)
+
+
+def claim_breakdown(eid, minutes):
+    """Shared mode, under the state lock, after the scan's sync: write a breakdown claim on epic
+    eid in a commit naming this clone, and push it. Returns (the claim's value, None) if this
+    dispatcher holds it now, else (None, why not): then no claim of this clone's is left."""
+    e = _tasks.load(_config.EPICS).get(eid)
+    held = breakdown_claim(e)
+    if held:
+        return None, f"another dispatcher holds it ({claim_holder(held)}); not started"
+    until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes + CLAIM_SLACK)
+    mine = f"{_tasks.clone_id()} until {until:{CLAIM_UNTIL}} ({os.urandom(4).hex()})"
+    e[BREAKDOWN_CLAIM] = mine
+    _tasks.dump(e, _tasks.EPIC_KEYS)
+    _shared.commit_pending("dispatch", body=f"Breakdown of {eid} claimed by {_tasks.clone_id()} in "
+                                            f"{_config.HOME} ({os.getpid()})")
+    try:
+        _shared.push_rounds(say_sync, quiet=True)
+    except SystemExit as err:
+        release_breakdown(eid, mine)
+        return None, f"couldn't push the claim, so it's dropped and the breakdown not started: {err}"
+    cur = _tasks.load(_config.EPICS).get(eid)
+    if not cur:
+        return None, f"{eid} is gone since the sync; not started"
+    now = cur.get(BREAKDOWN_CLAIM)
+    if now != mine:
+        return None, ("another dispatcher claimed it first (" + _shared.remote()
+                      + (f" has it held by {claim_holder(now)}" if now else " had it claimed and released")
+                      + "); not started")
+    # what the claim's merge brought in: a teammate's breakdown that filed tasks, an edit to the brief
+    why = (None if cur.get("status") == "open" else f"{eid} is {cur.get('status')}") \
+        or _tasks.epic_problem(cur, _gitops.approvals()) \
+        or (f"{eid} got tasks from another clone" if any(t.get("epic") == eid for t in
+                                                          _tasks.load(_config.ITEMS).values()) else None)
+    if why:
+        release_breakdown(eid, mine, push=True)
+        return None, f"{why}; claim released, not started"
+    return mine, None
+
+
+def release_breakdown(eid, mine, push=False):
+    """Take this dispatcher's breakdown claim (value `mine`) off epic eid, in a commit; pushed if
+    `push` (best effort). A claim that isn't `mine` any more is left alone. Caller holds the state
+    lock."""
+    e = _tasks.load(_config.EPICS).get(eid)
+    if not e or e.get(BREAKDOWN_CLAIM) != mine:
+        return
+    e.pop(BREAKDOWN_CLAIM)
+    _tasks.dump(e, _tasks.EPIC_KEYS)
+    _shared.commit_pending("dispatch")
+    if push:
+        try:
+            _shared.push_rounds(say_sync, quiet=True)
+        except SystemExit as err:
+            say_sync(f"breakdown claim on {eid} released, not pushed yet: {err}")
 
 
 # ---------- questions ----------
@@ -2443,6 +2534,7 @@ def dispatch(args):
     reviewer = review_agent() if _config.REVIEW else None
     tried, skipped, results = set(), {}, []
     breaks, broken = [], set()  # this run's breakdowns (their info), and the epics they ran on
+    bheld = {}  # shared mode: epic id -> the other dispatcher's breakdown claim last reported
     learns, learn_asked = [], set()  # this run's learn runs (their info), and the incidents they sent
     cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
     capped = stopped = False
@@ -2498,20 +2590,42 @@ def dispatch(args):
         if ids or args.tier:
             return []
         epics.update(_tasks.load(_config.EPICS))
-        return [e for e in breakdown_candidates(tasks, epics, _gitops.approvals())
-                if e["id"] not in broken and (not args.epic or e["id"] == args.epic)]
+        out = []
+        for e in breakdown_candidates(tasks, epics, _gitops.approvals()):
+            if e["id"] in broken or (args.epic and e["id"] != args.epic):
+                continue
+            held = breakdown_claim(e) if _config.SHARED else None
+            if held:  # shared mode: another dispatcher is breaking it down now
+                if bheld.get(e["id"]) != held:  # once per claim, not per scan
+                    bheld[e["id"]] = held
+                    print(f"  claimed  breakdown {e['id']}  another dispatcher holds it ({claim_holder(held)}); "
+                          "not started", flush=True)
+                continue
+            out.append(e)
+        return out
 
-    def break_down(e):
-        """A pool job: one breakdown of e. Files nothing if the epic got tasks meanwhile."""
+    def break_down(e, mine=None):
+        """A pool job: one breakdown of e. Files nothing if the epic got tasks meanwhile, or (shared
+        mode) if this dispatcher's claim on it, `mine`, is gone. The claim goes when it ends."""
         eid = e["id"]
 
         def gate():
             if any(t.get("epic") == eid for t in _tasks.load(_config.ITEMS).values()):
                 return f"{eid} got tasks while the breakdown ran; nothing filed (`ergon breakdown {eid}` adds more)"
+            if mine and _tasks.load(_config.EPICS).get(eid, {}).get(BREAKDOWN_CLAIM) != mine:
+                return f"this dispatcher's breakdown claim on {eid} is gone; nothing filed"
             return None
-        info = run_breakdown(e, args, by="dispatch", gate=gate, sync=(lambda: sync_state()) if claims else None)
-        print_breakdown(info)
-        if claims and info["filed"]:
+        try:
+            info = run_breakdown(e, args, by="dispatch", gate=gate, sync=(lambda: sync_state()) if claims else None)
+            print_breakdown(info)
+        finally:
+            if mine:  # filed, blocked or crashed: the claim goes, so a failed run doesn't hold the epic
+                try:
+                    with _gitops.state_lock("dispatch"):
+                        release_breakdown(eid, mine)
+                except Exception as err:  # noqa: BLE001 - it lapses at its deadline anyway
+                    say_sync(f"couldn't release the breakdown claim on {eid} ({err}); it lapses at its deadline")
+        if claims and (info["filed"] or mine):
             failed = sync_state()
             if failed:
                 say_sync(f"breakdown {eid} not pushed yet ({failed}); the next sync pushes it")
@@ -3117,8 +3231,15 @@ def dispatch(args):
                             while bq and len(running) < args.jobs:
                                 e = bq.pop(0)
                                 broken.add(e["id"])
+                                mine = None
+                                if claims:  # pushed before the agent launches, as a task's claim is
+                                    mine, lost = claim_breakdown(e["id"], args.timeout)
+                                    if lost:
+                                        print(f"  claimed  breakdown {e['id']}  {lost}", flush=True)
+                                        continue
+                                    e = _tasks.load(_config.EPICS)[e["id"]]  # as the claim's merge left it
                                 print(f"  breakdown {e['id']}  read-only in {_config.HOME}  {e['title']}", flush=True)
-                                running[pool.submit(break_down, e)] = e["id"]
+                                running[pool.submit(break_down, e, mine)] = e["id"]
                             # --watch: new incidents become proposed harden tasks each scan (learn = true)
                             if (args.watch and not capped and not unsynced and len(running) < args.jobs
                                     and "learn" not in running.values() and learn_due()):

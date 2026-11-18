@@ -61,7 +61,12 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                A reviewer's fail (`review` in .ergon.toml) goes back to the worker
                                and is reviewed again, up to review_rounds times, then blocks.
                                An approved open epic with no tasks is broken down first, once
-                               (as `breakdown` below; not with --ids or --tier)
+                               (as `breakdown` below; not with --ids or --tier). With [shared],
+                               each task is claimed by pushing ready -> doing, and each breakdown
+                               by pushing a `breakdown:` claim on the epic, before anything runs:
+                               a clone that sees another's claim skips it and says who holds it,
+                               a claim that can't be pushed launches nothing, and a breakdown's
+                               claim comes off when it ends (or lapses after --timeout + 15 min)
   ergon breakdown E-ID [--budget USD] [--timeout MIN]
                                one read-only `claude -p --agent task-breakdown` (opus) in the main
                                checkout reads the approved epic's brief, rules, policies and open

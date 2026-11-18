@@ -780,6 +780,169 @@ class TestDispatchClaims(Shared):
         self.assertEqual(self.status(self.a, "T-003"), "dropped")
 
 
+BREAKDOWN_ONE = """TASK: Add the schema
+tier: haiku
+tier_why: the exact change is written below
+touches: db/schema.sql
+depends:
+## What
+Add a `widgets` table to db/schema.sql:1.
+## Done when
+- `widgets` is in db/schema.sql
+END TASK
+RESULT: done
+"""
+
+
+class TestBreakdownClaims(Shared):
+    """Dispatch claims an epic's breakdown by pushing a `breakdown:` field on the epic before the
+    agent launches, and takes it off when the breakdown ends (T-130). Two clones, each a person."""
+
+    def setUp(self):
+        super().setUp()
+        base = Path(self.tmp.name)
+        bindir = base / "bin"
+        bindir.mkdir()
+        (bindir / "claude").write_text(FAKE_CLAUDE.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
+        (bindir / "claude").chmod(0o755)
+        self.calls = base / "breakdowns.jsonl"
+        common = dict(ERGON_ASK_STDIN="1", PATH=f"{bindir}:{os.environ['PATH']}",
+                      FAKE_BREAKDOWN=BREAKDOWN_ONE, FAKE_BREAKDOWN_SEEN=str(self.calls))
+        self.env_a = clean_env(USER="ann", LOGNAME="ann", **common)
+        self.env_b = clean_env(USER="dana", LOGNAME="dana", **common)
+        self.host = socket.gethostname().split(".")[0]
+
+    def breakdowns(self):
+        """The checkout each breakdown agent ran in, from either clone."""
+        if not self.calls.exists():
+            return []
+        return [json.loads(l)["cwd"] for l in self.calls.read_text().splitlines() if l.strip()]
+
+    def epic(self, where):
+        return next((where / "tasks" / "epics").glob("E-001-*/EPIC.md")).read_text()
+
+    def remote_epic(self):
+        names = sh("git", "ls-tree", "-r", "--name-only", "ergon-state", cwd=self.remote).stdout.split()
+        return sh("git", "show", f"ergon-state:{next(n for n in names if n.endswith('/EPIC.md'))}",
+                  cwd=self.remote).stdout
+
+    def remote_tasks(self):
+        names = sh("git", "ls-tree", "-r", "--name-only", "ergon-state", cwd=self.remote).stdout.split()
+        return sorted(re.search(r"(T-\d+)", n).group(1) for n in names if re.search(r"/T-\d+-", n))
+
+    def empty_epic_in_both(self):
+        """A files epic E-001, publishes it and approves it; B joins. It has no tasks."""
+        self.ergon(self.a, "new", "epic", "Widgets", env=self.env_a)
+        f = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        f.write_text(f.read_text().replace("## Goal\n", "## Goal\nShip widgets end to end.\n"))
+        self.ergon(self.a, "sync", "--init", inp="y\n", env=self.env_a)
+        self.assertIn("approved 1", self.ergon(self.a, "approve", "E-001", inp="y\n", env=self.env_a).stdout)
+        self.ergon(self.a, "sync", env=self.env_a)
+        self.ergon(self.b, "sync", "--join", env=self.env_b)
+        self.assertIn("status: open", self.epic(self.b))
+
+    def test_two_dispatchers_racing_for_one_empty_epic_run_one_breakdown(self):
+        self.empty_epic_in_both()
+        # A's whole dispatch (claim, breakdown, filing, release) runs between B's fetch and B's push
+        # of its claim. Without a claim B would push nothing before its own breakdown, so A's
+        # dispatch would run in the middle of B's filing and break the epic down a second time.
+        mark, a_out = Path(self.tmp.name) / "raced", Path(self.tmp.name) / "a-dispatch.txt"
+        hook = self.b / ".git" / "hooks" / "pre-push"
+        hook.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            [ -e "{mark}" ] && exit 0
+            touch "{mark}"
+            unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
+            cd "{self.a}" && USER=ann LOGNAME=ann "{sys.executable}" "{ERGON}" dispatch > "{a_out}" 2>&1
+            exit 0
+            """))
+        hook.chmod(0o755)
+        r = self.ergon(self.b, "dispatch", env=self.env_b)
+        self.assertTrue(mark.exists())
+        a = a_out.read_text()
+        self.assertIn("breakdown E-001  read-only in", a)
+        self.assertIn("proposed T-001  (breakdown E-001)  Add the schema", a)
+        self.assertEqual(self.breakdowns(), [str(self.a)])  # one breakdown: A's
+        self.assertIn("push rejected", r.stdout)
+        self.assertIn("claimed  breakdown E-001  E-001 got tasks from another clone; claim released, not started",
+                      r.stdout)
+        self.assertNotIn("read-only in", r.stdout)
+        self.assertEqual(self.remote_tasks(), ["T-001"])
+        # both claims went out and came off again: the remote holds none
+        self.assertNotIn("\nbreakdown:", self.remote_epic())
+        self.assertNotIn("\nbreakdown:", self.epic(self.b))
+        self.assertEqual(sh("git", "rev-parse", "HEAD", cwd=self.b / "tasks").stdout.strip(), self.remote_tip())
+        log = sh("git", "log", "--format=%B", "ergon-state", cwd=self.remote).stdout
+        self.assertIn(f"Breakdown of E-001 claimed by ann@{self.host} in {self.a}", log)
+        self.assertIn(f"Breakdown of E-001 claimed by dana@{self.host} in {self.b}", log)
+
+    def test_a_second_clone_that_sees_the_claim_leaves_the_epic_alone(self):
+        self.empty_epic_in_both()
+        p = subprocess.Popen([sys.executable, str(ERGON), "dispatch"], cwd=self.a,
+                             env=dict(self.env_a, FAKE_SLEEP="4"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True)
+        try:
+            for _ in range(200):  # until A's claim is on the remote (its breakdown is running then)
+                if "\nbreakdown: ann@" in self.remote_epic():
+                    break
+                time.sleep(0.05)
+            claim = re.search(r"^breakdown: (.*)$", self.remote_epic(), re.M).group(1)
+            self.assertRegex(claim, rf"^ann@{re.escape(self.host)} until \d{{4}}-\d\d-\d\dT\d\d:\d\d:\d\dZ "
+                                    r"\([0-9a-f]{8}\)$")
+            r = self.ergon(self.b, "dispatch", env=self.env_b)
+            self.assertIn(f"claimed  breakdown E-001  another dispatcher holds it (ann@{self.host} until ", r.stdout)
+            self.assertNotIn("read-only in", r.stdout)
+            dry = self.ergon(self.b, "dispatch", "--dry-run", env=self.env_b).stdout
+            self.assertIn("claimed  breakdown E-001  another dispatcher holds it", dry)
+            self.assertNotIn("would run  breakdown", dry)
+            out, err = p.communicate(timeout=120)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertEqual(p.returncode, 0, out + err)
+        self.assertIn("proposed T-001  (breakdown E-001)", out)
+        self.assertEqual(self.breakdowns(), [str(self.a)])
+        self.assertNotIn("\nbreakdown:", self.remote_epic())  # released as it ended, and pushed
+        self.assertEqual(self.remote_tasks(), ["T-001"])
+
+    def test_a_claim_that_cant_be_pushed_launches_nothing(self):
+        self.empty_epic_in_both()
+        hook = self.b / ".git" / "hooks" / "pre-push"
+        hook.write_text("#!/bin/sh\necho 'no pushing today' >&2\nexit 1\n")
+        hook.chmod(0o755)
+        before = self.remote_tip()
+        r = self.ergon(self.b, "dispatch", env=self.env_b)
+        self.assertIn("claimed  breakdown E-001  couldn't push the claim, so it's dropped and the breakdown "
+                      "not started", r.stdout)
+        self.assertEqual(self.breakdowns(), [])  # no agent, so no cost
+        self.assertNotIn("breakdown(s), $", r.stdout)
+        self.assertNotIn("\nbreakdown:", self.epic(self.b))
+        self.assertEqual(self.remote_tip(), before)
+        hook.unlink()  # it never ran here, so the next dispatch breaks it down
+        r = self.ergon(self.b, "dispatch", env=self.env_b)
+        self.assertIn("proposed T-001  (breakdown E-001)", r.stdout)
+        self.assertEqual(self.breakdowns(), [str(self.b)])
+        self.assertNotIn("\nbreakdown:", self.remote_epic())
+
+    def test_a_failed_breakdown_releases_its_claim_and_a_lapsed_claim_holds_nothing(self):
+        self.empty_epic_in_both()
+        blocked = dict(self.env_a, FAKE_BREAKDOWN="nothing\nRESULT: blocked — say where widgets live")
+        r = self.ergon(self.a, "dispatch", env=blocked)
+        self.assertIn("breakdown E-001 blocked: say where widgets live", r.stdout)
+        self.assertNotIn("\nbreakdown:", self.remote_epic())  # a failed run doesn't hold the epic
+        self.ergon(self.a, "dispatch", env=self.env_a)  # A's own history row: A doesn't run it again
+        self.assertEqual(self.breakdowns(), [str(self.a)])
+        # a dispatcher that died mid-run left a claim; past its deadline it holds nothing
+        f = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        f.write_text(f.read_text().replace("\n---\n", "\nbreakdown: ann@gone until 2020-01-01T00:00:00Z (0badc0de)\n---\n", 1))
+        self.ergon(self.a, "sync", env=self.env_a)
+        self.assertIn("breakdown: ann@gone", self.remote_epic())
+        r = self.ergon(self.b, "dispatch", env=self.env_b)
+        self.assertIn("proposed T-001  (breakdown E-001)", r.stdout)
+        self.assertEqual(self.breakdowns(), [str(self.a), str(self.b)])
+        self.assertNotIn("\nbreakdown:", self.remote_epic())
+
+
 class TestSignedApprovals(Shared):
     """Approvals are SSH-signed state commits, verified against the approvers file on the remote's
     trunk (T-020). Each failing case is left out by `next`, reported by `check` and skipped by
