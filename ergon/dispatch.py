@@ -2732,7 +2732,7 @@ def dispatch(args):
                 skipped[t["id"]] = (f"touches {missing[0]['name']} but there's no checkout at "
                                     f"{missing[0]['path']}: clone the repo there")
                 continue
-            # its epic's brief must be approved: proposed, or (shared mode) a stamp that doesn't verify
+            # its epic's brief must be approved: proposed, or (shared mode) open with no signed approval that verifies, stamped or not
             why = _tasks.epic_problem(_tasks.epic_of(t, epics), apr)
             if why:
                 skipped[t["id"]] = why
