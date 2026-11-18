@@ -8,6 +8,7 @@ live in serve.css, so light and dark both work.
 import datetime
 import statistics
 
+from . import history as _history
 from . import report as _report
 from . import tasks as _tasks
 
@@ -126,6 +127,7 @@ def compute(tasks, rows, runs_dir, since=None, until=None, epic=None, summary=No
                     "asking → answered": spread(gap(("question",), ("answered",))),
                     "review → accepted": spread(gap(("review_hold",), ("accepted",)))},
         "lead": spread(lead), "weeks": dict(sorted(weeks.items())),
+        "pyramid": _history.catches(keep),
         "tokens": tokens, "denials": denials, "rebuilds": rebuilds,
         "empty": not stats["tiers"] and not keep,
     }
@@ -167,6 +169,30 @@ def columns(items, esc, label="chart"):
         out.append(f'<rect class=b3 x={x} y={120 - hh} width={max(step - 8, 4)} height={hh} rx=2 />'
                    f'<text class=m x={x + max(step - 8, 4) // 2} y={114 - hh} text-anchor=middle>{v}</text>'
                    f'<text class=m x={x + max(step - 8, 4) // 2} y=136 text-anchor=middle>{esc(k[5:])}</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def stacked(weeks, layers, esc, label="chart"):
+    """Stacked columns per week: weeks {week: {layer: n}}, layers in stack order (bottom first)."""
+    if not weeks:
+        return ""
+    top = max(sum(w.values()) for w in weeks.values()) or 1
+    step = min(60, 520 // len(weeks))
+    bw = max(step - 8, 4)
+    out = [f'<svg class=chart viewBox="0 0 560 150" role=img aria-label="{esc(label)}">',
+           '<line class=axis x1=20 y1=120 x2=550 y2=120 />']
+    for i, (wk, w) in enumerate(weeks.items()):
+        x = 24 + i * step
+        y = 120
+        for j, k in enumerate(layers):
+            n = w.get(k, 0)
+            if not n:
+                continue
+            hh = max(round(90 * n / top), 1)
+            y -= hh
+            out.append(f'<rect class=b{j % 4 + 1} x={x} y={y} width={bw} height={hh}><title>{esc(k)}: {n}</title></rect>')
+        out.append(f'<text class=m x={x + bw // 2} y=136 text-anchor=middle>{esc(wk[5:])}</text>')
     out.append("</svg>")
     return "".join(out)
 
@@ -241,6 +267,17 @@ def render(m, esc, money, filters):
     w = m["weeks"]
     b.append(section("Landed per week", columns(list(w.items()), esc, "tasks landed per week"),
                      table(["week", "landed"], list(w.items()), esc) if w else "<p>Nothing has landed in this range.</p>"))
+    py = m["pyramid"]
+    if py["totals"]:
+        cols = _report.layer_order(py["totals"])
+        late = f"{100 * py['late']:.0f}%" if py["late"] is not None else "—"
+        legend = "<p>" + " · ".join(f"{esc(k)}" for k in cols) + " (bottom to top)</p>"
+        b.append(section("Trust pyramid: catches per layer",
+                         stacked(py["weeks"], cols, esc, "catches per layer per week") + legend,
+                         table(["week", *cols], [(wk, *(w.get(k, 0) for k in cols)) for wk, w in py["weeks"].items()], esc)
+                         + table(["measure", "value"],
+                                 [("caught by review + human", late),
+                                  ("answers to questions (not catches)", py["answers"])], esc)))
     tk = m["tokens"]
     rb = m["rebuilds"]
     if tk:

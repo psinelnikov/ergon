@@ -1932,6 +1932,41 @@ class TestStats(Project):
         self.assertIn("skipped 2", out)
 
 
+class TestTrustPyramid(Project):
+    ROWS = [
+        {"at": "2026-11-16T10:00:00+00:00", "event": "verify", "task": "T-001", "ok": False, "layer": "static"},
+        {"at": "2026-11-16T10:01:00+00:00", "event": "verify", "task": "T-001", "ok": False},  # old row: runtime
+        {"at": "2026-11-16T10:02:00+00:00", "event": "verify", "task": "T-001", "ok": True, "layer": "static"},
+        {"at": "2026-11-17T10:00:00+00:00", "event": "review", "task": "T-001", "verdict": "fail"},
+        {"at": "2026-11-17T10:01:00+00:00", "event": "review", "task": "T-001", "verdict": "pass"},
+        {"at": "2026-11-24T10:00:00+00:00", "event": "rejected", "task": "T-002", "from": "review", "to": "ready"},
+        {"at": "2026-11-24T10:01:00+00:00", "event": "rejected", "task": "T-003", "from": "proposed", "to": "dropped"},
+        {"at": "2026-11-24T10:02:00+00:00", "event": "verify", "task": "T-002", "ok": False, "layer": "prove"},
+        {"at": "2026-11-24T10:03:00+00:00", "event": "answered", "task": "T-002"},
+        {"at": "2026-11-24T10:04:00+00:00", "event": "mystery", "task": "T-002"},
+    ]
+
+    def test_catches_per_layer_and_week(self):
+        from ergon import history
+        c = history.catches(self.ROWS)
+        self.assertEqual(c["weeks"], {"2026-W47": {"static": 1, "runtime": 1, "review": 1},
+                                      "2026-W48": {"human": 1, "prove": 1}})
+        self.assertEqual(c["totals"], {"static": 1, "runtime": 1, "review": 1, "human": 1, "prove": 1})
+        self.assertEqual(c["answers"], 1)
+        self.assertAlmostEqual(c["late"], 0.4)
+        self.assertEqual(history.catches(self.ROWS, since="2026-11-20")["totals"], {"human": 1, "prove": 1})
+        self.assertIsNone(history.catches([])["late"])
+
+    def test_stats_prints_section(self):
+        runs = self.root / "tasks" / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        (runs / "history.jsonl").write_text("".join(json.dumps(r) + "\n" for r in self.ROWS))
+        out = self.ergon("stats").stdout
+        self.assertIn("trust pyramid", out)
+        self.assertIn("2026-W48", out)
+        self.assertIn("caught by review + human: 40%", out)
+
+
 class TestApproverSignals(Project):
     def rows(self):
         def r(day, tid, event, **kw):

@@ -665,6 +665,12 @@ class TestMetrics(ServeFixture):
         self.assertIn("No runs yet", empty)
         self.assertEqual(self.snapshot(), self.before)
 
+    def test_metrics_trust_pyramid(self):
+        _, _, page = self.req("GET", "/metrics")
+        self.assertIn("Trust pyramid", page)
+        self.assertIn("caught by review + human", page)
+        self.assertIn("<title>review: 2</title>", page)  # the fixture's two failed reviews
+
     def test_metrics_veto_and_filter(self):
         _, _, page = self.req("GET", "/metrics?epic=E-001&since=2026-11-16")
         self.assertIn("veto rate", page)

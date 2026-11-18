@@ -97,6 +97,44 @@ def _week(at):
     return f"{y}-W{w:02d}"
 
 
+LAYERS = ("guard", "static", "runtime", "prove", "weaken", "review", "human")
+
+
+def catches(rows, since=None, epic=None, until=None):
+    """Where mistakes were caught, from the history: {"weeks": {week: {layer: n}}, "totals": {layer: n},
+    "answers": n, "late": share caught by review + human (None when nothing was caught)}.
+    A failed `verify` row counts under its `layer` (an old row with none is `runtime`); a failed
+    `review` is `review`; a `rejected` row going from review is `human`. Answers are counted apart:
+    they're a human's input, not a caught mistake. Layers this reader doesn't know are kept as
+    they come. Never raises on odd rows."""
+    weeks, totals, answers = {}, {}, 0
+    for r in rows:
+        d = str(r.get("at") or "")[:10]
+        if (since and d < since) or (until and d > until) or (epic and r.get("epic") != epic):
+            continue
+        ev = r.get("event")
+        if ev == "verify" and r.get("ok") is False:
+            layer = str(r.get("layer") or "runtime")
+        elif ev == "review" and r.get("verdict") == "fail":
+            layer = "review"
+        elif ev == "rejected" and r.get("from") == "review":
+            layer = "human"
+        elif ev == "answered":
+            answers += 1
+            continue
+        else:
+            continue
+        wk = _week(r.get("at"))
+        if not wk:
+            continue
+        w = weeks.setdefault(wk, {})
+        w[layer] = w.get(layer, 0) + 1
+        totals[layer] = totals.get(layer, 0) + 1
+    n = sum(totals.values())
+    late = (totals.get("review", 0) + totals.get("human", 0)) / n if n else None
+    return {"weeks": dict(sorted(weeks.items())), "totals": totals, "answers": answers, "late": late}
+
+
 def approver_signals(tasks, rows, since=None, epic=None, until=None):
     """How the tasks each approver approved went, as counts of tasks:
     {name: {"approved", "tiers", "landed", "escalated", "blocked", "asked", "fails", "sent_back",

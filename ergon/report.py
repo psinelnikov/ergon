@@ -115,7 +115,27 @@ def stats(args):
             print(f"  {tid} x{n}  {tasks[tid].get('title', '')}")
     if r["skipped"]:
         print(f"\nskipped {r['skipped']} unreadable or unmatched log(s)")
+    pyramid_section(args)
     approver_section(tasks, args)
+
+
+def layer_order(totals):
+    return [*(k for k in _history.LAYERS if k in totals), *sorted(k for k in totals if k not in _history.LAYERS)]
+
+
+def pyramid_section(args):
+    c = _history.catches(_history.read(), since=args.since, epic=args.epic)
+    if not c["totals"] and not c["answers"]:
+        return
+    cols = layer_order(c["totals"])
+    print("\ntrust pyramid (catches per layer, per week)")
+    print(f"  {'week':<10}" + "".join(f"{k:>9}" for k in cols))
+    for wk, w in c["weeks"].items():
+        print(f"  {wk:<10}" + "".join(f"{w.get(k, 0):>9}" for k in cols))
+    print(f"  {'total':<10}" + "".join(f"{c['totals'][k]:>9}" for k in cols))
+    if c["late"] is not None:
+        print(f"  caught by review + human: {100 * c['late']:.0f}% (the share hardening should drive down)")
+    print(f"  answers to workers' questions (not catches): {c['answers']}")
 
 
 MIX = {"haiku": "h", "sonnet": "s", "opus": "o", "human": "hu"}
