@@ -345,6 +345,18 @@ class TestBasics(Project):
         event = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ergon approve T-001"}, "cwd": str(other)})
         self.assertEqual(self.ergon("hook", "guard", cwd=other, inp=event).stdout, "")
 
+    def test_approve_listing_shows_verify_and_prove_no(self):
+        self.ergon("new", "task", "Plain", "--tier", "sonnet")
+        self.ergon("new", "task", "Odd", "--tier", "sonnet")
+        f = self.task_file("T-002")
+        f.write_text(f.read_text().replace("\n---\n", "\nverify: echo hi\nprove: no\n---\n", 1))
+        r = self.ergon("approve", "T-001", "T-002", env=clean_env(ERGON_ASK_STDIN="1"), inp="n\n", check=False)
+        out = r.stdout
+        self.assertIn("verify: echo hi", out)
+        self.assertIn("prove: no", out)
+        self.assertEqual(out.count("verify:"), 1)
+        self.assertEqual(out.count("prove:"), 1)
+
     def test_approval_is_human_only(self):
         self.ergon("new", "task", "Fix it", "--tier", "sonnet")
         self.assertEqual(self.status("T-001"), "proposed")

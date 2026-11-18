@@ -308,6 +308,10 @@ def approve(args):
             continue
         print(_tasks.line(t, tasks) + (f"  (approve again: {again[t['id']]})" if t["id"] in again else "")
               + (f"  (two-person: {apr.tally(t)})" if _tasks.two_person(t) else ""))
+        if str(t.get("verify") or "").strip():  # both are signed by the approval, so show them
+            print(f"      verify: {str(t['verify']).strip()}  (replaces the runtime gate)")
+        if _tasks.prove_off(t):
+            print("      prove: no  (skips the red-on-base proof)")
     n_epics = sum(map(_tasks.is_epic, todo))
     what = " and ".join(x for x in (f"{n_epics} epic brief(s)" if n_epics else "",
                                     f"{len(todo) - n_epics} task(s)" if len(todo) > n_epics else "") if x)
