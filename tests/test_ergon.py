@@ -38,7 +38,10 @@ lands a conflicting commit on the main checkout's trunk after merging. With $FAK
 the weakening check asked for puts the file back as main has it. $FAKE_EDIT_TOUCHES rewrites its
 own task file's touches: in the main checkout to that list. $FAKE_WRITE = "<path>|<text>" has its
 first run overwrite that file with that line. With $FAKE_REPRO = "<dest>|<src>" a fix round the
-harden proof asked for copies the file src to dest and commits it."""
+harden proof asked for copies the file src to dest and commits it. $FAKE_EVIDENCE =
+"<path>|<caption>[|file|symlink|none];..." has a worker write each file (a symlink to /etc/hosts, or
+nothing), commit it and end with an EVIDENCE: line each, on every run, or with $FAKE_EVIDENCE_FIX only
+when asked again for its evidence."""
 import json, os, re, subprocess, sys, time
 if "--agent" not in sys.argv:
     n = 0
@@ -158,6 +161,16 @@ if os.environ.get("FAKE_EDIT_TOUCHES"):  # a worker widening its own touches: to
         text = open(f).read()
         open(f, "w").write(re.sub(r"^touches:.*$", "touches: [" + os.environ["FAKE_EDIT_TOUCHES"] + "]", text,
                                   count=1, flags=re.M))
+evidence = ""
+if os.environ.get("FAKE_EVIDENCE") and (not os.environ.get("FAKE_EVIDENCE_FIX") or "its evidence" in prompt):
+    for ent in os.environ["FAKE_EVIDENCE"].split(";"):
+        path, caption, kind = (ent.split("|") + ["", "file"][len(ent.split("|")) - 1:])[:3]
+        if kind == "file":
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            open(path, "wb").write(b"\x89PNG\x00fake" if path.endswith(".png") else b"3 passed\n")
+        elif kind == "symlink":
+            os.symlink("/etc/hosts", path)
+        evidence += f"EVIDENCE: {path} \u2014 {caption}\n"
 commit(".", f"Do the thing ({tid})", os.environ.get("FAKE_SHARED"))
 pub = os.path.join("pub", "src")
 if os.path.isdir(pub):
@@ -169,7 +182,7 @@ if os.environ.get("FAKE_ASK") and "answered" not in prompt:
     print(json.dumps({"result": "need a call\n" + found + os.environ["FAKE_ASK"] + "\nRESULT: asking",
                       "session_id": "s-1", "total_cost_usd": 0.01}))
     sys.exit()
-print(json.dumps({"result": "did it\n" + found + os.environ.get("FAKE_RESULT_" + tier, os.environ.get("FAKE_RESULT", "RESULT: done")), "session_id": "s-1", "total_cost_usd": 0.01}))
+print(json.dumps({"result": "did it\n" + found + evidence + os.environ.get("FAKE_RESULT_" + tier, os.environ.get("FAKE_RESULT", "RESULT: done")), "session_id": "s-1", "total_cost_usd": 0.01}))
 '''
 
 
@@ -1416,6 +1429,81 @@ class TestWeakening(DispatchProject):
         cfg.write_text(base.replace('protect = ["ruff.toml", "tests/arch/**"]', 'protect = "ruff.toml"'))
         r = self.ergon("board", check=False)
         self.assertIn("protect and suppress, each a list of patterns", r.stderr + r.stdout)
+
+
+class TestEvidence(DispatchProject):
+    """EVIDENCE: lines (T-103): copied to <state>/runs/<ID>-evidence/, listed to the reviewer,
+    refused outside the worktree or through a symlink, and required by `evidence: yes`."""
+    config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
+                                            '        review = ["haiku"]')
+
+    def setUp(self):
+        super().setUp()
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0")
+        self.env.pop("CLAUDE_CONFIG_DIR", None)
+
+    def task(self, extra=""):
+        self.ergon("new", "task", "Proved", "--tier", "haiku")
+        f = self.task_file("T-001")
+        stamp(f)
+        if extra:
+            f.write_text(f.read_text().replace("tier: haiku\n", f"tier: haiku\n{extra}\n", 1))
+
+    def calls(self):
+        return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+
+    def rows(self):
+        return [r for r in history(self.root) if r["task"] == "T-001" and r["event"] == "evidence"]
+
+    def test_copied_and_listed_for_the_reviewer(self):
+        self.task()
+        self.env["FAKE_EVIDENCE"] = "out/shot.png|the <b>page</b> renders;out/log.txt|3 tests pass"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        d = self.root / "tasks" / "runs" / "T-001-evidence"
+        self.assertEqual(sorted(p.name for p in d.iterdir()), ["log.txt", "shot.png"])
+        self.assertEqual((d / "log.txt").read_text(), "3 passed\n")
+        review = [c for c in self.calls() if c["agent"] == "REVIEW"][0]["prompt"]
+        self.assertIn(f"{d / 'shot.png'}: the <b>page</b> renders", review)
+        self.assertIn("log.txt: 3 tests pass", review)
+        self.assertEqual([f["name"] for f in self.rows()[0]["files"]], ["shot.png", "log.txt"])
+
+    def test_outside_and_symlink_refused(self):
+        self.task()
+        self.env["FAKE_EVIDENCE"] = "/etc/hosts|abs|none;../up.txt|up|none;link.txt|sym|symlink;ok.txt|fine"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        d = self.root / "tasks" / "runs" / "T-001-evidence"
+        self.assertEqual([p.name for p in d.iterdir()], ["ok.txt"])
+        refused = self.rows()[0]["refused"]
+        self.assertEqual(len(refused), 3, refused)
+        self.assertTrue(any("link.txt: a symlink" in r for r in refused))
+        self.assertTrue(any("/etc/hosts: outside the worktree" in r for r in refused))
+        review = [c for c in self.calls() if c["agent"] == "REVIEW"][0]["prompt"]
+        self.assertIn("refused, not copied: link.txt: a symlink", review)
+
+    def test_required_evidence_gets_a_fix_round(self):
+        self.task("evidence: yes")
+        self.env.update(FAKE_EVIDENCE="proof.txt|it runs", FAKE_EVIDENCE_FIX="1")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        workers = [c for c in self.calls() if c["agent"] == "HAIKU"]
+        self.assertEqual(len(workers), 2, out)
+        self.assertIn("REQUIRES evidence", workers[0]["prompt"])
+        self.assertIn("missing its evidence", workers[1]["prompt"])
+        self.assertTrue((self.root / "tasks" / "runs" / "T-001-evidence" / "proof.txt").is_file())
+
+    def test_required_by_a_rule_blocks_when_never_given(self):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + '\n[[evidence]]\ntiers = ["haiku"]\n')
+        self.task()
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("requires evidence", self.task_file("T-001").read_text())
+        self.assertEqual(self.rows(), [])
 
 
 class TestHarden(DispatchProject):

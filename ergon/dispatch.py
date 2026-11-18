@@ -45,6 +45,10 @@ Working tree: {wt} (a git worktree of this repo), on branch {branch}, cut from {
 {retry}{nested}{companions}{rules}{gates}
 Work you find but don't do: end your final message with one line per item, before the RESULT line,
 `FOUND: <title> — <why>`. The dispatcher files each as a proposed task.
+To prove the work runs, end a line `EVIDENCE: <path in this worktree> — <what it shows>` for each
+runtime artifact (test output, a screenshot, a recording), before the RESULT line. Dispatch copies
+those files (regular files inside the worktree, no symlinks, at most {evmax} MB each) for the
+reviewer and the human; never write to the state directory yourself.{evneed}
 
 The task file, read-only to you (it lives in the main checkout):
 
@@ -471,6 +475,9 @@ def worker_prompt(t, base, wt, branch, pubs, veto=None, lines=None):
     pol = policies_text()
     return WORKER_PROMPT.format(id=t["id"], wt=wt, branch=branch, base=base, retry=retry,
                                 nested=nested, companions=companions, gates=gates_text(t),
+                                evmax=EVIDENCE_MAX // 1_000_000,
+                                evneed=(" This task REQUIRES evidence: a done with none goes back to you."
+                                        if _tasks.needs_evidence(t) else ""),
                                 rules=(f"\nThis project's worker rules:\n\n{rules}\n" if rules else "")
                                 + (WORKER_POLICIES.format(policies=pol) if pol else ""),
                                 text=t["_path"].read_text())
@@ -486,6 +493,82 @@ def md_trim(s):
     if len(s) > 1 and s[0] == s[-1] == "`" and s.count("`") == 2:
         s = s[1:-1]
     return s.strip(" *")
+
+
+EVIDENCE_MAX = 5_000_000  # bytes per evidence file
+EVIDENCE_FILES = 20  # evidence files kept per task
+
+
+def evidence_dir(tid):
+    return _config.RUNS / f"{tid}-evidence"
+
+
+def copy_evidence(t, wt, items, rnd=None):
+    """Copy a worker's EVIDENCE: files, [(path, caption)], into <state>/runs/<ID>-evidence/.
+    Only a regular file inside the worktree, reached through no symlink and within EVIDENCE_MAX,
+    is copied; anything else is refused. Records an `evidence` history row. Returns (kept,
+    refused): kept is [{name, caption, bytes}], refused is ["path: why"]."""
+    dest = evidence_dir(t["id"])
+    shutil.rmtree(dest, ignore_errors=True)
+    kept, refused, seen = [], [], set()
+    root = Path(wt)
+    for path, caption in items:
+        if (path, caption) in seen:
+            continue
+        seen.add((path, caption))
+        if len(kept) >= EVIDENCE_FILES:
+            refused.append(f"{path}: more than {EVIDENCE_FILES} files")
+            continue
+        p = Path(path)
+        try:
+            rel = p.relative_to(root) if p.is_absolute() else p
+        except ValueError:
+            refused.append(f"{path}: outside the worktree")
+            continue
+        if ".." in rel.parts or not rel.parts:
+            refused.append(f"{path}: outside the worktree")
+            continue
+        cur, bad = root, None
+        for part in rel.parts:
+            cur = cur / part
+            if cur.is_symlink():
+                bad = "a symlink"
+                break
+        if bad:
+            refused.append(f"{path}: {bad}")
+            continue
+        try:
+            if not cur.is_file():
+                refused.append(f"{path}: not a file")
+                continue
+            size = cur.stat().st_size
+            if size > EVIDENCE_MAX:
+                refused.append(f"{path}: {size:,} bytes, over the {EVIDENCE_MAX:,} cap")
+                continue
+            stem = re.sub(r"[^A-Za-z0-9._-]", "_", cur.name).lstrip(".") or "file"
+            name, n = stem, 1
+            while any(k["name"] == name for k in kept):
+                n += 1
+                name = f"{n}-{stem}"
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(cur, dest / name)
+        except OSError as err:
+            refused.append(f"{path}: {err.strerror or err}")
+            continue
+        kept.append({"name": name, "caption": caption, "bytes": size, "path": rel.as_posix()})
+    _history.record("evidence", t, files=kept, refused=refused, **_round(rnd))
+    return kept, refused
+
+
+def evidence_text(tid, kept, refused=()):
+    """The reviewer prompt's section on a worker's evidence, or ''."""
+    if not kept and not refused:
+        return ""
+    d = evidence_dir(tid)
+    out = "\nThe worker's evidence that the work runs. Read each file (open images) and judge it:\n"
+    out += "".join(f"- {d / k['name']}: {k['caption'] or '(no caption)'}\n" for k in kept)
+    out += "".join(f"- refused, not copied: {r}\n" for r in refused)
+    return out
 
 
 def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
@@ -520,6 +603,8 @@ def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
                      re.findall(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if md_trim(m[0])]
     info["policy"] = [(md_trim(m[0]), md_trim(m[1])) for m in
                       re.findall(r"^\W*POLICY:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if md_trim(m[0])]
+    info["evidence"] = [(md_trim(m[0]), md_trim(m[1])) for m in
+                        re.findall(r"^\W*EVIDENCE:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if md_trim(m[0])]
     found = re.findall(r"^\W*RESULT:\s*(done|blocked|asking)\b[\s—:–-]*(.*)$", text, re.M)
     if not found:
         return "blocked", "worker ended without a RESULT line", info
@@ -1009,6 +1094,7 @@ REVIEW_PROMPT = """You are reviewing {id} before it lands.
 
 Working tree: {wt}, on branch {branch}, cut from {base}. A {tier}-tier worker says the task is done.
 {companions}{rules}
+{evidence}
 The task file:
 
 {text}
@@ -1054,7 +1140,7 @@ def tree_state(trees, branch, repos):
             + [_gitops.git("rev-parse", branch, cwd=r) for r in repos])
 
 
-def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None):
+def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None, evidence=None):
     """Run the reviewer on a finished task branch and record its review event. Returns (failure
     reason or None, cost, reviewer tier, fixable). Only a last line of `REVIEW: pass` passes: no
     such line, a fail, output that isn't JSON, an error, a kill, a timeout, or a reviewer that
@@ -1063,7 +1149,7 @@ def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None)
     start = time.monotonic()
     log = _config.RUNS / (f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-review"
                           + (str(rnd) if rnd and rnd > 1 else "") + ".json")
-    failed, cost, who, fixable = _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log)
+    failed, cost, who, fixable = _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log, evidence)
     _history.record("review", t, verdict="fail" if failed else "pass", reviewer=who, tier=tier,
                     reason=failed, cost=cost, seconds=round(time.monotonic() - start, 1), log=log, **_round(rnd))
     if failed and fixable:
@@ -1071,7 +1157,7 @@ def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None)
     return failed, cost, who, fixable
 
 
-def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log):
+def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log, evidence=None):
     who = reviewer_tier(tier)
     trees, repos = [wt] + [pub for _, pub in pubs], [None] + [c["path"] for c, _ in pubs]
     before = tree_state(trees, branch, repos)
@@ -1086,7 +1172,8 @@ def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log):
     prompt = REVIEW_PROMPT.format(id=t["id"], wt=wt, branch=branch, base=base, tier=tier, companions=companions,
                                   rules=(f"\nThe worker followed these project rules:\n\n{rules}\n" if rules else "")
                                   + (REVIEW_POLICIES.format(policies=pol) if pol else ""),
-                                  text=t["_path"].read_text(), diff=diff, size=size)
+                                  text=t["_path"].read_text(), diff=diff, size=size,
+                                  evidence=evidence_text(t["id"], *evidence) if evidence else "")
     cmd = ["claude", "-p", "--agents", json.dumps({"task-review": dict(agent, model=who)}),
            "--agent", "task-review", "--permission-mode", args.permission_mode, "--settings", settings,
            "--output-format", "json"]
@@ -1146,7 +1233,7 @@ def veto_lines(failed):
             + "Fix what it raised on this branch; it reviews again before this lands.\n")
 
 
-def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None):
+def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, evidence=None):
     """After a worker says done, before the merge lock: its done claim holds, verify passes,
     then the reviewer passes if `review` names the task's tier or `tier`, the one that finished
     (after --escalate the lower tier's commits are on the branch too). The reviewer is one tier
@@ -1174,9 +1261,14 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None):
     failed = run_harden(t, base, branch, rnd)
     if failed:
         return failed[0], 0, failed[1]
+    if _tasks.needs_evidence(t, tier) and not (evidence and evidence[0]):
+        refused = f" (refused: {'; '.join(evidence[1])})" if evidence and evidence[1] else ""
+        return (f"worker said done but gave no EVIDENCE: file, and {t['id']} requires evidence{refused}", 0,
+                "evidence")
     if t["tier"] not in _config.REVIEW and tier not in _config.REVIEW:
         return None, 0, False
-    failed, cost, who, fixable = run_review(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd)
+    failed, cost, who, fixable = run_review(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd,
+                                            evidence)
     print(f"  review   {t['id']}  {who}: " + ("pass" if not failed else "fail")
           + (f" (round {rnd})" if rnd and rnd > 1 else ""), flush=True)
     return failed, cost, fixable
@@ -1230,6 +1322,24 @@ stays a check, never a sentence in a doc or a prompt. The done checks, the gates
 again when you finish. End as before: a `FOUND: <title> — <why>` line for each piece of work you
 find but don't do, then `RESULT: done` or `RESULT: blocked — <why>`.
 """
+
+
+EVIDENCE_FIX_PROMPT = """Your work on {id} is missing its evidence (fix round {n} of {rounds}): {failed}
+
+This task requires proof that the work runs: test output, a screenshot, a recording. Produce it
+inside {wt} (a regular file, no symlinks, at most {evmax} MB), and end with a line
+`EVIDENCE: <path in the worktree> — <what it shows>` for each file, before the RESULT line. Commit
+anything else there citing {id}. The done checks and the gates run again when you finish. End as
+before: a `FOUND: <title> — <why>` line for each piece of work you find but don't do, then
+`RESULT: done` or `RESULT: blocked — <why>`.
+"""
+
+
+def evidence_lines(failed):
+    """Prompt lines for a fresh worker told its done lacked evidence."""
+    return (f"The last attempt lacked its evidence: {failed}\nEnd with a line `EVIDENCE: <path in the worktree> — "
+            "<what it shows>` for each artifact (test output, screenshot, recording) that proves the work runs; "
+            "regular files inside the worktree only, no symlinks. The check runs again before this lands.\n")
 
 
 def harden_lines(failed):
@@ -1307,14 +1417,18 @@ def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, 
     n, rounds = verify or (n, _config.REVIEW_ROUNDS)
     weaken = bool(verify) and kind == "weaken"
     harden = bool(verify) and kind == "harden"
-    what = "weaken fix" if weaken else "harden fix" if harden else "verify fix" if verify else "fix"
-    lines = ((weaken_lines if weaken else harden_lines if harden else verify_lines)(veto)) if verify else None
+    evid = bool(verify) and kind == "evidence"
+    what = "evidence fix" if evid else "weaken fix" if weaken else "harden fix" if harden else "verify fix" if verify else "fix"
+    lines = ((evidence_lines if evid else weaken_lines if weaken else harden_lines if harden else verify_lines)(veto)) if verify else None
     resume, fresh_because = resume_choice(session, wt)
     tt = dict(t, tier=tier)
     if resume:
         _history.record("resumed", t, session=session, round=rnd, tier=tier)
         print(f"  {what:<8} {t['id']}  round {n}/{rounds}: resumed {session}", flush=True)
-        if weaken:
+        if evid:
+            prompt = EVIDENCE_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, wt=wt,
+                                                evmax=EVIDENCE_MAX // 1_000_000)
+        elif weaken:
             prompt = WEAKEN_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, branch=branch, wt=wt)
         elif harden:
             prompt = HARDEN_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, branch=branch, wt=wt,
@@ -1648,6 +1762,7 @@ def dispatch(args):
             info["cost"] = info.get("cost", 0) + round_cost
             info["found"] = (info.get("found") or []) + (finfo.get("found") or [])
             info["policy"] = (info.get("policy") or []) + (finfo.get("policy") or [])
+            info["evidence"] = (info.get("evidence") or []) + (finfo.get("evidence") or [])
             info.update(log=finfo["log"], session=finfo.get("session") or info.get("session"),
                         asked=finfo.get("asked"), questions=finfo.get("questions"))
             with live_lock:
@@ -1662,7 +1777,8 @@ def dispatch(args):
 
         while True:
             try:
-                failed, rcost, fixable = gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd)
+                ev = copy_evidence(t, wt, info.get("evidence") or [], rnd) if info.get("evidence") else None
+                failed, rcost, fixable = gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd, ev)
             except _gitops.GitError as err:
                 failed, rcost, fixable = str(err), 0, False
             info["cost"] = info.get("cost", 0) + rcost
@@ -1683,7 +1799,7 @@ def dispatch(args):
             if fixable == "verify" and outside:  # the rerun as it was is red too: the worker's reason goes to a human
                 info.update(asked=True, rounds=f" (verify still red on rerun: {failed})")
                 return "blocked", f"{outside}. {kept}"
-            if fixable in ("verify", "weaken", "harden"):  # a weakening veto or harden proof uses up the same rounds
+            if fixable in ("verify", "weaken", "harden", "evidence"):  # a weakening veto or harden proof uses up the same rounds
                 stop = ""
                 if vfixes >= _config.VERIFY_ROUNDS:
                     stop = f"; no verify fix rounds left (verify_rounds = {_config.VERIFY_ROUNDS})" if vfixes else ""
@@ -1755,6 +1871,7 @@ def dispatch(args):
         info["cost"] = info.get("cost", 0) + info["round_cost"]
         info["found"] = (info.get("found") or []) + (finfo.get("found") or [])
         info["policy"] = (info.get("policy") or []) + (finfo.get("policy") or [])
+        info["evidence"] = (info.get("evidence") or []) + (finfo.get("evidence") or [])
         info.update(log=finfo["log"], session=finfo.get("session") or session,
                     asked=finfo.get("asked"), questions=finfo.get("questions"))
         with live_lock:

@@ -176,6 +176,31 @@ class TestServe(ServeFixture):
         self.assertEqual(self.req("GET", "/t/T-999")[0], 404)
         self.assertEqual(self.req("GET", "/t/E-001")[0], 404)
 
+    def test_task_page_evidence(self):
+        d = self.runs / "T-001-evidence"
+        d.mkdir()
+        (d / "shot.png").write_bytes(b"\x89PNG\x00fake")
+        (d / "out.txt").write_text("3 passed <b>\n")
+        files = [{"name": "shot.png", "caption": HOSTILE}, {"name": "out.txt", "caption": "tests"}]
+        journal = self.runs / ("history" + ".jsonl")
+        with journal.open("a") as f:
+            f.write(json.dumps(row("2026-11-16T12:08:00+00:00", "T-001", "evidence", files=files,
+                                   refused=["../x: outside the worktree"])) + "\n")
+        code, _, page = self.req("GET", "/t/T-001")
+        self.assertEqual(code, 200)
+        section = page.split("<h2>Evidence</h2>")[1].split("<h2>")[0]
+        self.assertIn('<img src="/runs/T-001-evidence/shot.png"', section)
+        self.assertIn('<a href="/runs/T-001-evidence/out.txt">out.txt</a>', section)
+        self.assertNotIn("<script>", section)
+        self.assertNotIn("<img src=x", section)
+        self.assertIn("&lt;script&gt;alert", section)
+        self.assertIn("refused: ../x: outside the worktree", section)
+        code, _, body = self.req("GET", "/runs/T-001-evidence/out.txt")
+        self.assertEqual(code, 200)
+        self.assertIn("3 passed", body)
+        self.assertEqual(self.req("GET", "/runs/T-001-evidence/..%2fsecret.txt")[0], 404)
+        self.assertEqual(self.req("GET", "/runs/T-001-evidence/missing.png")[0], 404)
+
     def test_priority_on_board_and_task_page(self):
         f = self.task_file("T-004")
         t = f.read_text()

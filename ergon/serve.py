@@ -17,6 +17,7 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
   /t/T-NNN     one task: its brief, frontmatter, every run and review from the history
                journal, transcript usage, links to the raw logs, `claude --resume` commands
   /runs/NAME   one file directly inside <state>/runs/, as plain text
+  /runs/T-NNN-evidence/NAME   a worker's evidence file (images by type, the rest plain text)
 
 The read-only guarantee:
 - GET and HEAD only. Every other method, known or not, gets 405.
@@ -63,6 +64,8 @@ from . import transcripts as _transcripts
 
 DEFAULT_PORT = 4300
 LOG_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+EV_NAME = LOG_NAME
+EV_DIR = re.compile(r"T-\d{3,}-evidence")
 TASK_ID = re.compile(r"T-\d{3,}")
 SESSION = re.compile(r"[A-Za-z0-9_-]{1,128}")
 COST_EVENTS = ("worker_end", "review")
@@ -677,6 +680,34 @@ def unjournaled(tid, trail, tier=None):
     return out
 
 
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+               ".webp": "image/webp"}  # not .svg: it can carry script
+
+
+def evidence_section(tid, trail):
+    """The worker's evidence from the latest `evidence` row: images inline, other files linked
+    through /runs/; every caption and name escaped. '' when there is none."""
+    rows = [r for r in trail if r.get("event") == "evidence"]
+    if not rows:
+        return ""
+    files, refused = rows[-1].get("files") or [], rows[-1].get("refused") or []
+    d = _config.RUNS / f"{tid}-evidence"
+    out = []
+    for f in files:
+        name = str(f.get("name") or "") if isinstance(f, dict) else ""
+        if not name or not (d / name).is_file() or not EV_NAME.fullmatch(name):
+            continue
+        href = f"/runs/{urllib.parse.quote(d.name)}/{urllib.parse.quote(name)}"
+        cap = esc(f.get("caption") or "(no caption)")
+        if Path(name).suffix.lower() in IMAGE_TYPES:
+            out.append(f'<figure><a href="{href}"><img src="{href}" alt="{cap}" style="max-width:100%"></a>'
+                       f"<figcaption>{cap}</figcaption></figure>")
+        else:
+            out.append(f'<p><a href="{href}">{esc(name)}</a> · {cap}</p>')
+    out += [f'<p class=muted>refused: {esc(r)}</p>' for r in refused]
+    return "<h2>Evidence</h2>" + "".join(out) if out else ""
+
+
 def task_page(tid, nonce):
     tasks = _tasks.load(_config.ITEMS)
     t = tasks.get(tid)
@@ -768,6 +799,7 @@ def task_page(tid, nonce):
                      f'<td class=num>{esc(r.get("round") or "")}</td><td class=why>{link_ids(esc(detail), tasks)}{log}</td></tr>')
         b.append("</tbody></table></div>")
 
+    b.append(evidence_section(tid, trail))
     logs = sorted(p.name for p in _config.RUNS.glob(f"{tid}-*") if p.is_file() and LOG_NAME.fullmatch(p.name))
     if logs:
         b.append("<h2>Logs</h2><ul>" + "".join(
@@ -1280,6 +1312,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             m = re.fullmatch(r"/runs/([^/]+)", path)
             if m:
                 return self._log(m[1], head)
+            m = re.fullmatch(r"/runs/(T-\d{3,}-evidence)/([^/]+)", path)
+            if m:
+                return self._log(m[2], head, m[1])
             return self._text(404, "404: not found", head)
         except (Exception, SystemExit) as err:  # noqa: BLE001 - a bad task file is a 500, not a dead thread
             print(f"ergon serve: {self.path}: {err!r}", file=sys.stderr)
@@ -1288,9 +1323,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def _log(self, name, head):
-        """A file directly inside <state>/runs/, by bare name; 404 for anything else."""
+    def _log(self, name, head, sub=None):
+        """A file directly inside <state>/runs/ (or its <ID>-evidence/ directory), by bare name;
+        404 for anything else. Evidence images get their image type, the rest is plain text."""
         runs = _config.RUNS.resolve()
+        if sub:
+            runs = (runs / sub).resolve()
+            if runs.parent != _config.RUNS.resolve():
+                return self._text(404, "404: not found", head)
         if not LOG_NAME.fullmatch(name):
             return self._text(404, "404: not found", head)
         p = (runs / name).resolve()
@@ -1302,7 +1342,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._text(404, "404: not found", head)
         with f:
             size = os.fstat(f.fileno()).st_size
-            self._send(200, b"", "text/plain; charset=utf-8", True, length=size)
+            ctype = (IMAGE_TYPES.get(p.suffix.lower()) if sub else None) or "text/plain; charset=utf-8"
+            self._send(200, b"", ctype, True, length=size)
             if not head:
                 shutil.copyfileobj(f, self.wfile)
 

@@ -79,6 +79,14 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # tiers = ["opus"]
 # touches = ["server/**"]       # fnmatch patterns, like [[protect]]
 
+# Tasks whose done needs runtime evidence: the worker ends with `EVIDENCE: <path> — <what it shows>`
+# lines (test output, screenshots), copied to <state>/runs/<ID>-evidence/ for the reviewer and the
+# task page; a done with none goes to a fix round. Matched like [[accept]]; a task's own
+# `evidence: yes` opts it in too.
+# [[evidence]]
+# tiers = ["sonnet"]
+# touches = ["ui/**"]
+
 # A separate repo checked out inside this one that tasks may change, e.g. a public product
 # repo next to a private install. Each dispatched task touching it gets its own worktree of it.
 # [[companion]]
@@ -116,6 +124,7 @@ SUPPRESS = []  # [gates] suppress, compiled
 REPROS = "tests/harden"  # [gates] repros: a harden task's reproductions, <incident id>.patch
 PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
 ACCEPT = []  # [[accept]] rules: {tiers, touches}
+EVIDENCE = []  # [[evidence]] rules: {tiers, touches}; a matching task's done needs EVIDENCE: files
 TWO_PERSON = []  # [[two_person]] rules: {tiers, touches}; shared mode only
 
 
@@ -198,7 +207,7 @@ def configure(start=None, need_config=True):
     the main checkout: task state, worktrees, run logs and companion checkouts live there, so
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
-        RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, \
+        RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, EVIDENCE, \
         REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, \
         GATE_FILES, SUPPRESS, REPROS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
@@ -316,6 +325,7 @@ def configure(start=None, need_config=True):
             out.append({"tiers": list(tiers), "touches": [str(x).strip("/") for x in touches]})
         return out
     ACCEPT = match_rules("accept", WORKER_TIERS)
+    EVIDENCE = match_rules("evidence", WORKER_TIERS)
     # The two-person rule (docs/shared-state.md) counts verified approvals from distinct
     # principals in the approvers file, which only shared mode has. Without [shared] it would
     # silently mean nothing, so it is an error instead.

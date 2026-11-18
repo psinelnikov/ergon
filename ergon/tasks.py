@@ -247,6 +247,13 @@ def needs_accept(t, *tiers):
     return any(rule_hit(rule, t, tiers) for rule in _config.ACCEPT)
 
 
+def needs_evidence(t, *tiers):
+    """Does t's done need EVIDENCE: files? Its own `evidence: yes`, or an [[evidence]] rule."""
+    if str(t.get("evidence", "")).lower() in YES:
+        return True
+    return any(rule_hit(rule, t, tiers) for rule in _config.EVIDENCE)
+
+
 def rule_hit(rule, t, tiers=()):
     """Does t match an [[accept]] or [[two_person]] rule? Its tier (or one of `tiers`) is in the
     rule's tiers, when given, and a touches: entry falls under one of its patterns, when given."""
@@ -802,6 +809,8 @@ def lint():
         if t.get("accept") and str(t["accept"]).lower() not in YES:
             errs.append(f"{where}: accept: {t['accept']!r} isn't `yes` (leave it out for no; config "
                         f"[[accept]] rules can't be opted out of)")
+        if t.get("evidence") and str(t["evidence"]).lower() not in YES:
+            errs.append(f"{where}: evidence: {t['evidence']!r} isn't `yes` (leave it out for no)")
         harden = _dispatch.harden_ids(t)  # a harden task (T-106)
         for i in harden:
             if not _dispatch.HARDEN_ID.fullmatch(i):
