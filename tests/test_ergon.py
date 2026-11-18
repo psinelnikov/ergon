@@ -1724,8 +1724,8 @@ class TestWeakening(DispatchProject):
         self.assertEqual(self.status("T-001"), "blocked", out)
         self.assertEqual([(r["layer"], r["ok"]) for r in self.rows()], [("weaken", False)] * 2)
         self.assertIn("a.py adds a suppression marker (suppress `# noqa`): `import os  # noqa: F401` "
-                      "(touches: names it, but that allows a marker only in a harden task)", self.notes())
-        self.assertIn("only a harden task may", self.calls()[1]["prompt"])
+                      "(touches: names it, but that allows a marker only in a harden task, or in a file suppress_ok: names)", self.notes())
+        self.assertIn("only a task whose suppress_ok: names the file may", self.calls()[1]["prompt"])
         self.assertNotIn("a.py", sh("git", "ls-tree", "--name-only", "main", cwd=self.root).stdout.split())
 
     def test_a_marker_in_a_named_gate_file_is_caught(self):
@@ -1771,7 +1771,7 @@ class TestWeakening(DispatchProject):
         self.assertEqual(self.weakening(t, "a.py", "import os  # noqa: F401"), [])
         self.assertEqual(self.weakening(dict(t, harden=[]), "a.py", "import os  # noqa: F401"),
                          ["a.py adds a suppression marker (suppress `# noqa`): `import os  # noqa: F401` "
-                          "(touches: names it, but that allows a marker only in a harden task)"])
+                          "(touches: names it, but that allows a marker only in a harden task, or in a file suppress_ok: names)"])
 
     def test_a_kept_reproduction_may_not_be_changed_or_deleted_unnamed(self):
         """T-161: a file under [gates] repros that exists on the base is vetoed unless touches:
@@ -1948,8 +1948,64 @@ class TestWeakening(DispatchProject):
         t = {"id": "T-001", "touches": ["a.py"], "harden": ["I-1"]}
         found = self.check(t, {"a.py": "import os  # noqa: F401\n"})
         self.assertEqual(len(found), 1, found)
-        self.assertIn("(touches: names it, but that allows a marker only in a harden task) "
+        self.assertIn("(touches: names it, but that allows a marker only in a harden task, or in a file suppress_ok: names) "
                       "(harden: names I-1 only since its approval", found[0])
+
+    NOQA = "from .core import thing  # noqa: F401\n"
+
+    def test_suppress_ok_lets_a_named_file_add_a_marker(self):
+        """T-160: an ordinary task's suppress_ok: exempts a marker added to exactly the files it
+        names; the same marker in a file it doesn't list is vetoed, and it exempts no gate file."""
+        t = {"id": "T-001", "touches": ["a.py", "b.py"], "suppress_ok": ["a.py"]}
+        self.assertEqual(self.check(t, {"a.py": self.NOQA}), [])
+        self.assertEqual(self.check(dict(t, touches=[]), {"a.py": self.NOQA}), [])  # touches: needn't name it
+        self.assertEqual(self.check(dict(t, suppress_ok="a.py, c.py"), {"a.py": self.NOQA}), [])  # read as a list
+        found = self.check(t, {"a.py": self.NOQA, "b.py": self.NOQA})
+        self.assertEqual(found, ["b.py adds a suppression marker (suppress `# noqa`): `from .core import thing  "
+                                 "# noqa: F401` (touches: names it, but that allows a marker only in a harden "
+                                 "task, or in a file suppress_ok: names)"])
+        for other in (["*.py"], ["src"], ["src/*"]):  # a glob or a directory names no file
+            found = self.check(dict(t, suppress_ok=other), {"src/a.py": self.NOQA})
+            self.assertEqual(len(found), 1, (other, found))
+        # a gate file is still a gate file: suppress_ok: exempts its marker, not its change
+        found = self.check(dict(t, suppress_ok=["ruff.toml"]), {"ruff.toml": "x = 1  # noqa\n"})
+        self.assertEqual(found, ["ruff.toml changed (a gate file: protect `ruff.toml`)"])
+        self.assertEqual(self.check({"id": "T-001", "touches": ["ruff.toml"], "suppress_ok": ["ruff.toml"]},
+                                    {"ruff.toml": "x = 1  # noqa\n"}), [])
+
+    def test_suppress_ok_lands_a_marker(self):
+        """T-160 end to end: a task whose suppress_ok: names a.py lands a `# noqa` there."""
+        self.task("a.py")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("touches: [a.py]\n", "touches: [a.py]\nsuppress_ok: [a.py]\n"))
+        self.env["FAKE_WEAKEN"] = "a.py|import os  # noqa: F401"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.rows("dispatched")[0]["suppress_ok"], ["a.py"])  # the launch records it
+        self.assertIn("# noqa: F401", sh("git", "show", "main:a.py", cwd=self.root).stdout)
+        self.assertIn("unless this task's approved suppress_ok: names it", self.calls()[0]["prompt"])
+
+    def test_suppress_ok_added_after_approval_exempts_nothing(self):
+        """T-160: suppress_ok: is recorded beside touches: and harden:; an entry added by hand after
+        the approval (the guard bypassed) exempts nothing until a human approves the task again."""
+        self.ergon("new", "task", "Plain", "--tier", "haiku", "--touches", "a.py")
+        approve = lambda: self.ergon("approve", "T-001", env=dict(self.env, ERGON_ASK_STDIN="1"), inp="y\n")
+        approve()
+        self.assertEqual(self.rows("approved")[-1]["suppress_ok"], [])
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("touches: [a.py]\n", "touches: [a.py]\nsuppress_ok: [a.py]\n"))
+        t = {"id": "T-001", "touches": ["a.py"], "suppress_ok": ["a.py"]}
+        found = self.check(t, {"a.py": self.NOQA})
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("(suppress_ok: names it only since its approval", found[0])
+        from ergon import dispatch
+        rows = self.rows("approved")
+        self.assertEqual(dispatch.unapproved_suppress_ok(t, rows), ["a.py"])
+        self.assertEqual(dispatch.approved_suppress_ok(t, []), None)  # nothing recorded: the launch records it
+        r = approve()
+        self.assertIn("approve again: suppress_ok: gained a.py since its approval", r.stdout)
+        self.assertEqual(self.rows("approved")[-1]["suppress_ok"], ["a.py"])
+        self.assertEqual(self.check(t, {"a.py": self.NOQA}), [])
 
     def test_a_launch_records_harden_for_a_hand_stamped_task(self):
         """With no approved row, the first dispatched row records harden: as the approved one."""
@@ -4007,6 +4063,79 @@ class TestHardenInDigest(Project):
             self.assertNotEqual(self.ergon("set", "T-001", kv, check=False).returncode, 0, kv)
         self.assertEqual(f.read_text(), hard)
         self.assertEqual(brief_digest(parse(f)), base)
+
+
+class TestSuppressOk(Project):
+    """`suppress_ok:` names the files a task may add a suppression marker to (T-160): it is in the
+    brief digest, `set` refuses it, and the guard refuses an agent's edit to it."""
+
+    def test_digest_covers_suppress_ok(self):
+        from ergon.tasks import brief_digest
+        t = {"id": "T-1", "title": "x", "tier": "sonnet", "touches": ["a"], "_body": "## What\n\nx\n"}
+        base = brief_digest(t)
+        for none in ([], "", "[]"):  # no files: the old digest stands
+            self.assertEqual(brief_digest({**t, "suppress_ok": none}), base, none)
+        one = brief_digest({**t, "suppress_ok": ["a.py"]})
+        two = brief_digest({**t, "suppress_ok": ["a.py", "b.py"]})
+        self.assertEqual(len({base, one, two}), 3)
+        self.assertEqual(brief_digest({**t, "suppress_ok": ["b.py", "a.py", "a.py/"]}), two)  # a set
+        self.assertEqual(brief_digest({**t, "suppress_ok": "a.py, b.py"}), two)
+
+    def test_set_refuses_suppress_ok(self):
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        f = self.task_file("T-001")
+        stamp(f)
+        plain = f.read_text()
+        for env in (None, clean_env(CLAUDECODE="1")):
+            for kv in ("suppress_ok=a.py", "suppress_ok=[a.py]", "suppress_ok=", " suppress_ok =a.py"):
+                r = self.ergon("set", "T-001", kv, check=False, env=env)
+                self.assertNotEqual(r.returncode, 0, kv)
+                self.assertIn("`suppress_ok:` names the files", r.stderr, kv)
+                self.assertIn("set won't write it", r.stderr, kv)
+                r = self.ergon("set", "T-001", "tier=opus", kv, check=False, env=env)  # nothing of a refused set lands
+                self.assertNotEqual(r.returncode, 0, kv)
+        self.assertEqual(f.read_text(), plain)
+
+    def test_guard_refuses_writing_suppress_ok(self):
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        f = self.task_file("T-001")
+        stamp(f)
+        plain = f.read_text()
+        refused = "`suppress_ok:` names the files the weakening check lets a task add a suppression marker to"
+        line = "suppress_ok: [a.py]"
+        add = plain.replace("\n---\n", f"\n{line}\n---\n", 1)
+        for tool, inp in (("Edit", {"old_string": "tier: sonnet", "new_string": f"tier: sonnet\n{line}"}),
+                          ("Edit", {"old_string": "tier_why:", "new_string": " suppress_ok :a.py  # ok\ntier_why:"}),
+                          ("MultiEdit", {"edits": [{"old_string": "## What", "new_string": "## What\nx"},
+                                                   {"old_string": "tier: sonnet", "new_string": f"tier: sonnet\n{line}"}]}),
+                          ("Write", {"content": add})):
+            self.assertIn(refused, self.guard(tool, {"file_path": str(f), **inp}) or "", (tool, inp))
+        f.write_text(add)  # a human wrote one: changing or removing it is a human's edit too
+        for new in ("suppress_ok: [a.py, b.py]", "suppress_ok: [b.py]", "suppress_ok:", ""):
+            why = self.guard("Edit", {"file_path": str(f), "old_string": line, "new_string": new})
+            self.assertIn(refused, why or "", new)
+        self.assertIn(refused, self.guard("Write", {"file_path": str(f), "content": plain}) or "")
+        # re-spacing the same list, other edits, and a suppress_ok line in the body pass
+        self.assertIsNone(self.guard("Edit", {"file_path": str(f), "old_string": line, "new_string": "suppress_ok: [ a.py ]"}))
+        self.assertIsNone(self.guard("Edit", {"file_path": str(f), "old_string": "## What", "new_string": "## What\nx"}))
+        self.assertIsNone(self.guard("Edit", {"file_path": str(f), "old_string": "## Notes",
+                                              "new_string": "## Notes\nsuppress_ok: [b.py]"}))
+        # a new task file that arrives with one is refused too
+        new = str(f.with_name("T-009-new.md"))
+        fresh = "---\nid: T-009\ntitle: New\ntier: sonnet\nstatus: proposed\napproved:\n---\n\n## What\nx\n"
+        self.assertIsNone(self.guard("Write", {"file_path": new, "content": fresh}))
+        why = self.guard("Write", {"file_path": new, "content": fresh.replace("approved:", f"approved:\n{line}")})
+        self.assertIn(refused, why or "")
+
+    def test_check_refuses_a_glob(self):
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("\n---\n", "\nsuppress_ok: [a.py, src/*.py]\n---\n", 1))
+        r = self.ergon("check", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("suppress_ok: 'src/*.py' is a glob", r.stdout + r.stderr)
+        f.write_text(f.read_text().replace(", src/*.py", ""))
+        self.ergon("check")
 
 
 class TestHardenInDigestSigned(unittest.TestCase):

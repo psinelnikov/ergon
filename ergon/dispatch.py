@@ -71,7 +71,8 @@ that passes without your change proves nothing and goes back to you.
 WORKER_WEAKEN = """
 Before any gate, dispatch vetoes a branch that changes a gate file ({files})
 unless this task's approved touches: names that file{markers}. Fix the code, not the gate; if a
-rule is wrong, say so on a FOUND line. Don't edit this task's touches: or tier: (that's a re-plan).
+rule is wrong, say so on a FOUND line. Don't edit this task's touches:, suppress_ok: or tier:
+(that's a re-plan).
 """
 
 WORKER_POLICIES = """
@@ -616,8 +617,8 @@ def gates_text(t):
     sup = [f"`{rx.pattern}`" for rx in _config.SUPPRESS]
     weak = WORKER_WEAKEN.format(files=", ".join(f"`{p}`" for p in _config.GATE_FILES),
                                 markers=(f", and one that adds a line matching a suppression marker ({', '.join(sup)}) to any "
-                                         f"file, named or not, unless this is a harden task whose approved "
-                                         f"touches: names it") if sup else "")
+                                         f"file, named or not, unless this task's approved suppress_ok: names "
+                                         f"it, or this is a harden task whose approved touches: names it") if sup else "")
     return (weak + (WORKER_GATES.format(cmds="\n".join(f"- {layer}: `{cmd}`" for layer, cmd in cmds)) if cmds else "")
             + (WORKER_PROVE.format(patterns=", ".join(f"`{p}`" for p in _config.TESTS)) if not prove_skip(t) else "")
             + harden_text(t))
@@ -1001,6 +1002,12 @@ def gate_cmds(t):
 # harden: is recorded beside touches: and read back the same way (T-162): only the ids a human
 # approved make a task a harden task here and exempt their reproductions, so a worker that adds
 # an id to its own harden: (the guard bypassed) gets neither until a human approves it again.
+# An ordinary task with a real need for a marker (a re-export's `# noqa: F401`) names the file in
+# `suppress_ok:` (T-160): exactly that file, as names_file reads a path (no directory, no glob),
+# exempts its added markers, harden task or not. It exempts nothing else: not a gate-file change,
+# not a kept reproduction. It is human-only like harden: (`set` and the guard refuse it, and it is
+# in the brief digest), and recorded beside touches: and harden: on the same rows, so an entry a
+# worker adds to its own suppress_ok: (the guard bypassed) exempts nothing until a human approves.
 
 def gate_file_hit(path, c=None):
     """The [gates] protect pattern a changed file falls under, or None. `path` is relative to its
@@ -1015,11 +1022,11 @@ def gate_file_hit(path, c=None):
     return None
 
 
-def names_file(t, path, c=None, pattern=None):
-    """Does t's touches: name this file: the path itself (a companion's as `<name>/<path>` or
-    `<companion path>/<path>`), or the protect pattern it falls under, as written? A directory
-    or a wider glob doesn't: a gate file is named on purpose or not at all."""
-    names = {str(x).strip().strip("/") for x in t.get("touches") or []}
+def names_file(t, path, c=None, pattern=None, key="touches"):
+    """Does t's touches: (or `key`: suppress_ok) name this file: the path itself (a companion's as
+    `<name>/<path>` or `<companion path>/<path>`), or the protect pattern it falls under, as
+    written? A directory or a wider glob doesn't: a gate file is named on purpose or not at all."""
+    names = {touch_key(x) for x in (suppress_ok_paths(t) if key == "suppress_ok" else t.get(key) or [])}
     roots = [""] if c is None else [k + "/" for k in c["touches"]]
     cands = {r + path for r in roots} | ({r + pattern for r in roots} | {pattern} if pattern else set())
     return bool(names & cands)
@@ -1030,14 +1037,23 @@ def touch_key(x):
     return str(x).strip().strip("/")
 
 
+def suppress_ok_paths(t):
+    """The files a task's `suppress_ok:` names (T-160), as touch_key, in order."""
+    v = t.get("suppress_ok") or []
+    if isinstance(v, str):
+        v = v.strip().strip("[]").split(",")
+    return list(dict.fromkeys(k for k in (touch_key(x) for x in v) if k))
+
+
 def approval_record(t):
     """What an `approved` history row records of t, and a launch's `dispatched` row too
-    (approved_touches and approved_harden read it back): its touches: and harden: as they are."""
-    return {"touches": list(t.get("touches") or []), "harden": harden_ids(t)}
+    (approved_touches, approved_harden and approved_suppress_ok read it back): its touches:,
+    harden: and suppress_ok: as they are."""
+    return {"touches": list(t.get("touches") or []), "harden": harden_ids(t), "suppress_ok": suppress_ok_paths(t)}
 
 
 def _approved(t, key, rows=None):
-    """The list a human approved for t's `key` (touches or harden), or None if nothing recorded
+    """The list a human approved for t's `key` (touches, harden or suppress_ok), or None if nothing recorded
     it. The last `approved` row decides; one without that list (from before rows held it) resets
     the record, and then the first `dispatched` row after it that has one stands in for it."""
     rec = None
@@ -1079,6 +1095,20 @@ def unapproved_harden(t, rows=None):
     return [] if ok is None else [i for i in harden_ids(t) if i not in ok]
 
 
+def approved_suppress_ok(t, rows=None):
+    """The suppress_ok: files a human approved for t, or None if nothing recorded them (see
+    _approved). A row from before rows held suppress_ok resets the record like any other list."""
+    rec = _approved(t, "suppress_ok", rows)
+    return None if rec is None else {touch_key(x) for x in rec}
+
+
+def unapproved_suppress_ok(t, rows=None):
+    """t's suppress_ok: files no human approved (added to the file since approved_suppress_ok), in
+    file order; [] when nothing is recorded yet (the launch records them)."""
+    ok = approved_suppress_ok(t, rows)
+    return [] if ok is None else [x for x in suppress_ok_paths(t) if x not in ok]
+
+
 def added_lines(rng, path, repo=None):
     """The lines `git diff <rng>` adds to `path`, as text. --text so no .gitattributes setting
     hides a file's lines as binary."""
@@ -1116,7 +1146,8 @@ def weakening(t, base, branch, pubs=()):
     human approved (unapproved_touches) exempt a file: from the gate-file check in any task, and
     from the suppression-marker check only in a harden task (T-118), one with a harden: id a human
     approved (T-162). A harden task's own reproductions (own_repros) pass both of those unnamed,
-    but not the kept-reproduction check (T-161) if the base already has one."""
+    but not the kept-reproduction check (T-161) if the base already has one. A file the task's
+    approved suppress_ok: names passes the marker check, harden task or not (T-160)."""
     rows = _history.read()
     found, late, repros = [], {touch_key(x) for x in unapproved_touches(t, rows)}, own_repros(t, rows)
     hlate = unapproved_harden(t, rows)
@@ -1127,6 +1158,10 @@ def weakening(t, base, branch, pubs=()):
     hsince = (f" (harden: names {', '.join(hlate)} only since its approval, so it doesn't count: a human "
               f"approves the new harden: with `ergon approve {t.get('id')}`)") if hlate else ""
     late_repros = {repro_path(i) for i in hlate if HARDEN_ID.fullmatch(i)}
+    slate = set(unapproved_suppress_ok(t, rows))
+    sok = dict(t, suppress_ok=[x for x in suppress_ok_paths(t) if x not in slate])
+    ssince = (f" (suppress_ok: names it only since its approval, so it doesn't count: a human approves the "
+              f"new suppress_ok: with `ergon approve {t.get('id')}`)")
     for c, repo, trunk in [(None, None, base)] + [(c, c["path"], c["trunk"]) for c, _ in pubs]:
         rng = f"{trunk}...{branch}"
         files = _gitops.git("diff", "--name-only", "-z", "--no-renames", rng, raw=True, cwd=repo)
@@ -1143,13 +1178,15 @@ def weakening(t, base, branch, pubs=()):
             if c is None and not named and path.startswith(f"{_config.REPROS}/") and _on_base(trunk, path):
                 found.append(f"{shown} changed or deleted (a kept reproduction on the base; touches: must name it){note}")
                 continue
-            if own or not _config.SUPPRESS or (harden and named):
+            if own or not _config.SUPPRESS or (harden and named) or names_file(sok, path, c, key="suppress_ok"):
                 continue
             if not harden and named:
-                note = (" (touches: names it, but that allows a marker only in a harden task)"
-                        + (hsince if hlate else ""))
+                note = (" (touches: names it, but that allows a marker only in a harden task, or in a file "
+                        "suppress_ok: names)" + (hsince if hlate else ""))
             elif not harden and not (c is None and path in late_repros):
                 note = ""
+            if slate and names_file(t, path, c, key="suppress_ok"):
+                note += ssince
             hits = []
             for line in added_lines(rng, path, repo):
                 rx = next((r for r in _config.SUPPRESS if r.search(line)), None)
@@ -1928,12 +1965,13 @@ line for each piece of work you find but don't do, then `RESULT: done` or
 WEAKEN_FIX_PROMPT = """The weakening check vetoed your work on {id} (fix round {n} of {rounds}): {failed}
 
 Your branch changes a gate file this task's touches: doesn't name, or adds a suppression marker
-(which only a harden task may, in a file its touches: names). Revert the change to each file named
-above on {branch} in {wt}, fix the code instead, and commit there citing {id}. If the rule itself
-is wrong, revert it anyway and end with a `FOUND: <title> — <why>` line naming the rule and why: a
-human approves a task whose touches: names the file (a harden task, for a marker). Editing your
-task's touches: changes nothing: the check reads the task as it was at launch, and only entries a
-human approved count on a later launch. The done checks and the gates run again when you finish. End as before: a
+(which only a task whose suppress_ok: names the file may, or a harden task in a file its touches:
+names). Revert the change to each file named above on {branch} in {wt}, fix the code instead, and
+commit there citing {id}. If the rule itself is wrong, or a marker is really needed, revert it
+anyway and end with a `FOUND: <title> — <why>` line naming the rule or the file and why: a human
+approves a task whose touches: names the gate file, or whose suppress_ok: names the file for a
+marker. Editing your task's touches: or suppress_ok: changes nothing: the check reads the task as
+it was at launch, and only entries a human approved count on a later launch. The done checks and the gates run again when you finish. End as before: a
 `FOUND: <title> — <why>` line for each piece of work you find but don't do, then `RESULT: done`
 or `RESULT: blocked — <why>`.
 """
@@ -3511,7 +3549,7 @@ def dispatch(args):
                                 _history.record("dispatched", t, tier=t["tier"], model=agents[f"task-{t['tier']}"]["model"],
                                                 base=base, branch=branch, worktree=wt,
                                                 companions=[c["name"] for c, _ in pubs],
-                                                **approval_record(t),  # approved_touches, approved_harden
+                                                **approval_record(t),  # approved_touches, _harden, _suppress_ok
                                                 **({"answered": True} if answered else {}))
                                 print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
                                       + also(t) + f"  {t['title']}")

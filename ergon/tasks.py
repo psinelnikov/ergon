@@ -183,9 +183,10 @@ def brief_digest(t):
     concepts, tagged). A task's gate-weakening fields (a `verify:` override of the runtime gate,
     `prove: no`) are in it, so writing one after approval un-approves the task. So are a harden
     task's incidents (`harden:`, as a set) and the gate its proof replays them on (`harden_layer:`,
-    `static` when unset), since together they are what the task must prove it catches. Each goes
-    in only when set (the layer only with incidents, as it does nothing without them), so a task
-    that has none of these keeps the digest it had before they counted."""
+    `static` when unset), since together they are what the task must prove it catches. So are the
+    files a task may add a suppression marker to (`suppress_ok:`, as a set, T-160). Each goes in
+    only when set (the layer only with incidents, as it does nothing without them), so a task that
+    has none of these keeps the digest it had before they counted."""
     body = t.get("_body") or ""
     if is_epic(t):
         doc = {"kind": "epic", "id": str(t.get("id") or "").strip(),
@@ -210,6 +211,9 @@ def brief_digest(t):
     if harden:
         doc["harden"] = harden
         doc["harden_layer"] = _dispatch.harden_layer(t)
+    suppress_ok = sorted(set(_dispatch.suppress_ok_paths(t)))
+    if suppress_ok:
+        doc["suppress_ok"] = suppress_ok
     for name in DIGEST_SECTIONS:
         doc[name] = normalised(sections(body, name))
     return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -1064,6 +1068,9 @@ def lint(warns=None):
             errs.append(f"{where}: harden_layer: {t['harden_layer']!r} isn't one of {', '.join(_dispatch.HARDEN_LAYERS)}")
         if t.get("harden_layer") and not harden:
             errs.append(f"{where}: harden_layer: is set but harden: names no incident")
+        for x in _dispatch.suppress_ok_paths(t):  # T-160: a file, named on purpose
+            if any(ch in x for ch in "*?["):
+                errs.append(f"{where}: suppress_ok: {x!r} is a glob; it names files one by one (a glob exempts nothing)")
         if t.get("epic") and t["epic"] not in epics:
             errs.append(f"{where}: epic {t['epic']} doesn't exist")
         for d in t.get("depends") or []:

@@ -61,6 +61,10 @@ def setf(args):
             raise SystemExit(f"`{key}:` decides what a harden task must prove (and a harden task skips the "
                              f"red-on-base proof), so set won't write it: a human edits the task file (it's in "
                              f"the brief digest, so an approved task needs approving again)")
+        if key == "suppress_ok":  # the files a task may add a suppression marker to (T-160)
+            raise SystemExit("`suppress_ok:` names the files the weakening check lets a task add a suppression "
+                             "marker to, so set won't write it: a human edits the task file (it's in the brief "
+                             "digest, so an approved task needs approving again)")
         if is_task and key == "pin":
             raise SystemExit("`pin:` is human-only: use `ergon pin ID first|last|clear` from a real terminal")
         if is_task and key in ("asking", "answered"):
@@ -259,8 +263,9 @@ def stamp_approved(todo):
 
 
 def approved_touches_field(t):
-    """The `touches` and `harden` fields of t's `approved` history row (dispatch.approved_touches
-    and approved_harden read them): a task's touches: and harden: as approved; nothing for an epic."""
+    """The `touches`, `harden` and `suppress_ok` fields of t's `approved` history row
+    (dispatch.approved_touches, approved_harden and approved_suppress_ok read them): a task's
+    touches:, harden: and suppress_ok: as approved; nothing for an epic."""
     return {} if _tasks.is_epic(t) else _dispatch.approval_record(t)
 
 
@@ -293,16 +298,17 @@ def approve(args):
     again = {t["id"]: why for t in named if apr and t["id"] in args.ids and t["status"] in ("ready", "blocked")
              and (why := apr.problem(t))}
     again.update((e["id"], apr.problem(e)) for e in briefs if e["status"] == "open")
-    # local mode: no digest, so an approved task whose touches: or harden: gained an entry since
-    # its approval (a hand edit) is approved again by naming it, or the weakening check won't
-    # count the entry
+    # local mode: no digest, so an approved task whose touches:, harden: or suppress_ok: gained an
+    # entry since its approval (a hand edit) is approved again by naming it, or the weakening check
+    # won't count the entry
     if not apr:
         rows = _history.read()
         for t in named:
             if t["id"] in args.ids and t["status"] in ("ready", "blocked"):
                 why = [f"{k}: gained {', '.join(new)} since its approval"
                        for k, new in (("touches", _dispatch.unapproved_touches(t, rows)),
-                                      ("harden", _dispatch.unapproved_harden(t, rows))) if new]
+                                      ("harden", _dispatch.unapproved_harden(t, rows)),
+                                      ("suppress_ok", _dispatch.unapproved_suppress_ok(t, rows))) if new]
                 if why:
                     again[t["id"]] = "; ".join(why)
     todo += [t for t in named if t["id"] in again]
@@ -310,7 +316,7 @@ def approve(args):
     if not todo:
         raise SystemExit("nothing in `proposed` among those ids" + (
             ", nor an approved task or epic whose approval doesn't verify" if apr else
-            ", nor an approved task whose touches: or harden: gained an entry since its approval"))
+            ", nor an approved task whose touches:, harden: or suppress_ok: gained an entry since its approval"))
     # shared mode: an unpublished ID can still be renumbered, so sync first (or refuse)
     _shared.ensure_published([t["id"] for t in todo] + [i for i in args.ids if i in epics])
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
@@ -1589,6 +1595,11 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
         if fb.get(key, "") != fa.get(key, ""):
             return (f"`{key}:` decides what a harden task must prove (and a harden task skips the red-on-base "
                     "proof), so a human writes, changes or removes it by editing the task file")
+    # suppress_ok: names the files a task may add a suppression marker to (T-160): refused by `set`
+    # whatever the value, and the same edit by hand here, a new file arriving with one included.
+    if fm_value(fb, "suppress_ok") != fm_value(fa, "suppress_ok"):
+        return ("`suppress_ok:` names the files the weakening check lets a task add a suppression marker to, "
+                "so a human writes, changes or removes it by editing the task file")
     # A new task or epic file starts proposed: in local mode an open epic with no stamp counts as
     # approved (nothing verifies one), so an agent's new EPIC.md can't be open.
     if fb.get("status", "") != fa.get("status", "") and not (not before and fa.get("status") == "proposed"):
@@ -1609,10 +1620,11 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
 
 
 def fm_value(fm, key):
-    """A frontmatter value as the guard compares it: touches: as its set of entries (dispatch.touch_key),
-    so reordering or re-spacing the list changes nothing; anything else stripped."""
+    """A frontmatter value as the guard compares it: touches: and suppress_ok: as their set of
+    entries (dispatch.touch_key), so reordering or re-spacing the list changes nothing; anything
+    else stripped."""
     val = fm.get(key, "")
-    if key != "touches":
+    if key not in ("touches", "suppress_ok"):
         return val.strip()
     return frozenset(x for x in (_dispatch.touch_key(v) for v in val.strip().strip("[]").split(",")) if x)
 
