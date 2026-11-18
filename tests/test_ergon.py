@@ -2133,6 +2133,30 @@ class TestProve(DispatchProject):
         self.assertIn("prove_tiers", r.stderr + r.stdout)
 
 
+class TestProveReviewed(TestProve):
+    """TestProve's toy suite with the reviewer on: it hears about a waived proof."""
+    config = TestProve.config.replace('verify_rounds = 1', 'verify_rounds = 1\n        review = ["sonnet", "haiku"]')
+
+    def test_review_prompt_quotes_the_waiver_reason(self):
+        self.task()
+        self.env.update(FAKE_WRITES="app.txt|new;tests/t_app.sh|true",
+                        FAKE_FIX_RESULT="RESULT: blocked — outside: a pure refactor, no behaviour to pin")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        prompt = [c["prompt"] for c in map(json.loads, self.seen.read_text().splitlines()) if c["agent"] == "REVIEW"]
+        self.assertTrue(prompt, "no review ran")
+        self.assertIn("waived the red-on-base proof", prompt[-1])
+        self.assertIn("outside: a pure refactor, no behaviour to pin", prompt[-1])
+
+    def test_review_prompt_has_no_waiver_section_without_one(self):
+        self.task()
+        self.env["FAKE_WRITES"] = "app.txt|old too"
+        self.ergon("dispatch")
+        prompt = [c["prompt"] for c in map(json.loads, self.seen.read_text().splitlines()) if c["agent"] == "REVIEW"]
+        self.assertTrue(prompt, "no review ran")
+        self.assertNotIn("waived the red-on-base proof", prompt[-1])
+
+
 class TestVerifyRounds(DispatchProject):
     """verify_rounds (default 2): a red verify goes back to the worker with its output."""
     config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
