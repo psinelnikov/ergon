@@ -4540,6 +4540,19 @@ class TestStats(Project):
         self.assertIn("skipped 2", out)
 
 
+    def test_stats_ignores_a_limit_stop(self):
+        self.ergon("new", "task", "A", "--tier", "sonnet")
+        runs = self.root / "tasks" / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        (runs / "T-001-20261101-100000.json").write_text(json.dumps({"result": "RESULT: done", "total_cost_usd": 1.0}))
+        (runs / "T-001-20261102-100000.json").write_text(json.dumps(
+            {"result": "You've hit your session limit", "is_error": True, "total_cost_usd": 0}))
+        out = self.ergon("stats").stdout
+        row = [l.split() for l in out.splitlines() if l.split()[:1] == ["sonnet"]][0]
+        self.assertEqual(row[:5], ["sonnet", "1", "1", "0", "0%"])
+        self.assertNotIn("T-001 x", out)
+
+
 class TestTrustPyramid(Project):
     ROWS = [
         {"at": "2026-11-16T10:00:00+00:00", "event": "verify", "task": "T-001", "ok": False, "layer": "static"},
