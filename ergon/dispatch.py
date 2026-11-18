@@ -1492,7 +1492,14 @@ The task file:
 The diff, `git diff {base}...{branch}`{size}:
 
 {diff}
-{found}"""
+{found}{waived}"""
+REVIEW_WAIVED = """
+The worker waived the red-on-base proof (it said the change has no behaviour a test could check). Its reason:
+
+{reason}
+
+Check that this is true; if the change does have behaviour to test, fail the review.
+"""
 REVIEW_FOUND = """
 The worker's FOUND lines, which dispatch files as follow-up tasks once this branch passes:
 
@@ -1557,7 +1564,8 @@ def found_lines(found):
     return REVIEW_FOUND.format(lines="".join(out))
 
 
-def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None, found=(), evidence=None):
+def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None, found=(), evidence=None,
+               waived=None):
     """Run the reviewer on a finished task branch and record its review event. Returns (failure
     reason or None, cost, reviewer tier, fixable). Only a last line of `REVIEW: pass` passes: no
     such line, a fail, output that isn't JSON, an error, a kill, a timeout, or a reviewer that
@@ -1567,7 +1575,7 @@ def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None,
     log = _config.RUNS / (f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-review"
                           + (str(rnd) if rnd and rnd > 1 else "") + ".json")
     failed, cost, who, fixable = _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log,
-                                             found, evidence)
+                                             found, evidence, waived)
     _history.record("review", t, verdict="fail" if failed else "pass", reviewer=who, tier=tier,
                     reason=failed, cost=cost, seconds=round(time.monotonic() - start, 1), log=log, **_round(rnd))
     if failed and fixable:
@@ -1575,7 +1583,8 @@ def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None,
     return failed, cost, who, fixable
 
 
-def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log, found=(), evidence=None):
+def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log, found=(), evidence=None,
+                waived=None):
     who = reviewer_tier(tier)
     trees, repos = [wt] + [pub for _, pub in pubs], [None] + [c["path"] for c, _ in pubs]
     before = tree_state(trees, branch, repos)
@@ -1591,6 +1600,7 @@ def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log, fou
                                   rules=(f"\nThe worker followed these project rules:\n\n{rules}\n" if rules else "")
                                   + (REVIEW_POLICIES.format(policies=pol) if pol else ""),
                                   text=t["_path"].read_text(), diff=diff, size=size, found=found_lines(found),
+                                  waived=REVIEW_WAIVED.format(reason=waived) if waived else "",
                                   evidence=evidence_text(t["id"], *evidence) if evidence else "")
     cmd = ["claude", "-p", "--agents", json.dumps({"task-review": dict(agent, model=who)}),
            "--agent", "task-review", "--permission-mode", args.permission_mode, "--settings", settings,
@@ -1652,7 +1662,7 @@ def veto_lines(failed):
 
 
 def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, evidence=None, prove=True,
-         found=()):
+         found=(), waived=None):
     """After a worker says done, before the merge lock: its done claim holds, verify passes,
     then the reviewer passes if `review` names the task's tier or `tier`, the one that finished
     (after --escalate the lower tier's commits are on the branch too). The reviewer is one tier
@@ -1691,7 +1701,7 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, ev
     if t["tier"] not in _config.REVIEW and tier not in _config.REVIEW:
         return None, 0, False
     failed, cost, who, fixable = run_review(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd,
-                                            found, evidence)
+                                            found, evidence, waived)
     print(f"  review   {t['id']}  {who}: " + ("pass" if not failed else "fail")
           + (f" (round {rnd})" if rnd and rnd > 1 else ""), flush=True)
     return failed, cost, fixable
@@ -2738,7 +2748,8 @@ def dispatch(args):
                 ev = copy_evidence(t, wt, info.get("evidence") or [], rnd) if info.get("evidence") else None
                 failed, rcost, fixable = gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd, ev,
                                               prove=not info.get("prove_waived"),
-                                              found=info.get("found") or [])
+                                              found=info.get("found") or [],
+                                              waived=info.get("prove_waived"))
             except _gitops.GitError as err:
                 failed, rcost, fixable = str(err), 0, False
             info["cost"] = info.get("cost", 0) + rcost
