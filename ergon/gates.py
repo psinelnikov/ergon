@@ -1380,6 +1380,12 @@ def guard_reason(tool, inp, worker=False, cwd=None):
                 "changes or removes it by editing the task file")
     if _tasks.prove_off(fa) and not _tasks.prove_off(fb):
         return "`prove: no` skips the red-on-base proof, so a human writes it by editing the task file"
+    # A harden task skips the red-on-base proof and its layer picks the gate its own proof runs, so
+    # `set` refuses both whatever the value (T-149); the same edit by hand is refused here (T-153).
+    for key in ("harden", "harden_layer"):
+        if fb.get(key, "") != fa.get(key, ""):
+            return (f"`{key}:` decides what a harden task must prove (and a harden task skips the red-on-base "
+                    "proof), so a human writes, changes or removes it by editing the task file")
     # A new task or epic file starts proposed: an open epic with no stamp would count as approved
     # (grandfathered), so an agent's new EPIC.md can't be open.
     if fb.get("status", "") != fa.get("status", "") and not (not before and fa.get("status") == "proposed"):

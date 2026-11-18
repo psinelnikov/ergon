@@ -3226,6 +3226,42 @@ class TestGateWeakeningFields(Project):
         for new in ("prove: yes", "", "prove: false"):
             self.assertIsNone(self.guard("Edit", {"file_path": str(f), "old_string": "prove: no", "new_string": new}), new)
 
+    def test_guard_refuses_writing_harden_fields(self):
+        """`set` refuses `harden=` and `harden_layer=` (T-149); the guard refuses the same edit by
+        hand, adding, changing or removing either, by Edit, MultiEdit or Write (T-153)."""
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        f = self.task_file("T-001")
+        stamp(f)
+        plain = f.read_text()
+        for key, val, other in (("harden", "[I-1]", "[I-1, I-2]"), ("harden_layer", "unit", "static")):
+            refused = f"`{key}:` decides what a harden task must prove"
+            line = f"{key}: {val}"
+            add = plain.replace("\n---\n", f"\n{line}\n---\n", 1)
+            for tool, inp in (("Edit", {"old_string": "tier: sonnet", "new_string": f"tier: sonnet\n{line}"}),
+                              ("Edit", {"old_string": "tier_why:", "new_string": f" {key} :{val}  # ok\ntier_why:"}),
+                              ("MultiEdit", {"edits": [{"old_string": "## What", "new_string": "## What\nx"},
+                                                       {"old_string": "tier: sonnet", "new_string": f"tier: sonnet\n{line}"}]}),
+                              ("Write", {"content": add})):
+                self.assertIn(refused, self.guard(tool, {"file_path": str(f), **inp}) or "", (tool, inp))
+            f.write_text(add)  # a human wrote one: changing or removing it is a human's edit too
+            for new in (f"{key}: {other}", f"{key}:", ""):
+                why = self.guard("Edit", {"file_path": str(f), "old_string": line, "new_string": new})
+                self.assertIn(refused, why or "", new)
+            why = self.guard("Write", {"file_path": str(f), "content": plain})
+            self.assertIn(refused, why or "")
+            # other edits to a harden task pass, and so does a harden line in the body
+            self.assertIsNone(self.guard("Edit", {"file_path": str(f), "old_string": "## What", "new_string": "## What\nx"}))
+            self.assertIsNone(self.guard("Edit", {"file_path": str(f), "old_string": "## Notes",
+                                                  "new_string": f"## Notes\n{key}: {other}"}))
+            f.write_text(plain)
+        # a new task file that arrives as a harden task is refused too
+        new = str(f.with_name("T-009-new.md"))
+        fresh = "---\nid: T-009\ntitle: New\ntier: sonnet\nstatus: proposed\napproved:\n---\n\n## What\nx\n"
+        self.assertIsNone(self.guard("Write", {"file_path": new, "content": fresh}))
+        for line in ("harden: [I-1]", "harden_layer: unit"):
+            why = self.guard("Write", {"file_path": new, "content": fresh.replace("approved:", f"approved:\n{line}")})
+            self.assertIn("decides what a harden task must prove", why or "", line)
+
 
 class TestGateWeakeningFieldsSigned(unittest.TestCase):
     """Shared mode: `verify:` or `prove: no` written into an approved task after its signed approval
