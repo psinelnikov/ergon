@@ -34,7 +34,10 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                verifies (an old epic with no approved: stamp counts as approved
                                in local mode only); otherwise it approves its proposed tasks
   ergon reject ID [--reason R] HUMAN ONLY. proposed -> dropped; review -> ready (needs --reason,
-                               which the next worker is shown; branch and worktree are kept)
+                               which the next worker is shown; branch and worktree are kept).
+                               An epic ID drops its brief when it's proposed (its tasks stay
+                               proposed, never offered; naming the epic again drops them);
+                               otherwise it drops its proposed tasks
   ergon accept ID [ID ...]     HUMAN ONLY, real terminal. Land a task dispatch held at `review`
                                (merge its branch like dispatch would, close the epic if last).
                                An epic ID accepts its tasks in review

@@ -771,6 +771,79 @@ class TestEpicApproval(Project):
         self.assertIn("[1/2]", r.stdout)
         self.ergon("check")
 
+    def test_reject_drops_a_proposed_epic_brief(self):
+        """T-126: rejecting a proposed epic's ID drops its brief alone, as approving one approves
+        the brief alone; its tasks are then never offered or started. Naming the dropped epic
+        again drops its proposed tasks, and on an open epic the ID names its proposed tasks."""
+        human = clean_env(ERGON_ASK_STDIN="1")
+        agent = clean_env(CLAUDECODE="1")
+        self.ergon("new", "epic", "Unwanted", env=agent)
+        self.ergon("new", "task", "Part one", "--tier", "haiku", "--epic", "E-001", env=agent)
+        self.ergon("new", "task", "Part two", "--tier", "haiku", "--epic", "E-001", env=agent)
+        stamp(self.task_file("T-001"))  # a human approved this task, but not its epic's brief
+        r = self.ergon("reject", "E-001", check=False, env=agent, inp="y\n")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("refused", r.stderr)
+        r = self.ergon("reject", "E-001", check=False, env=human, inp="n\n")  # the prompt comes first
+        self.assertIn("aborted", r.stderr)
+        self.assertIn("\nstatus: proposed\n", self.epic_file().read_text())
+
+        r = self.ergon("reject", "E-001", "--reason", "not this quarter", env=human, inp="y\n")
+        self.assertIn("E-001  epic    Unwanted  (its brief: proposed -> dropped)", r.stdout)
+        self.assertIn("Goal:", r.stdout)
+        self.assertIn("the brief only: its 1 proposed task(s) stay proposed", r.stdout)  # stated, not done
+        self.assertIn("Drop 1 epic brief(s)?", r.stdout)
+        self.assertIn("dropped 1 epic brief(s)", r.stdout)
+        text = self.epic_file().read_text()
+        self.assertIn("\nstatus: dropped\n", text)
+        self.assertRegex(text, r"Rejected \d{4}-\d\d-\d\d: not this quarter")
+        self.assertEqual(self.status("T-001"), "ready")
+        self.assertEqual(self.status("T-002"), "proposed")
+        rows = [e for e in history(self.root) if e["event"] == "rejected"]
+        self.assertEqual([(e["task"], e["epic"], e["from"], e["to"], e["by"], e["reason"]) for e in rows],
+                         [(None, "E-001", "proposed", "dropped", "Tester", "not this quarter")])
+        # a dropped epic's tasks aren't offered or started, approved or not
+        r = self.ergon("next")
+        self.assertNotIn("  T-001  ", r.stdout)
+        self.assertIn("left out because epic E-001 is dropped", r.stdout)
+        r = self.ergon("dispatch", "--dry-run")
+        self.assertNotIn("would run  T-001", r.stdout)
+        self.assertIn("skipped  T-001  epic E-001 is dropped", r.stdout)
+        r = self.ergon("set", "T-001", "status=doing", check=False, env=agent)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("epic E-001 is dropped", r.stderr)
+        self.assertNotIn("EPICS AWAITING APPROVAL", self.ergon("review").stdout)
+
+        # naming the dropped epic again drops its proposed tasks, and leaves the epic as it is
+        r = self.ergon("reject", "E-001", env=human, inp="y\n")
+        self.assertNotIn("epic brief", r.stdout)
+        self.assertIn("dropped 1", r.stdout)
+        self.assertEqual(self.status("T-002"), "dropped")
+        self.assertEqual(self.status("T-001"), "ready")
+        self.assertIn("\nstatus: dropped\n", self.epic_file().read_text())
+
+        # on an open epic, its ID names its proposed tasks, as before; the epic stays open
+        self.ergon("new", "epic", "Wanted")
+        self.ergon("new", "task", "Keep", "--tier", "haiku", "--epic", "E-002")
+        approve_epic(self, "E-002")
+        r = self.ergon("reject", "E-002", env=human, inp="y\n")
+        self.assertNotIn("epic brief", r.stdout)
+        self.assertIn("dropped 1", r.stdout)
+        self.assertEqual(self.status("T-003"), "dropped")
+        self.assertIn("\nstatus: open\n", self.epic_file("E-002").read_text())
+        r = self.ergon("reject", "E-002", check=False, env=human, inp="y\n")
+        self.assertIn("nothing in `proposed` or `review`", r.stderr)
+
+        # a proposed brief and a proposed task named together: the prompt names both
+        self.ergon("new", "epic", "Also unwanted")
+        self.ergon("new", "task", "Loose", "--tier", "sonnet")
+        r = self.ergon("reject", "E-003", "T-004", env=human, inp="y\n")
+        self.assertIn("Drop 1 epic brief(s) and drop 1 proposed?", r.stdout)
+        self.assertIn("dropped 1 epic brief(s), dropped 1", r.stdout)
+        self.assertIn("\nstatus: dropped\n", self.epic_file("E-003").read_text())
+        self.assertEqual(self.status("T-004"), "dropped")
+        self.ergon("check")
+
     def test_epics_from_before_approval_count_as_approved(self):
         # Local mode only (T-124): a stamp can't be verified here, so an open epic with no stamp
         # counts as approved and `check` doesn't report it; the guard stops an agent opening one.

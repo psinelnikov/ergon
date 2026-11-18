@@ -561,7 +561,8 @@ def review(args):
     briefs = sorted((e for e in epics.values() if e.get("status") == "proposed"), key=lambda e: e["id"])
     if briefs:
         print(f"\nEPICS AWAITING APPROVAL ({len(briefs)}): approving one approves its brief "
-              f"(Goal, Out of scope, Constraints) and opens it; its tasks wait until then")
+              f"(Goal, Out of scope, Constraints) and opens it; its tasks wait until then. "
+              f"Rejecting one drops its brief")
         for e in briefs:
             kids = sum(t.get("epic") == e["id"] and t["status"] != "dropped" for t in tasks.values())
             print(f"  {e['id']}  {e['title']}  ({kids} task(s))")
@@ -581,7 +582,7 @@ def review(args):
     if not waiting and not briefs:
         print("nothing awaiting approval")
     else:
-        print("\napprove from your own terminal:  ergon approve <ID|E-ID> ...")
+        print("\napprove from your own terminal:  ergon approve <ID|E-ID> ...   or drop:  ergon reject <ID|E-ID>")
     asking = sorted((t for t in tasks.values() if is_asking(t)), key=lambda t: t["id"])
     if asking:
         print(f"\nAWAITING ANSWER ({len(asking)}): a worker asked, its branch is kept")

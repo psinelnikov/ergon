@@ -615,21 +615,34 @@ def review_interactive(args):
 def reject(args):
     """HUMAN ONLY. A proposed task is dropped. A task in `review` goes back to `ready` with the
     reason in its Notes; its branch and worktree stay, so the next dispatch picks up from them
-    and its worker is told why."""
+    and its worker is told why. An epic ID whose brief is proposed drops the brief alone, as
+    approving it approves the brief alone: its proposed tasks stay proposed, and aren't offered
+    or started while the epic is dropped (`_tasks.epic_problem`); naming the epic again drops
+    them. On any other epic, its ID names its proposed tasks."""
     if _config.SHARED:  # act on the latest state, and publish the result
         sync_for_count(args.ids, what="rejection")
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
-    named = targets(args.ids, tasks, epics)
+    briefs = [epics[i] for i in dict.fromkeys(args.ids) if i in epics and epics[i].get("status") == "proposed"]
+    named = targets([i for i in args.ids if i not in {e["id"] for e in briefs}], tasks, epics)
     todo = [t for t in named if t["status"] == "proposed"]
     back = [t for t in named if t["status"] == "review"]
-    if not todo and not back:
+    if not briefs and not todo and not back:
         raise SystemExit("nothing in `proposed` or `review` among those ids")
     if back and not args.reason:
         raise SystemExit("rejecting work in `review` needs --reason: it's what the next worker is told to fix")
     sign = signing()
+    named_ids = {t["id"] for t in todo}
+    for e in briefs:
+        print(f"  {e['id']}  epic    {e['title']}  (its brief: proposed -> dropped)")
+        print_brief(e)
+        kids = sum(t.get("epic") == e["id"] and t["status"] == "proposed" and t["id"] not in named_ids for t in tasks.values())
+        if kids:
+            print(f"      (the brief only: its {kids} proposed task(s) stay proposed, and aren't offered or "
+                  f"started while it's dropped; naming {e['id']} again drops them)")
     for t in todo + back:
         print(_tasks.line(t, tasks) + ("  (review -> ready)" if t in back else ""))
-    what = " and ".join(x for x in (f"drop {len(todo)} proposed" if todo else "",
+    what = " and ".join(x for x in (f"drop {len(briefs)} epic brief(s)" if briefs else "",
+                                    f"drop {len(todo)} proposed" if todo else "",
                                     f"send {len(back)} in review back to ready" if back else "") if x)
     if not human_gate(f"{what[0].upper() + what[1:]}?"):
         raise SystemExit("aborted")
@@ -642,23 +655,24 @@ def reject(args):
     with _gitops.state_lock():  # in shared mode, commits the change on the state branch, signed
         if sign:
             _shared.commit_pending()  # hand edits go in a commit of their own, not the signed one
-        for t in todo:
+        for t in briefs + todo:
             t["status"] = "dropped"
             if args.reason:
                 t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {args.reason}\n"
-            _tasks.dump(t, _tasks.TASK_KEYS)
+            _tasks.dump(t, _tasks.EPIC_KEYS if _tasks.is_epic(t) else _tasks.TASK_KEYS)
         for t in back:
             t["status"] = "ready"
             _dispatch.add_note(t, f"rejected by {approver()}: {args.reason}", who="review")
             _tasks.dump(t, _tasks.TASK_KEYS)
         if sign:
-            _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {t['id']}" for t in todo + back],
-                               [t["_path"] for t in todo + back])
-        for t in todo:
+            _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {t['id']}" for t in briefs + todo + back],
+                               [t["_path"] for t in briefs + todo + back])
+        for t in briefs + todo:
             _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "proposed", "to": "dropped"})
         for t in back:
             _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "review", "to": "ready"})
-    print(", ".join(x for x in (f"dropped {len(todo)}" if todo else "",
+    print(", ".join(x for x in (f"dropped {len(briefs)} epic brief(s)" if briefs else "",
+                                f"dropped {len(todo)}" if todo else "",
                                 f"sent {len(back)} back to ready" if back else "") if x))
     if _config.SHARED:
         sync_for_count(args.ids, after=True, what="rejection")
