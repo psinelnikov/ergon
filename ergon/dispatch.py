@@ -437,7 +437,8 @@ def gates_text(t):
     sup = [f"`{rx.pattern}`" for rx in _config.SUPPRESS]
     weak = WORKER_WEAKEN.format(files=", ".join(f"`{p}`" for p in _config.GATE_FILES),
                                 markers=f" or adds a line matching a suppression marker ({', '.join(sup)}) to any file" if sup else "")
-    return weak + (WORKER_GATES.format(cmds="\n".join(f"- {layer}: `{cmd}`" for layer, cmd in cmds)) if cmds else "")
+    return (weak + (WORKER_GATES.format(cmds="\n".join(f"- {layer}: `{cmd}`" for layer, cmd in cmds)) if cmds else "")
+            + harden_text(t))
 
 
 def worker_prompt(t, base, wt, branch, pubs, veto=None, lines=None):
@@ -757,6 +758,253 @@ def run_verify(t, wt, rnd=None):
     return None
 
 
+# ---------- the harden proof ----------
+# A harden task (frontmatter `harden: [<incident id>, ...]`) turns incidents (dispatch.save_incident)
+# into a deterministic check. Its gates passing proves the check doesn't break the branch; that it
+# catches the incidents needs a replay. So after the gates go green, in a scratch worktree, dispatch
+# runs the harden layer's gate (`harden_layer:`, static by default) on:
+#   - each incident's patch applied to the branch (plain, else a 3-way merge): it must go red;
+#   - the same patch applied to the branch's merge-base, without the new check: it must be green,
+#     or the red proves nothing about the check (the replay itself is broken, or an older gate
+#     catches it already). This is what keeps a stale patch, merged onto a moved branch, honest;
+#   - the merge-base with only the branch's gate-file changes ([gates] protect), no patch: green,
+#     so the check flags the incident and not code already there.
+# An incident whose patch can't be replayed both ways is reported, never passed: the worker gets a
+# fix round to commit a minimal reproduction, <[gates] repros>/<incident id>.patch, a `git diff`
+# against the branch that the check must flag. The proof replays it in the patch's place, and it
+# lands with the task as the check's test. Only the main repo's patch is replayed, not a companion's.
+
+HARDEN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # an incident's file stem, no path in it
+HARDEN_LAYERS = ("static", "runtime")
+
+
+def harden_ids(t):
+    """The incident ids a task's `harden:` names, in order."""
+    v = t.get("harden") or []
+    if isinstance(v, str):
+        v = v.split(",")
+    return list(dict.fromkeys(str(x).strip() for x in v if str(x).strip()))
+
+
+def harden_layer(t):
+    return str(t.get("harden_layer") or "static").strip()
+
+
+def incident_files(iid):
+    """(meta, patch path) of a saved incident, or None if it isn't in this clone's runs/."""
+    if not HARDEN_ID.fullmatch(iid):
+        return None
+    d = _config.RUNS / "incidents"
+    try:
+        return json.loads((d / f"{iid}.json").read_text()), d / f"{iid}.patch"
+    except (OSError, ValueError):
+        return None
+
+
+def repro_path(iid):
+    return f"{_config.REPROS}/{iid}.patch"
+
+
+WORKER_HARDEN = """
+This is a harden task. Turn each incident below into a deterministic check in this project (a lint
+rule, an import boundary, a type, an arch test), never a sentence in a doc or a prompt. Put the
+check in a gate file this task's touches: names. After the gates pass, dispatch proves the check
+in a scratch worktree with the {layer} gate (`{cmd}`): with each incident's patch applied to this
+branch it must go red; with the patch on the base, without your check, green (so the red is your
+check's); and on the base with only your gate-file changes and no patch, green (so it flags the
+incident, not code already there: don't rewrite existing code to satisfy it here). Incidents:
+{incidents}
+If an incident's patch no longer applies, the proof says so. Then commit a minimal reproduction at
+`{repros}/<incident id>.patch`: a `git diff` against this branch that adds code your check must
+flag, and that applies to the base too. The proof replays it in the patch's place, and it lands
+with this task as the check's test.
+"""
+
+
+def harden_text(t):
+    """The harden part of a harden task's worker prompt, or ''."""
+    ids = harden_ids(t)
+    if not ids:
+        return ""
+    layer = harden_layer(t)
+    lines = []
+    for iid in ids:
+        got = incident_files(iid)
+        if not got:
+            lines.append(f"- {iid}: no such incident in {_config.RUNS / 'incidents'}")
+            continue
+        meta, patch = got
+        lines.append(f"- {iid} (caught by {meta.get('layer')} on {meta.get('task')}): "
+                     f"{str(meta.get('reason') or '')[:300]}; its patch is {patch}")
+    return WORKER_HARDEN.format(layer=layer, cmd=dict(gate_cmds(t)).get(layer, "(none set)"),
+                                incidents="\n".join(lines), repros=_config.REPROS)
+
+
+@contextmanager
+def scratch_tree(t, ref):
+    """A detached worktree of `ref`, removed after."""
+    path = _config.WORKTREES / f"{t['id']}-harden"
+    if path.exists():
+        _gitops.git("worktree", "remove", "--force", str(path))
+    _config.WORKTREES.mkdir(parents=True, exist_ok=True)
+    _gitops.git("worktree", "prune")  # a scratch tree a crash left behind is still registered
+    _gitops.git("worktree", "add", "--detach", str(path), ref)
+    try:
+        yield path
+    finally:
+        try:
+            _gitops.git("worktree", "remove", "--force", str(path))
+        except _gitops.GitError:
+            shutil.rmtree(path, ignore_errors=True)
+            _gitops.git("worktree", "prune")
+
+
+def reset_tree(tree, ref):
+    _gitops.git("reset", "-q", "--hard", ref, cwd=tree)
+    _gitops.git("clean", "-ffdxq", cwd=tree)
+
+
+def apply_patch(tree, patch):
+    """Apply a patch file in `tree`: "clean", "3-way" (a 3-way merge of it, no conflict left), or
+    None if neither works."""
+    for how, flags in (("clean", ["--index"]), ("3-way", ["--3way"])):
+        r = subprocess.run(["git", "-C", str(tree), "apply", "--whitespace=nowarn", *flags, str(patch)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return how
+    return None  # a failed 3-way merge may leave conflicts behind: the next reset_tree clears them
+
+
+def proof_run(tree, cmd, log, title):
+    """Run a gate command in the scratch tree; append its output to `log`. Returns its exit code
+    (None on a timeout, which proves nothing either way)."""
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=tree, capture_output=True, text=True, timeout=VERIFY_TIMEOUT)
+        out, code = r.stdout + r.stderr, r.returncode
+    except subprocess.TimeoutExpired:
+        out, code = f"timed out after {VERIFY_TIMEOUT // 60} min\n", None
+    with open(log, "a") as f:
+        f.write(f"===== {title}: exit {code}\n{out}\n")
+    return code
+
+
+def replay(tree, cmd, log, iid, patch, tip, mb):
+    """Replay one patch: (outcome, how, why). outcome is "caught" (red on the branch, green on the
+    base without the check), "missed" (green on the branch) or "stale" (can't be replayed both ways;
+    `why` says how)."""
+    reset_tree(tree, tip)
+    how = apply_patch(tree, patch)
+    if not how:
+        return "stale", None, "no longer applies to the branch, a 3-way merge included"
+    code = proof_run(tree, cmd, log, f"{iid}: branch + patch ({how})")
+    if code is None:
+        return "stale", how, "the gate timed out on the branch with it applied"
+    if code == 0:
+        return "missed", how, None
+    reset_tree(tree, mb)
+    if not apply_patch(tree, patch):
+        return "stale", how, "applies to the branch but not to its base, so it can't be checked without the check"
+    code = proof_run(tree, cmd, log, f"{iid}: base + patch, without the check")
+    if code != 0:
+        return "stale", how, ("the gate is red on it even without the new check, so red proves nothing about "
+                              "the check" if code is not None else "the gate timed out on the base with it applied")
+    return "caught", how, None
+
+
+def gate_file_changes(mb, tip):
+    names = _gitops.git("diff", "--name-only", "-z", "--no-renames", mb, tip, raw=True)
+    return [p for p in names.split("\0") if p and gate_file_hit(p)]
+
+
+def run_harden(t, base, branch, rnd=None):
+    """The harden proof (above) on a harden task's branch, after its gates passed. Returns None if
+    it holds (or `t` isn't a harden task), else (reason, fixable): what the worker can fix (a miss,
+    a stale patch, a red base) goes to a fix round; a missing incident or gate blocks. Records a
+    `harden` history row whenever it replays. Git errors propagate: the caller blocks on them."""
+    ids = harden_ids(t)
+    if not ids:
+        return None
+    layer = harden_layer(t)
+    if layer not in HARDEN_LAYERS:
+        return f"harden proof: harden_layer {layer!r} isn't one of {', '.join(HARDEN_LAYERS)}", False
+    cmd = dict(gate_cmds(t)).get(layer)
+    if not cmd:
+        return (f"harden proof: harden_layer is {layer} but no {layer} gate is set "
+                f"([gates] {layer} in {_config.CONFIG_FILE})"), False
+    bad = [i for i in ids if not HARDEN_ID.fullmatch(i)]
+    if bad:
+        return f"harden proof: {', '.join(bad)} isn't an incident id (a file stem in runs/incidents)", False
+    tip = _gitops.git("rev-parse", branch)
+    mb = _gitops.git("merge-base", base, tip)
+    repro_on = lambda iid: subprocess.run(["git", "-C", str(_config.REPO), "cat-file", "-e", f"{tip}:{repro_path(iid)}"],
+                                          capture_output=True).returncode == 0
+    missing = [i for i in ids if not incident_files(i) and not repro_on(i)]
+    if missing:
+        return (f"harden proof: no incident {', '.join(missing)} in {_config.RUNS.relative_to(_config.HOME)}/incidents "
+                f"(incidents stay in the clone that saw them) and no reproduction at "
+                f"{', '.join(repro_path(i) for i in missing)} on the branch"), False
+    start = time.monotonic()
+    _config.RUNS.mkdir(parents=True, exist_ok=True)
+    log = _config.RUNS / f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-harden.log"
+    log.write_text(f"harden proof of {t['id']}: {layer} gate `{cmd}`, branch {tip}, base {mb}\n")
+    caught, missed, stale, problems, via = [], [], [], [], {}
+    with scratch_tree(t, tip) as tree:
+        for iid in ids:
+            tries, why_stale = [], []
+            got = incident_files(iid)
+            if got:
+                tries.append(("its patch", got[1]))
+            if repro_on(iid):
+                text = _gitops.git("show", f"{tip}:{repro_path(iid)}", raw=True)
+                rp = log.with_name(f"{log.stem}-{iid}.patch")
+                rp.write_text(text)
+                tries.append((f"its reproduction {repro_path(iid)}", rp))
+            for what, patch in tries:
+                outcome, how, why = replay(tree, cmd, log, iid, patch, tip, mb)
+                if outcome == "stale":
+                    why_stale.append(f"{what} {why}")
+                    continue
+                via[iid] = what + (" (3-way)" if how == "3-way" else "")
+                if outcome == "caught":
+                    caught.append(iid)
+                else:
+                    missed.append(iid)
+                    problems.append(f"missed {iid}: the gate stayed green with {via[iid]} applied to the branch; "
+                                    f"make the check flag it")
+                break
+            else:
+                stale.append(iid)
+                problems.append(f"{iid} can't be replayed: {'; '.join(why_stale)}; commit a minimal reproduction "
+                                f"at `{repro_path(iid)}` (a `git diff` against the branch that the check must flag "
+                                f"and the base without it doesn't)")
+        reset_tree(tree, mb)
+        files = gate_file_changes(mb, tip)
+        for p in files:
+            if subprocess.run(["git", "-C", str(_config.REPO), "cat-file", "-e", f"{tip}:{p}"],
+                              capture_output=True).returncode == 0:
+                _gitops.git("checkout", tip, "--", f":(literal){p}", cwd=tree)
+            else:
+                _gitops.git("rm", "-q", "--ignore-unmatch", "--", f":(literal){p}", cwd=tree)
+        if _gitops.git("write-tree", cwd=tree) == _gitops.git("rev-parse", f"{tip}^{{tree}}"):
+            base_ok = True  # the branch is only gate-file changes: its gates just passed on this very tree
+        else:
+            base_ok = proof_run(tree, cmd, log, "base + the branch's gate-file changes, no patch") == 0
+        if not base_ok:
+            problems.append(f"the gate isn't green on the base with only the branch's gate-file changes "
+                            f"({', '.join(files) or 'none'}) and no patch: the check flags code already there "
+                            f"(or the base is red); make it flag the incidents only")
+    ok = not problems
+    _history.record("harden", t, ok=ok, layer=layer, cmd=cmd, incidents=ids, caught=caught, missed=missed,
+                    stale=stale, base_ok=base_ok, via=via, seconds=round(time.monotonic() - start, 1),
+                    log=log, **_round(rnd))
+    print(f"  harden   {t['id']}  {layer}: caught {len(caught)} of {len(ids)}"
+          + ("" if base_ok else ", red on the base") + (f" (round {rnd})" if rnd and rnd > 1 else ""), flush=True)
+    if ok:
+        return None
+    return (f"harden proof ({layer} gate `{cmd}`) failed: {'; '.join(problems)} "
+            f"(full output {log.relative_to(_config.HOME)})"), "harden"
+
+
 REVIEW_PROMPT = """You are reviewing {id} before it lands.
 
 Working tree: {wt}, on branch {branch}, cut from {base}. A {tier}-tier worker says the task is done.
@@ -904,9 +1152,10 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None):
     (after --escalate the lower tier's commits are on the branch too). The reviewer is one tier
     above `tier`. Touches only the task's own worktrees and branch, so a long verify or review
     doesn't hold the state lock. Returns (failure reason or None, review cost, fixable): a
-    reviewer's `REVIEW: fail` is fixable (True), and so are a red verify ("verify") and a
-    weakening veto ("weaken"), each by a fix round (fix_loop). The weakening check runs first,
-    on `t` as it was at launch. The caller adds kept_note."""
+    reviewer's `REVIEW: fail` is fixable (True), and so are a red verify ("verify"), a
+    weakening veto ("weaken") and a failed harden proof ("harden"), each by a fix round
+    (fix_loop). The weakening check runs first, on `t` as it was at launch; a harden task's
+    proof runs after its gates pass. The caller adds kept_note."""
     for tree in [wt] + [pub for _, pub in pubs]:
         if _gitops.dirty_paths(tree):
             return f"worker said done but left uncommitted changes in {tree}", 0, False
@@ -922,6 +1171,9 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None):
             log = re.search(r"\(full output (\S+?)\)\s*$", failed)
             save_incident(t, "runtime", failed, base, branch, pubs, log=log and log[1], tier=tier)
         return failed, 0, "verify"
+    failed = run_harden(t, base, branch, rnd)
+    if failed:
+        return failed[0], 0, failed[1]
     if t["tier"] not in _config.REVIEW and tier not in _config.REVIEW:
         return None, 0, False
     failed, cost, who, fixable = run_review(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd)
@@ -966,6 +1218,27 @@ was at launch. The done checks and the gates run again when you finish. End as b
 `FOUND: <title> — <why>` line for each piece of work you find but don't do, then `RESULT: done`
 or `RESULT: blocked — <why>`.
 """
+
+
+HARDEN_FIX_PROMPT = """The harden proof failed on your work on {id} (fix round {n} of {rounds}): {failed}
+
+The full output of each replay is in {log}.
+Fix it on {branch} in {wt}, and commit there citing {id}: make the check flag what it missed,
+commit a minimal reproduction where an incident's patch can't be replayed, and narrow a check that
+flags code already on the base (don't rewrite that code here; say so on a FOUND line). The check
+stays a check, never a sentence in a doc or a prompt. The done checks, the gates and the proof run
+again when you finish. End as before: a `FOUND: <title> — <why>` line for each piece of work you
+find but don't do, then `RESULT: done` or `RESULT: blocked — <why>`.
+"""
+
+
+def harden_lines(failed):
+    """Prompt lines for a fresh worker told that the harden proof failed."""
+    _tail, log = verify_detail(failed)
+    return (f"The harden proof failed on the last attempt: {failed}\nThe full output of each replay is in {log}.\n"
+            "Fix it on this branch: make the check flag what it missed, commit a minimal reproduction where an "
+            "incident's patch can't be replayed, and narrow a check that flags code already on the base. The "
+            "proof runs again before this lands.\n")
 
 
 def weaken_lines(failed):
@@ -1028,12 +1301,14 @@ def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, 
     resume_choice() allows, else a fresh worker with the retry prompt. Returns run_worker's
     (verdict, reason, info), with info["resumed"] and, for a fresh one, info["fresh_because"].
     `verify` = (n, rounds) makes it a round for a red verify (`veto` is run_verify's reason), or
-    with kind="weaken" for a weakening veto (run_weakening's). `rnd` numbers every worker run
+    with kind="weaken" for a weakening veto (run_weakening's) or kind="harden" for a failed
+    harden proof (run_harden's). `rnd` numbers every worker run
     (logs, history); a review fix round's own count is `n`."""
     n, rounds = verify or (n, _config.REVIEW_ROUNDS)
     weaken = bool(verify) and kind == "weaken"
-    what = "weaken fix" if weaken else "verify fix" if verify else "fix"
-    lines = (weaken_lines(veto) if weaken else verify_lines(veto)) if verify else None
+    harden = bool(verify) and kind == "harden"
+    what = "weaken fix" if weaken else "harden fix" if harden else "verify fix" if verify else "fix"
+    lines = ((weaken_lines if weaken else harden_lines if harden else verify_lines)(veto)) if verify else None
     resume, fresh_because = resume_choice(session, wt)
     tt = dict(t, tier=tier)
     if resume:
@@ -1041,6 +1316,9 @@ def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, 
         print(f"  {what:<8} {t['id']}  round {n}/{rounds}: resumed {session}", flush=True)
         if weaken:
             prompt = WEAKEN_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, branch=branch, wt=wt)
+        elif harden:
+            prompt = HARDEN_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, branch=branch, wt=wt,
+                                              log=verify_detail(veto)[1])
         elif verify:
             tail, vlog = verify_detail(veto)
             prompt = VERIFY_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, tail=tail,
@@ -1405,7 +1683,7 @@ def dispatch(args):
             if fixable == "verify" and outside:  # the rerun as it was is red too: the worker's reason goes to a human
                 info.update(asked=True, rounds=f" (verify still red on rerun: {failed})")
                 return "blocked", f"{outside}. {kept}"
-            if fixable in ("verify", "weaken"):  # a weakening veto uses up the same rounds, per task
+            if fixable in ("verify", "weaken", "harden"):  # a weakening veto or harden proof uses up the same rounds
                 stop = ""
                 if vfixes >= _config.VERIFY_ROUNDS:
                     stop = f"; no verify fix rounds left (verify_rounds = {_config.VERIFY_ROUNDS})" if vfixes else ""
@@ -1665,6 +1943,8 @@ def dispatch(args):
                   + (f", up to {_config.VERIFY_ROUNDS} verify fix round{'s' if _config.VERIFY_ROUNDS != 1 else ''}"
                      if _config.VERIFY_ROUNDS and gate_cmds(t) else "")
                   + "".join(f", {layer} gate `{cmd}`" for layer, cmd in gate_cmds(t))
+                  + (f", harden proof of {len(harden_ids(t))} incident(s) on the {harden_layer(t)} gate"
+                     if harden_ids(t) else "")
                   + (f", {crounds} if its branch conflicts" if cr else "")
                   + (f", escalates to {_config.WORKER_TIERS[_config.WORKER_TIERS.index(t['tier']) + 1]} if blocked"
                      if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1] else "")

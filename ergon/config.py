@@ -70,6 +70,7 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # runtime = "make test"
 # protect = ["ruff.toml", ".eslintrc*", "tests/arch/**"]
 # suppress = ['# noqa', 'eslint-disable', '@pytest\\.mark\\.skip']   # regexes ('literal' strings)
+# repros = "tests/harden"       # where a harden task commits <incident id>.patch when an incident's patch is stale
 
 # Tasks whose finished branch waits at status `review` for a human `ergon accept` instead of landing.
 # A task matches a rule if its tier is in tiers (when given) and a touches: entry matches (when
@@ -112,6 +113,7 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 SHARED = None  # [shared]: {remote, branch}, or None for local-only state
 GATE_FILES = [CONFIG_FILE]  # [gates] protect, plus the config itself
 SUPPRESS = []  # [gates] suppress, compiled
+REPROS = "tests/harden"  # [gates] repros: a harden task's reproductions, <incident id>.patch
 PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
 ACCEPT = []  # [[accept]] rules: {tiers, touches}
 TWO_PERSON = []  # [[two_person]] rules: {tiers, touches}; shared mode only
@@ -198,7 +200,7 @@ def configure(start=None, need_config=True):
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, \
         REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, \
-        GATE_FILES, SUPPRESS
+        GATE_FILES, SUPPRESS, REPROS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -244,10 +246,10 @@ def configure(start=None, need_config=True):
     GATES = CFG.get("gates") or {}
     strings = lambda v: isinstance(v, list) and all(isinstance(x, str) and x.strip() for x in v)
     if not isinstance(GATES, dict) or any(
-            k not in ("static", "runtime", "protect", "suppress")
-            or not (isinstance(v, str) if k in ("static", "runtime") else strings(v)) for k, v in GATES.items()):
-        raise NotConfigured(f"{CONFIG_FILE}: [gates] takes static and runtime, each a shell command, and "
-                            f"protect and suppress, each a list of patterns")
+            k not in ("static", "runtime", "protect", "suppress", "repros")
+            or not (isinstance(v, str) if k in ("static", "runtime", "repros") else strings(v)) for k, v in GATES.items()):
+        raise NotConfigured(f"{CONFIG_FILE}: [gates] takes static and runtime, each a shell command, "
+                            f"protect and suppress, each a list of patterns, and repros, a directory")
     # The weakening check (T-101): gate files a branch may change, and markers it may add, only
     # where its task's touches: names the file. The config itself is always a gate file.
     GATE_FILES = list(dict.fromkeys([CONFIG_FILE] + [x.strip().strip("/") for x in GATES.get("protect") or []]))
@@ -257,6 +259,10 @@ def configure(start=None, need_config=True):
             SUPPRESS.append(re.compile(x))
         except re.error as err:
             raise NotConfigured(f"{CONFIG_FILE}: [gates] suppress {x!r} isn't a regex: {err}")
+    # A harden task's reproductions (T-106): a directory in the repo, never outside it.
+    REPROS = (GATES.get("repros") or "tests/harden").strip().strip("/")
+    if not REPROS or any(x in (".", "..", "") for x in REPROS.split("/")):
+        raise NotConfigured(f"{CONFIG_FILE}: [gates] repros is a directory inside the repo")
     REVIEW_ROUNDS = count("review_rounds", 2)
     VERIFY_ROUNDS = count("verify_rounds", 2)  # a red verify goes back to the worker this many times (T-027)
     CONFLICT_ROUNDS = count("conflict_rounds", 1)  # a branch that conflicts with its base goes back to its worker (T-095)

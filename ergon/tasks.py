@@ -802,6 +802,14 @@ def lint():
         if t.get("accept") and str(t["accept"]).lower() not in YES:
             errs.append(f"{where}: accept: {t['accept']!r} isn't `yes` (leave it out for no; config "
                         f"[[accept]] rules can't be opted out of)")
+        harden = _dispatch.harden_ids(t)  # a harden task (T-106)
+        for i in harden:
+            if not _dispatch.HARDEN_ID.fullmatch(i):
+                errs.append(f"{where}: harden: {i!r} isn't an incident id (the file stem in <state>/runs/incidents)")
+        if t.get("harden_layer") and t["harden_layer"] not in _dispatch.HARDEN_LAYERS:
+            errs.append(f"{where}: harden_layer: {t['harden_layer']!r} isn't one of {', '.join(_dispatch.HARDEN_LAYERS)}")
+        if t.get("harden_layer") and not harden:
+            errs.append(f"{where}: harden_layer: is set but harden: names no incident")
         if t.get("epic") and t["epic"] not in epics:
             errs.append(f"{where}: epic {t['epic']} doesn't exist")
         for d in t.get("depends") or []:

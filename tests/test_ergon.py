@@ -36,7 +36,9 @@ of each conflicted file, then ends $FAKE_CONFLICT_RESULT (default RESULT: done);
 lands a conflicting commit on the main checkout's trunk after merging. With $FAKE_WEAKEN =
 "<path>|<line>" its first run appends that line to that file too; with $FAKE_UNWEAKEN a fix round
 the weakening check asked for puts the file back as main has it. $FAKE_EDIT_TOUCHES rewrites its
-own task file's touches: in the main checkout to that list."""
+own task file's touches: in the main checkout to that list. $FAKE_WRITE = "<path>|<text>" has its
+first run overwrite that file with that line. With $FAKE_REPRO = "<dest>|<src>" a fix round the
+harden proof asked for copies the file src to dest and commits it."""
 import json, os, re, subprocess, sys, time
 if "--agent" not in sys.argv:
     n = 0
@@ -120,6 +122,14 @@ if resume and os.environ.get("FAKE_UNWEAKEN") and "weakening check" in prompt:
     subprocess.run(["git", "commit", "-qm", f"Put the gate back ({tid})"], check=True)
     print(json.dumps({"result": "reverted\nRESULT: done", "session_id": resume, "total_cost_usd": 0.01}))
     sys.exit()
+if resume and os.environ.get("FAKE_REPRO") and "harden proof" in prompt:
+    dest, _, src = os.environ["FAKE_REPRO"].partition("|")
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    open(dest, "w").write(open(src).read())
+    subprocess.run(["git", "add", dest], check=True)
+    subprocess.run(["git", "commit", "-qm", f"Add a reproduction ({tid})"], check=True)
+    print(json.dumps({"result": "reproduced\nRESULT: done", "session_id": resume, "total_cost_usd": 0.01}))
+    sys.exit()
 if resume and os.environ.get("FAKE_FIX_NOTHING"):
     print(json.dumps({"result": "nothing to change\nRESULT: done", "session_id": resume, "total_cost_usd": 0.01}))
     sys.exit()
@@ -137,6 +147,9 @@ if os.environ.get("FAKE_WEAKEN") and not resume and "An earlier attempt" not in 
     wpath, _, wline = os.environ["FAKE_WEAKEN"].partition("|")
     os.makedirs(os.path.dirname(wpath) or ".", exist_ok=True)
     open(wpath, "a").write(wline + "\n")
+if os.environ.get("FAKE_WRITE") and not resume and "An earlier attempt" not in prompt:
+    wpath, _, wline = os.environ["FAKE_WRITE"].partition("|")
+    open(wpath, "w").write(wline + "\n")
 if os.environ.get("FAKE_EDIT_TOUCHES"):  # a worker widening its own touches: to cover what it did
     common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
                             capture_output=True, text=True).stdout.strip()
@@ -1403,6 +1416,197 @@ class TestWeakening(DispatchProject):
         cfg.write_text(base.replace('protect = ["ruff.toml", "tests/arch/**"]', 'protect = "ruff.toml"'))
         r = self.ergon("board", check=False)
         self.assertIn("protect and suppress, each a list of patterns", r.stderr + r.stdout)
+
+
+class TestHarden(DispatchProject):
+    """A harden task (T-106) lands only if, in a scratch worktree, its new check goes red on each
+    incident's patch, the gate is green on that patch without the check, and green on the base with
+    only the check. The toy lint fails any .py file holding a line of rules.txt."""
+    config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
+                                            '        verify_rounds = 1')
+    IID = "T-050-20261101-120000"
+    LINT = textwrap.dedent('''\
+        import pathlib, subprocess, sys
+        rules = [l.strip() for l in open("rules.txt") if l.strip()]
+        files = subprocess.run(["git", "ls-files", "-co", "--exclude-standard"], capture_output=True, text=True).stdout
+        bad = [f"{f}: {r}" for f in files.split() if f.endswith(".py") and f != "lint.py"
+               for r in rules if r in pathlib.Path(f).read_text()]
+        print("\\n".join(bad))
+        sys.exit(1 if bad else 0)
+        ''')
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "lint.py").write_text(self.LINT)
+        (self.root / "rules.txt").write_text("danger\n")
+        (self.root / "app.py").write_text("x = 1\n")
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + f'\n[gates]\nstatic = {json.dumps(sys.executable + " lint.py")}\n'
+                       'runtime = "true"\nprotect = ["rules.txt", "lint.py"]\n')
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "lint", cwd=self.root)
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0",
+                        FAKE_FIX_RESULT="tried\nRESULT: done")
+        self.env.pop("CLAUDE_CONFIG_DIR", None)
+
+    def incident(self, files, iid=IID):
+        """Save an incident as dispatch.save_incident would: the diff of a throwaway branch off main
+        that writes `files`, and its JSON."""
+        sh("git", "checkout", "-qb", "oops", cwd=self.root)
+        for name, text in files.items():
+            (self.root / name).write_text(text)
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "the mistake", cwd=self.root)
+        sh("git", "checkout", "-q", "main", cwd=self.root)
+        base = sh("git", "rev-parse", "main", cwd=self.root).stdout.strip()
+        tip = sh("git", "rev-parse", "oops", cwd=self.root).stdout.strip()
+        d = self.root / "tasks" / "runs" / "incidents"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{iid}.patch").write_text(sh("git", "diff", f"{base}...{tip}", cwd=self.root).stdout)
+        (d / f"{iid}.json").write_text(json.dumps({"task": "T-050", "layer": "review", "reason": "eval on input",
+                                                   "log": None, "base": base, "tip": tip, "tier": "sonnet",
+                                                   "companions": []}))
+        sh("git", "branch", "-qD", "oops", cwd=self.root)
+
+    def task(self, harden=IID, extra=""):
+        self.ergon("new", "task", "Harden eval", "--tier", "haiku", "--touches", "rules.txt")
+        p = self.task_file("T-001")
+        p.write_text(re.sub(r"^touches:.*$", lambda m: m[0] + f"\nharden: [{harden}]{extra}", p.read_text(),
+                            count=1, flags=re.M))
+        stamp(p)
+
+    def calls(self):
+        return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+
+    def rows(self, event="harden"):
+        return [r for r in history(self.root) if r["task"] == "T-001" and r["event"] == event]
+
+    def notes(self):
+        return self.task_file("T-001").read_text().split("## Notes", 1)[1]
+
+    def scratch_gone(self):
+        wts = sh("git", "worktree", "list", cwd=self.root).stdout
+        self.assertNotIn("T-001-harden", wts)
+
+    def test_a_rule_that_flags_the_incident_lands(self):
+        self.incident({"app.py": "x = eval(input())\n"})
+        self.task()
+        self.assertIn("harden proof of 1 incident(s) on the static gate", self.ergon("dispatch", "--dry-run").stdout)
+        self.env["FAKE_WEAKEN"] = "rules.txt|eval("
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("eval(", sh("git", "show", "main:rules.txt", cwd=self.root).stdout)
+        (row,) = self.rows()
+        self.assertEqual((row["ok"], row["layer"], row["incidents"], row["caught"], row["missed"], row["stale"],
+                          row["base_ok"]), (True, "static", [self.IID], [self.IID], [], [], True))
+        self.assertEqual(row["via"], {self.IID: "its patch"})
+        log = (self.root / row["log"]).read_text()
+        self.assertIn("branch + patch (clean): exit 1", log)
+        self.assertIn("base + patch, without the check: exit 0", log)
+        self.assertIn("base + the branch's gate-file changes, no patch: exit 0", log)
+        prompt = self.calls()[0]["prompt"]
+        self.assertIn("This is a harden task", prompt)
+        self.assertIn("never a sentence in a doc or a prompt", prompt)
+        self.assertIn(f"- {self.IID} (caught by review on T-050): eval on input", prompt)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual([r["layer"] for r in history(self.root) if r["task"] == "T-001" and r["event"] == "verify"],
+                         ["static", "runtime"])  # the gates ran green before the proof
+        self.scratch_gone()
+
+    def test_a_rule_that_misses_gets_a_fix_round_then_blocks(self):
+        self.incident({"app.py": "x = eval(input())\n"})
+        self.task()
+        self.env["FAKE_WEAKEN"] = "rules.txt|exec("
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("The harden proof failed on your work on T-001 (fix round 1 of 1)", calls[1]["prompt"])
+        self.assertIn(f"missed {self.IID}: the gate stayed green with its patch applied", calls[1]["prompt"])
+        self.assertIn(f"missed {self.IID}", self.notes())
+        self.assertIn("no verify fix rounds left (verify_rounds = 1)", self.notes())
+        self.assertEqual([(r["ok"], r["missed"]) for r in self.rows()], [(False, [self.IID])] * 2)
+        self.assertEqual(self.rows("incident"), [])  # a failed proof isn't an incident of its own
+        self.assertNotIn("exec(", sh("git", "show", "main:rules.txt", cwd=self.root).stdout)
+        self.scratch_gone()
+
+    def test_a_rule_that_fails_the_clean_base_blocks(self):
+        (self.root / "legacy.py").write_text("y = eval('2')\n")
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "legacy", cwd=self.root)
+        self.incident({"app.py": "x = eval(input())\n"})
+        self.task()
+        # the worker rewrites the code already on the base so its branch passes: the proof sees through it
+        self.env.update(FAKE_WEAKEN="rules.txt|eval(", FAKE_WRITE="legacy.py|y = 2")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("flags code already there", self.notes())
+        rows = self.rows()
+        self.assertEqual([(r["ok"], r["caught"], r["base_ok"]) for r in rows], [(False, [self.IID], False)] * 2)
+        self.assertIn("legacy.py: eval(", (self.root / rows[0]["log"]).read_text())
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_a_patch_that_no_longer_applies_asks_for_a_reproduction(self):
+        self.incident({"app.py": "x = eval(input())\n"})
+        (self.root / "app.py").write_text("y = 2\n")  # the base moved on under the incident
+        sh("git", "commit", "-qam", "moved", cwd=self.root)
+        self.task()
+        repro = Path(self.tmp.name) / "repro.patch"
+        repro.write_text("diff --git a/repro.py b/repro.py\nnew file mode 100644\n--- /dev/null\n+++ b/repro.py\n"
+                         "@@ -0,0 +1 @@\n+z = eval(input())\n")
+        dest = f"tests/harden/{self.IID}.patch"
+        self.env.update(FAKE_WEAKEN="rules.txt|eval(", FAKE_REPRO=f"{dest}|{repro}")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn(f"{self.IID} can't be replayed: its patch no longer applies to the branch, a 3-way merge "
+                      f"included; commit a minimal reproduction at `{dest}`", calls[1]["prompt"])
+        first, second = self.rows()
+        self.assertEqual((first["ok"], first["stale"], first["caught"]), (False, [self.IID], []))
+        self.assertEqual((second["ok"], second["stale"], second["caught"]), (True, [], [self.IID]))
+        self.assertEqual(second["via"], {self.IID: f"its reproduction {dest}"})
+        self.assertIn("z = eval", sh("git", "show", f"main:{dest}", cwd=self.root).stdout)  # it lands as the test
+        self.scratch_gone()
+
+    def test_a_patch_red_without_the_check_proves_nothing(self):
+        self.incident({"app.py": "x = eval(input())  # danger\n"})  # an older rule flags it too now
+        self.task()
+        self.env["FAKE_WEAKEN"] = "rules.txt|eval("
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("the gate is red on it even without the new check", self.notes())
+        self.assertEqual(self.rows()[0]["stale"], [self.IID])
+
+    def test_a_missing_incident_blocks_without_a_round(self):
+        self.task()
+        self.env["FAKE_WEAKEN"] = "rules.txt|eval("
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertIn(f"no incident {self.IID} in tasks/runs/incidents", self.notes())
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.rows(), [])
+
+    def test_runtime_layer_and_check(self):
+        self.incident({"app.py": "x = eval(input())\n"})
+        self.task(extra="\nharden_layer: runtime")
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text().replace('runtime = "true"', f'runtime = {json.dumps(sys.executable + " lint.py")}'))
+        sh("git", "commit", "-qam", "runtime lint", cwd=self.root)
+        self.env["FAKE_WEAKEN"] = "rules.txt|eval("
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.rows()[0]["layer"], "runtime")
+        self.ergon("new", "task", "Bad layer", "--tier", "haiku")
+        t2 = self.task_file("T-002")
+        t2.write_text(re.sub(r"^touches:.*$", "touches: []\nharden: [../x]\nharden_layer: unit", t2.read_text(),
+                             count=1, flags=re.M))
+        r = self.ergon("check", check=False)
+        self.assertIn("harden: '../x' isn't an incident id", r.stdout)
+        self.assertIn("harden_layer: 'unit' isn't one of static, runtime", r.stdout)
 
 
 class TestVerifyRounds(DispatchProject):
