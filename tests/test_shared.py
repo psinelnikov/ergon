@@ -1239,6 +1239,21 @@ class TestSignedApprovals(Shared):
         self.assertIn("\n\nErgon-Reject: T-002\n", self.head(self.a))
         self.assertTrue(self.signed(self.a))
 
+    def test_rejecting_a_proposed_epic_is_signed_and_the_other_clone_sees_it_dropped(self):
+        self.start()
+        self.ergon(self.a, "new", "epic", "Widgets")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        self.ergon(self.a, "reject", "E-001", inp="y\n")
+        self.assertIn("\n\nErgon-Reject: E-001\n", self.head(self.a))
+        self.assertTrue(self.signed(self.a))
+        remote_head = sh("git", "cat-file", "commit", "ergon-state", cwd=self.remote).stdout
+        self.assertIn("\n\nErgon-Reject: E-001\n", remote_head)
+        self.assertIn("-----BEGIN SSH SIGNATURE-----", remote_head)
+        self.ergon(self.b, "sync")
+        epic = next((self.b / "tasks" / "epics").glob("E-001-*/EPIC.md")).read_text()
+        self.assertIn("status: dropped", epic)
+
     def test_agents_cant_move_the_ref_the_approvers_file_is_read_from(self):
         self.start()
         for cmd in ["git update-ref refs/ergon/trunk HEAD", "git fetch . main:refs/ergon/trunk"]:
