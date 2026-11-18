@@ -1288,8 +1288,10 @@ class TestConflictRounds(DispatchProject):
         self.wt = self.root / ".claude" / "worktrees" / "T-002"
 
     def tasks(self, *touches):
-        self.ergon("new", "task", "First", "--tier", "haiku", *touches)
-        self.ergon("new", "task", "Second", "--tier", "sonnet", *touches)
+        # Disjoint declared touches so dispatch runs both at once (empty touches would hold
+        # one behind the other, T-094); the conflict is in shared.txt, which neither declares.
+        self.ergon("new", "task", "First", "--tier", "haiku", *(touches or ("--touches", "first.txt")))
+        self.ergon("new", "task", "Second", "--tier", "sonnet", *(touches or ("--touches", "second.txt")))
         for t in ("T-001", "T-002"):
             stamp(self.task_file(t))
 
