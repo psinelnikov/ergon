@@ -733,6 +733,44 @@ class TestEpicApproval(Project):
         self.assertIn("approved", [e["event"] for e in history(self.root) if e.get("epic") == "E-001" and not e.get("task")])
         self.ergon("check")
 
+    def test_review_interactive_approves_an_epic_brief(self):
+        """T-125: the interactive review walks a proposed epic's brief before its tasks; `a`
+        approves the brief alone, as `ergon approve E-NNN` does."""
+        self.ergon("new", "epic", "Big thing")
+        ef = self.epic_file()
+        ef.write_text(ef.read_text().replace("## Goal\n", "## Goal\nShip the big thing.\n", 1))
+        self.ergon("new", "task", "Part one", "--tier", "haiku", "--epic", "E-001")
+        self.ergon("new", "task", "Loose", "--tier", "sonnet")  # T-002, in no epic
+        review_i = lambda *a, inp="": self.ergon("review", "-i", *a, inp=inp, check=False,
+                                                 env=clean_env(ERGON_ASK_STDIN="1"))
+        r = review_i("--tier", "haiku", inp="q\n")  # a brief has no tier
+        self.assertNotIn("epic brief", r.stdout)
+        r = review_i("--epic", "E-001", inp="s\nq\n")  # skipping it writes nothing
+        self.assertIn("[1/2]  E-001  Big thing  (epic brief, proposed)", r.stdout)
+        self.assertIn("Goal: Ship the big thing.", r.stdout)
+        self.assertIn("Out of scope:", r.stdout)
+        self.assertIn("Constraints:", r.stdout)
+        self.assertIn("its 1 proposed task(s) stay proposed", r.stdout)
+        self.assertNotIn("Loose", r.stdout)
+        self.assertIn("\nstatus: proposed\n", ef.read_text())
+
+        r = review_i(inp="a\ns\ns\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = r.stdout
+        self.assertLess(out.index("E-001  Big thing  (epic brief"), out.index("title: Part one"))  # brief first
+        self.assertIn("[3/3]", out)
+        self.assertIn("approved 1  dropped 0  answered 0  skipped 2", out)
+        text = ef.read_text()
+        self.assertIn("\nstatus: open\n", text)
+        self.assertRegex(text, r"\napproved: Tester \d{4}-\d\d-\d\d\n")
+        self.assertEqual(self.status("T-001"), "proposed")  # the brief only
+        self.assertEqual(self.status("T-002"), "proposed")
+        self.assertIn("approved", [e["event"] for e in history(self.root) if e.get("epic") == "E-001" and not e.get("task")])
+        r = review_i(inp="q\n")  # an approved brief isn't due again
+        self.assertNotIn("epic brief", r.stdout)
+        self.assertIn("[1/2]", r.stdout)
+        self.ergon("check")
+
     def test_epics_from_before_approval_count_as_approved(self):
         # Local mode only (T-124): a stamp can't be verified here, so an open epic with no stamp
         # counts as approved and `check` doesn't report it; the guard stops an agent opening one.
