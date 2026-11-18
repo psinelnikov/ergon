@@ -1455,6 +1455,22 @@ def replan_reason(key, status):
             f"edit it and run `ergon approve <ID>` again")
 
 
+def record_refusal(event, why, worker):
+    """Append a `guard` history row for a refused tool call. Never raises: a failed write only warns."""
+    try:
+        item = None
+        try:
+            br = _gitops.git("branch", "--show-current", cwd=event.get("cwd") or None)
+        except Exception:  # noqa: BLE001 - not a git folder: no task
+            br = ""
+        if br.startswith(_config.TASK_BRANCH):
+            tid = br[len(_config.TASK_BRANCH):]
+            item = _tasks.load(_config.ITEMS).get(tid) or {"id": tid}
+        _history.record("guard", item, tool=event.get("tool_name"), reason=str(why)[:200], worker=bool(worker))
+    except Exception as err:  # noqa: BLE001 - history never turns a deny into an error
+        print(f"ergon: couldn't record guard refusal: {err}", file=sys.stderr)
+
+
 def hook(args):
     if args.event == "commit-msg":
         return commit_msg_hook(args)
@@ -1467,6 +1483,7 @@ def hook(args):
         if args.event == "guard":
             why = guard_reason(event.get("tool_name"), event.get("tool_input") or {}, args.worker, event.get("cwd"))
             if why:
+                record_refusal(event, why, args.worker)
                 print(json.dumps({"hookSpecificOutput": {
                     "hookEventName": "PreToolUse", "permissionDecision": "deny",
                     "permissionDecisionReason": f"ergon guard: {why}"}}))

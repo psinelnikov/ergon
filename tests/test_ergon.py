@@ -419,6 +419,30 @@ class TestBasics(Project):
         self.assertIn("shell", self.guard("Bash", {"command": f"sed -i '' s/a/b/ {f}"}))
         self.assertIsNone(self.guard("Bash", {"command": "cat tasks/items/*.md"}))
 
+    def test_guard_logs_refusal_to_history(self):
+        from ergon import history
+        self.ergon("new", "task", "Fix it", "--tier", "haiku")
+        f = str(self.task_file("T-001"))
+        edit = {"file_path": f, "old_string": "status: proposed", "new_string": "status: ready"}
+        self.assertIn("ergon set", self.guard("Edit", edit, "--worker"))
+        rows = [r for r in history.read(self.root / "tasks" / "runs" / "history.jsonl") if r["event"] == "guard"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["tool"], rows[0]["worker"], rows[0]["task"], rows[0]["epic"]),
+                         ("Edit", True, None, None))
+        self.assertIn("ergon set", rows[0]["reason"])
+        self.assertLessEqual(len(rows[0]["reason"]), 200)
+        self.assertEqual(history.catches(rows)["totals"]["guard"], 1)
+
+    def test_guard_still_denies_when_history_unwritable(self):
+        self.ergon("new", "task", "Fix it", "--tier", "haiku")
+        runs = self.root / "tasks" / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        (runs / "history.jsonl").unlink(missing_ok=True)
+        (runs / "history.jsonl").mkdir()  # can't be opened for append
+        f = str(self.task_file("T-001"))
+        why =self.guard("Edit", {"file_path": f, "old_string": "status: proposed", "new_string": "status: ready"})
+        self.assertIn("ergon set", why)
+
     def test_guard_human_cmd_only_real_calls(self):
         """T-044: a human-only verb in a grep pattern or a commit message is data; a real call is
         refused wherever it sits in the command."""
