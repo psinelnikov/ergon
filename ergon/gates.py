@@ -1372,6 +1372,14 @@ def guard_reason(tool, inp, worker=False, cwd=None):
             if fb.get(key, "") != fa.get(key, ""):
                 return (f"`{key}:` of a task approved by inheritance (`approved: auto …`) is fixed: its approval "
                         f"holds only for what it was filed as. File a new task, or ask a human to change it")
+    # The two fields that weaken a gate, as `set` refuses them: the digest catches them in shared
+    # mode only, so in local mode this is what stops an edit to an approved task's gate (T-150).
+    # A new file counts too: a brief that arrives with its own gate is a human's to write.
+    if fb.get("verify", "") != fa.get("verify", ""):
+        return ("`verify:` overrides the runtime gate (`verify: true` passes anything), so a human writes, "
+                "changes or removes it by editing the task file")
+    if _tasks.prove_off(fa) and not _tasks.prove_off(fb):
+        return "`prove: no` skips the red-on-base proof, so a human writes it by editing the task file"
     # A new task or epic file starts proposed: an open epic with no stamp would count as approved
     # (grandfathered), so an agent's new EPIC.md can't be open.
     if fb.get("status", "") != fa.get("status", "") and not (not before and fa.get("status") == "proposed"):

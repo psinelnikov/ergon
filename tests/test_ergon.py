@@ -3176,6 +3176,56 @@ class TestGateWeakeningFields(Project):
             f.write_text(text)
         self.assertEqual(brief_digest(parse(f)), base)
 
+    def test_guard_refuses_writing_verify(self):
+        """Local mode has no digest to catch it, so the guard refuses an agent's edit that adds,
+        changes or removes a task's `verify:`, by Edit, MultiEdit or Write (T-150)."""
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        f = self.task_file("T-001")
+        stamp(f)
+        add = f.read_text().replace("\n---\n", "\nverify: true\n---\n", 1)
+        refused = "`verify:` overrides the runtime gate"
+        for tool, inp in (("Edit", {"old_string": "tier: sonnet", "new_string": "tier: sonnet\nverify: true"}),
+                          ("Edit", {"old_string": "tier_why:", "new_string": "verify: true  # ok\ntier_why:"}),
+                          ("MultiEdit", {"edits": [{"old_string": "## What", "new_string": "## What\nx"},
+                                                   {"old_string": "tier: sonnet", "new_string": "tier: sonnet\n verify : true"}]}),
+                          ("Write", {"content": add})):
+            self.assertIn(refused, self.guard(tool, {"file_path": str(f), **inp}) or "", (tool, inp))
+        f.write_text(add)  # a human wrote one: changing or removing it is a human's edit too
+        for new in ("verify: pytest -x", "verify:", ""):
+            why = self.guard("Edit", {"file_path": str(f), "old_string": "verify: true", "new_string": new})
+            self.assertIn(refused, why or "", new)
+        self.assertIsNone(self.guard("Edit", {"file_path": str(f), "old_string": "## What", "new_string": "## What\nx"}))
+        # a `verify:` line in the body isn't frontmatter
+        self.assertIsNone(self.guard("Edit", {"file_path": str(f), "old_string": "## Notes",
+                                              "new_string": "## Notes\nverify: true"}))
+        # a new task file that brings its own gate is refused too; one without passes
+        new = str(f.with_name("T-009-new.md"))
+        fresh = "---\nid: T-009\ntitle: New\ntier: sonnet\nstatus: proposed\napproved:\n---\n\n## What\nx\n"
+        self.assertIsNone(self.guard("Write", {"file_path": new, "content": fresh}))
+        why = self.guard("Write", {"file_path": new, "content": fresh.replace("approved:", "approved:\nverify: true")})
+        self.assertIn(refused, why or "")
+
+    def test_guard_refuses_setting_prove_no(self):
+        """As with `verify:`, the guard refuses an agent's edit that turns the red-on-base proof
+        off, whatever spelling of no it uses (T-150)."""
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        f = self.task_file("T-001")
+        stamp(f)
+        refused = "`prove: no` skips the red-on-base proof"
+        for no in ("no", " No", " false", " 0", " no  # mechanical"):
+            why = self.guard("Edit", {"file_path": str(f), "old_string": "tier: sonnet",
+                                      "new_string": f"tier: sonnet\nprove:{no}"})
+            self.assertIn(refused, why or "", no)
+        why = self.guard("Write", {"file_path": str(f), "content": f.read_text().replace("\n---\n", "\nprove: no\n---\n", 1)})
+        self.assertIn(refused, why or "")
+        f.write_text(f.read_text().replace("\n---\n", "\nprove: yes\n---\n", 1))
+        why = self.guard("Edit", {"file_path": str(f), "old_string": "prove: yes", "new_string": "prove: false"})
+        self.assertIn(refused, why or "")
+        # turning the proof on, or taking `prove: no` off, weakens nothing
+        f.write_text(f.read_text().replace("prove: yes", "prove: no"))
+        for new in ("prove: yes", "", "prove: false"):
+            self.assertIsNone(self.guard("Edit", {"file_path": str(f), "old_string": "prove: no", "new_string": new}), new)
+
 
 class TestGateWeakeningFieldsSigned(unittest.TestCase):
     """Shared mode: `verify:` or `prove: no` written into an approved task after its signed approval
