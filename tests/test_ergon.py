@@ -113,6 +113,19 @@ if os.environ.get("FAKE_TRANSCRIPT_AGE"):
              "message": {"id": "m1", "usage": {"input_tokens": int(os.environ.get("FAKE_CONTEXT", "1000"))}}}
     with open(os.path.join(d, "s-1.jsonl"), "w") as f:
         f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+if os.environ.get("FAKE_STOPS"):  # nth worker call: nojson (what a timeout leaves), error, noresult or ok
+    cf = os.environ["FAKE_STOPS_FILE"]
+    n = len(open(cf).read()) if os.path.exists(cf) else 0
+    open(cf, "a").write("x")
+    seq = os.environ["FAKE_STOPS"].split("|")
+    kind = seq[min(n, len(seq) - 1)]
+    if kind == "nojson":
+        print("garbage"); sys.exit()
+    if kind == "error":
+        print(json.dumps({"is_error": True, "subtype": "error_during_execution", "result": "boom", "session_id": "s-1",
+                          "total_cost_usd": 0.01})); sys.exit()
+    if kind == "noresult":
+        print(json.dumps({"result": "I ran out of steam", "session_id": "s-1", "total_cost_usd": 0.01})); sys.exit()
 tid = re.search(r"(?:dispatched|work|asked) on (T-\d+)", prompt).group(1)
 if "conflicts with its base" in prompt:
     mode = os.environ.get("FAKE_CONFLICT", "resolve")
@@ -2695,6 +2708,110 @@ class TestVerifyRounds(DispatchProject):
         self.assertIn("green", text)
         self.assertIn("verify (runtime gate)", text)  # the branch's log too
         self.assertIn("depends: [T-002]", self.task_file("T-001").read_text())
+
+
+class TestUntilDone(DispatchProject):
+    """--until-done N: a worker that stops short runs again on the same branch."""
+
+    def setUp(self):
+        super().setUp()
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0",
+                        FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"))
+        self.env.pop("CLAUDE_CONFIG_DIR", None)
+        self.ergon("new", "task", "Job", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+
+    def run_it(self, stops, n, *extra, **env):
+        self.env.update(FAKE_STOPS=stops, **env)
+        return self.ergon("dispatch", "--until-done", str(n), *extra).stdout
+
+    def rows(self, event):
+        return [r for r in history(self.root) if r["task"] == "T-001" and r["event"] == event]
+
+    def notes(self):
+        return self.task_file("T-001").read_text().split("## Notes", 1)[1]
+
+    def test_no_result_then_done_resumes(self):
+        out = self.run_it("noresult|ok", 1)
+        self.assertEqual(self.status("T-001"), "done", out)
+        res = self.rows("resumed")
+        self.assertEqual([(r["after"], r["round"]) for r in res], [("until_done", 2)])
+        calls = [json.loads(l) for l in self.seen.read_text().splitlines()]
+        self.assertEqual(calls[1]["resume"], "s-1")
+        self.assertIn("ended without a RESULT line", calls[1]["prompt"])
+        self.assertIn("QUESTION:", calls[1]["prompt"])
+        self.assertTrue(list((self.root / "tasks" / "runs").glob("T-001-*-fix2.json")))
+        self.assertIn("finished after 1 stop(s): worker ended without a RESULT line", self.notes())
+
+    def test_no_json_then_done_starts_fresh(self):  # a timeout leaves no output, so no session to resume
+        out = self.run_it("nojson|ok", 1)
+        self.assertEqual(self.status("T-001"), "done", out)
+        fresh = [r for r in self.rows("dispatched") if r.get("after") == "until_done"]
+        self.assertEqual([(r["round"], r["fresh_because"]) for r in fresh],
+                         [(2, "the worker reported no session")])
+        self.assertEqual(self.rows("resumed"), [])
+
+    def test_error_then_no_result_then_done(self):
+        out = self.run_it("error|noresult|ok", 2)
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual([r.get("round") for r in self.rows("worker_end")], [None, 2, 3])
+        self.assertEqual([r["after"] for r in self.rows("resumed")], ["until_done", "until_done"])
+
+    def test_rounds_out_blocks_with_every_reason(self):
+        out = self.run_it("nojson|error|noresult", 2)
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        notes = self.notes()
+        self.assertIn("worker ended without a RESULT line (stop 3, after 2 until-done round(s)); no until-done rounds left (--until-done 2)", notes)
+        self.assertIn("stop 1: worker output wasn't JSON", notes)
+        self.assertIn("stop 2: worker errored (error_during_execution): boom", notes)
+        self.assertLess(notes.index("without a RESULT line"), notes.index("stop 1"))
+        self.assertEqual(len(self.rows("worker_end")), 3)
+        self.assertFalse(list(self.root.glob("tasks/**/T-002*")))  # no human task
+
+    def test_zero_blocks_as_today(self):
+        out = self.run_it("noresult|ok", 0)
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("worker ended without a RESULT line", self.notes())
+        self.assertEqual(len(self.rows("worker_end")), 1)
+
+    def test_workers_own_block_is_not_retried(self):
+        out = self.run_it("ok", 2, FAKE_RESULT="RESULT: blocked \u2014 rotate the key")
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertEqual(len(self.rows("worker_end")), 1)
+
+    def test_budget_cap_stops_a_round(self):
+        out = self.run_it("noresult|ok", 2, "--budget", "1", "--budget-total", "0.015")
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("no until-done round 1: $0.01 spent and a round costs about $0.01, past the $0.01 cap",
+                      self.notes())
+        self.assertEqual(len(self.rows("worker_end")), 1)
+
+    def test_dry_run_counts_the_extra_calls(self):
+        out = self.ergon("dispatch", "--dry-run", "--until-done", "2", "--budget", "1", "--budget-total", "100").stdout
+        self.assertIn("up to 2 until-done rounds", out)
+        base = self.ergon("dispatch", "--dry-run", "--budget", "1", "--budget-total", "100").stdout
+        est = lambda o: float(re.search(r"estimated at most \$([\d.]+)", o)[1])
+        self.assertEqual(est(out) - est(base), 2)
+        self.assertNotIn("until-done", base)
+
+    def test_second_ctrl_c_and_timeout_are_told_apart(self):
+        from unittest import mock
+        from ergon import dispatch as d
+        agents = {"task-sonnet": {"model": "m"}}
+        t = {"id": "T-001", "tier": "sonnet"}
+        args = mock.Mock(permission_mode="auto", budget=None, timeout=1)
+        runs = Path(self.tmp.name) / "runs"
+        runs.mkdir()
+        for err, stopped in ((d.KILLED, False), ("timed out after 1 min\n", True)):
+            with mock.patch.object(d, "run_proc", return_value=("", err)), \
+                    mock.patch.object(d._config, "RUNS", runs, create=True), \
+                    mock.patch.object(d._config, "HOME", Path(self.tmp.name), create=True):
+                v, why, info = d._run_worker(t, self.root, args, agents, "{}", "p")
+            self.assertEqual((v, bool(info.get("stopped"))), ("blocked", stopped), why)
+        self.assertEqual(why, "timed out after 1 min")
 
 
 class TestConflictRounds(DispatchProject):

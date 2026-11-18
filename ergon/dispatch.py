@@ -815,10 +815,14 @@ def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
     try:
         d = json.loads(out)
     except ValueError:
+        info["stopped"] = True  # --until-done may resume it
+        if err.startswith("timed out"):
+            return "blocked", err.splitlines()[0], info
         return "blocked", "worker output wasn't JSON" + (f" ({err.strip().splitlines()[0]})" if err.strip() else ""), info
     info.update(session=d.get("session_id"), cost=d.get("total_cost_usd") or 0)
     text = d.get("result") or ""
     if d.get("is_error"):
+        info["stopped"] = True
         return "blocked", f"worker errored ({d.get('subtype') or d.get('terminal_reason')}): {text[:200]}", info
     info["found"] = [(ti, why, dict(extra, log=str(info["log"]))) for ti, why, extra in parse_found(text)]
     info["policy"] = [(md_trim(m[0]), md_trim(m[1])) for m in
@@ -827,6 +831,7 @@ def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
                         re.findall(r"^\W*EVIDENCE:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if md_trim(m[0])]
     found = re.findall(r"^\W*RESULT:\s*(done|blocked|asking)\b[\s—:–-]*(.*)$", text, re.M)
     if not found:
+        info["stopped"] = True
         return "blocked", "worker ended without a RESULT line", info
     verdict, why = found[-1]
     if verdict == "asking":
@@ -2109,6 +2114,28 @@ def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, 
     return verdict, why, info
 
 
+UNTIL_DONE_TAIL = """If you need a decision, end with `QUESTION:` lines and `RESULT: asking`. Otherwise end as before:
+`FOUND:` lines for work you find but don't do, then `RESULT: done` or `RESULT: blocked — <why>`.
+"""
+
+UNTIL_DONE_PROMPT = ("Your work on {id} stopped before it finished (until-done round {n} of {rounds}): {why}.\n"
+                     "Carry on from where you were on branch `{branch}` in {wt}: check `git status` and "
+                     "`git log`, then finish the task.\n" + UNTIL_DONE_TAIL)
+
+UNTIL_DONE_LINES = ("The earlier run on this task stopped before it finished (until-done round {n} of {rounds}): "
+                    "{why}.\nIts commits are on this branch: carry on from where it was and finish the task.\n"
+                    + UNTIL_DONE_TAIL)
+
+
+def until_done_note(stops, stop=""):
+    """A block reason after until-done rounds: the last stop first, why no round followed it, then
+    each earlier stop (rounds_note's shape)."""
+    if len(stops) == 1:
+        return stops[0] + stop
+    return (f"{stops[-1]} (stop {len(stops)}, after {len(stops) - 1} until-done round(s)){stop}. Earlier stops: "
+            + "; ".join(f"stop {i}: {v}" for i, v in enumerate(stops[:-1], 1)))
+
+
 def rounds_note(last, vetoes, stop=""):
     """A block reason after fix rounds: the last failure first (review_retry quotes it and its
     log to the next worker), why no fix round followed it, then each earlier round's veto."""
@@ -2708,6 +2735,7 @@ def dispatch(args):
         raise SystemExit("--watch needs --budget-total (a cap on spend, so an unattended watch can't run away)")
     if args.watch and args.dry_run:
         raise SystemExit("--watch and --dry-run don't combine")
+    args.until_done = max(0, getattr(args, "until_done", 0) or 0)
     if args.max is None:
         args.max = float("inf") if args.watch else 6
     if _config.REPO != _config.HOME and not args.dry_run:  # a dry run only reads, so any checkout will do
@@ -3091,6 +3119,54 @@ def dispatch(args):
             if v != "done":
                 return v, w
 
+    def until_done(t, base, wt, branch, pubs, verdict, why, info):
+        """A worker that stopped short (info["stopped"]: it timed out, errored, printed no JSON or
+        no RESULT line) runs again on the same branch, up to --until-done times: its session
+        resumed if resume_choice() allows, else a fresh worker. Returns (verdict, reason)."""
+        halts, tier, limit = [], t["tier"], args.until_done
+        while verdict == "blocked" and info.get("stopped"):
+            halts.append(why)
+            n = len(halts)
+            stop = (f"; no until-done rounds left (--until-done {limit})" if n > limit
+                    else round_stop(info, info.get("round_cost", info.get("cost", 0)), info.get("rnd", 1) + 1,
+                                    kind="until-done"))
+            if stop:
+                return "blocked", until_done_note(halts, stop)
+            info["rnd"] = rnd = info.get("rnd", 1) + 1
+            session = info.get("session")
+            resume, fresh_because = resume_choice(session, wt)
+            fmt = dict(id=t["id"], n=n, rounds=limit, why=why, branch=branch, wt=wt)
+            tt = dict(t, tier=tier)
+            if resume:
+                _history.record("resumed", t, session=session, round=rnd, tier=tier, after="until_done")
+                print(f"  until-done {t['id']}  round {n}/{limit} ({why}): resumed {session}", flush=True)
+                v, w, finfo = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd, resume=session,
+                                         prompt=UNTIL_DONE_PROMPT.format(**fmt), after="until_done")
+            else:
+                _history.record("dispatched", t, tier=tier, model=agents[f"task-{tier}"]["model"], base=base,
+                                branch=branch, worktree=wt, companions=[c["name"] for c, _ in pubs],
+                                round=rnd, fresh_because=fresh_because, after="until_done")
+                print(f"  until-done {t['id']}  round {n}/{limit} ({why}): fresh session ({fresh_because})",
+                      flush=True)
+                v, w, finfo = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd,
+                                         lines=UNTIL_DONE_LINES.format(**fmt), after="until_done")
+            info["round_cost"] = finfo.get("cost", 0)
+            info["cost"] = info.get("cost", 0) + info["round_cost"]
+            for k in ("found", "policy", "evidence"):
+                info[k] = (info.get(k) or []) + (finfo.get(k) or [])
+            info.update(log=finfo["log"], session=finfo.get("session") or session, asked=finfo.get("asked"),
+                        questions=finfo.get("questions"), stopped=finfo.get("stopped"))
+            with live_lock:
+                live[t["id"]] = info["cost"]
+            verdict, why = v, w
+        if halts:
+            if verdict == "done":
+                info["fixed"] = "; ".join(x for x in (info.get("fixed"),
+                    f"finished after {len(halts)} stop(s): " + "; ".join(halts)) if x)
+            else:
+                info["rounds"] = f" (until-done round {len(halts)}, after: " + "; ".join(halts) + ")"
+        return verdict, why
+
     def one(t, base, wt, branch, pubs, answered=None):
         if answered:  # a human answered its question: resume that session, or a fresh worker
             resume, fresh_because = resume_choice(None if answered == NO_SESSION else answered, wt)
@@ -3107,6 +3183,10 @@ def dispatch(args):
             info["resumed"], info["fresh_because"] = resume, fresh_because
         else:
             verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings)
+        if args.until_done:
+            with live_lock:
+                live[t["id"]] = info.get("cost", 0)
+            verdict, why = until_done(t, base, wt, branch, pubs, verdict, why, info)
         up = None
         if (args.escalate and verdict == "blocked" and info.get("asked")
                 and t["tier"] in _config.WORKER_TIERS[:-1]):
@@ -3270,6 +3350,7 @@ def dispatch(args):
                   + (f", escalates to {_config.WORKER_TIERS[_config.WORKER_TIERS.index(t['tier']) + 1]} if blocked"
                      if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1] else "")
                   + (", held for your accept" if _tasks.needs_accept(t) else "")
+                  + (f", up to {args.until_done} until-done rounds if its worker stops short" if args.until_done else "")
                   + (", resumes with your answer" if t.get("answered") else "") + f"  {t['title']}")
         bplan = to_break(tasks)
         bmodel = breakdown_agent()["model"] if bplan else ""
@@ -3314,7 +3395,9 @@ def dispatch(args):
                     counted.add("escalate")  # after it the tier that finished is reviewed too
                     up = _config.WORKER_TIERS[_config.WORKER_TIERS.index(t["tier"]) + 1]
                     calls = max(calls, 2 + cr + after(own or up in _config.REVIEW))
-                return calls
+                if args.until_done:
+                    counted.add("until-done")
+                return calls + args.until_done
             # The n costliest count, so the estimate stays an upper bound whichever tasks launch.
             calls = sorted((max_calls(t) for t in plan), reverse=True)[:n]
             what = [x for k, x in (
@@ -3323,7 +3406,9 @@ def dispatch(args):
                            + " for a reviewed tier"),
                 ("verify", f"up to {vr} verify fix round{'s' if vr != 1 else ''} (a fix each) "
                            "(with or without a verify: a weakening veto or failed harden proof takes one too)"),
-                ("conflict", f"{crounds} (a worker each) if the branch conflicts")) if k in counted]
+                ("conflict", f"{crounds} (a worker each) if the branch conflicts"),
+                ("until-done", f"up to {args.until_done} until-done rounds (a worker each) if it stops short"))
+                if k in counted]
             print(f"  cap        ${cap:.2f} total ({args.budget_pct:g}% of ${args.budget_total:.2f}): "
                   "no new task launches once finished workers' cost reaches it"
                   + (f"; estimated at most ${(sum(calls) + len(bplan)) * args.budget:.2f} for {n} task(s)"

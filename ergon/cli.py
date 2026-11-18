@@ -54,7 +54,7 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                in epics/<epic>/, the rest in items/ (idempotent)
   ergon dispatch [--tier T] [--epic E] [--ids T-1,T-2] [--max N] [--jobs J]
                       [--budget-total USD [--budget-pct P]] [--watch [--interval SEC]]
-                      [--dry-run]
+                      [--until-done N] [--dry-run]
                                run ready tasks headless, one worktree + task/<ID> branch each,
                                merge each finished branch into its epic branch (and, for a task
                                touching a companion repo, that repo's local trunk).
@@ -63,6 +63,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                or Ctrl-C (stop launching, let workers finish; a second kills them)
                                A reviewer's fail (`review` in .ergon.toml) goes back to the worker
                                and is reviewed again, up to review_rounds times, then blocks.
+                               --until-done N (default 0): a worker that stops short (timeout,
+                               error, output that isn't JSON, no RESULT line) runs again on the
+                               same branch, up to N more rounds (session resumed, or a fresh
+                               worker); the done checks, verify and review then run as usual.
+                               Not retried: RESULT: blocked or asking, a second Ctrl-C, the cap.
                                An approved open epic with no tasks is broken down first, once
                                (as `breakdown` below; not with --ids or --tier). With [shared],
                                each task is claimed by pushing ready -> doing, and each breakdown
@@ -469,6 +474,10 @@ def main():
     d.add_argument("--interval", type=float, default=30, help="seconds between rescans with --watch (default 30)")
     d.add_argument("--escalate", action="store_true",
                    help="when a worker reports blocked, retry once one tier up (haiku→sonnet→opus)")
+    d.add_argument("--until-done", type=int, default=0, metavar="N",
+                   help="when a worker stops short (timeout, error, output that isn't JSON, no RESULT line), "
+                        "run up to N more rounds on the same branch, resuming its session or starting a fresh "
+                        "worker (default 0: it blocks)")
     d.add_argument("--dry-run", action="store_true")
     bd = sub.add_parser("breakdown", help="break an approved epic down into proposed tasks (runs claude -p, read-only)")
     bd.add_argument("id", help="the epic, E-NNN")
