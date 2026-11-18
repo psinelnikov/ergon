@@ -70,7 +70,7 @@ Order: tasks pinned `first` go to the top, tasks pinned `last` to the bottom, an
 
 ## Filling in thin briefs
 
-Every task has a `category:` (feature, bugfix, refactor or chore; `ergon new --category`, `ergon set T-NNN category=…` on any status). It is outside the brief digest, so setting it never un-approves a task. `ergon fill` writes a blank category on a task of any status, so one run backfills old tasks; `ergon stats` counts done tasks per category.
+Every task has a `category:` (feature, bugfix, refactor or chore; `ergon new --category`, `ergon set T-NNN category=…` on any status). It is outside the brief digest, so setting it never un-approves a task. The two fields that weaken a gate are the other way round: a task's `verify:` (it replaces the runtime gate, and `verify: true` passes anything) and `prove: no` (it skips the red-on-base proof). `ergon set` refuses `verify=` and `prove=no`, so a human writes them by editing the file, and both are in the brief digest, so writing one on an approved task un-approves it until a human approves it again. A task with neither keeps the digest it had before they counted, so existing signed approvals still verify. `ergon fill` writes a blank category on a task of any status, so one run backfills old tasks; `ergon stats` counts done tasks per category.
 
 `ergon fill [ID|E-ID ...] [--epic E] [--model sonnet] [--budget USD] [--dry-run]` writes the parts a proposed brief left blank: What, Done when, `touches:`, and `tier` with `tier_why:` when nobody sized it (empty, or the placeholder a FOUND line or an import leaves). It runs one `claude -p` per batch of up to 8 tasks in the main checkout with Read, Grep and Glob only, so it can cite `file:line` and name real paths. It never replaces what's written and never edits a task past `proposed`. A tier below a matching `[[protect]]` minimum is raised to it. Each filled task gets a Notes line naming what was machine-written: read it before approving. Agents may run it, since it only proposes. The record goes to `<state>/runs/fill/`.
 
@@ -147,6 +147,7 @@ tier_why: one line
 accept: yes             # optional: dispatch holds the finished branch at `review` for a human
 harden: [T-050-20261101-120000]   # optional: a harden task; incident ids (stems in <state>/runs/incidents)
 harden_layer: static    # optional, with harden: the gate the proof runs (static, the default, or runtime)
+verify: make test       # optional: replaces the runtime gate's command for this task; a human writes it
 prove: no               # optional: skip the red-on-base proof (mechanical tasks); a human writes it
 cod: 60                 # optional, 0-100 cost of delay: written by `ergon grade` (absent counts as 50)
 cod_why: one line       # optional, why that grade: written by `ergon grade`

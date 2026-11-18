@@ -3118,6 +3118,96 @@ class TestCategory(Project):
         self.assertEqual(brief_digest({**t, "category": "bugfix"}), brief_digest(t))
 
 
+class TestGateWeakeningFields(Project):
+    """A task's `verify:` replaces the runtime gate and `prove: no` skips the red-on-base proof, so
+    `set` won't write them and both are in the brief digest (T-138)."""
+
+    def test_set_refuses_verify_and_prove_no(self):
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        before = self.task_file("T-001").read_text()
+        for env in (None, clean_env(CLAUDECODE="1")):
+            for kv in ("verify=true", "verify=pytest -x", "verify=", "prove=no", "prove=False", "prove=0"):
+                r = self.ergon("set", "T-001", kv, check=False, env=env)
+                self.assertNotEqual(r.returncode, 0, kv)
+                self.assertIn("set won't write it", r.stderr, kv)
+                r = self.ergon("set", "T-001", "tier=opus", kv, check=False, env=env)  # nothing of a refused set lands
+                self.assertNotEqual(r.returncode, 0, kv)
+        self.assertEqual(self.task_file("T-001").read_text(), before)
+        self.ergon("set", "T-001", "prove=yes")  # turning the proof on weakens nothing
+        self.assertIn("prove: yes\n", self.task_file("T-001").read_text())
+
+    def test_set_cant_smuggle_a_field_past_its_refusal(self):
+        """The file reads keys stripped and splits on the first `:` and on line breaks, so set
+        refuses whatever it would write that reads back as another field."""
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        before = self.task_file("T-001").read_text()
+        for kv in ("verify =true", " prove=no", "verify:x=true", "tier=opus\nverify: true",
+                   "tier=opus\rprove: no", "approved =Me", "x y=1", "=1"):
+            r = self.ergon("set", "T-001", kv, check=False)
+            self.assertNotEqual(r.returncode, 0, kv)
+        self.assertEqual(self.task_file("T-001").read_text(), before)
+        self.ergon("set", "T-001", " tier =opus")  # a padded key that isn't refused lands under its real name
+        self.assertIn("\ntier: opus\n", self.task_file("T-001").read_text())
+
+    def test_digest_covers_verify_and_prove_no(self):
+        from ergon.tasks import brief_digest
+        t = {"id": "T-1", "title": "x", "tier": "sonnet", "touches": ["a"], "_body": "## What\n\nx\n"}
+        base = brief_digest(t)
+        for extra in ({"verify": ""}, {"prove": ""}, {"prove": "yes"}):  # unset or on: the old digest stands
+            self.assertEqual(brief_digest({**t, **extra}), base, extra)
+        weak = [brief_digest({**t, **extra}) for extra in ({"verify": "true"}, {"verify": "pytest -x"}, {"prove": "no"})]
+        self.assertNotIn(base, weak)
+        self.assertEqual(len(set(weak)), 3)
+        for no in ("No", " false ", "0"):
+            self.assertEqual(brief_digest({**t, "prove": no}), weak[2], no)
+        self.assertEqual(brief_digest({**t, "verify": " pytest   -x "}), weak[1])
+
+    def test_hand_edit_on_an_approved_task_changes_its_digest(self):
+        from ergon.tasks import brief_digest, parse
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        f = self.task_file("T-001")
+        stamp(f)
+        base = brief_digest(parse(f))
+        for line in ("verify: true\n", "prove: no\n"):
+            text = f.read_text()
+            f.write_text(text.replace("\n---\n", f"\n{line}---\n", 1))
+            self.assertNotEqual(brief_digest(parse(f)), base, line)
+            f.write_text(text)
+        self.assertEqual(brief_digest(parse(f)), base)
+
+
+class TestGateWeakeningFieldsSigned(unittest.TestCase):
+    """Shared mode: `verify:` or `prove: no` written into an approved task after its signed approval
+    un-approves it, as any brief edit does (T-138). Borrows test_shared's signed-approval fixture,
+    imported here since test_shared imports this module."""
+
+    def __getattr__(self, name):
+        from test_shared import TestSignedApprovals
+        attr = getattr(TestSignedApprovals, name)
+        return attr.__get__(self) if callable(attr) else attr
+
+    def setUp(self):
+        from test_shared import Shared
+        Shared.setUp(self)
+
+    def tearDown(self):
+        from test_shared import Shared
+        Shared.tearDown(self)
+
+    def test_weakening_an_approved_task_unapproves_it(self):
+        self.start()
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.counts(self.a, "T-001")
+        for line in ("verify: true\n", "prove: no\n"):
+            f = self.task(self.a, "T-001")
+            text = f.read_text()
+            f.write_text(text.replace("\n---\n", f"\n{line}---\n", 1))
+            self.doesnt_count(self.a, "T-001", "brief changed after approval")
+            f.write_text(text)
+            self.counts(self.a, "T-001")
+
+
 class TestAutoApprove(DispatchProject):
     """A FOUND follow-up that is a bugfix, refactor or chore is approved by inheritance (T-136)."""
     config = DispatchProject.config + '''

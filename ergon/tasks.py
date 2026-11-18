@@ -180,7 +180,9 @@ def is_epic(item):
 def brief_digest(t):
     """sha256 (hex) of what approving t (a task or an epic) approves. Notes, status, depends and
     epic don't change it, nor any field a command writes about the brief (cod*, graded, category,
-    concepts, tagged)."""
+    concepts, tagged). A task's gate-weakening fields (a `verify:` override of the runtime gate,
+    `prove: no`) are in it, so writing one after approval un-approves the task; each goes in only
+    when set, so a task that has neither keeps the digest it had before they counted."""
     body = t.get("_body") or ""
     if is_epic(t):
         doc = {"kind": "epic", "id": str(t.get("id") or "").strip(),
@@ -195,9 +197,23 @@ def brief_digest(t):
         "touches": sorted({str(x).strip().strip("/") for x in t.get("touches") or [] if str(x).strip()}),
         "accept": "yes" if str(t.get("accept") or "").strip().lower() in YES else "",
     }
+    verify = t.get("verify")
+    verify = " ".join(" ".join(verify) if isinstance(verify, list) else str(verify or "").split())
+    if verify:
+        doc["verify"] = verify
+    if prove_off(t):
+        doc["prove"] = "no"
     for name in DIGEST_SECTIONS:
         doc[name] = normalised(sections(body, name))
     return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+PROVE_NO = ("no", "false", "0")  # as dispatch.PROVE_NO reads `prove:`
+
+
+def prove_off(t):
+    """Does t's `prove:` waive the red-on-base proof?"""
+    return str(t.get("prove") or "").strip().lower() in PROVE_NO
 
 
 # ---------- is an epic approved? ----------

@@ -33,6 +33,12 @@ def setf(args):
         raise SystemExit(f"no such id: {args.id}")
     is_task = args.id in tasks
     epic = epics.get(item.get("epic")) if is_task else None
+    if any("\n" in kv or "\r" in kv for kv in args.pairs):  # a line break would write a frontmatter line of its own
+        raise SystemExit("set takes one line per key=value: no line breaks")
+    args.pairs = [kv.partition("=")[0].strip() + "=" + kv.partition("=")[2] for kv in args.pairs]  # the file reads keys stripped
+    bad = [kv.partition("=")[0] for kv in args.pairs if not re.fullmatch(r"[A-Za-z_][\w-]*", kv.partition("=")[0])]
+    if bad:  # `verify:x=…` would be read back as `verify: x: …`
+        raise SystemExit(f"not a field name: {bad[0]!r} (letters, digits, _ and -)")
     new_status = dict(kv.partition("=")[::2] for kv in args.pairs).get("status")
     old_status = item.get("status")
     if new_status and _gitops.current_branch().startswith(_config.TASK_BRANCH):
@@ -45,6 +51,12 @@ def setf(args):
         key, _, val = kv.partition("=")
         if key == "approved":
             raise SystemExit("approval is human-only: use `approve` from a real terminal")
+        if key == "verify":  # a task's verify: replaces the runtime gate (`verify: true` passes anything)
+            raise SystemExit("`verify:` overrides the runtime gate, so set won't write it: a human edits the "
+                             "task file (it's in the brief digest, so an approved task needs approving again)")
+        if key == "prove" and val.strip().lower() in _tasks.PROVE_NO:
+            raise SystemExit("`prove: no` skips the red-on-base proof, so set won't write it: a human edits the "
+                             "task file (it's in the brief digest, so an approved task needs approving again)")
         if is_task and key == "pin":
             raise SystemExit("`pin:` is human-only: use `ergon pin ID first|last|clear` from a real terminal")
         if is_task and key in ("asking", "answered"):
