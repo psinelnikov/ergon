@@ -1492,8 +1492,9 @@ class TestGateLayers(DispatchProject):
 
 
 class TestWeakening(DispatchProject):
-    """The weakening check (T-101): a branch that changes a gate file or adds a suppression marker
-    goes back to its worker, then blocks, unless the task's touches: (as at launch) names the file."""
+    """The weakening check (T-101): a branch that changes a gate file goes back to its worker, then
+    blocks, unless the task's touches: (as at launch) names the file; one that adds a suppression
+    marker does too, in any file, unless it is a harden task whose touches: names the file (T-118)."""
     config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
                                             '        verify_rounds = 1')
 
@@ -1576,24 +1577,75 @@ class TestWeakening(DispatchProject):
 
     def test_touches_naming_the_file_lands(self):
         self.task("ruff.toml")
-        self.env["FAKE_WEAKEN"] = 'ruff.toml|ignore = ["E501"]  # noqa'
+        self.env["FAKE_WEAKEN"] = 'ruff.toml|ignore = ["E501"]'
         out = self.ergon("dispatch").stdout
         self.assertEqual(self.status("T-001"), "done", out)
         self.assertIn('E501', sh("git", "show", "main:ruff.toml", cwd=self.root).stdout)
         self.assertEqual(self.rows("incident"), [])
         self.assertEqual(len(self.calls()), 1)
 
-    def test_a_marker_in_a_named_file_lands(self):
-        self.task("src/app.py")
-        self.env["FAKE_WEAKEN"] = "src/app.py|import os  # noqa: F401"
+    def test_a_marker_in_a_named_file_is_caught(self):
+        """T-118: naming a file in touches: exempts a gate-file change, not a suppression marker:
+        most of what a task edits is named, so naming alone would let it silence nearly anything."""
+        self.task("a.py")
+        self.env["FAKE_WEAKEN"] = "a.py|import os  # noqa: F401"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertEqual([(r["layer"], r["ok"]) for r in self.rows()], [("weaken", False)] * 2)
+        self.assertIn("a.py adds a suppression marker (suppress `# noqa`): `import os  # noqa: F401` "
+                      "(touches: names it, but that allows a marker only in a harden task)", self.notes())
+        self.assertIn("only a harden task may", self.calls()[1]["prompt"])
+        self.assertNotIn("a.py", sh("git", "ls-tree", "--name-only", "main", cwd=self.root).stdout.split())
+
+    def test_a_marker_in_a_named_gate_file_is_caught(self):
+        self.task("ruff.toml")
+        self.env["FAKE_WEAKEN"] = 'ruff.toml|ignore = ["E501"]  # noqa'
         self.ergon("dispatch")
-        self.assertEqual(self.status("T-001"), "done")
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertIn("ruff.toml adds a suppression marker (suppress `# noqa`)", self.notes())
+        self.assertNotIn("ruff.toml changed", self.notes())  # the gate-file change itself is allowed
 
     def test_touches_naming_the_protect_pattern_lands(self):
         self.task("tests/arch/**")
-        self.env["FAKE_WEAKEN"] = "tests/arch/test_layers.py|@pytest.mark.skip"
+        self.env["FAKE_WEAKEN"] = "tests/arch/test_layers.py|def test_layers(): pass"
         self.ergon("dispatch")
         self.assertEqual(self.status("T-001"), "done")
+
+    def weakening(self, t, path, line):
+        """dispatch.weakening(t) on a branch off main that adds `line` to `path`, run in a process
+        of its own configured on the project."""
+        sh("git", "checkout", "-qB", "weak", "main", cwd=self.root)
+        f = self.root / path
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(line + "\n")
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "weak", cwd=self.root)
+        sh("git", "checkout", "-q", "main", cwd=self.root)
+        code = textwrap.dedent(f"""
+            import json, sys
+            sys.path.insert(0, {str(ERGON.parent)!r})
+            from ergon import config, dispatch
+            config.configure({str(self.root)!r})
+            print(json.dumps(dispatch.weakening(json.loads(sys.argv[1]), "main", "weak")))
+        """)
+        r = subprocess.run([sys.executable, "-c", code, json.dumps(t)], cwd=self.root, env=self.env,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_a_harden_task_may_add_a_marker_in_a_named_file(self):
+        """T-118: a harden task (harden: is human-only and in the brief digest) is exempt for the
+        files its touches: names, and only those."""
+        t = {"id": "T-001", "touches": ["a.py"], "harden": ["T-050-20261101-120000"]}
+        self.assertEqual(self.weakening(t, "a.py", "import os  # noqa: F401"), [])
+        self.assertEqual(self.weakening(dict(t, harden=[]), "a.py", "import os  # noqa: F401"),
+                         ["a.py adds a suppression marker (suppress `# noqa`): `import os  # noqa: F401` "
+                          "(touches: names it, but that allows a marker only in a harden task)"])
+
+    def test_a_harden_task_may_not_add_a_marker_in_an_unnamed_file(self):
+        t = {"id": "T-001", "touches": ["a.py"], "harden": ["T-050-20261101-120000"]}
+        self.assertEqual(self.weakening(t, "b.py", "@pytest.mark.skip"),
+                         ["b.py adds a suppression marker (suppress `@pytest\\.mark\\.skip`): `@pytest.mark.skip`"])
 
     def test_a_directory_in_touches_does_not_name_a_gate_file(self):
         self.task("tests")

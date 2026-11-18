@@ -75,8 +75,10 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # Layered gates, cheapest first: static (lint, types, import boundaries), then runtime (tests); the
 # first red stops the rest. `verify` above is an alias for runtime; a task's `verify:` overrides runtime only.
 # Before both, the weakening check: a branch whose diff changes a gate file (protect, fnmatch; a
-# pattern with no `/` matches that name in any directory; .ergon.toml always) or adds a line matching
-# a suppression regex (suppress) goes back to its worker, unless the task's touches: names that file.
+# pattern with no `/` matches that name in any directory; .ergon.toml always) goes back to its worker
+# unless the task's touches: names that file, and so does one that adds a line matching a suppression
+# regex (suppress) to any file, named or not, unless the task is a harden task (harden: set) whose
+# touches: names that file.
 # [gates]
 # static = "ruff check ."
 # runtime = "make test"
@@ -291,8 +293,9 @@ def configure(start=None, need_config=True):
         raise NotConfigured(f"{CONFIG_FILE}: [gates] takes static and runtime, each a shell command, "
                             f"protect, suppress and tests, each a list of patterns, repros, a directory, "
                             f"and prove_tiers, a list of worker tiers")
-    # The weakening check (T-101): gate files a branch may change, and markers it may add, only
-    # where its task's touches: names the file. The config itself is always a gate file.
+    # The weakening check (T-101): gate files a branch may change only where its task's touches:
+    # names the file, and markers it may add only there in a harden task (T-118). The config itself
+    # is always a gate file.
     GATE_FILES = list(dict.fromkeys([CONFIG_FILE] + [x.strip().strip("/") for x in GATES.get("protect") or []]))
     SUPPRESS = []
     for x in GATES.get("suppress") or []:
