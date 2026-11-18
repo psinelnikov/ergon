@@ -201,6 +201,27 @@ class TestServe(ServeFixture):
         self.assertEqual(self.req("GET", "/runs/T-001-evidence/..%2fsecret.txt")[0], 404)
         self.assertEqual(self.req("GET", "/runs/T-001-evidence/missing.png")[0], 404)
 
+    def test_epic_page_breakdown_runs(self):
+        d = self.runs / "breakdown"
+        d.mkdir()
+        (d / "E-001-20261116-100000.json").write_text("bd log <b>\n")
+        journal = self.runs / ("history" + ".jsonl")
+        with journal.open("a") as f:
+            f.write(json.dumps(row("2026-11-16T10:00:00+00:00", None, "breakdown", verdict="blocked", cost=1.25,
+                                   seconds=30, log="tasks/runs/breakdown/E-001-20261116-100000.json")) + "\n")
+        code, _, page = self.req("GET", "/e/E-001")
+        self.assertEqual(code, 200)
+        sec = page.split("<h2>Breakdown runs</h2>")[1].split("<h2")[0]
+        self.assertIn('<span class="v-blocked">blocked</span>', sec)
+        self.assertIn("$1.25", sec)
+        self.assertIn('<a href="/runs/breakdown/E-001-20261116-100000.json">', sec)
+        code, _, body = self.req("GET", "/runs/breakdown/E-001-20261116-100000.json")
+        self.assertEqual(code, 200)
+        self.assertIn("bd log", body)
+        for bad in ("/runs/breakdown/..%2fT-001-20261116-120000.json", "/runs/breakdown/missing.json",
+                    "/runs/breakdown/.hidden", "/runs/breakdown/%2e%2e/x"):
+            self.assertEqual(self.req("GET", bad)[0], 404, bad)
+
     def test_follow_ups_open_on_board_and_task_page(self):
         f = self.task_file("T-004")
         f.write_text(re.sub(r"(?m)^source:.*$", "source: T-001", f.read_text()))

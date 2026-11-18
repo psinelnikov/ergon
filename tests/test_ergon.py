@@ -3855,6 +3855,18 @@ class TestTrustPyramid(Project):
         self.assertEqual(history.catches(self.ROWS, since="2026-11-20")["totals"], {"human": 1, "prove": 1})
         self.assertIsNone(history.catches([])["late"])
 
+    def test_stats_counts_breakdowns(self):
+        self.ergon("new", "epic", "Big")
+        runs = self.root / "tasks" / "runs" / "breakdown"
+        runs.mkdir(parents=True, exist_ok=True)
+        (runs / "E-001-20261105-100000.json").write_text(json.dumps({"total_cost_usd": 1.5}))
+        (runs / "E-002-20261105-100000.json").write_text(json.dumps({"total_cost_usd": 2}))
+        (runs / "E-001-20261001-100000.json").write_text(json.dumps({"total_cost_usd": 9}))
+        out = self.ergon("stats", "--since", "2026-11-01").stdout
+        self.assertIn("epic breakdowns: 2 runs, $3.50", out)
+        out = self.ergon("stats", "--since", "2026-11-01", "--epic", "E-001").stdout
+        self.assertIn("epic breakdowns: 1 run, $1.50", out)
+
     def test_stats_prints_section(self):
         runs = self.root / "tasks" / "runs"
         runs.mkdir(parents=True, exist_ok=True)

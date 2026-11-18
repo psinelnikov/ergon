@@ -75,7 +75,8 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                E-ID); a malformed one is refused with a warning. Only adds tasks
   ergon stats [--since DATE] [--epic E] [--approver NAME | --approvers]
                                read-only: per tier, runs / done / blocked / block rate / cost /
-                               timeouts from <state>/runs/*.json, and tasks that blocked twice+
+                               timeouts from <state>/runs/*.json, epic breakdown runs and cost from
+                               <state>/runs/breakdown/, and tasks that blocked twice+
   ergon serve [--port 4300] [--bind 127.0.0.1]
                                read-only web board, task pages (brief, runs, reviews, logs, resume
                                commands) and live dispatch state. GET/HEAD only; writes nothing.

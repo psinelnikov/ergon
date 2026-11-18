@@ -29,10 +29,33 @@ from . import tasks as _tasks
 RUN_LOG = re.compile(r"^(?P<id>[A-Z]+-\d+)-(?P<date>\d{4})(?P<m>\d{2})(?P<d>\d{2})-\d{6}(?:-\w+)?\.json$")
 
 
+BREAKDOWN_LOG = re.compile(r"^(?P<id>E-\d+)-(?P<date>\d{4})(?P<m>\d{2})(?P<d>\d{2})-\d{6}\.json$")
+
+
+def _breakdown_totals(runs_dir, since, until, epic):
+    """{runs, cost} of the breakdown logs in <runs_dir>/breakdown/ (E-NNN-<time>.json), in range;
+    with epic, only that epic's. Never raises on a bad log."""
+    out = {"runs": 0, "cost": 0.0}
+    for log in sorted((Path(runs_dir) / "breakdown").glob("*.json")):
+        m = BREAKDOWN_LOG.match(log.name)
+        if not m or (epic and m["id"] != epic):
+            continue
+        day = f"{m['date']}-{m['m']}-{m['d']}"
+        if (since and day < since) or (until and day > until):
+            continue
+        out["runs"] += 1
+        try:
+            d = json.loads(log.read_text())
+            out["cost"] += float(d.get("total_cost_usd") or 0) if isinstance(d, dict) else 0
+        except (OSError, ValueError, TypeError):
+            pass
+    return out
+
+
 def aggregate_stats(runs_dir, tasks, since=None, epic=None, until=None):
     """Per-tier numbers from the dispatch logs in runs_dir, joined with tasks (id -> meta).
     since / until: 'YYYY-MM-DD' (runs started that day or later / that day or earlier); epic: only that epic's tasks.
-    Returns {"tiers": {tier: {runs, done, blocked, timeouts, cost}}, "repeat": {id: blocked
+    Returns {"breakdown": {runs, cost} of the epic breakdown logs in runs_dir/breakdown/, "tiers": {tier: {runs, done, blocked, timeouts, cost}}, "repeat": {id: blocked
     count} for tasks blocked more than once, "skipped": logs that were unreadable, not JSON
     (and not a timeout) or whose task is gone}. A reviewer's log (<ID>-<time>-review[N].json) and
     a fix round's worker log (<ID>-<time>-fix<N>.json) add their cost to the task's tier but
@@ -86,7 +109,7 @@ def aggregate_stats(runs_dir, tasks, since=None, epic=None, until=None):
         row["cost"] += float(d.get("total_cost_usd") or 0)
         if verdict == "blocked":
             per_task[t["id"]] = per_task.get(t["id"], 0) + 1
-    return {"tiers": tiers, "skipped": skipped,
+    return {"tiers": tiers, "skipped": skipped, "breakdown": _breakdown_totals(runs_dir, since, until, epic),
             "repeat": {k: v for k, v in sorted(per_task.items()) if v > 1}}
 
 
@@ -104,8 +127,12 @@ def stats(args):
         print(f"{tier:<8}{row['runs']:>5}{row['done']:>6}{row['blocked']:>8}{100 * row['blocked'] / n:>7.0f}%"
               f"{'$%.2f' % row['cost']:>10}{'$%.2f' % (row['cost'] / n):>9}{row['timeouts']:>9}"
               + (f"{_limits.pct(row['cost'], per):>8}{_limits.pct(row['cost'] / n, per):>9}" if per is not None else ""))
-    if not r["tiers"]:
+    if not r["tiers"] and not r["breakdown"]["runs"]:
         print("(no runs)")
+    if r["breakdown"]["runs"]:
+        b = r["breakdown"]
+        print(f"\nepic breakdowns: {b['runs']} run{'s' if b['runs'] != 1 else ''}, ${b['cost']:.2f}"
+              + " (not in the tier rows above)")
     if per is not None and r["tiers"]:
         print(f"\n5h%: share of the 5-hour limit at {per:.1f}% per $, measured by dispatch over its last "
               f"{measured} run{'s' if measured != 1 else ''} (an upper bound: other use of the plan counts too)")

@@ -18,6 +18,7 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
                journal, transcript usage, links to the raw logs, `claude --resume` commands,
                and (with a concept map) the tasks it relates to, as `ergon related` lists them
   /runs/NAME   one file directly inside <state>/runs/, as plain text
+  /runs/breakdown/NAME   an epic breakdown's log (listed on the epic page)
   /runs/T-NNN-evidence/NAME   a worker's evidence file (images by type, the rest plain text)
 
 The read-only guarantee:
@@ -276,7 +277,10 @@ def log_href(path):
     if not path:
         return None
     p = _config.HOME / str(path)
-    if p.parent.resolve() != _config.RUNS.resolve() or not LOG_NAME.fullmatch(p.name):
+    parent = p.parent.resolve()
+    if parent == (_config.RUNS / "breakdown").resolve() and LOG_NAME.fullmatch(p.name):
+        return "/runs/breakdown/" + urllib.parse.quote(p.name)
+    if parent != _config.RUNS.resolve() or not LOG_NAME.fullmatch(p.name):
         return None
     return "/runs/" + urllib.parse.quote(p.name)
 
@@ -596,6 +600,19 @@ def journal_block(eid, tasks):
             + (f' · {money(cost)}' if isinstance(cost, (int, float)) and not isinstance(cost, bool) else "") + "</p>")
 
 
+def breakdown_block(eid):
+    """The epic's breakdown runs (history `breakdown` rows): verdict, cost, time, log link. '' if none."""
+    rows = [r for r in _history.read() if r.get("event") == "breakdown" and r.get("epic") == eid]
+    if not rows:
+        return ""
+    cost = sum(r["cost"] for r in rows if isinstance(r.get("cost"), (int, float)) and not isinstance(r["cost"], bool))
+    items = "".join(
+        f'<li><span class="v-{esc(r.get("verdict"))}">{esc(r.get("verdict"))}</span> · {money(r.get("cost"))} · '
+        f'{esc(secs(r.get("seconds")))} · <span class=muted>{esc(r.get("at"))}</span>'
+        + (f' · log {log_link(r["log"])}' if r.get("log") else "") + "</li>" for r in rows)
+    return f"<h2>Breakdown runs</h2><p>{len(rows)} run(s), {money(cost)}</p><ul>{items}</ul>"
+
+
 def epic_page(eid, nonce, now=None):
     epics = _tasks.load(_config.EPICS)
     e = epics.get(eid)
@@ -612,7 +629,7 @@ def epic_page(eid, nonce, now=None):
     tl = _timeline.build(rows, tasks, eid, now or time.time(), tokens)
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
          f'<h1>{esc(eid)} {esc(e.get("title"))}</h1>']
-    jb = journal_block(eid, tasks)
+    jb = journal_block(eid, tasks) + breakdown_block(eid)
     if not tl["lanes"]:
         b.append(jb)
         b.append("<p class=muted>no task of this epic has a journal yet</p>")
@@ -1403,7 +1420,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             m = re.fullmatch(r"/runs/([^/]+)", path)
             if m:
                 return self._log(m[1], head)
-            m = re.fullmatch(r"/runs/(T-\d{3,}-evidence)/([^/]+)", path)
+            m = re.fullmatch(r"/runs/(breakdown|T-\d{3,}-evidence)/([^/]+)", path)
             if m:
                 return self._log(m[2], head, m[1])
             return self._text(404, "404: not found", head)
