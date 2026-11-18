@@ -1170,6 +1170,7 @@ def dispatch(args):
     agents, settings = worker_agents(), worker_settings()
     reviewer = review_agent() if _config.REVIEW else None
     tried, skipped, results = set(), {}, []
+    first_ready = None  # ids ready at the run's first scan; a launch of any other says it was approved meanwhile
     cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
     capped = stopped = False
     probing = not args.dry_run and _limits.enabled()  # the 5-hour window, read before and after
@@ -1660,6 +1661,8 @@ def dispatch(args):
                             if cap is not None and spent() >= cap:
                                 capped = True
                             queue = [] if capped or unsynced else list(eligible(_tasks.load(_config.ITEMS)))
+                            if first_ready is None and not unsynced:
+                                first_ready = {t["id"] for t in queue}
                             while queue and len(running) < args.jobs:
                                 t = queue.pop(0)
                                 # an auto-approved follow-up isn't one of the --max, but follow_ups bounds them
@@ -1706,7 +1709,8 @@ def dispatch(args):
                                                 companions=[c["name"] for c, _ in pubs],
                                                 **({"answered": True} if answered else {}))
                                 print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
-                                      + also(t) + f"  {t['title']}")
+                                      + also(t) + f"  {t['title']}"
+                                      + ("" if follow or t["id"] in first_ready else "  (approved during this run)"))
                                 running[pool.submit(one, t, base, wt, branch, pubs, answered)] = t["id"]
                                 active[t["id"]] = t
                                 if follow:
@@ -1731,7 +1735,7 @@ def dispatch(args):
                             results.append(f.result())
                             live.pop(tid, None)
                         scan = True
-                    if args.watch and time.monotonic() >= next_scan:
+                    if (args.watch or running) and time.monotonic() >= next_scan:
                         scan = True
         finally:
             signal.signal(signal.SIGINT, old_handler)

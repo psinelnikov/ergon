@@ -55,6 +55,9 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                run ready tasks headless, one worktree + task/<ID> branch each,
                                merge each finished branch into its epic branch (and, for a task
                                touching a companion repo, that repo's local trunk).
+                               While workers run, every --interval seconds it also picks up tasks
+                               approved meanwhile and runs those that share no touches: path with
+                               a running task beside it; an overlapping one waits for its blocker.
                                --watch (needs --budget-total) keeps rescanning for newly ready
                                tasks every --interval seconds (default 30) until the cap is hit
                                or Ctrl-C (stop launching, let workers finish; a second kills them)
@@ -431,7 +434,7 @@ def main():
                    help="use only this %% of --budget-total as the cap (default 100)")
     d.add_argument("--watch", action="store_true",
                    help="keep running: rescan for newly ready tasks until Ctrl-C or --budget-total is reached")
-    d.add_argument("--interval", type=float, default=30, help="seconds between rescans with --watch (default 30)")
+    d.add_argument("--interval", type=float, default=30, help="seconds between rescans for newly approved tasks while workers run, and with --watch (default 30)")
     d.add_argument("--escalate", action="store_true",
                    help="when a worker reports blocked, retry once one tier up (haiku→sonnet→opus)")
     d.add_argument("--dry-run", action="store_true")
