@@ -57,6 +57,12 @@ Before landing, dispatch runs these gates in the worktree, in order, stopping at
 Run them yourself before `RESULT: done`.
 """
 
+WORKER_WEAKEN = """
+Before any gate, dispatch vetoes a branch that changes a gate file ({files}){markers},
+unless this task's touches: names that file. Fix the code, not the gate; if a rule is wrong, say
+so on a FOUND line.
+"""
+
 WORKER_POLICIES = """
 Policies a human settled on past review findings. Follow them. To propose one, end a line
 `POLICY: <title> — <why>` before the RESULT line (it becomes a note on the task); never write the
@@ -428,7 +434,10 @@ def _round(rnd):
 
 def gates_text(t):
     cmds = gate_cmds(t)
-    return WORKER_GATES.format(cmds="\n".join(f"- {layer}: `{cmd}`" for layer, cmd in cmds)) if cmds else ""
+    sup = [f"`{rx.pattern}`" for rx in _config.SUPPRESS]
+    weak = WORKER_WEAKEN.format(files=", ".join(f"`{p}`" for p in _config.GATE_FILES),
+                                markers=f" or adds a line matching a suppression marker ({', '.join(sup)}) to any file" if sup else "")
+    return weak + (WORKER_GATES.format(cmds="\n".join(f"- {layer}: `{cmd}`" for layer, cmd in cmds)) if cmds else "")
 
 
 def worker_prompt(t, base, wt, branch, pubs, veto=None, lines=None):
@@ -586,11 +595,107 @@ def gate_cmds(t):
     return out
 
 
+# ---------- the weakening check ----------
+# The cheapest way past a gate is to edit the gate: turn a lint rule off, add a `# noqa`, skip a
+# test. So before static, a deterministic check reads the branch's diff against its base (and each
+# companion's against its trunk): a changed gate file ([gates] protect, and .ergon.toml always) or
+# an added line matching a [gates] suppress regex, in any file, is a veto unless the task's
+# touches: names that file. That is what a harden task is: approved, naming the file. It reads the
+# task as it was at launch (like accept), so a worker that adds the file to its own touches: since
+# gets nowhere. This check is on what lands; guarding gate files at the tool call is the guard
+# hook's side (T-069).
+
+def gate_file_hit(path, c=None):
+    """The [gates] protect pattern a changed file falls under, or None. `path` is relative to its
+    repo; a companion's file is tried as `<companion path>/<path>` too. fnmatch, as [[protect]]
+    does (a directory pattern covers what's under it), and a pattern with no `/` also matches the
+    file's name in any directory, as .gitignore does."""
+    cands = [path] + ([f"{c['rel']}/{path}"] if c else [])
+    name = path.rsplit("/", 1)[-1]
+    for p in _config.GATE_FILES:
+        if any(_config.protect_hit(x, p) for x in cands) or ("/" not in p and fnmatch.fnmatchcase(name, p)):
+            return p
+    return None
+
+
+def names_file(t, path, c=None, pattern=None):
+    """Does t's touches: name this file: the path itself (a companion's as `<name>/<path>` or
+    `<companion path>/<path>`), or the protect pattern it falls under, as written? A directory
+    or a wider glob doesn't: a gate file is named on purpose or not at all."""
+    names = {str(x).strip().strip("/") for x in t.get("touches") or []}
+    roots = [""] if c is None else [k + "/" for k in c["touches"]]
+    cands = {r + path for r in roots} | ({r + pattern for r in roots} | {pattern} if pattern else set())
+    return bool(names & cands)
+
+
+def added_lines(rng, path, repo=None):
+    """The lines `git diff <rng>` adds to `path`, as text. --text so no .gitattributes setting
+    hides a file's lines as binary."""
+    diff = _gitops.git("diff", "-U0", "--text", "--no-color", "--no-ext-diff", "--no-textconv",
+                       "--no-renames", rng, "--", f":(literal){path}", raw=True, cwd=repo)
+    lines, hunks = [], False
+    for line in diff.splitlines():
+        if line.startswith("@@"):
+            hunks = True
+        elif hunks and line.startswith("+"):
+            lines.append(line[1:])
+    return lines
+
+
+def weakening(t, base, branch, pubs=()):
+    """The weakening check on t's branch: [] if it passes, else one finding per file, each naming
+    the file as touches: would. `t` is the task as it was at launch."""
+    found = []
+    for c, repo, trunk in [(None, None, base)] + [(c, c["path"], c["trunk"]) for c, _ in pubs]:
+        rng = f"{trunk}...{branch}"
+        files = _gitops.git("diff", "--name-only", "-z", "--no-renames", rng, raw=True, cwd=repo)
+        for path in (p for p in files.split("\0") if p):
+            shown = path if c is None else f"{c['name']}/{path}"
+            pattern = gate_file_hit(path, c)
+            if names_file(t, path, c, pattern):
+                continue
+            if pattern:
+                found.append(f"{shown} changed (a gate file: protect `{pattern}`)")
+                continue
+            if not _config.SUPPRESS:
+                continue
+            hits = []
+            for line in added_lines(rng, path, repo):
+                rx = next((r for r in _config.SUPPRESS if r.search(line)), None)
+                if rx:
+                    hits.append((rx, line))
+            if hits:
+                rx, line = hits[0]
+                more = f" (and {len(hits) - 1} more line(s))" if len(hits) > 1 else ""
+                found.append(f"{shown} adds a suppression marker (suppress `{rx.pattern}`): "
+                             f"`{line.strip()[:120]}`{more}")
+    return found
+
+
+WEAKEN_MAX = 8  # findings quoted in the reason; the rest are counted
+
+
+def run_weakening(t, base, branch, pubs, rnd=None, tier=None):
+    """The weakening check as a gate: None on a pass, else the reason, after a failed `verify`
+    row (layer `weaken`) and an incident. Git errors propagate: the caller blocks on them."""
+    start = time.monotonic()
+    found = weakening(t, base, branch, pubs)
+    if not found:
+        return None
+    _history.record("verify", t, ok=False, cmd="weakening check", layer="weaken",
+                    seconds=round(time.monotonic() - start, 1), log=None, findings=found, **_round(rnd))
+    more = f"; and {len(found) - WEAKEN_MAX} more" if len(found) > WEAKEN_MAX else ""
+    failed = (f"verify (weakening check) vetoed the branch: it weakens a gate its task's touches: doesn't "
+              f"name: {'; '.join(found[:WEAKEN_MAX])}{more}")
+    save_incident(t, "weaken", failed, base, branch, pubs, tier=tier)
+    return failed
+
+
 def save_incident(t, layer, reason, base, branch, pubs=(), log=None, tier=None):
     """Keep a caught mistake in a form a check can run against: <state>/runs/incidents/<ID>-<time>.patch
     (`git diff base...branch` now) and .json (task, layer, reason, log, base, tip, tier), and an
     `incident` history row naming both. A companion's diff goes in <ID>-<time>-<name>.patch. Only
-    git diff, so it is fast and offline; never raises. Layers: runtime, review, weakening, reject."""
+    git diff, so it is fast and offline; never raises. Layers: runtime, review, weaken, reject."""
     try:
         d = _config.RUNS / "incidents"
         d.mkdir(parents=True, exist_ok=True)
@@ -799,14 +904,18 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None):
     (after --escalate the lower tier's commits are on the branch too). The reviewer is one tier
     above `tier`. Touches only the task's own worktrees and branch, so a long verify or review
     doesn't hold the state lock. Returns (failure reason or None, review cost, fixable): a
-    reviewer's `REVIEW: fail` is fixable (True), and so is a red verify ("verify"), each by a fix
-    round (fix_loop). The caller adds kept_note."""
+    reviewer's `REVIEW: fail` is fixable (True), and so are a red verify ("verify") and a
+    weakening veto ("weaken"), each by a fix round (fix_loop). The weakening check runs first,
+    on `t` as it was at launch. The caller adds kept_note."""
     for tree in [wt] + [pub for _, pub in pubs]:
         if _gitops.dirty_paths(tree):
             return f"worker said done but left uncommitted changes in {tree}", 0, False
     msgs = _gitops.git("log", "--format=%B%x1e", f"{base}..{branch}", raw=True)
     if not re.search(rf"\b{t['id']}\b", msgs):
         return f"worker said done but no commit on {branch} cites {t['id']}", 0, False
+    failed = run_weakening(t, base, branch, pubs, rnd, tier)
+    if failed:
+        return failed, 0, "weaken"
     failed = run_verify(t, wt, rnd)
     if failed:
         if "(runtime gate)" in failed:
@@ -844,6 +953,28 @@ as it is, and this doesn't use up a round. Otherwise end as before: a `FOUND: <t
 line for each piece of work you find but don't do, then `RESULT: done` or
 `RESULT: blocked — <why>`.
 """
+
+
+WEAKEN_FIX_PROMPT = """The weakening check vetoed your work on {id} (fix round {n} of {rounds}): {failed}
+
+Your branch changes a gate file, or adds a suppression marker, in a file this task's touches:
+doesn't name. Revert the change to each file named above on {branch} in {wt}, fix the code
+instead, and commit there citing {id}. If the rule itself is wrong, revert it anyway and end with
+a `FOUND: <title> — <why>` line naming the rule and why: a human approves a task whose touches:
+names the file. Editing your task's touches: changes nothing, since the check reads the task as it
+was at launch. The done checks and the gates run again when you finish. End as before: a
+`FOUND: <title> — <why>` line for each piece of work you find but don't do, then `RESULT: done`
+or `RESULT: blocked — <why>`.
+"""
+
+
+def weaken_lines(failed):
+    """Prompt lines for a fresh worker told that the weakening check vetoed the branch."""
+    return (f"The weakening check vetoed the last attempt: {failed}\n"
+            "Revert the change to each file it names on this branch and fix the code instead; the check "
+            "runs again before this lands. If the rule itself is wrong, revert it anyway and end with a "
+            "`FOUND: <title> — <why>` line naming the rule and why: a human approves a task whose touches: "
+            "names the file. Editing this task's touches: changes nothing.\n")
 
 
 def verify_detail(failed):
@@ -891,21 +1022,26 @@ def resume_choice(session, wt):
     return True, None
 
 
-def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, veto, rnd, verify=None, n=None):
+def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, veto, rnd, verify=None, n=None,
+              kind="verify"):
     """Hand a reviewer's veto back to a worker on the same branch: its own session resumed if
     resume_choice() allows, else a fresh worker with the retry prompt. Returns run_worker's
     (verdict, reason, info), with info["resumed"] and, for a fresh one, info["fresh_because"].
-    `verify` = (n, rounds) makes it a round for a red verify (`veto` is run_verify's reason).
-    `rnd` numbers every worker run (logs, history); a review fix round's own count is `n`."""
+    `verify` = (n, rounds) makes it a round for a red verify (`veto` is run_verify's reason), or
+    with kind="weaken" for a weakening veto (run_weakening's). `rnd` numbers every worker run
+    (logs, history); a review fix round's own count is `n`."""
     n, rounds = verify or (n, _config.REVIEW_ROUNDS)
-    what = "verify fix" if verify else "fix"
-    lines = verify_lines(veto) if verify else None
+    weaken = bool(verify) and kind == "weaken"
+    what = "weaken fix" if weaken else "verify fix" if verify else "fix"
+    lines = (weaken_lines(veto) if weaken else verify_lines(veto)) if verify else None
     resume, fresh_because = resume_choice(session, wt)
     tt = dict(t, tier=tier)
     if resume:
         _history.record("resumed", t, session=session, round=rnd, tier=tier)
         print(f"  {what:<8} {t['id']}  round {n}/{rounds}: resumed {session}", flush=True)
-        if verify:
+        if weaken:
+            prompt = WEAKEN_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, branch=branch, wt=wt)
+        elif verify:
             tail, vlog = verify_detail(veto)
             prompt = VERIFY_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, tail=tail,
                                               log=vlog, branch=branch, wt=wt)
@@ -1218,7 +1354,7 @@ def dispatch(args):
         round_cost = info.get("round_cost", info.get("cost", 0))
         info.setdefault("review_cost", 0)
 
-        def fix(failed, verify=None, n=None):
+        def fix(failed, verify=None, n=None, kind="verify"):
             """One fix worker on the branch. Returns (verdict, reason); folds its cost, FOUND lines,
             log and session into info. A review round whose worker commits nothing blocks."""
             nonlocal rnd, round_cost
@@ -1229,7 +1365,7 @@ def dispatch(args):
             except _gitops.GitError:
                 tips = None
             v, w, finfo = fix_round(t, tier, base, wt, branch, pubs, args, agents, settings,
-                                    info.get("session"), failed, rnd, verify, n)
+                                    info.get("session"), failed, rnd, verify, n, kind)
             round_cost = finfo.get("cost", 0)
             info["cost"] = info.get("cost", 0) + round_cost
             info["found"] = (info.get("found") or []) + (finfo.get("found") or [])
@@ -1266,10 +1402,10 @@ def dispatch(args):
                         f"review passed in round {len(vetoes) + 1}, after {len(vetoes)} fix round(s): "
                         + "; ".join(f"round {i}: {x}" for i, x in enumerate(vetoes, 1)) if vetoes else "") if x)
                 return "done", ""
-            if fixable == "verify":
-                if outside:  # the rerun as it was is red too: the worker's reason goes to a human
-                    info.update(asked=True, rounds=f" (verify still red on rerun: {failed})")
-                    return "blocked", f"{outside}. {kept}"
+            if fixable == "verify" and outside:  # the rerun as it was is red too: the worker's reason goes to a human
+                info.update(asked=True, rounds=f" (verify still red on rerun: {failed})")
+                return "blocked", f"{outside}. {kept}"
+            if fixable in ("verify", "weaken"):  # a weakening veto uses up the same rounds, per task
                 stop = ""
                 if vfixes >= _config.VERIFY_ROUNDS:
                     stop = f"; no verify fix rounds left (verify_rounds = {_config.VERIFY_ROUNDS})" if vfixes else ""
@@ -1277,8 +1413,8 @@ def dispatch(args):
                     stop = round_stop(info, round_cost, rnd + 1)
                 if stop or vfixes >= _config.VERIFY_ROUNDS:
                     return "blocked", f"{failed}{stop}. {kept}"
-                v, w = fix(failed, (vfixes + 1, _config.VERIFY_ROUNDS))
-                if v == "blocked" and w.lower().startswith("outside:"):
+                v, w = fix(failed, (vfixes + 1, _config.VERIFY_ROUNDS), kind=fixable)
+                if fixable == "verify" and v == "blocked" and w.lower().startswith("outside:"):
                     outside, info["asked"] = w, False
                     print(f"  verify   {t['id']}  worker says outside the branch ({w}): rerunning as is", flush=True)
                     continue

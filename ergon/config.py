@@ -62,9 +62,14 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 
 # Layered gates, cheapest first: static (lint, types, import boundaries), then runtime (tests); the
 # first red stops the rest. `verify` above is an alias for runtime; a task's `verify:` overrides runtime only.
+# Before both, the weakening check: a branch whose diff changes a gate file (protect, fnmatch; a
+# pattern with no `/` matches that name in any directory; .ergon.toml always) or adds a line matching
+# a suppression regex (suppress) goes back to its worker, unless the task's touches: names that file.
 # [gates]
 # static = "ruff check ."
 # runtime = "make test"
+# protect = ["ruff.toml", ".eslintrc*", "tests/arch/**"]
+# suppress = ['# noqa', 'eslint-disable', '@pytest\\.mark\\.skip']   # regexes ('literal' strings)
 
 # Tasks whose finished branch waits at status `review` for a human `ergon accept` instead of landing.
 # A task matches a rule if its tier is in tiers (when given) and a touches: entry matches (when
@@ -105,6 +110,8 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 
 
 SHARED = None  # [shared]: {remote, branch}, or None for local-only state
+GATE_FILES = [CONFIG_FILE]  # [gates] protect, plus the config itself
+SUPPRESS = []  # [gates] suppress, compiled
 PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
 ACCEPT = []  # [[accept]] rules: {tiers, touches}
 TWO_PERSON = []  # [[two_person]] rules: {tiers, touches}; shared mode only
@@ -190,7 +197,8 @@ def configure(start=None, need_config=True):
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, \
-        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL
+        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, \
+        GATE_FILES, SUPPRESS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -234,9 +242,21 @@ def configure(start=None, need_config=True):
             raise NotConfigured(f"{CONFIG_FILE}: {key} is a whole number, 0 or more")
         return v
     GATES = CFG.get("gates") or {}
-    if not isinstance(GATES, dict) or any(k not in ("static", "runtime") or not isinstance(v, str)
-                                          for k, v in GATES.items()):
-        raise NotConfigured(f"{CONFIG_FILE}: [gates] takes static and runtime, each a shell command")
+    strings = lambda v: isinstance(v, list) and all(isinstance(x, str) and x.strip() for x in v)
+    if not isinstance(GATES, dict) or any(
+            k not in ("static", "runtime", "protect", "suppress")
+            or not (isinstance(v, str) if k in ("static", "runtime") else strings(v)) for k, v in GATES.items()):
+        raise NotConfigured(f"{CONFIG_FILE}: [gates] takes static and runtime, each a shell command, and "
+                            f"protect and suppress, each a list of patterns")
+    # The weakening check (T-101): gate files a branch may change, and markers it may add, only
+    # where its task's touches: names the file. The config itself is always a gate file.
+    GATE_FILES = list(dict.fromkeys([CONFIG_FILE] + [x.strip().strip("/") for x in GATES.get("protect") or []]))
+    SUPPRESS = []
+    for x in GATES.get("suppress") or []:
+        try:
+            SUPPRESS.append(re.compile(x))
+        except re.error as err:
+            raise NotConfigured(f"{CONFIG_FILE}: [gates] suppress {x!r} isn't a regex: {err}")
     REVIEW_ROUNDS = count("review_rounds", 2)
     VERIFY_ROUNDS = count("verify_rounds", 2)  # a red verify goes back to the worker this many times (T-027)
     CONFLICT_ROUNDS = count("conflict_rounds", 1)  # a branch that conflicts with its base goes back to its worker (T-095)

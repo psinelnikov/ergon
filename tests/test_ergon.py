@@ -33,7 +33,10 @@ $FAKE_SHARED (and $FAKE_PUB_SHARED in the companion) too, so two tasks conflict,
 $FAKE_SLEEP_<TIER> first. Handed a conflict round, it merges each base named and keeps both sides
 of each conflicted file, then ends $FAKE_CONFLICT_RESULT (default RESULT: done); $FAKE_CONFLICT
 = markers commits the markers, nomerge aborts the merge and commits something else, and still
-lands a conflicting commit on the main checkout's trunk after merging."""
+lands a conflicting commit on the main checkout's trunk after merging. With $FAKE_WEAKEN =
+"<path>|<line>" its first run appends that line to that file too; with $FAKE_UNWEAKEN a fix round
+the weakening check asked for puts the file back as main has it. $FAKE_EDIT_TOUCHES rewrites its
+own task file's touches: in the main checkout to that list."""
 import json, os, re, subprocess, sys, time
 if "--agent" not in sys.argv:
     n = 0
@@ -108,6 +111,15 @@ if "conflicts with its base" in prompt:
                       "session_id": "s-1", "total_cost_usd": 0.01}))
     sys.exit()
 time.sleep(float(os.environ.get("FAKE_SLEEP_" + tier, "0")))
+if resume and os.environ.get("FAKE_UNWEAKEN") and "weakening check" in prompt:
+    wpath = os.environ["FAKE_WEAKEN"].partition("|")[0]
+    if subprocess.run(["git", "cat-file", "-e", f"main:{wpath}"], capture_output=True).returncode == 0:
+        subprocess.run(["git", "checkout", "main", "--", wpath], check=True)
+    else:
+        subprocess.run(["git", "rm", "-q", wpath], check=True)
+    subprocess.run(["git", "commit", "-qm", f"Put the gate back ({tid})"], check=True)
+    print(json.dumps({"result": "reverted\nRESULT: done", "session_id": resume, "total_cost_usd": 0.01}))
+    sys.exit()
 if resume and os.environ.get("FAKE_FIX_NOTHING"):
     print(json.dumps({"result": "nothing to change\nRESULT: done", "session_id": resume, "total_cost_usd": 0.01}))
     sys.exit()
@@ -121,6 +133,18 @@ def commit(where, msg, shared=None):
         open(os.path.join(where, shared), "w").write(tid + "\n")
     subprocess.run(["git", "-C", where, "add", "-A"], check=True)
     subprocess.run(["git", "-C", where, "commit", "-qm", msg], check=True)
+if os.environ.get("FAKE_WEAKEN") and not resume and "An earlier attempt" not in prompt:
+    wpath, _, wline = os.environ["FAKE_WEAKEN"].partition("|")
+    os.makedirs(os.path.dirname(wpath) or ".", exist_ok=True)
+    open(wpath, "a").write(wline + "\n")
+if os.environ.get("FAKE_EDIT_TOUCHES"):  # a worker widening its own touches: to cover what it did
+    common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            capture_output=True, text=True).stdout.strip()
+    import glob
+    for f in glob.glob(os.path.join(os.path.dirname(common), "tasks", "**", tid + "-*.md"), recursive=True):
+        text = open(f).read()
+        open(f, "w").write(re.sub(r"^touches:.*$", "touches: [" + os.environ["FAKE_EDIT_TOUCHES"] + "]", text,
+                                  count=1, flags=re.M))
 commit(".", f"Do the thing ({tid})", os.environ.get("FAKE_SHARED"))
 pub = os.path.join("pub", "src")
 if os.path.isdir(pub):
@@ -1238,6 +1262,147 @@ class TestGateLayers(DispatchProject):
         out = self.ergon("dispatch", "--dry-run").stdout
         self.assertIn("static gate `lint-cmd`", out)
         self.assertIn("runtime gate `test-cmd`", out)
+
+
+class TestWeakening(DispatchProject):
+    """The weakening check (T-101): a branch that changes a gate file or adds a suppression marker
+    goes back to its worker, then blocks, unless the task's touches: (as at launch) names the file."""
+    config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
+                                            '        verify_rounds = 1')
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "ruff.toml").write_text('[lint]\nselect = ["E", "F"]\n')
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + '\n[gates]\nruntime = "true"\nprotect = ["ruff.toml", "tests/arch/**"]\n'
+                       "suppress = ['# noqa', '@pytest\\.mark\\.skip']\n")
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "gates", cwd=self.root)
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0",
+                        FAKE_FIX_RESULT="tried\nRESULT: done")
+        self.env.pop("CLAUDE_CONFIG_DIR", None)
+
+    def task(self, touches=None):
+        self.ergon("new", "task", "Weak", "--tier", "haiku", *(["--touches", touches] if touches else []))
+        stamp(self.task_file("T-001"))
+
+    def calls(self):
+        return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+
+    def rows(self, event="verify"):
+        return [r for r in history(self.root) if r["task"] == "T-001" and r["event"] == event]
+
+    def notes(self):
+        return self.task_file("T-001").read_text().split("## Notes", 1)[1]
+
+    def test_disabling_a_rule_gets_a_fix_round_then_blocks(self):
+        self.task()
+        self.env["FAKE_WEAKEN"] = 'ruff.toml|ignore = ["E501"]'
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)  # the worker, one fix round, and no more
+        self.assertIn("The weakening check vetoed your work on T-001 (fix round 1 of 1)", calls[1]["prompt"])
+        self.assertIn("ruff.toml changed (a gate file: protect `ruff.toml`)", calls[1]["prompt"])
+        self.assertIn("FOUND", calls[1]["prompt"])
+        self.assertIn("`ruff.toml`", calls[0]["prompt"])  # the worker is told up front
+        self.assertIn("ruff.toml changed", self.notes())
+        self.assertIn("no verify fix rounds left (verify_rounds = 1)", self.notes())
+        rows = self.rows()
+        self.assertEqual([(r["layer"], r["ok"]) for r in rows], [("weaken", False)] * 2)  # runtime never ran
+        self.assertEqual({r["layer"] for r in self.rows("incident")}, {"weaken"})
+        self.assertNotIn('E501', sh("git", "show", "main:ruff.toml", cwd=self.root).stdout)
+
+    def test_reverted_in_the_fix_round_lands(self):
+        self.task()
+        self.env.update(FAKE_WEAKEN='ruff.toml|ignore = ["E501"]', FAKE_UNWEAKEN="1")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual([(r["layer"], r["ok"]) for r in self.rows()],
+                         [("weaken", False), ("runtime", True)])
+        self.assertNotIn('E501', sh("git", "show", "main:ruff.toml", cwd=self.root).stdout)
+
+    def test_a_suppression_marker_anywhere_is_caught(self):
+        self.task("T-001.txt")
+        self.env["FAKE_WEAKEN"] = "src/deep/app.py|import os  # noqa: F401"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("src/deep/app.py adds a suppression marker (suppress `# noqa`): "
+                      "`import os  # noqa: F401`", self.notes())
+
+    def test_a_new_file_under_a_protected_directory_is_caught(self):
+        self.task()
+        self.env["FAKE_WEAKEN"] = "tests/arch/test_skip.py|x = 1"
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertIn("tests/arch/test_skip.py changed (a gate file: protect `tests/arch/**`)", self.notes())
+
+    def test_the_config_itself_is_always_a_gate_file(self):
+        self.task()
+        self.env["FAKE_WEAKEN"] = ".ergon.toml|verify_rounds = 9"
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertIn(".ergon.toml changed (a gate file: protect `.ergon.toml`)", self.notes())
+
+    def test_touches_naming_the_file_lands(self):
+        self.task("ruff.toml")
+        self.env["FAKE_WEAKEN"] = 'ruff.toml|ignore = ["E501"]  # noqa'
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn('E501', sh("git", "show", "main:ruff.toml", cwd=self.root).stdout)
+        self.assertEqual(self.rows("incident"), [])
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_a_marker_in_a_named_file_lands(self):
+        self.task("src/app.py")
+        self.env["FAKE_WEAKEN"] = "src/app.py|import os  # noqa: F401"
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "done")
+
+    def test_touches_naming_the_protect_pattern_lands(self):
+        self.task("tests/arch/**")
+        self.env["FAKE_WEAKEN"] = "tests/arch/test_layers.py|@pytest.mark.skip"
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "done")
+
+    def test_a_directory_in_touches_does_not_name_a_gate_file(self):
+        self.task("tests")
+        self.env["FAKE_WEAKEN"] = "tests/arch/test_layers.py|x = 1"
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "blocked")
+
+    def test_a_worker_widening_its_own_touches_gets_nowhere(self):
+        self.task("T-001.txt")
+        self.env.update(FAKE_WEAKEN='ruff.toml|ignore = ["E501"]', FAKE_EDIT_TOUCHES="T-001.txt, ruff.toml")
+        out = self.ergon("dispatch").stdout
+        self.assertIn("touches: [T-001.txt, ruff.toml]", self.task_file("T-001").read_text())  # it did edit it
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("ruff.toml changed", self.notes())
+
+    def test_a_companion_gate_file_is_caught(self):
+        self.task("acme/public")
+        pub = self.root / "pub" / "src"
+        (pub / "ruff.toml").write_text("[lint]\n")
+        sh("git", "add", "-A", cwd=pub)
+        sh("git", "commit", "-qm", "lint", cwd=pub)
+        self.env["FAKE_WEAKEN"] = "pub/src/ruff.toml|ignore = ['E501']"  # in the task's companion worktree
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertIn("acme/public/ruff.toml changed (a gate file: protect `ruff.toml`)", self.notes())
+
+    def test_bad_settings_are_refused(self):
+        cfg = self.root / ".ergon.toml"
+        base = cfg.read_text()
+        cfg.write_text(base.replace("suppress = ['# noqa', '@pytest\\.mark\\.skip']", "suppress = ['(']"))
+        r = self.ergon("board", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("isn't a regex", r.stderr + r.stdout)
+        cfg.write_text(base.replace('protect = ["ruff.toml", "tests/arch/**"]', 'protect = "ruff.toml"'))
+        r = self.ergon("board", check=False)
+        self.assertIn("protect and suppress, each a list of patterns", r.stderr + r.stdout)
 
 
 class TestVerifyRounds(DispatchProject):
