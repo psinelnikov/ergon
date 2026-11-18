@@ -729,6 +729,34 @@ class TestDispatch(DispatchProject):
                     self.assertIn(f"title: {title}", text)
                 self.assertIn("2 proposed", out)
 
+    def test_found_lines_carry_touches_done_when_and_tier(self):
+        self.ergon("new", "task", "Source", "--tier", "opus")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="Fix X — y breaks\nTOUCHES: a.py, b.py\nDONE WHEN: z holds\n"
+                                   "DONE WHEN: w too\nTIER: haiku — one line\n"
+                                   "FOUND: Bare — why\nTIER: wild — no")
+        self.ergon("dispatch")
+        text = self.task_file("T-002").read_text()
+        self.assertIn("touches: [a.py, b.py]", text)
+        self.assertIn("## Done when\n- z holds\n- w too\n", text)
+        self.assertIn("tier: haiku\n", text)
+        self.assertIn("tier_why: one line\n", text)
+        self.assertIn("## What\nY breaks Found by T-001 while working it (", text)
+        text = self.task_file("T-003").read_text()
+        self.assertIn("tier: opus\n", text)
+        self.assertIn("tier_why: tier of the task that found it (T-001); size it before approving", text)
+
+    def test_found_bare_line_gets_prefix_and_fallback_tier_why(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="X — y")
+        self.ergon("dispatch")
+        text = self.task_file("T-002").read_text()
+        self.assertIn("tier: sonnet\n", text)
+        self.assertIn("touches: []", text)
+        self.assertIn("Y Found by T-001 while working it (", text)
+        self.assertIn("tier_why: tier of the task that found it (T-001); size it before approving", text)
+
     def test_found_lines_keep_code_spans(self):
         self.ergon("new", "task", "Source", "--tier", "sonnet")
         stamp(self.task_file("T-001"))
@@ -739,13 +767,13 @@ class TestDispatch(DispatchProject):
         self.assertIn("3 proposed", out)
         text = self.task_file("T-002").read_text()
         self.assertIn("title: `ergon dispatch` filing tasks\n", text)
-        self.assertIn("## What\n`[[two_person]]`, the flow\n", text)
+        self.assertIn("## What\n`[[two_person]]`, the flow Found by T-001", text)
         text = self.task_file("T-003").read_text()
         self.assertIn("title: Fix alpha\n", text)
-        self.assertIn("## What\nit breaks\n", text)
+        self.assertIn("## What\nIt breaks Found by T-001", text)
         text = self.task_file("T-004").read_text()
         self.assertIn("title: Fix beta\n", text)
-        self.assertIn("## What\nwrapped whole\n", text)
+        self.assertIn("## What\nWrapped whole Found by T-001", text)
 
     def test_md_trim(self):
         from ergon.dispatch import md_trim

@@ -44,7 +44,7 @@ WORKER_PROMPT = """You are dispatched on {id}.
 Working tree: {wt} (a git worktree of this repo), on branch {branch}, cut from {base}.
 {retry}{nested}{companions}{rules}
 Work you find but don't do: end your final message with one line per item, before the RESULT line,
-`FOUND: <title> — <why>`. The dispatcher files each as a proposed task.
+`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`). The dispatcher files each as a proposed task.
 
 The task file, read-only to you (it lives in the main checkout):
 
@@ -260,7 +260,7 @@ ANSWER_PROMPT = """A human answered the question(s) you asked on {id}:
 
 {note}
 Carry on with the task on {branch} in {wt}, and commit there citing {id}. End as before: a
-`FOUND: <title> — <why>` line for each piece of work you find but don't do, then `RESULT: done`,
+`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`) line for each piece of work you find but don't do, then `RESULT: done`,
 `RESULT: blocked — <why>`, or new `QUESTION:` lines and `RESULT: asking`.
 """
 
@@ -467,6 +467,42 @@ def md_trim(s):
     return s.strip(" *")
 
 
+FOUND_TIERS = ("haiku", "sonnet", "opus", "human")
+
+
+def parse_found(text):
+    """[(title, why, extra)] from a worker's FOUND: lines. TOUCHES (once), DONE WHEN (repeatable)
+    and TIER (once) lines directly after a FOUND line fill `extra`: touches, done, tier, tier_why.
+    A line md_trim would empty is ignored, and so is a tier that isn't one."""
+    out, cur = [], None
+    for line in text.splitlines():
+        m = re.match(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", line)
+        if m:
+            cur = None
+            if md_trim(m[1]):
+                cur = {}
+                out.append((md_trim(m[1]), md_trim(m[2]), cur))
+            continue
+        m = re.match(r"^\W*(TOUCHES|DONE WHEN|TIER):\s*(.*?)\s*$", line)
+        if not m:
+            if line.strip():
+                cur = None
+            continue
+        val = md_trim(m[2])
+        if cur is None or not val:
+            continue
+        if m[1] == "DONE WHEN":
+            cur.setdefault("done", []).append(val)
+        elif m[1] == "TOUCHES":
+            if "touches" not in cur:
+                cur["touches"] = [x for x in (md_trim(x) for x in val.split(",")) if x]
+        elif "tier" not in cur:
+            tm = re.match(r"^(\w+)\s*(?:[—–]\s*(.*))?$", val)
+            if tm and tm[1].lower() in FOUND_TIERS:
+                cur["tier"], cur["tier_why"] = tm[1].lower(), md_trim(tm[2])
+    return out
+
+
 def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
     # A resumed session gets the same agent, permission mode and guard hook as a fresh one.
     cmd = ["claude", "-p", "--agents", json.dumps(agents), "--agent", f"task-{t['tier']}",
@@ -495,8 +531,7 @@ def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
     text = d.get("result") or ""
     if d.get("is_error"):
         return "blocked", f"worker errored ({d.get('subtype') or d.get('terminal_reason')}): {text[:200]}", info
-    info["found"] = [(md_trim(m[0]), md_trim(m[1])) for m in
-                     re.findall(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if md_trim(m[0])]
+    info["found"] = [(ti, why, dict(extra, log=str(info["log"]))) for ti, why, extra in parse_found(text)]
     info["policy"] = [(md_trim(m[0]), md_trim(m[1])) for m in
                       re.findall(r"^\W*POLICY:\s*(.*?)(?:\s+[—–]\s+(.*))?$", text, re.M) if md_trim(m[0])]
     found = re.findall(r"^\W*RESULT:\s*(done|blocked|asking)\b[\s—:–-]*(.*)$", text, re.M)
@@ -513,16 +548,22 @@ def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
 
 
 def file_found(t, found, epics):
-    """Create each FOUND line a worker emitted as a `proposed` task: same tier, epic and a
+    """Create each FOUND line a worker emitted as a `proposed` task: its TIER line's tier or the finder's, same epic and a
     source: of the task that found it. Never ready. Caller holds the state lock."""
     made = []
-    for title, why in found:
+    for title, why, extra in found:
         tid = _tasks.next_id(_config.ITEMS, "T")
-        e = epics.get(t.get("epic"))
-        body = _tasks.TASK_BODY.replace("## What\n", f"## What\n{why or title}\n", 1)
-        meta = {"id": tid, "title": title, "tier": t["tier"], "status": "proposed",
-                "epic": t.get("epic") or "", "depends": [], "touches": [],
-                "source": t["id"], "created": _tasks.today(), "approved": "", "tier_why": "",
+        what = (why[:1].upper() + why[1:] + " " if why else "") + \
+            f"Found by {t['id']} while working it ({extra.get('log') or 'no log'})."
+        body = _tasks.TASK_BODY.replace("## What\n", f"## What\n{what}\n", 1)
+        if extra.get("done"):
+            body = body.replace("## Done when\n", "## Done when\n" + "".join(f"- {d}\n" for d in extra["done"]), 1)
+        sized = extra.get("tier")
+        meta = {"id": tid, "title": title, "tier": sized or t["tier"], "status": "proposed",
+                "epic": t.get("epic") or "", "depends": [], "touches": extra.get("touches") or [],
+                "source": t["id"], "created": _tasks.today(), "approved": "",
+                "tier_why": (extra.get("tier_why") or "") if sized else
+                f"tier of the task that found it ({t['id']}); size it before approving",
                 "_path": _tasks.task_home(t, epics) / f"{tid}-{_tasks.slug(title)}.md", "_body": body}
         _tasks.dump(meta, _tasks.TASK_KEYS)
         _history.record("created", meta, tier=meta["tier"], title=title, source=t["id"], by="found")
@@ -754,7 +795,8 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None):
 FIX_PROMPT = """The reviewer vetoed your work on {id} (fix round {n} of {rounds}): {veto}
 {log}
 Fix what it raised on {branch} in {wt}, and commit there citing {id}. The done checks, verify and
-the review run again when you finish. End as before: a `FOUND: <title> — <why>` line for each
+the review run again when you finish. End as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`,
+`TIER: haiku|sonnet|opus|human — <why>`) line for each
 piece of work you find but don't do, then `RESULT: done`, `RESULT: blocked — <why>`, or
 `QUESTION:` lines and `RESULT: asking`.
 """
@@ -770,7 +812,7 @@ The full output is in {log}.
 Fix it on {branch} in {wt}, and commit there citing {id}. The done checks and verify run again
 when you finish. If the failure isn't caused by this branch (a flaky test, a broken trunk, a
 missing tool), change nothing and end `RESULT: blocked — outside: <why>`: verify runs once more
-as it is, and this doesn't use up a round. Otherwise end as before: a `FOUND: <title> — <why>`
+as it is, and this doesn't use up a round. Otherwise end as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`)
 line for each piece of work you find but don't do, then `RESULT: done` or
 `RESULT: blocked — <why>`.
 """
@@ -887,7 +929,7 @@ since the resolution is new code. If you can't reconcile the two sides, don't gu
 CONFLICT_PROMPT = """Your work on {id} conflicts with its base, which moved since you started (conflict round {n} of {rounds}):
 
 {body}
-End as before: a `FOUND: <title> — <why>` line for each piece of work you find but don't do, then
+End as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`) line for each piece of work you find but don't do, then
 `RESULT: done`, `RESULT: blocked — <why>`, or `QUESTION:` lines and `RESULT: asking`.
 """
 
