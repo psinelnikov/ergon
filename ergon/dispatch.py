@@ -2988,9 +2988,15 @@ def dispatch(args):
             info["policy"] = (info.get("policy") or []) + (finfo.get("policy") or [])
             info["evidence"] = (info.get("evidence") or []) + (finfo.get("evidence") or [])
             info.update(log=finfo["log"], session=finfo.get("session") or info.get("session"),
-                        asked=finfo.get("asked"), questions=finfo.get("questions"))
+                        asked=finfo.get("asked"), questions=finfo.get("questions"),
+                        stopped=finfo.get("stopped"))
             with live_lock:
                 live[t["id"]] = info["cost"]
+            if args.until_done and v == "blocked" and finfo.get("stopped"):
+                info["round_cost"] = round_cost
+                v, w = until_done(t, base, wt, branch, pubs, v, w, info, tier=tier,
+                                  extra=f"The round it stopped in was fixing:\n{failed}\n")
+                rnd, round_cost = info["rnd"], info["round_cost"]
             if v == "done" and tips is not None and not verify:
                 try:
                     if [_gitops.git("rev-parse", branch, cwd=r) for r in repos] == tips:
@@ -3116,9 +3122,14 @@ def dispatch(args):
         info["policy"] = (info.get("policy") or []) + (finfo.get("policy") or [])
         info["evidence"] = (info.get("evidence") or []) + (finfo.get("evidence") or [])
         info.update(log=finfo["log"], session=finfo.get("session") or session,
-                    asked=finfo.get("asked"), questions=finfo.get("questions"))
+                    asked=finfo.get("asked"), questions=finfo.get("questions"),
+                    stopped=finfo.get("stopped"))
         with live_lock:
             live[t["id"]] = info["cost"]
+        if args.until_done and v == "blocked" and finfo.get("stopped"):
+            v, w = until_done(t, base, wt, branch, pubs, v, w, info, tier=tier,
+                              extra="The round it stopped in: the branch conflicts with its base, which moved "
+                                    f"since the work started.\n\n{body}\n")
         if v != "done":
             info["rounds"] = f" (conflict round {n}, after: {what})"
             return v, w
@@ -3157,11 +3168,12 @@ def dispatch(args):
             if v != "done":
                 return v, w
 
-    def until_done(t, base, wt, branch, pubs, verdict, why, info):
+    def until_done(t, base, wt, branch, pubs, verdict, why, info, tier=None, extra=""):
         """A worker that stopped short (info["stopped"]: it timed out, errored, printed no JSON or
         no RESULT line) runs again on the same branch, up to --until-done times: its session
-        resumed if resume_choice() allows, else a fresh worker. Returns (verdict, reason)."""
-        halts, tier, limit = [], t["tier"], args.until_done
+        resumed if resume_choice() allows, else a fresh worker. Also used for a fix-round or
+        conflict-round worker that stopped short. Returns (verdict, reason)."""
+        halts, tier, limit = [], tier or t["tier"], args.until_done
         while verdict == "blocked" and info.get("stopped"):
             halts.append(why)
             n = len(halts)
@@ -3179,7 +3191,7 @@ def dispatch(args):
                 _history.record("resumed", t, session=session, round=rnd, tier=tier, after="until_done")
                 print(f"  until-done {t['id']}  round {n}/{limit} ({why}): resumed {session}", flush=True)
                 v, w, finfo = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd, resume=session,
-                                         prompt=UNTIL_DONE_PROMPT.format(**fmt), after="until_done")
+                                         prompt=UNTIL_DONE_PROMPT.format(**fmt) + extra, after="until_done")
             else:
                 _history.record("dispatched", t, tier=tier, model=agents[f"task-{tier}"]["model"], base=base,
                                 branch=branch, worktree=wt, companions=[c["name"] for c, _ in pubs],
@@ -3187,7 +3199,7 @@ def dispatch(args):
                 print(f"  until-done {t['id']}  round {n}/{limit} ({why}): fresh session ({fresh_because})",
                       flush=True)
                 v, w, finfo = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd,
-                                         lines=UNTIL_DONE_LINES.format(**fmt), after="until_done")
+                                         lines=UNTIL_DONE_LINES.format(**fmt) + extra, after="until_done")
             info["round_cost"] = finfo.get("cost", 0)
             info["cost"] = info.get("cost", 0) + info["round_cost"]
             for k in ("found", "policy", "evidence"):
