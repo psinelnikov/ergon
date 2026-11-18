@@ -3208,6 +3208,77 @@ class TestGateWeakeningFieldsSigned(unittest.TestCase):
             self.counts(self.a, "T-001")
 
 
+class TestHardenInDigest(Project):
+    """A harden task's `harden:` and `harden_layer:` are in the brief digest, so changing either
+    after approval un-approves it (T-134)."""
+
+    I1, I2 = "T-001-20261101-120000", "T-002-20261102-120000"
+
+    def test_digest_covers_harden_and_its_layer(self):
+        from ergon.tasks import brief_digest
+        t = {"id": "T-1", "title": "x", "tier": "sonnet", "touches": ["a"], "_body": "## What\n\nx\n"}
+        base = brief_digest(t)
+        for extra in ({"harden": []}, {"harden": ""}, {"harden_layer": "runtime"}):  # no incidents: the old digest stands
+            self.assertEqual(brief_digest({**t, **extra}), base, extra)
+        one = brief_digest({**t, "harden": [self.I1]})
+        two = brief_digest({**t, "harden": [self.I1, self.I2]})
+        rt = brief_digest({**t, "harden": [self.I1], "harden_layer": "runtime"})
+        self.assertEqual(len({base, one, two, rt}), 4)
+        self.assertEqual(brief_digest({**t, "harden": [self.I1], "harden_layer": "static"}), one)  # the default, spelt out
+        self.assertEqual(brief_digest({**t, "harden": [self.I2, self.I1, self.I1]}), two)  # a set: order and repeats don't count
+        self.assertEqual(brief_digest({**t, "harden": f"{self.I1}, {self.I2}"}), two)
+
+    def test_hand_edit_on_an_approved_task_changes_its_digest(self):
+        from ergon.tasks import brief_digest, parse
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("\n---\n", f"\nharden: [{self.I1}]\n---\n", 1))
+        stamp(f)
+        self.ergon("check")
+        base = brief_digest(parse(f))
+        for old, new in ((f"harden: [{self.I1}]", f"harden: [{self.I1}, {self.I2}]"),
+                         (f"harden: [{self.I1}]", f"harden: [{self.I2}]"),
+                         (f"harden: [{self.I1}]\n", f"harden: [{self.I1}]\nharden_layer: runtime\n")):
+            text = f.read_text()
+            f.write_text(text.replace(old, new, 1))
+            self.assertNotEqual(brief_digest(parse(f)), base, new)
+            f.write_text(text)
+        self.assertEqual(brief_digest(parse(f)), base)
+
+
+class TestHardenInDigestSigned(unittest.TestCase):
+    """Shared mode: changing an approved harden task's `harden:` or `harden_layer:` after its signed
+    approval un-approves it (T-134). Borrows test_shared's fixture, as TestGateWeakeningFieldsSigned does."""
+
+    def __getattr__(self, name):
+        from test_shared import TestSignedApprovals
+        attr = getattr(TestSignedApprovals, name)
+        return attr.__get__(self) if callable(attr) else attr
+
+    def setUp(self):
+        from test_shared import Shared
+        Shared.setUp(self)
+
+    def tearDown(self):
+        from test_shared import Shared
+        Shared.tearDown(self)
+
+    def test_changing_an_approved_harden_task_unapproves_it(self):
+        i1, i2 = TestHardenInDigest.I1, TestHardenInDigest.I2
+        self.start()
+        self.edit(self.a, "T-001", "\n---\n", f"\nharden: [{i1}]\n---\n")
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        self.counts(self.a, "T-001")
+        for old, new in ((f"harden: [{i1}]", f"harden: [{i1}, {i2}]"),
+                         (f"harden: [{i1}]\n", f"harden: [{i1}]\nharden_layer: runtime\n")):
+            f = self.task(self.a, "T-001")
+            text = f.read_text()
+            self.edit(self.a, "T-001", old, new)
+            self.doesnt_count(self.a, "T-001", "brief changed after approval")
+            f.write_text(text)
+            self.counts(self.a, "T-001")
+
+
 class TestAutoApprove(DispatchProject):
     """A FOUND follow-up that is a bugfix, refactor or chore is approved by inheritance (T-136)."""
     config = DispatchProject.config + '''
@@ -4788,7 +4859,7 @@ class TestLearn(Project):
         t = self.fields("T-004")
         self.assertEqual(t["harden"], [self.A, self.B, self.C, self.D])
         self.assertIn(f"- `{self.D}` (T-001, caught by runtime)", t["_body"])
-        self.assertEqual(brief_digest(t), digest)  # an approval in progress still holds
+        self.assertNotEqual(brief_digest(t), digest)  # harden: is in the digest (T-134): a half-given approval is for the old list
         self.assertEqual(sorted(p.name[:5] for p in (self.root / "tasks").rglob("T-*.md")),
                          ["T-001", "T-002", "T-003", "T-004"])  # nothing new filed
         self.ergon("check")
