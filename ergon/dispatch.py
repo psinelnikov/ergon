@@ -875,7 +875,7 @@ def file_found(t, found, epics, vouch=True):
         _history.record("created", meta, tier=meta["tier"], title=title, source=t["id"], by="found")
         if auto:
             _history.record("approved", meta, by="auto", tier=meta["tier"], category=meta["category"],
-                            parent=t["id"], root=auto[1], depth=auto[2], touches=list(meta["touches"]))
+                            parent=t["id"], root=auto[1], depth=auto[2], **approval_record(meta))
         made.append((tid, title, meta["status"]))
     return made
 
@@ -993,6 +993,9 @@ def gate_cmds(t):
 # harden: (as at launch), in the main repo. It is the incident's bad diff, so it may well hold the
 # marker the incident was about, and no one can name it in touches: before the proof asks for it.
 # Exactly those files: anything else under [gates] repros, or a task with no harden:, is checked.
+# harden: is recorded beside touches: and read back the same way (T-162): only the ids a human
+# approved make a task a harden task here and exempt their reproductions, so a worker that adds
+# an id to its own harden: (the guard bypassed) gets neither until a human approves it again.
 
 def gate_file_hit(path, c=None):
     """The [gates] protect pattern a changed file falls under, or None. `path` is relative to its
@@ -1022,19 +1025,32 @@ def touch_key(x):
     return str(x).strip().strip("/")
 
 
-def approved_touches(t, rows=None):
-    """The touches: entries (as touch_key) a human approved for t, or None if nothing recorded
-    them. The last `approved` row decides; one without a touches list (from before rows held them)
-    resets the record, and then the first `dispatched` row after it that has one stands in for it."""
+def approval_record(t):
+    """What an `approved` history row records of t, and a launch's `dispatched` row too
+    (approved_touches and approved_harden read it back): its touches: and harden: as they are."""
+    return {"touches": list(t.get("touches") or []), "harden": harden_ids(t)}
+
+
+def _approved(t, key, rows=None):
+    """The list a human approved for t's `key` (touches or harden), or None if nothing recorded
+    it. The last `approved` row decides; one without that list (from before rows held it) resets
+    the record, and then the first `dispatched` row after it that has one stands in for it."""
     rec = None
     for r in _history.read() if rows is None else rows:
         if r.get("task") != t.get("id"):
             continue
-        touches = r.get("touches") if isinstance(r.get("touches"), list) else None
+        got = r.get(key) if isinstance(r.get(key), list) else None
         if r.get("event") == "approved":
-            rec = touches
+            rec = got
         elif r.get("event") == "dispatched" and rec is None:
-            rec = touches
+            rec = got
+    return rec
+
+
+def approved_touches(t, rows=None):
+    """The touches: entries (as touch_key) a human approved for t, or None if nothing recorded
+    them (see _approved)."""
+    rec = _approved(t, "touches", rows)
     return None if rec is None else {touch_key(x) for x in rec}
 
 
@@ -1043,6 +1059,19 @@ def unapproved_touches(t, rows=None):
     order; [] when nothing is recorded yet (the launch records them)."""
     ok = approved_touches(t, rows)
     return [] if ok is None else [x for x in t.get("touches") or [] if touch_key(x) not in ok]
+
+
+def approved_harden(t, rows=None):
+    """The harden: ids a human approved for t, or None if nothing recorded them (see _approved)."""
+    rec = _approved(t, "harden", rows)
+    return None if rec is None else {str(x).strip() for x in rec}
+
+
+def unapproved_harden(t, rows=None):
+    """t's harden: ids no human approved (added to the file since approved_harden), in file order;
+    [] when nothing is recorded yet (the launch records them)."""
+    ok = approved_harden(t, rows)
+    return [] if ok is None else [i for i in harden_ids(t) if i not in ok]
 
 
 def added_lines(rng, path, repo=None):
@@ -1059,10 +1088,12 @@ def added_lines(rng, path, repo=None):
     return lines
 
 
-def own_repros(t):
+def own_repros(t, rows=None):
     """The reproductions t's harden: lets past the gate-file and marker checks: repro_path(id) for
-    each well-formed incident id it names (main repo paths); empty for a task with no harden:."""
-    return {repro_path(i) for i in harden_ids(t) if HARDEN_ID.fullmatch(i)}
+    each well-formed incident id it names that a human approved (unapproved_harden), as main repo
+    paths; empty for a task with no harden:."""
+    late = set(unapproved_harden(t, rows))
+    return {repro_path(i) for i in harden_ids(t) if HARDEN_ID.fullmatch(i) and i not in late}
 
 
 def _on_base(ref, path):
@@ -1078,14 +1109,19 @@ def weakening(t, base, branch, pubs=()):
     """The weakening check on t's branch: [] if it passes, else one finding per file, each naming
     the file as touches: would. `t` is the task as it was at launch; only its touches: entries a
     human approved (unapproved_touches) exempt a file: from the gate-file check in any task, and
-    from the suppression-marker check only in a harden task (T-118). A harden task's own
-    reproductions (own_repros) pass both of those unnamed, but not the kept-reproduction check
-    (T-161) if the base already has one."""
-    found, late, repros = [], {touch_key(x) for x in unapproved_touches(t)}, own_repros(t)
-    harden = bool(harden_ids(t))
+    from the suppression-marker check only in a harden task (T-118), one with a harden: id a human
+    approved (T-162). A harden task's own reproductions (own_repros) pass both of those unnamed,
+    but not the kept-reproduction check (T-161) if the base already has one."""
+    rows = _history.read()
+    found, late, repros = [], {touch_key(x) for x in unapproved_touches(t, rows)}, own_repros(t, rows)
+    hlate = unapproved_harden(t, rows)
+    harden = bool(set(harden_ids(t)) - set(hlate))
     ok = dict(t, touches=[x for x in t.get("touches") or [] if touch_key(x) not in late])
     since = (f" (touches: names it only since its approval, so it doesn't count: a human approves the new "
              f"touches: with `ergon approve {t.get('id')}`)")
+    hsince = (f" (harden: names {', '.join(hlate)} only since its approval, so it doesn't count: a human "
+              f"approves the new harden: with `ergon approve {t.get('id')}`)") if hlate else ""
+    late_repros = {repro_path(i) for i in hlate if HARDEN_ID.fullmatch(i)}
     for c, repo, trunk in [(None, None, base)] + [(c, c["path"], c["trunk"]) for c, _ in pubs]:
         rng = f"{trunk}...{branch}"
         files = _gitops.git("diff", "--name-only", "-z", "--no-renames", rng, raw=True, cwd=repo)
@@ -1095,6 +1131,7 @@ def weakening(t, base, branch, pubs=()):
             pattern = gate_file_hit(path, c)
             named = names_file(ok, path, c, pattern)
             note = since if late and not named and names_file(t, path, c, pattern) else ""
+            note += hsince if c is None and path in late_repros else ""
             if pattern and not named and not own:
                 found.append(f"{shown} changed (a gate file: protect `{pattern}`){note}")
                 continue
@@ -1103,9 +1140,11 @@ def weakening(t, base, branch, pubs=()):
                 continue
             if own or not _config.SUPPRESS or (harden and named):
                 continue
-            if not harden:
+            if not harden and named:
                 note = (" (touches: names it, but that allows a marker only in a harden task)"
-                        if named else "")
+                        + (hsince if hlate else ""))
+            elif not harden and not (c is None and path in late_repros):
+                note = ""
             hits = []
             for line in added_lines(rng, path, repo):
                 rx = next((r for r in _config.SUPPRESS if r.search(line)), None)
@@ -3387,7 +3426,7 @@ def dispatch(args):
                                 _history.record("dispatched", t, tier=t["tier"], model=agents[f"task-{t['tier']}"]["model"],
                                                 base=base, branch=branch, worktree=wt,
                                                 companions=[c["name"] for c, _ in pubs],
-                                                touches=list(t.get("touches") or []),  # approved_touches
+                                                **approval_record(t),  # approved_touches, approved_harden
                                                 **({"answered": True} if answered else {}))
                                 print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
                                       + also(t) + f"  {t['title']}")

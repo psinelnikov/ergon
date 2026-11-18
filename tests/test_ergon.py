@@ -1893,6 +1893,58 @@ class TestWeakening(DispatchProject):
         found = self.check(dict(harden, harden=["../harden/I-1"]), {"tests/harden/I-1.patch": self.REPRO})
         self.assertEqual(len(found), 1, found)
 
+    def test_harden_added_after_approval_exempts_nothing(self):
+        """T-162: an approved row records harden: like touches:; an id added to the file after it
+        (the guard bypassed) neither exempts its reproduction nor makes the task a harden task,
+        until a human approves the task again."""
+        self.ergon("new", "task", "Harden", "--tier", "haiku", "--touches", "tests/lint.py")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("touches: [tests/lint.py]\n", "touches: [tests/lint.py]\nharden: [I-1]\n"))
+        approve = lambda: self.ergon("approve", "T-001", env=dict(self.env, ERGON_ASK_STDIN="1"), inp="y\n")
+        approve()
+        self.assertEqual(self.rows("approved")[-1]["harden"], ["I-1"])
+        t = {"id": "T-001", "touches": ["tests/lint.py"], "harden": ["I-1"]}
+        self.assertEqual(self.check(t, {"tests/harden/I-1.patch": self.REPRO}), [])
+        # the worker adds I-2 to its own harden: by hand
+        f.write_text(f.read_text().replace("harden: [I-1]", "harden: [I-1, I-2]"))
+        t = dict(t, harden=["I-1", "I-2"])
+        found = self.check(t, {"tests/harden/I-2.patch": self.REPRO})
+        self.assertEqual(len(found), 1, found)
+        self.assertTrue(found[0].startswith("tests/harden/I-2.patch adds a suppression marker"), found)
+        self.assertIn("(harden: names I-2 only since its approval", found[0])
+        self.assertEqual(self.check(t, {"tests/harden/I-1.patch": self.REPRO}), [])  # the approved one still passes
+        from ergon import dispatch
+        rows = self.rows("approved")
+        self.assertEqual(dispatch.unapproved_harden(t, rows), ["I-2"])
+        self.assertEqual(dispatch.approved_harden(t, rows), {"I-1"})
+        self.assertEqual(dispatch.approved_harden(t, []), None)  # nothing recorded: the launch records it
+        # a human approves the new harden: and the reproduction passes
+        r = approve()
+        self.assertIn("approve again: harden: gained I-2 since its approval", r.stdout)
+        self.assertEqual(self.rows("approved")[-1]["harden"], ["I-1", "I-2"])
+        self.assertEqual(self.check(t, {"tests/harden/I-2.patch": self.REPRO}), [])
+
+    def test_harden_added_after_approval_is_no_harden_task(self):
+        """T-162: a task approved without harden: that gains one by hand is no harden task: a marker
+        in a file its touches: names is still vetoed."""
+        self.ergon("new", "task", "Plain", "--tier", "haiku", "--touches", "a.py")
+        self.ergon("approve", "T-001", env=dict(self.env, ERGON_ASK_STDIN="1"), inp="y\n")
+        self.assertEqual(self.rows("approved")[-1]["harden"], [])
+        t = {"id": "T-001", "touches": ["a.py"], "harden": ["I-1"]}
+        found = self.check(t, {"a.py": "import os  # noqa: F401\n"})
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("(touches: names it, but that allows a marker only in a harden task) "
+                      "(harden: names I-1 only since its approval", found[0])
+
+    def test_a_launch_records_harden_for_a_hand_stamped_task(self):
+        """With no approved row, the first dispatched row records harden: as the approved one."""
+        self.task("T-001.txt")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("touches: [T-001.txt]\n", "touches: [T-001.txt]\nharden: [I-1]\n"))
+        self.ergon("dispatch")
+        self.assertEqual(self.rows("dispatched")[0]["harden"], ["I-1"])
+        self.assertEqual(self.rows("dispatched")[0]["touches"], ["T-001.txt"])
+
     def test_a_reproduction_under_a_protected_repros_passes(self):
         """With [gates] repros under [gates] protect, the own reproduction is exempt from that check
         too; a sibling file there is still a gate file."""

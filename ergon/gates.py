@@ -259,9 +259,9 @@ def stamp_approved(todo):
 
 
 def approved_touches_field(t):
-    """The `touches` field of t's `approved` history row (dispatch.approved_touches reads it): a
-    task's touches: as approved; nothing for an epic."""
-    return {} if _tasks.is_epic(t) else {"touches": list(t.get("touches") or [])}
+    """The `touches` and `harden` fields of t's `approved` history row (dispatch.approved_touches
+    and approved_harden read them): a task's touches: and harden: as approved; nothing for an epic."""
+    return {} if _tasks.is_epic(t) else _dispatch.approval_record(t)
 
 
 def brief_due(e, apr):
@@ -293,18 +293,24 @@ def approve(args):
     again = {t["id"]: why for t in named if apr and t["id"] in args.ids and t["status"] in ("ready", "blocked")
              and (why := apr.problem(t))}
     again.update((e["id"], apr.problem(e)) for e in briefs if e["status"] == "open")
-    # local mode: no digest, so an approved task whose touches: gained an entry since its approval
-    # (a hand edit) is approved again by naming it, or the weakening check won't count the entry
+    # local mode: no digest, so an approved task whose touches: or harden: gained an entry since
+    # its approval (a hand edit) is approved again by naming it, or the weakening check won't
+    # count the entry
     if not apr:
-        again.update({t["id"]: f"touches: gained {', '.join(new)} since its approval" for t in named
-                      if t["id"] in args.ids and t["status"] in ("ready", "blocked")
-                      and (new := _dispatch.unapproved_touches(t))})
+        rows = _history.read()
+        for t in named:
+            if t["id"] in args.ids and t["status"] in ("ready", "blocked"):
+                why = [f"{k}: gained {', '.join(new)} since its approval"
+                       for k, new in (("touches", _dispatch.unapproved_touches(t, rows)),
+                                      ("harden", _dispatch.unapproved_harden(t, rows))) if new]
+                if why:
+                    again[t["id"]] = "; ".join(why)
     todo += [t for t in named if t["id"] in again]
     todo = briefs + todo
     if not todo:
         raise SystemExit("nothing in `proposed` among those ids" + (
             ", nor an approved task or epic whose approval doesn't verify" if apr else
-            ", nor an approved task whose touches: gained an entry since its approval"))
+            ", nor an approved task whose touches: or harden: gained an entry since its approval"))
     # shared mode: an unpublished ID can still be renumbered, so sync first (or refuse)
     _shared.ensure_published([t["id"] for t in todo] + [i for i in args.ids if i in epics])
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
