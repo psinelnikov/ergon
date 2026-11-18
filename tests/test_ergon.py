@@ -2712,7 +2712,11 @@ class TestGradeUnits(unittest.TestCase):
         from ergon.grade import one_line, set_fields
         self.assertEqual(one_line("a\nstatus: done\r approved: me\x00"), "a status: done approved: me")
         self.assertEqual(one_line("[x, y]"), "x, y")
-        self.assertEqual(one_line("w" * 200), "w" * 120)
+        self.assertEqual(one_line("w" * 200), "w" * 200)  # past WHY_MAX is kept, not cut mid-word
+        self.assertEqual(one_line("w" * 400), "w" * 299 + "…")
+        long = "word " * 80
+        self.assertEqual(one_line(long), ("word " * 60).rstrip() + "…")
+        self.assertLessEqual(len(one_line(long)), 300)
         text = "---\nid: T-1\n# cod: 1\ncod: 3\nstatus: ready   # c\ncod: 4\n---\n## What\ncod: 9\n"
         self.assertEqual(set_fields(text, {"cod": 70, "graded": "d x"}),
                          "---\nid: T-1\n# cod: 1\ncod: 70\nstatus: ready   # c\ngraded: d x\n---\n## What\ncod: 9\n")
@@ -2768,7 +2772,7 @@ class TestGrade(Project):
         s = {i: self.fields(i) for i in ("T-001", "T-002", "T-003", "T-004", "T-005")}
         self.assertEqual([s[i]["cod"] for i in ("T-003", "T-001", "T-004", "T-002")], ["100", "50", "50", "0"])
         self.assertEqual(s["T-005"], {"cod": None, "cod_why": None, "graded": None})  # no comparison survived
-        self.assertEqual(s["T-003"]["cod_why"], ("users stay blocked " + "x" * 200)[:120])
+        self.assertEqual(s["T-003"]["cod_why"], "users stay blocked " + "x" * 200)
         self.assertEqual(s["T-001"]["cod_why"], "why T-001")
         from ergon.tasks import brief_digest, parse
         self.assertEqual(s["T-001"]["graded"],

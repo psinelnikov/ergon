@@ -38,7 +38,8 @@ from . import tasks as _tasks
 
 OPEN = ("proposed", "ready", "blocked")
 TIMEOUT = 600
-WHY_MAX = 120
+WHY_MAX = 120  # what the prompt asks for
+WHY_KEEP = 300  # what is stored: models overrun WHY_MAX, and a why cut mid-word reads as broken
 PRIOR_GAMES = 1  # virtual games, each a tie, against a fixed reference player (see fit)
 SPAN = 6.0  # log-strength spread of the 0-100 scale when anchors are held fixed (see fit)
 MIN_ANCHORS = 3  # fewer graded tasks than this and grade() falls back to a full grade
@@ -231,13 +232,19 @@ def fit(kept, iters=10000, tol=1e-10, fixed=None):
 
 
 def one_line(text):
-    """`text` as a single frontmatter-safe line of at most WHY_MAX characters: every line break and
+    """`text` as a single frontmatter-safe line of at most WHY_KEEP characters, shortened at a word
+    boundary with an ellipsis when longer: every line break and
     run of whitespace a space (str.split covers all splitlines() separators), no control
     characters, and not bracketed, which parse_text would read as a list."""
     s = " ".join("".join(c for c in str(text) if c.isprintable() or c.isspace()).split())
     if s.startswith("[") and s.endswith("]"):
         s = s[1:-1].strip()
-    return s[:WHY_MAX].rstrip()
+    if len(s) <= WHY_KEEP:
+        return s
+    cut = s[:WHY_KEEP - 1]
+    if " " in cut and not s[WHY_KEEP - 1].isspace():
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,;:") + "…"
 
 
 def set_fields(text, fields):

@@ -195,6 +195,36 @@ class TestServe(ServeFixture):
         _, _, page = self.req("GET", "/t/T-005")
         self.assertIn("not graded (neutral 50)", page)
 
+    def test_board_priority_and_reviews(self):
+        f = self.task_file("T-004")
+        f.write_text(f.read_text().replace("\ntier:", '\ncod: 80\ncod_why: "<b>x</b> see T-001"\ntier:', 1))
+        grade = self.runs / "grade"
+        grade.mkdir()
+        (grade / "grade-20261117-120000.json").write_text(json.dumps(
+            {"generated": "2026-11-17T12:00:00+00:00", "model": "sonnet", "cost": 0.08, "written": ["T-004"]}))
+        _, _, board = self.req("GET", "/")
+        prio = board.split("<h2 id=priority>")[1].split("<h2")[0]
+        self.assertIn("top 2 of 2 not started", prio)
+        self.assertLess(prio.index("/t/T-004"), prio.index("/t/T-005"))  # 80/1 beats an ungraded human task
+        self.assertIn("&lt;b&gt;x&lt;/b&gt; see", prio)
+        self.assertNotIn("<b>x</b>", prio)
+        self.assertIn("not graded (neutral 50)", prio)  # T-005
+        self.assertIn("last graded 2026-11-17T12:00:00+00:00 by sonnet · 1 task(s) · $0.08", prio)
+        li = re.search(r'<li><a class=id href="/t/T-004">.*?</li>', board, re.S)[0]
+        self.assertIn("p 80", li)
+        self.assertIn("cod 80", li)
+        revs = board.split("<h2 id=reviews>")[1].split("<h2")[0]
+        self.assertEqual(re.findall(r'href="/t/(T-\d+)"', revs), ["T-002", "T-001", "T-001"])  # newest first
+        self.assertIn('<td class="v-pass"><b>pass</b></td>', revs)
+        self.assertIn("missing &lt;tests&gt;", revs)
+        self.assertIn('href="/runs/T-001-20261116-120600-review.json"', revs)
+
+    def test_board_without_reviews_or_grades(self):
+        (self.runs / "history.jsonl").write_text("")
+        _, _, board = self.req("GET", "/")
+        self.assertIn("no review has run yet", board.split("<h2 id=reviews>")[1])
+        self.assertIn("nothing graded yet", board.split("<h2 id=priority>")[1].split("<h2")[0])
+
     def test_task_body_is_escaped(self):
         code, _, page = self.req("GET", "/t/T-004")
         self.assertEqual(code, 200)
@@ -298,6 +328,10 @@ class TestReview(ServeFixture):
         _, _, page = self.req("GET", "/review")
         cards = re.findall(r'<section class=card id="(T-\d+)">', page)
         self.assertLess(cards.index("T-007"), cards.index("T-006"))  # 20/1 beats 100/8
+        prio = page.split("<h2 id=priority>")[1].split("<h2")[0]
+        self.assertEqual(re.findall(r'<a href="#(T-\d+)">', prio), ["T-004", "T-007", "T-005", "T-006"])
+        self.assertIn("20.0 <span class=muted>(cod 20, unblocks 0, size 1)</span>", self.card(page, "T-007"))
+        self.assertIn("not graded (neutral 50)", self.card(page, "T-004"))
         self.assertEqual(cards[:2], ["T-004", "T-005"])  # the chain stays first, in dependency order
         find = re.search(r'<div class=finding id="find-T-005">.*?</div>', page, re.S)[0]
         self.assertIn("not graded", find)

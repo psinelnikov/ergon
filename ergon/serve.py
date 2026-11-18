@@ -3,13 +3,14 @@
 Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and JS inlined
 (serve.css, serve.js next to this file), no external assets.
 
-  /            the board: open work by status then tier, epics with progress, what waits on a
-               human (approval, acceptance, answers), and live dispatch state
+  /            the board: the top tasks by priority (score, cod, cod_why) and when they were last
+               graded, the newest review verdicts, open work by status then priority, epics with
+               progress, what waits on a human (approval, acceptance, answers), and live dispatch state
   /metrics     charts and tables: stats, review, human latency, lead time, tokens; ?epic=&since=&until=
-  /review      what waits for approval, read before approving: proposed tasks by tier, a
-               dependency map (inline SVG), a card per task, findings computed from files (missing
-               citations and touches, empty Done when / tier_why / touches, dead depends), and
-               the quiz `ergon quiz` last wrote, minus questions whose task has changed since
+  /review      what waits for approval, read before approving: proposed tasks by tier, their
+               priority ranking with each cod_why, a dependency map (inline SVG), a card per task,
+               findings computed from files (missing citations and touches, empty Done when /
+               tier_why / touches, dead depends), and the quiz `ergon quiz` last wrote, minus questions whose task has changed since
   /live.json   tasks `doing`: elapsed time, round, spend so far; the board polls it
   /e/E-NNN     one epic's replay timeline: a lane per task, a bar per phase from the journal,
                human waits hatched, a cost overlay, and a replay player (inline SVG, no libraries)
@@ -131,6 +132,104 @@ def prio_score(t, tasks):
         return _priority.score(t, tasks)
     except KeyError:
         return None
+
+
+GRADE_FILE = re.compile(r"grade-\d{8}-\d{6}\.json")
+PRIORITY_TOP = 5
+RECENT_REVIEWS = 8
+
+
+def latest_grade():
+    """(name, record) of the newest `ergon grade` record under <state>/runs/grade/, or (None, None)."""
+    folder = _config.RUNS / "grade"
+    try:
+        names = sorted(p.name for p in folder.iterdir() if GRADE_FILE.fullmatch(p.name) and p.is_file())
+    except OSError:
+        return None, None
+    for n in reversed(names):
+        try:
+            d = json.loads((folder / n).read_text(errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict):
+            return n, d
+    return None, None
+
+
+def grade_line():
+    """A muted line saying when the newest grade ran, by which model, over how many tasks, at
+    what cost; or how to run one."""
+    name, d = latest_grade()
+    if d is None:
+        return '<p class=muted>nothing graded yet: <code>ergon grade</code> sets each open task\'s cod</p>'
+    scores = d.get("written") if isinstance(d.get("written"), (list, dict)) else d.get("scores")
+    n = len(scores) if isinstance(scores, (list, dict)) else None
+    cost = d.get("cost")
+    return (f'<p class=muted>last graded {esc(d.get("generated"))}'
+            + (f' by {esc(d.get("model"))}' if d.get("model") else "")
+            + (f' · {n} task(s)' if n is not None else "")
+            + (f' · {money(cost)}' if isinstance(cost, (int, float)) and not isinstance(cost, bool) else "")
+            + f' · <code>{esc((_config.RUNS / "grade" / name).relative_to(_config.HOME).as_posix())}</code>'
+            + ' · <code>ergon grade</code> grades new and changed tasks</p>')
+
+
+def priority_table(ts, tasks, anchor=False):
+    """Tasks ranked as `ergon next` would take them: score, cod (or ungraded), unblocks, cod_why.
+    anchor: link each ID to its card on the same page instead of its task page."""
+    o = ['<div class=table><table class=prio><thead><tr><th>#</th><th>task</th><th>tier</th><th>score</th>'
+         '<th>cod</th><th class=hide-narrow>unblocks</th><th>why it matters</th></tr></thead><tbody>']
+    for i, t in enumerate(ts, 1):
+        sc = prio_score(t, tasks)
+        graded = t.get("cod") not in (None, "")
+        cod = f"{_priority.cod(t):g}" if graded else '<span class=muted>—</span>'
+        pin = str(t.get("pin") or "").strip()
+        why = (link_ids(esc(str(t.get("cod_why") or "")), tasks) or '<span class=muted>no cod_why</span>'
+               if graded else '<span class=muted>not graded (neutral 50)</span>')
+        href = f'#{esc(t["id"])}' if anchor else f'/t/{esc(t["id"])}'
+        o.append(f'<tr><td class=num>{i}</td><td class="id mono"><a href="{href}">{esc(t["id"])}</a></td>'
+                 f'<td><span class=tier>{esc(t.get("tier"))}</span></td>'
+                 f'<td class=num>{"—" if sc is None else f"{sc:.1f}"}</td><td class=num>{cod}</td>'
+                 f'<td class="num hide-narrow">{_priority.unblocks(t, tasks) or ""}</td>'
+                 f'<td class=why><b>{esc(t.get("title"))}</b>'
+                 + (f' <span class="pin">pin: {esc(pin)}</span>' if pin else "")
+                 + f'<br>{why}</td></tr>')
+    o.append("</tbody></table></div>")
+    return "".join(o)
+
+
+def last_review(trail):
+    """' · review <verdict> (round N)' for a task's newest review row, or ''."""
+    r = next((r for r in reversed(trail) if r.get("event") == "review"), None)
+    if not r:
+        return ""
+    v = str(r.get("verdict") or "")
+    return (f' <span class=flags>last review <b class="v-{esc(v)}">{esc(v)}</b>'
+            f' (round {esc(r.get("round") or 1)})</span>')
+
+
+def reviews_table(rows, tasks, limit=RECENT_REVIEWS):
+    """The newest `review` journal rows, newest first: what the reviewer said about each round."""
+    revs = [r for r in rows if r.get("event") == "review"][-limit:][::-1]
+    if not revs:
+        tiers = ", ".join(_config.REVIEW)
+        return ('<p class=muted>no review has run yet: dispatch reviews a task\'s branch when '
+                '<code>review</code> in .ergon.toml names its tier'
+                + (f' (now: {esc(tiers)})' if tiers else " (now: none)") + '</p>')
+    o = ['<div class=table><table><thead><tr><th>at</th><th>task</th><th>round</th><th>verdict</th>'
+         '<th class=hide-narrow>reviewer</th><th>reason</th><th class=hide-narrow>log</th></tr></thead><tbody>']
+    for r in revs:
+        v = str(r.get("verdict") or "")
+        tid = str(r.get("task") or "")
+        task = (f'<a href="/t/{esc(tid)}">{esc(tid)}</a>' if tid in tasks else esc(tid))
+        title = tasks.get(tid, {}).get("title")
+        reason = link_ids(esc(r.get("reason") or ""), tasks) or '<span class=muted>—</span>'
+        o.append(f'<tr><td class="muted mono">{esc(r.get("at"))}</td><td class="id mono">{task}</td>'
+                 f'<td class=num>{esc(r.get("round") or 1)}</td><td class="v-{esc(v)}"><b>{esc(v)}</b></td>'
+                 f'<td class=hide-narrow>{esc(r.get("reviewer"))}</td>'
+                 f'<td class=why>{"<b>" + esc(title) + "</b><br>" if title else ""}{reason}</td>'
+                 f'<td class=hide-narrow>{log_link(r.get("log"))}</td></tr>')
+    o.append("</tbody></table></div>")
+    return "".join(o)
 
 
 def parse_at(at):
@@ -387,7 +486,10 @@ def task_li(t, tasks, extra=""):
     if sc is not None:
         n = _priority.unblocks(t, tasks)
         pin = str(t.get("pin") or "").strip()
-        tail += (f' <span class="score" title="priority score">{sc:.0f}</span>'
+        cod = f"cod {_priority.cod(t):g}" if t.get("cod") not in (None, "") else "not graded"
+        why = str(t.get("cod_why") or "").strip()
+        tail += (f' <span class="score" title="{esc(why or cod)}">p {sc:.0f}</span>'
+                 f' <span class=flags>{esc(cod)}</span>'
                  + (f' <span class=flags>unblocks {n}</span>' if n > 0 else "")
                  + (f' <span class="pin">pin: {esc(pin)}</span>' if pin else ""))
     return (f'<li><a class=id href="/t/{esc(t["id"])}">{esc(t["id"])}</a>'
@@ -409,6 +511,7 @@ def live_rows(rows, now):
 def board_page(nonce):
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     rows = _history.read()
+    trails = by_task(rows)
     c = counts(tasks)
     now = time.time()
     lv = live(tasks, rows)
@@ -426,12 +529,20 @@ def board_page(nonce):
              '<th class=hide-narrow>last</th><th>title</th></tr></thead>'
              f'<tbody id=live-body>{live_rows(lv, now)}</tbody></table></div>')
     open_ = [t for t in tasks.values() if t["status"] not in ("done", "dropped")]
+    waiting = sorted((t for t in open_ if t["status"] in ("proposed", "ready", "blocked")
+                      and prio_score(t, tasks) is not None), key=lambda t: prio_key(t, tasks))
+    if waiting:
+        top = waiting[:PRIORITY_TOP]
+        b.append(f'<h2 id=priority>Priority (top {len(top)} of {len(waiting)} not started)</h2>'
+                 + priority_table(top, tasks) + grade_line())
+    b.append(f'<h2 id=reviews>Reviews</h2>{reviews_table(rows, tasks)}')
     for status in _tasks.TASK_STATUSES:
         group = sorted((t for t in open_ if t["status"] == status), key=lambda t: prio_key(t, tasks))
         if group:
             more = ' <a class=more href="/review">review them →</a>' if status == "proposed" else ""
             b.append(f'<h2 id="{status}">{esc(status.upper())} ({len(group)}){more}</h2><ul class=tasks>')
-            b.extend(task_li(t, tasks) for t in group)
+            b.extend(task_li(t, tasks, last_review(trails.get(t["id"], [])) if status == "review" else "")
+                     for t in group)
             b.append("</ul>")
     asked = asks(tasks)
     if asked:
@@ -899,9 +1010,18 @@ def review_card(t, tasks, found):
         brief = (f"<h3>What</h3>{markdown(what or '', tasks) if not blank(what) else '<p class=muted>empty</p>'}"
                  f"<h3>Done when</h3>{markdown(done or '', tasks) if not blank(done) else '<p class=muted>empty</p>'}")
     flag = (f' <a class=nfind href="#find-{esc(t["id"])}">{len(found)} finding(s)</a>' if found else "")
+    sc = prio_score(t, tasks)
+    prio = ""
+    if sc is not None:
+        graded = t.get("cod") not in (None, "")
+        parts = (f"cod {_priority.cod(t):g}" if graded else "not graded (neutral 50)") \
+            + f", unblocks {_priority.unblocks(t, tasks)}, size {_priority.SIZE[t.get('tier')]}"
+        prio = (f'<tr><th>priority</th><td>{sc:.1f} <span class=muted>({esc(parts)})</span></td></tr>'
+                + (f'<tr><th>cod_why</th><td class=why>{link_ids(esc(str(t["cod_why"])), tasks)}</td></tr>'
+                   if t.get("cod_why") else ""))
     return (f'<section class=card id="{esc(t["id"])}"><div class=head><a class=id href="/t/{esc(t["id"])}">{esc(t["id"])}</a>'
             f'<span class=tier>{esc(t.get("tier"))}</span><b class=ctitle>{esc(t.get("title"))}</b>{flag}</div>'
-            '<div class=table><table><tbody>'
+            f'<div class=table><table><tbody>{prio}'
             f'<tr><th>tier_why</th><td class=why>{link_ids(esc(t.get("tier_why") or ""), tasks) or "<span class=muted>empty</span>"}</td></tr>'
             f'<tr><th>depends</th><td class=why>{dep_html}</td></tr>'
             f'<tr><th>touches</th><td class=why>{touches}</td></tr>'
@@ -1022,6 +1142,12 @@ def review_page(nonce):
     b.append("</div>")
     b.append(f"<p>{len(met)} of {len(proposed)} have every dependency done; "
              f"{len(flagged)} have findings ({sum(map(len, flagged.values()))} in all).</p>")
+
+    ranked = sorted((t for t in proposed if prio_score(t, tasks) is not None), key=lambda t: prio_key(t, tasks))
+    if ranked:
+        b.append('<h2 id=priority>Priority</h2><p class=muted>In the order dispatch would take them once '
+                 'approved: score = (cod + 60 × tasks it unblocks) ÷ tier size.</p>'
+                 + priority_table(ranked, tasks, anchor=True) + grade_line())
 
     b.append(f'<h2>Dependency map</h2><div class=mapwrap>{dep_map(proposed, tasks, flagged)}</div>'
              '<p class=legend>A box links to its card; <b>!</b> marks findings; an arrow points from a '
