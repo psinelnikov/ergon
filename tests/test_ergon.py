@@ -500,6 +500,30 @@ class TestBasics(Project):
         self.assertNotIn("--read-only", worker["hooks"][0]["command"])
         self.assertEqual(worker["matcher"], "Edit|Write|MultiEdit|Bash")
 
+    def test_guard_logs_refusal_to_history(self):
+        from ergon import history
+        self.ergon("new", "task", "Fix it", "--tier", "haiku")
+        f = str(self.task_file("T-001"))
+        edit = {"file_path": f, "old_string": "status: proposed", "new_string": "status: ready"}
+        self.assertIn("ergon set", self.guard("Edit", edit, "--worker"))
+        rows = [r for r in history.read(self.root / "tasks" / "runs" / "history.jsonl") if r["event"] == "guard"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["tool"], rows[0]["worker"], rows[0]["task"], rows[0]["epic"]),
+                         ("Edit", True, None, None))
+        self.assertIn("ergon set", rows[0]["reason"])
+        self.assertLessEqual(len(rows[0]["reason"]), 200)
+        self.assertEqual(history.catches(rows)["totals"]["guard"], 1)
+
+    def test_guard_still_denies_when_history_unwritable(self):
+        self.ergon("new", "task", "Fix it", "--tier", "haiku")
+        runs = self.root / "tasks" / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        (runs / "history.jsonl").unlink(missing_ok=True)
+        (runs / "history.jsonl").mkdir()  # can't be opened for append
+        f = str(self.task_file("T-001"))
+        why =self.guard("Edit", {"file_path": f, "old_string": "status: proposed", "new_string": "status: ready"})
+        self.assertIn("ergon set", why)
+
     def test_guard_human_cmd_only_real_calls(self):
         """T-044: a human-only verb in a grep pattern or a commit message is data; a real call is
         refused wherever it sits in the command."""
@@ -684,6 +708,9 @@ class TestEpicApproval(Project):
         self.ergon("check")
 
     def test_epics_from_before_approval_count_as_approved(self):
+        # Local mode only (T-124): a stamp can't be verified here, so an open epic with no stamp
+        # counts as approved and `check` doesn't report it; the guard stops an agent opening one.
+        # In shared mode it is refused until a human approves it (test_shared.py).
         home = self.root / "tasks" / "epics" / "E-001-old"
         home.mkdir(parents=True)
         (home / "EPIC.md").write_text("---\nid: E-001\ntitle: Old\nstatus: open\ncreated: 2026-01-01\n---\n\n## Goal\nG\n")
@@ -693,6 +720,14 @@ class TestEpicApproval(Project):
         self.assertNotIn("E-001", r.stdout)
         self.assertIn("  T-001  ", self.ergon("next").stdout)
         self.assertIn("would run  T-001", self.ergon("dispatch", "--dry-run").stdout)
+        # naming the epic approves its proposed tasks: its brief isn't due again
+        self.ergon("new", "task", "Another", "--tier", "haiku", "--epic", "E-001")
+        r = self.ergon("approve", "E-001", env=clean_env(ERGON_ASK_STDIN="1"), inp="y\n")
+        self.assertIn("approved 1", r.stdout)
+        self.assertNotIn("its brief", r.stdout)
+        self.assertIn("status: ready", self.task_file("T-002").read_text())
+        self.assertIn("\nstatus: open\n", (home / "EPIC.md").read_text())
+        self.assertNotIn("approved:", (home / "EPIC.md").read_text())
 
     def test_guard_refuses_agent_edits_of_an_epics_breakdown(self):
         self.ergon("new", "epic", "Big thing")
@@ -1573,8 +1608,9 @@ class TestGateLayers(DispatchProject):
 
 
 class TestWeakening(DispatchProject):
-    """The weakening check (T-101): a branch that changes a gate file or adds a suppression marker
-    goes back to its worker, then blocks, unless the task's touches: (as at launch) names the file."""
+    """The weakening check (T-101): a branch that changes a gate file goes back to its worker, then
+    blocks, unless the task's touches: (as at launch) names the file; one that adds a suppression
+    marker does too, in any file, unless it is a harden task whose touches: names the file (T-118)."""
     config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
                                             '        verify_rounds = 1')
 
@@ -1657,24 +1693,90 @@ class TestWeakening(DispatchProject):
 
     def test_touches_naming_the_file_lands(self):
         self.task("ruff.toml")
-        self.env["FAKE_WEAKEN"] = 'ruff.toml|ignore = ["E501"]  # noqa'
+        self.env["FAKE_WEAKEN"] = 'ruff.toml|ignore = ["E501"]'
         out = self.ergon("dispatch").stdout
         self.assertEqual(self.status("T-001"), "done", out)
         self.assertIn('E501', sh("git", "show", "main:ruff.toml", cwd=self.root).stdout)
         self.assertEqual(self.rows("incident"), [])
         self.assertEqual(len(self.calls()), 1)
 
-    def test_a_marker_in_a_named_file_lands(self):
-        self.task("src/app.py")
-        self.env["FAKE_WEAKEN"] = "src/app.py|import os  # noqa: F401"
+    def test_a_marker_in_a_named_file_is_caught(self):
+        """T-118: naming a file in touches: exempts a gate-file change, not a suppression marker:
+        most of what a task edits is named, so naming alone would let it silence nearly anything."""
+        self.task("a.py")
+        self.env["FAKE_WEAKEN"] = "a.py|import os  # noqa: F401"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertEqual([(r["layer"], r["ok"]) for r in self.rows()], [("weaken", False)] * 2)
+        self.assertIn("a.py adds a suppression marker (suppress `# noqa`): `import os  # noqa: F401` "
+                      "(touches: names it, but that allows a marker only in a harden task)", self.notes())
+        self.assertIn("only a harden task may", self.calls()[1]["prompt"])
+        self.assertNotIn("a.py", sh("git", "ls-tree", "--name-only", "main", cwd=self.root).stdout.split())
+
+    def test_a_marker_in_a_named_gate_file_is_caught(self):
+        self.task("ruff.toml")
+        self.env["FAKE_WEAKEN"] = 'ruff.toml|ignore = ["E501"]  # noqa'
         self.ergon("dispatch")
-        self.assertEqual(self.status("T-001"), "done")
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertIn("ruff.toml adds a suppression marker (suppress `# noqa`)", self.notes())
+        self.assertNotIn("ruff.toml changed", self.notes())  # the gate-file change itself is allowed
 
     def test_touches_naming_the_protect_pattern_lands(self):
         self.task("tests/arch/**")
-        self.env["FAKE_WEAKEN"] = "tests/arch/test_layers.py|@pytest.mark.skip"
+        self.env["FAKE_WEAKEN"] = "tests/arch/test_layers.py|def test_layers(): pass"
         self.ergon("dispatch")
         self.assertEqual(self.status("T-001"), "done")
+
+    def weakening(self, t, path, line):
+        """dispatch.weakening(t) on a branch off main that adds `line` to `path`, run in a process
+        of its own configured on the project."""
+        sh("git", "checkout", "-qB", "weak", "main", cwd=self.root)
+        f = self.root / path
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(line + "\n")
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "weak", cwd=self.root)
+        sh("git", "checkout", "-q", "main", cwd=self.root)
+        code = textwrap.dedent(f"""
+            import json, sys
+            sys.path.insert(0, {str(ERGON.parent)!r})
+            from ergon import config, dispatch
+            config.configure({str(self.root)!r})
+            print(json.dumps(dispatch.weakening(json.loads(sys.argv[1]), "main", "weak")))
+        """)
+        r = subprocess.run([sys.executable, "-c", code, json.dumps(t)], cwd=self.root, env=self.env,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_a_harden_task_may_add_a_marker_in_a_named_file(self):
+        """T-118: a harden task (harden: is human-only and in the brief digest) is exempt for the
+        files its touches: names, and only those."""
+        t = {"id": "T-001", "touches": ["a.py"], "harden": ["T-050-20261101-120000"]}
+        self.assertEqual(self.weakening(t, "a.py", "import os  # noqa: F401"), [])
+        self.assertEqual(self.weakening(dict(t, harden=[]), "a.py", "import os  # noqa: F401"),
+                         ["a.py adds a suppression marker (suppress `# noqa`): `import os  # noqa: F401` "
+                          "(touches: names it, but that allows a marker only in a harden task)"])
+
+    def test_a_kept_reproduction_may_not_be_changed_or_deleted_unnamed(self):
+        """T-161: a file under [gates] repros that exists on the base is vetoed unless touches:
+        names it; a new reproduction of a harden task is unaffected."""
+        rp = "tests/harden/T-050-20261101-120000.patch"
+        f = self.root / rp
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("old\n")
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "kept", cwd=self.root)
+        t = {"id": "T-001", "touches": ["a.py"], "harden": ["T-050-20261101-120000"]}
+        veto = [f"{rp} changed or deleted (a kept reproduction on the base; touches: must name it)"]
+        self.assertEqual(self.weakening(t, rp, "edited"), veto)
+        self.assertEqual(self.weakening(dict(t, touches=[rp]), rp, "edited"), [])
+        self.assertEqual(self.weakening(t, "tests/harden/T-051-20261101-120000.patch", "new"), [])
+
+    def test_a_harden_task_may_not_add_a_marker_in_an_unnamed_file(self):
+        t = {"id": "T-001", "touches": ["a.py"], "harden": ["T-050-20261101-120000"]}
+        self.assertEqual(self.weakening(t, "b.py", "@pytest.mark.skip"),
+                         ["b.py adds a suppression marker (suppress `@pytest\\.mark\\.skip`): `@pytest.mark.skip`"])
 
     def test_a_directory_in_touches_does_not_name_a_gate_file(self):
         self.task("tests")
@@ -1746,6 +1848,63 @@ class TestWeakening(DispatchProject):
         self.ergon("dispatch")
         self.assertEqual(self.status("T-001"), "blocked")
         self.assertIn("acme/public/ruff.toml changed (a gate file: protect `ruff.toml`)", self.notes())
+
+    def check(self, task, files):
+        """weakening() on a branch off main that commits each of `files` ({path: text}), for the
+        task `task` (as at launch), run in a fresh process configured for the project."""
+        sh("git", "checkout", "-qb", "probe", cwd=self.root)
+        try:
+            for path, text in files.items():
+                (self.root / path).parent.mkdir(parents=True, exist_ok=True)
+                (self.root / path).write_text(text)
+            sh("git", "add", "-A", cwd=self.root)
+            sh("git", "commit", "-qm", "probe", cwd=self.root)
+        finally:
+            sh("git", "checkout", "-q", "main", cwd=self.root)
+        script = textwrap.dedent(f"""
+            import json, sys
+            sys.path.insert(0, {str(ERGON.parent)!r})
+            from ergon import config, dispatch
+            config.configure({str(self.root)!r})
+            print(json.dumps(dispatch.weakening(json.loads(sys.argv[1]), "main", "probe")))
+        """)
+        r = subprocess.run([sys.executable, "-c", script, json.dumps(task)], cwd=self.root, env=self.env,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sh("git", "branch", "-qD", "probe", cwd=self.root)
+        return json.loads(r.stdout)
+
+    REPRO = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -0,0 +1 @@\n+x = 1  # noqa\n"
+
+    def test_a_harden_tasks_own_reproduction_passes(self):
+        """T-121: the reproduction a harden task commits for an incident in its harden: is the bad
+        diff, marker and all; it passes without a touches: entry. Nothing else under repros does."""
+        harden = {"id": "T-001", "touches": ["tests/lint.py"], "harden": ["I-1"]}
+        self.assertEqual(self.check(harden, {"tests/harden/I-1.patch": self.REPRO}), [])
+        found = self.check(harden, {"tests/harden/I-1.patch": self.REPRO, "tests/harden/I-9.patch": self.REPRO})
+        self.assertEqual(len(found), 1, found)
+        self.assertTrue(found[0].startswith("tests/harden/I-9.patch adds a suppression marker (suppress `# noqa`)"),
+                        found)
+        # a task with no harden: is checked as today
+        found = self.check({"id": "T-001", "touches": ["tests/lint.py"]}, {"tests/harden/I-1.patch": self.REPRO})
+        self.assertEqual(len(found), 1, found)
+        self.assertTrue(found[0].startswith("tests/harden/I-1.patch adds a suppression marker"), found)
+        # no path tricks through a malformed id
+        found = self.check(dict(harden, harden=["../harden/I-1"]), {"tests/harden/I-1.patch": self.REPRO})
+        self.assertEqual(len(found), 1, found)
+
+    def test_a_reproduction_under_a_protected_repros_passes(self):
+        """With [gates] repros under [gates] protect, the own reproduction is exempt from that check
+        too; a sibling file there is still a gate file."""
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text().replace("[gates]\n", '[gates]\nrepros = "tests/arch/repros"\n'))
+        sh("git", "commit", "-qam", "repros", cwd=self.root)
+        harden = {"id": "T-001", "touches": ["tests/lint.py"], "harden": ["I-1"]}
+        self.assertEqual(self.check(harden, {"tests/arch/repros/I-1.patch": self.REPRO}), [])
+        found = self.check(harden, {"tests/arch/repros/I-1.patch": self.REPRO, "tests/arch/repros/I-9.patch": "x\n"})
+        self.assertEqual(found, ["tests/arch/repros/I-9.patch changed (a gate file: protect `tests/arch/**`)"])
+        found = self.check(dict(harden, harden=[]), {"tests/arch/repros/I-1.patch": "x\n"})
+        self.assertEqual(found, ["tests/arch/repros/I-1.patch changed (a gate file: protect `tests/arch/**`)"])
 
     def test_bad_settings_are_refused(self):
         cfg = self.root / ".ergon.toml"
@@ -2044,6 +2203,74 @@ class TestHarden(DispatchProject):
         self.assertIn(f"no incident {self.IID} in tasks/runs/incidents", self.notes())
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual(self.rows(), [])
+
+    def keep(self, patches):
+        """Commit reproductions on main as earlier harden tasks would have: {incident id: patch text}."""
+        d = self.root / "tests" / "harden"
+        d.mkdir(parents=True, exist_ok=True)
+        for iid, text in patches.items():
+            (d / f"{iid}.patch").write_text(text)
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "kept reproductions", cwd=self.root)
+
+    @staticmethod
+    def adds(name, line):
+        return (f"diff --git a/{name} b/{name}\nnew file mode 100644\n--- /dev/null\n+++ b/{name}\n"
+                f"@@ -0,0 +1 @@\n+{line}\n")
+
+    def test_a_check_change_that_lets_a_kept_reproduction_pass_fails(self):
+        """T-120: the base keeps I-1's reproduction, which the static gate catches; a harden task for
+        another incident rewrites the rules so I-1 passes. Its own proof holds, the kept replay fails it."""
+        self.incident({"app.py": "x = eval(input())\n"})
+        self.keep({"I-1": self.adds("old.py", "w = 'danger'")})
+        self.task()
+        self.assertIn("harden proof of 1 incident(s) on the static gate then 1 kept reproduction(s) in "
+                      "tests/harden/ replayed on it", self.ergon("dispatch", "--dry-run").stdout)
+        self.env["FAKE_WRITE"] = "rules.txt|eval("  # catches the new incident, drops `danger`
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("kept reproductions: 1 missed", out)
+        miss = ("missed kept reproduction I-1 (tests/harden/I-1.patch on the base): the static gate stayed green "
+                "with it applied to the branch")
+        self.assertIn(miss, self.notes())
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn(miss, calls[1]["prompt"])
+        self.assertIn("each kept reproduction it names caught", calls[1]["prompt"])
+        self.assertIn("every other reproduction already in `tests/harden/`", calls[0]["prompt"])
+        rows = self.rows()
+        self.assertEqual([(r["ok"], r["caught"], r["base_ok"], r["kept"]) for r in rows],
+                         [(False, [self.IID], True, {"I-1": "missed"})] * 2)
+        log = (self.root / rows[0]["log"]).read_text()
+        self.assertIn("kept I-1: branch + reproduction (clean): exit 0", log)
+        self.assertIn("kept I-1: base + reproduction: exit 1", log)
+        self.assertIn("base alone, for the kept reproductions: exit 0", log)
+        self.assertIn("danger", sh("git", "show", "main:rules.txt", cwd=self.root).stdout)  # nothing landed
+        self.scratch_gone()
+
+    def test_a_check_change_that_still_catches_kept_reproductions_lands(self):
+        """T-120: the same with a rule added beside the old one: I-1 is still caught and the task
+        lands. A kept reproduction that no longer applies is stale and one the gate never caught on
+        the base is inconclusive: reported, neither fails it. The task's own reproduction isn't replayed twice."""
+        self.incident({"app.py": "x = eval(input())\n"})
+        self.keep({"I-1": self.adds("old.py", "w = 'danger'"),
+                   "I-3": ("diff --git a/gone.py b/gone.py\n--- a/gone.py\n+++ b/gone.py\n@@ -1 +1 @@\n"
+                           "-a = 1\n+a = 'danger'\n"),
+                   "I-4": self.adds("other.py", "v = 'fine'"),
+                   self.IID: self.adds("own.py", "q = eval('1')")})
+        self.task()
+        self.assertIn("then 3 kept reproduction(s)", self.ergon("dispatch", "--dry-run").stdout)
+        self.env["FAKE_WEAKEN"] = "rules.txt|eval("
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("kept reproductions: 1 caught, 1 stale, 1 inconclusive", out)
+        (row,) = self.rows()
+        self.assertEqual((row["ok"], row["caught"], row["kept"]),
+                         (True, [self.IID], {"I-1": "caught", "I-3": "stale", "I-4": "inconclusive"}))
+        self.assertEqual(row["kept_why"]["I-3"], "no longer applies to the branch, a 3-way merge included")
+        self.assertIn("green with it on the base too", row["kept_why"]["I-4"])
+        self.assertEqual(len(self.calls()), 1)
+        self.scratch_gone()
 
     def test_runtime_layer_and_check(self):
         self.incident({"app.py": "x = eval(input())\n"})

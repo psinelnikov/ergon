@@ -1218,7 +1218,7 @@ EPIC_ID = re.compile(r"E-\d{3,}")
 
 
 def epic_briefs(epics):
-    """Epics whose brief awaits a human: proposed, or (shared mode) open with a stamp that doesn't verify."""
+    """Epics whose brief awaits a human: proposed, or (shared mode) open with no signed approval that verifies, stamped or not."""
     apr = _gitops.approvals()  # None outside shared mode; never raises
     return sorted((e for e in epics.values()
                    if e.get("status") not in ("dropped", "done") and _tasks.epic_problem(e, apr)

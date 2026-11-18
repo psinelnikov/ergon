@@ -265,11 +265,12 @@ def approved_touches_field(t):
 
 
 def brief_due(e, apr):
-    """Does approving epic e mean approving its brief? It's proposed, or (shared mode) open with
-    an approved: stamp that doesn't verify. An open epic with no stamp is grandfathered."""
+    """Does approving epic e mean approving its brief? It's proposed, or (shared mode) open
+    without a signed approval of its brief that verifies: a stamp that doesn't verify, or no stamp
+    at all (an old epic, or one a clone pushed). In local mode an open epic is approved already."""
     if e.get("status") == "proposed":
         return True
-    return bool(apr and e.get("status") == "open" and e.get("approved") and apr.problem(e))
+    return bool(apr and e.get("status") == "open" and apr.problem(e))
 
 
 def approve(args):
@@ -281,8 +282,8 @@ def approve(args):
         sync_for_count(args.ids)
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     apr = _gitops.approvals()
-    # An epic ID whose brief needs a human's approval (proposed, or in shared mode open with a
-    # stamp that doesn't verify) approves the brief alone: its tasks are approved by naming the
+    # An epic ID whose brief needs a human's approval (proposed, or in shared mode open without
+    # an approval that verifies) approves the brief alone: its tasks are approved by naming the
     # epic again once it's open, so each approval is of something the human has read.
     briefs = [epics[i] for i in dict.fromkeys(args.ids) if i in epics and brief_due(epics[i], apr)]
     named = targets([i for i in args.ids if i not in {e["id"] for e in briefs}], tasks, epics)
@@ -1582,8 +1583,8 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
         if fb.get(key, "") != fa.get(key, ""):
             return (f"`{key}:` decides what a harden task must prove (and a harden task skips the red-on-base "
                     "proof), so a human writes, changes or removes it by editing the task file")
-    # A new task or epic file starts proposed: an open epic with no stamp would count as approved
-    # (grandfathered), so an agent's new EPIC.md can't be open.
+    # A new task or epic file starts proposed: in local mode an open epic with no stamp counts as
+    # approved (nothing verifies one), so an agent's new EPIC.md can't be open.
     if fb.get("status", "") != fa.get("status", "") and not (not before and fa.get("status") == "proposed"):
         if fb.get("status") == "review":
             return "a task in review leaves it only by a human's `ergon accept` or `ergon reject`, run in their own terminal"
@@ -1624,6 +1625,22 @@ def deny(why):
         "permissionDecisionReason": f"ergon guard: {why}"}}))
 
 
+def record_refusal(event, why, worker):
+    """Append a `guard` history row for a refused tool call. Never raises: a failed write only warns."""
+    try:
+        item = None
+        try:
+            br = _gitops.git("branch", "--show-current", cwd=event.get("cwd") or None)
+        except Exception:  # noqa: BLE001 - not a git folder: no task
+            br = ""
+        if br.startswith(_config.TASK_BRANCH):
+            tid = br[len(_config.TASK_BRANCH):]
+            item = _tasks.load(_config.ITEMS).get(tid) or {"id": tid}
+        _history.record("guard", item, tool=event.get("tool_name"), reason=str(why)[:200], worker=bool(worker))
+    except Exception as err:  # noqa: BLE001 - history never turns a deny into an error
+        print(f"ergon: couldn't record guard refusal: {err}", file=sys.stderr)
+
+
 def hook(args):
     if args.event == "commit-msg":
         return commit_msg_hook(args)
@@ -1641,6 +1658,7 @@ def hook(args):
             why = guard_reason(event.get("tool_name"), event.get("tool_input") or {}, args.worker,
                                event.get("cwd"), read_only)
             if why:
+                record_refusal(event, why, args.worker)
                 deny(why)
         elif args.event == "stop" and not event.get("stop_hook_active"):
             errs, summary = _tasks.lint()
@@ -1695,9 +1713,10 @@ def commit_msg_reason(msg, tasks, epics=None):
     out of `proposed` and carry a human's `approved:` stamp: a proposed task (stamped or not), one
     rejected to dropped, one hand-edited to ready, or an ID nobody filed are all refused. So is an
     approved task whose epic's brief isn't approved (`_tasks.epic_problem`: proposed, dropped, or
-    in shared mode a stamp that doesn't verify); a task with no epic, or an old open epic without a
-    stamp, passes. An epic ID cited on its own isn't checked. In shared mode the stamp is only a display copy, so the
-    signed approval must verify too (`Approvals.problem`); approvals load once, if a task is cited."""
+    in shared mode open without a signed approval that verifies, stamped or not); a task with no
+    epic passes, and so does one of an open epic without a stamp in local mode. An epic ID cited
+    on its own isn't checked. In shared mode the stamp is only a display copy, so the signed
+    approval must verify too (`Approvals.problem`); approvals load once, if a task is cited."""
     bad = []
     apr = None
     for tid in cited_tasks(msg):

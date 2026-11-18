@@ -69,9 +69,9 @@ that passes without your change proves nothing and goes back to you.
 """
 
 WORKER_WEAKEN = """
-Before any gate, dispatch vetoes a branch that changes a gate file ({files}){markers},
-unless this task's approved touches: names that file. Fix the code, not the gate; if a rule is
-wrong, say so on a FOUND line. Don't edit this task's touches: or tier: (that's a re-plan).
+Before any gate, dispatch vetoes a branch that changes a gate file ({files})
+unless this task's approved touches: names that file{markers}. Fix the code, not the gate; if a
+rule is wrong, say so on a FOUND line. Don't edit this task's touches: or tier: (that's a re-plan).
 """
 
 WORKER_POLICIES = """
@@ -615,7 +615,9 @@ def gates_text(t):
     cmds = gate_cmds(t)
     sup = [f"`{rx.pattern}`" for rx in _config.SUPPRESS]
     weak = WORKER_WEAKEN.format(files=", ".join(f"`{p}`" for p in _config.GATE_FILES),
-                                markers=f" or adds a line matching a suppression marker ({', '.join(sup)}) to any file" if sup else "")
+                                markers=(f", and one that adds a line matching a suppression marker ({', '.join(sup)}) to any "
+                                         f"file, named or not, unless this is a harden task whose approved "
+                                         f"touches: names it") if sup else "")
     return (weak + (WORKER_GATES.format(cmds="\n".join(f"- {layer}: `{cmd}`" for layer, cmd in cmds)) if cmds else "")
             + (WORKER_PROVE.format(patterns=", ".join(f"`{p}`" for p in _config.TESTS)) if not prove_skip(t) else "")
             + harden_text(t))
@@ -973,8 +975,12 @@ def gate_cmds(t):
 # The cheapest way past a gate is to edit the gate: turn a lint rule off, add a `# noqa`, skip a
 # test. So before static, a deterministic check reads the branch's diff against its base (and each
 # companion's against its trunk): a changed gate file ([gates] protect, and .ergon.toml always) or
-# an added line matching a [gates] suppress regex, in any file, is a veto unless the task's
-# touches: names that file. That is what a harden task is: approved, naming the file. It reads the
+# an added line matching a [gates] suppress regex, in any file, is a veto. Naming a gate file in
+# touches: exempts its change: that is what a harden task is, approved, naming the file. Naming a
+# file exempts a marker added to it only in a harden task (`harden:` set, T-118): most of what an
+# ordinary task edits is in its touches:, so if naming were enough it could silence a check in
+# nearly any file it changes. `harden:` is human-only like touches: (`set` and the guard refuse
+# it, and it is in the brief digest), so a worker can't opt itself in. It reads the
 # task as it was at launch (like accept), so a worker that adds the file to its own touches: since
 # gets nowhere in that run. Nor in the next (T-117): only an entry a human approved counts. Each
 # `approved` history row records the touches: it approved, and a launch records them too when no
@@ -983,6 +989,10 @@ def gate_cmds(t):
 # The guard refuses the edit in the first place; this holds when the guard was bypassed, and in
 # local mode, where no brief digest notices. This check is on what lands; guarding gate files at
 # the tool call is the guard hook's side (T-069).
+# One exemption (T-121): a harden task's own reproduction, repro_path(<id>) for each id in its
+# harden: (as at launch), in the main repo. It is the incident's bad diff, so it may well hold the
+# marker the incident was about, and no one can name it in touches: before the proof asks for it.
+# Exactly those files: anything else under [gates] repros, or a task with no harden:, is checked.
 
 def gate_file_hit(path, c=None):
     """The [gates] protect pattern a changed file falls under, or None. `path` is relative to its
@@ -1049,11 +1059,30 @@ def added_lines(rng, path, repo=None):
     return lines
 
 
+def own_repros(t):
+    """The reproductions t's harden: lets past the gate-file and marker checks: repro_path(id) for
+    each well-formed incident id it names (main repo paths); empty for a task with no harden:."""
+    return {repro_path(i) for i in harden_ids(t) if HARDEN_ID.fullmatch(i)}
+
+
+def _on_base(ref, path):
+    """Is `path` a file at `ref`? (a kept reproduction a branch changes or deletes, T-161)"""
+    try:
+        _gitops.git("cat-file", "-e", f"{ref}:{path}")
+        return True
+    except _gitops.GitError:
+        return False
+
+
 def weakening(t, base, branch, pubs=()):
     """The weakening check on t's branch: [] if it passes, else one finding per file, each naming
     the file as touches: would. `t` is the task as it was at launch; only its touches: entries a
-    human approved (unapproved_touches) exempt a file."""
-    found, late = [], {touch_key(x) for x in unapproved_touches(t)}
+    human approved (unapproved_touches) exempt a file: from the gate-file check in any task, and
+    from the suppression-marker check only in a harden task (T-118). A harden task's own
+    reproductions (own_repros) pass both of those unnamed, but not the kept-reproduction check
+    (T-161) if the base already has one."""
+    found, late, repros = [], {touch_key(x) for x in unapproved_touches(t)}, own_repros(t)
+    harden = bool(harden_ids(t))
     ok = dict(t, touches=[x for x in t.get("touches") or [] if touch_key(x) not in late])
     since = (f" (touches: names it only since its approval, so it doesn't count: a human approves the new "
              f"touches: with `ergon approve {t.get('id')}`)")
@@ -1062,15 +1091,21 @@ def weakening(t, base, branch, pubs=()):
         files = _gitops.git("diff", "--name-only", "-z", "--no-renames", rng, raw=True, cwd=repo)
         for path in (p for p in files.split("\0") if p):
             shown = path if c is None else f"{c['name']}/{path}"
+            own = c is None and path in repros
             pattern = gate_file_hit(path, c)
-            if names_file(ok, path, c, pattern):
+            named = names_file(ok, path, c, pattern)
+            note = since if late and not named and names_file(t, path, c, pattern) else ""
+            if pattern and not named and not own:
+                found.append(f"{shown} changed (a gate file: protect `{pattern}`){note}")
                 continue
-            named = since if late and names_file(t, path, c, pattern) else ""
-            if pattern:
-                found.append(f"{shown} changed (a gate file: protect `{pattern}`){named}")
+            if c is None and not named and path.startswith(f"{_config.REPROS}/") and _on_base(trunk, path):
+                found.append(f"{shown} changed or deleted (a kept reproduction on the base; touches: must name it){note}")
                 continue
-            if not _config.SUPPRESS:
+            if own or not _config.SUPPRESS or (harden and named):
                 continue
+            if not harden:
+                note = (" (touches: names it, but that allows a marker only in a harden task)"
+                        if named else "")
             hits = []
             for line in added_lines(rng, path, repo):
                 rx = next((r for r in _config.SUPPRESS if r.search(line)), None)
@@ -1080,7 +1115,7 @@ def weakening(t, base, branch, pubs=()):
                 rx, line = hits[0]
                 more = f" (and {len(hits) - 1} more line(s))" if len(hits) > 1 else ""
                 found.append(f"{shown} adds a suppression marker (suppress `{rx.pattern}`): "
-                             f"`{line.strip()[:120]}`{more}{named}")
+                             f"`{line.strip()[:120]}`{more}{note}")
     return found
 
 
@@ -1097,8 +1132,8 @@ def run_weakening(t, base, branch, pubs, rnd=None, tier=None):
     _history.record("verify", t, ok=False, cmd="weakening check", layer="weaken",
                     seconds=round(time.monotonic() - start, 1), log=None, findings=found, **_round(rnd))
     more = f"; and {len(found) - WEAKEN_MAX} more" if len(found) > WEAKEN_MAX else ""
-    failed = (f"verify (weakening check) vetoed the branch: it weakens a gate its task's touches: doesn't "
-              f"name: {'; '.join(found[:WEAKEN_MAX])}{more}")
+    failed = (f"verify (weakening check) vetoed the branch: it weakens a gate its task doesn't allow it to: "
+              f"{'; '.join(found[:WEAKEN_MAX])}{more}")
     save_incident(t, "weaken", failed, base, branch, pubs, tier=tier)
     return failed
 
@@ -1184,6 +1219,13 @@ def run_verify(t, wt, rnd=None):
 # fix round to commit a minimal reproduction, <[gates] repros>/<incident id>.patch, a `git diff`
 # against the branch that the check must flag. The proof replays it in the patch's place, and it
 # lands with the task as the check's test. Only the main repo's patch is replayed, not a companion's.
+# A harden task may change gate files, so one that adds check X can quietly weaken check Y (T-120).
+# So once its own proof holds, every other reproduction kept on the merge-base (<[gates] repros>/
+# *.patch, the tests earlier harden tasks landed) is replayed on the branch with the same gate. Red
+# is caught. Green is a miss, and fails the proof as `harden` naming it, if the gate is red with it
+# on the base (and green on the base alone): the branch stopped catching it. A reproduction that
+# no longer applies is stale, and one the gate never caught on the base (another layer's) is
+# inconclusive: both are reported in the `harden` row, neither fails the proof.
 
 HARDEN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # an incident's file stem, no path in it
 HARDEN_LAYERS = ("static", "runtime")
@@ -1216,6 +1258,19 @@ def repro_path(iid):
     return f"{_config.REPROS}/{iid}.patch"
 
 
+def kept_repros(ref, skip=()):
+    """The incident ids of the reproductions kept at `ref` (<[gates] repros>/<id>.patch, not in a
+    subdirectory), sorted, but those in `skip`."""
+    out = _gitops.git("ls-tree", "-z", ref, "--", f":(literal){_config.REPROS}/", raw=True)
+    ids = []
+    for ent in out.split("\0"):
+        info, _, path = ent.partition("\t")
+        name = path.rsplit("/", 1)[-1]
+        if info.split(" ")[1:2] == ["blob"] and name.endswith(".patch") and HARDEN_ID.fullmatch(name[:-6]):
+            ids.append(name[:-6])
+    return sorted(i for i in set(ids) if i not in set(skip))
+
+
 WORKER_HARDEN = """
 This is a harden task. Turn each incident below into a deterministic check in this project (a lint
 rule, an import boundary, a type, an arch test), never a sentence in a doc or a prompt. Put the
@@ -1228,7 +1283,8 @@ incident, not code already there: don't rewrite existing code to satisfy it here
 If an incident's patch no longer applies, the proof says so. Then commit a minimal reproduction at
 `{repros}/<incident id>.patch`: a `git diff` against this branch that adds code your check must
 flag, and that applies to the base too. The proof replays it in the patch's place, and it lands
-with this task as the check's test.
+with this task as the check's test. Then every other reproduction already in `{repros}/` is
+replayed on this branch with the same gate: each must still go red, so don't weaken an older check.
 """
 
 
@@ -1322,6 +1378,33 @@ def replay(tree, cmd, log, iid, patch, tip, mb):
     return "caught", how, None
 
 
+def replay_kept(tree, cmd, log, iid, patch, tip, mb, base_green):
+    """Replay a kept reproduction (one an earlier harden task landed): (outcome, why). outcome is
+    "caught" (red on the branch), "missed" (green on the branch, red on the base, green on the
+    base alone), "stale" (can't be replayed) or "inconclusive" (the base can't tell: green with it
+    too, or red alone). `base_green()` runs the gate on the base alone, once."""
+    reset_tree(tree, tip)
+    how = apply_patch(tree, patch)
+    if not how:
+        return "stale", "no longer applies to the branch, a 3-way merge included"
+    code = proof_run(tree, cmd, log, f"kept {iid}: branch + reproduction ({how})")
+    if code is None:
+        return "stale", "the gate timed out on the branch with it applied"
+    if code != 0:
+        return "caught", None
+    reset_tree(tree, mb)
+    if not apply_patch(tree, patch):
+        return "stale", "applies to the branch but not to its base"
+    code = proof_run(tree, cmd, log, f"kept {iid}: base + reproduction")
+    if code is None:
+        return "stale", "the gate timed out on the base with it applied"
+    if code == 0:
+        return "inconclusive", "the gate is green with it on the base too, so it never caught it (another layer's?)"
+    if not base_green():
+        return "inconclusive", "the gate is red on the base without it, so red there proves nothing"
+    return "missed", None
+
+
 def gate_file_changes(mb, tip):
     names = _gitops.git("diff", "--name-only", "-z", "--no-renames", mb, tip, raw=True)
     return [p for p in names.split("\0") if p and gate_file_hit(p)]
@@ -1404,12 +1487,37 @@ def run_harden(t, base, branch, rnd=None):
             problems.append(f"the gate isn't green on the base with only the branch's gate-file changes "
                             f"({', '.join(files) or 'none'}) and no patch: the check flags code already there "
                             f"(or the base is red); make it flag the incidents only")
+        kept, kept_why, alone = {}, {}, []
+        if not problems:  # its own proof holds: now the reproductions earlier harden tasks kept
+
+            def base_green():
+                if not alone:
+                    reset_tree(tree, mb)
+                    alone.append(proof_run(tree, cmd, log, "base alone, for the kept reproductions") == 0)
+                return alone[0]
+
+            for iid in kept_repros(mb, skip=ids):
+                rp = log.with_name(f"{log.stem}-kept-{iid}.patch")
+                rp.write_text(_gitops.git("show", f"{mb}:{repro_path(iid)}", raw=True))
+                try:
+                    kept[iid], why = replay_kept(tree, cmd, log, iid, rp, tip, mb, base_green)
+                finally:
+                    rp.unlink(missing_ok=True)  # the base holds it: no copy per proof left in runs/
+                if why:
+                    kept_why[iid] = why
+                if kept[iid] == "missed":
+                    problems.append(f"missed kept reproduction {iid} ({repro_path(iid)} on the base): the {layer} "
+                                    f"gate stayed green with it applied to the branch but goes red with it on the "
+                                    f"base, so this branch stopped catching it; keep the older check flagging it")
     ok = not problems
     _history.record("harden", t, ok=ok, layer=layer, cmd=cmd, incidents=ids, caught=caught, missed=missed,
-                    stale=stale, base_ok=base_ok, via=via, seconds=round(time.monotonic() - start, 1),
-                    log=log, **_round(rnd))
+                    stale=stale, base_ok=base_ok, via=via, kept=kept, kept_why=kept_why,
+                    seconds=round(time.monotonic() - start, 1), log=log, **_round(rnd))
+    tally = {o: sum(1 for v in kept.values() if v == o) for o in ("caught", "missed", "stale", "inconclusive")}
     print(f"  harden   {t['id']}  {layer}: caught {len(caught)} of {len(ids)}"
-          + ("" if base_ok else ", red on the base") + (f" (round {rnd})" if rnd and rnd > 1 else ""), flush=True)
+          + ("" if base_ok else ", red on the base")
+          + ("; kept reproductions: " + ", ".join(f"{n} {o}" for o, n in tally.items() if n) if kept else "")
+          + (f" (round {rnd})" if rnd and rnd > 1 else ""), flush=True)
     if ok:
         return None
     return (f"harden proof ({layer} gate `{cmd}`) failed: {'; '.join(problems)} "
@@ -1775,12 +1883,13 @@ line for each piece of work you find but don't do, then `RESULT: done` or
 
 WEAKEN_FIX_PROMPT = """The weakening check vetoed your work on {id} (fix round {n} of {rounds}): {failed}
 
-Your branch changes a gate file, or adds a suppression marker, in a file this task's touches:
-doesn't name. Revert the change to each file named above on {branch} in {wt}, fix the code
-instead, and commit there citing {id}. If the rule itself is wrong, revert it anyway and end with
-a `FOUND: <title> — <why>` line naming the rule and why: a human approves a task whose touches:
-names the file. Editing your task's touches: changes nothing: the check reads the task as it
-was at launch, and only entries a human approved count on a later launch. The done checks and the gates run again when you finish. End as before: a
+Your branch changes a gate file this task's touches: doesn't name, or adds a suppression marker
+(which only a harden task may, in a file its touches: names). Revert the change to each file named
+above on {branch} in {wt}, fix the code instead, and commit there citing {id}. If the rule itself
+is wrong, revert it anyway and end with a `FOUND: <title> — <why>` line naming the rule and why: a
+human approves a task whose touches: names the file (a harden task, for a marker). Editing your
+task's touches: changes nothing: the check reads the task as it was at launch, and only entries a
+human approved count on a later launch. The done checks and the gates run again when you finish. End as before: a
 `FOUND: <title> — <why>` line for each piece of work you find but don't do, then `RESULT: done`
 or `RESULT: blocked — <why>`.
 """
@@ -1790,8 +1899,9 @@ HARDEN_FIX_PROMPT = """The harden proof failed on your work on {id} (fix round {
 
 The full output of each replay is in {log}.
 Fix it on {branch} in {wt}, and commit there citing {id}: make the check flag what it missed,
-commit a minimal reproduction where an incident's patch can't be replayed, and narrow a check that
-flags code already on the base (don't rewrite that code here; say so on a FOUND line). The check
+commit a minimal reproduction where an incident's patch can't be replayed, narrow a check that
+flags code already on the base (don't rewrite that code here; say so on a FOUND line), and keep
+each kept reproduction it names caught (the base's copy is what's replayed). The check
 stays a check, never a sentence in a doc or a prompt. The done checks, the gates and the proof run
 again when you finish. End as before: a `FOUND: <title> — <why>` line for each piece of work you
 find but don't do, then `RESULT: done` or `RESULT: blocked — <why>`.
@@ -1845,8 +1955,8 @@ def harden_lines(failed):
     _tail, log = verify_detail(failed)
     return (f"The harden proof failed on the last attempt: {failed}\nThe full output of each replay is in {log}.\n"
             "Fix it on this branch: make the check flag what it missed, commit a minimal reproduction where an "
-            "incident's patch can't be replayed, and narrow a check that flags code already on the base. The "
-            "proof runs again before this lands.\n")
+            "incident's patch can't be replayed, narrow a check that flags code already on the base, and keep "
+            "each kept reproduction it names caught. The proof runs again before this lands.\n")
 
 
 def weaken_lines(failed):
@@ -2625,7 +2735,7 @@ def dispatch(args):
                 skipped[t["id"]] = (f"touches {missing[0]['name']} but there's no checkout at "
                                     f"{missing[0]['path']}: clone the repo there")
                 continue
-            # its epic's brief must be approved: proposed, or (shared mode) a stamp that doesn't verify
+            # its epic's brief must be approved: proposed, or (shared mode) open with no signed approval that verifies, stamped or not
             why = _tasks.epic_problem(_tasks.epic_of(t, epics), apr)
             if why:
                 skipped[t["id"]] = why
@@ -3088,6 +3198,14 @@ def dispatch(args):
     def also(t):
         return "".join(f" + {c['name']} {c['trunk']}" for c in _config.COMPANIONS if companion_touch(t, c))
 
+    def n_kept(t, e):
+        """How many kept reproductions t's harden proof would replay besides its own, as of now."""
+        ref = _gitops.epic_branch(e) if e and _gitops.branch_exists(_gitops.epic_branch(e)) else _config.MAIN
+        try:
+            return len(kept_repros(ref, skip=harden_ids(t)))
+        except _gitops.GitError:
+            return 0
+
     if args.dry_run:
         tasks = _tasks.load(_config.ITEMS)
         plan = list(eligible(tasks))
@@ -3106,6 +3224,7 @@ def dispatch(args):
                      if _config.VERIFY_ROUNDS else "")
                   + "".join(f", {layer} gate `{cmd}`" for layer, cmd in gate_cmds(t))
                   + (f", harden proof of {len(harden_ids(t))} incident(s) on the {harden_layer(t)} gate"
+                     f" then {n_kept(t, e)} kept reproduction(s) in {_config.REPROS}/ replayed on it"
                      if harden_ids(t) else "")
                   + (f", red-on-base proof if it changes {', '.join(_config.TESTS)}" if not prove_skip(t) else "")
                   + (f", {crounds} if its branch conflicts" if cr else "")
