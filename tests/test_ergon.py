@@ -2845,6 +2845,47 @@ class TestUntilDone(DispatchProject):
                       self.notes())
         self.assertEqual(len(self.rows("worker_end")), 1)
 
+    def red_once(self):
+        cfg = self.root / ".ergon.toml"
+        flag = Path(self.tmp.name) / "red-once"
+        cfg.write_text(f'verify = "test -e {flag} || {{ touch {flag}; exit 1; }}"\n' + cfg.read_text())
+
+    def test_fix_round_that_stops_short_runs_again(self):
+        self.red_once()
+        out = self.run_it("ok|noresult|ok", 1)
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual([(r.get("after"), r["round"]) for r in self.rows("resumed")], [(None, 2), ("until_done", 3)])
+        self.assertEqual([r.get("round") for r in self.rows("worker_end")], [None, 2, 3])
+        self.assertEqual(self.rows("worker_end")[2]["after"], "until_done")
+        calls = [json.loads(l) for l in self.seen.read_text().splitlines()]
+        self.assertIn("ended without a RESULT line", calls[2]["prompt"])
+        self.assertIn("finished after 1 stop(s)", self.notes())
+
+    def test_fix_round_out_of_until_done_rounds_blocks_with_every_reason(self):
+        self.red_once()
+        out = self.run_it("ok|nojson|error|noresult", 2)
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        notes = self.notes()
+        self.assertIn("worker ended without a RESULT line (stop 3, after 2 until-done round(s)); "
+                      "no until-done rounds left (--until-done 2)", notes)
+        self.assertIn("stop 1: worker output wasn't JSON", notes)
+        self.assertIn("stop 2: worker errored", notes)
+        self.assertEqual(len(self.rows("worker_end")), 4)
+
+    def test_fix_round_stop_is_final_with_zero(self):
+        self.red_once()
+        out = self.run_it("ok|noresult|ok", 0)
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("worker ended without a RESULT line", self.notes())
+        self.assertEqual(len(self.rows("worker_end")), 2)
+
+    def test_budget_cap_stops_a_fix_round_retry(self):
+        self.red_once()
+        out = self.run_it("ok|noresult|ok", 2, "--budget", "1", "--budget-total", "0.025")
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("no until-done round", self.notes())
+        self.assertEqual(len(self.rows("worker_end")), 2)
+
     def test_dry_run_counts_the_extra_calls(self):
         out = self.ergon("dispatch", "--dry-run", "--until-done", "2", "--budget", "1", "--budget-total", "100").stdout
         self.assertIn("up to 2 until-done rounds", out)
@@ -2945,6 +2986,24 @@ class TestConflictRounds(DispatchProject):
         self.assertEqual([r.get("round") for r in self.rows("worker_end")], [None, 2])
         self.assertRegex(self.rows("worker_end")[1]["log"], r"-fix2\.json$")
         self.assertFalse(self.wt.exists())
+
+    def test_conflict_round_that_stops_short_runs_again_with_until_done(self):
+        self.tasks()
+        self.env.update(FAKE_STOPS="ok|ok|noresult|ok", FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"))
+        out = self.ergon("dispatch", "--jobs", "2", "--until-done", "1").stdout
+        self.assertEqual(self.status("T-002"), "done", out)
+        self.assertEqual((self.root / "shared.txt").read_text(), "T-002\nT-001\n")
+        self.assertEqual([(r.get("after"), r["round"]) for r in self.rows("resumed")],
+                         [("conflict", 2), ("until_done", 3)])
+        self.assertEqual(self.rows("worker_end")[2]["after"], "until_done")
+        self.assertIn("conflicts with its base", self.calls()[2]["prompt"])
+
+    def test_conflict_round_stop_blocks_without_until_done(self):
+        self.tasks()
+        self.env.update(FAKE_STOPS="ok|ok|noresult|ok", FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"))
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        self.assertEqual(self.status("T-002"), "blocked", out)
+        self.assertIn("worker ended without a RESULT line", self.notes())
 
     def test_fresh_worker_when_the_session_cannot_resume(self):
         self.tasks()

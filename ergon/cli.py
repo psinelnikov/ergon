@@ -66,7 +66,8 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                --until-done N (default 0): a worker that stops short (timeout,
                                error, output that isn't JSON, no RESULT line) runs again on the
                                same branch, up to N more rounds (session resumed, or a fresh
-                               worker); the done checks, verify and review then run as usual.
+                               worker); the done checks, verify and review then run as usual. A fix-round or
+                               conflict-round worker that stops short is retried the same way.
                                Not retried: RESULT: blocked or asking, a second Ctrl-C, the cap.
                                An approved open epic with no tasks is broken down first, once
                                (as `breakdown` below; not with --ids or --tier). With [shared],
@@ -478,7 +479,7 @@ def main():
     d.add_argument("--until-done", type=int, default=0, metavar="N",
                    help="when a worker stops short (timeout, error, output that isn't JSON, no RESULT line), "
                         "run up to N more rounds on the same branch, resuming its session or starting a fresh "
-                        "worker (default 0: it blocks)")
+                        "worker, also for a fix-round or conflict-round worker (default 0: it blocks)")
     d.add_argument("--dry-run", action="store_true")
     bd = sub.add_parser("breakdown", help="break an approved epic down into proposed tasks (runs claude -p, read-only)")
     bd.add_argument("id", help="the epic, E-NNN")
