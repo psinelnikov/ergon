@@ -284,6 +284,13 @@ def brief_due(e, apr):
     return bool(apr and e.get("status") == "open" and apr.problem(e))
 
 
+def print_brief(e):
+    """Print what approving epic e approves: its Goal, Out of scope and Constraints sections."""
+    for name in _tasks.EPIC_DIGEST_SECTIONS:
+        text = _tasks.normalised(_tasks.sections(e.get("_body") or "", name))
+        print(f"      {name.capitalize()}: " + ("\n        ".join(text.split("\n")) if text else "(empty)"))
+
+
 def approve(args):
     approve_ready()
     # With [[two_person]] rules, sync before and after: whether a task matches a rule, and whose
@@ -338,9 +345,7 @@ def approve(args):
         if _tasks.is_epic(t):
             print(f"  {t['id']}  epic    {t['title']}  (its brief: Goal, Out of scope, Constraints)"
                   + (f"  (approve again: {again[t['id']]})" if t["id"] in again else ""))
-            for name in _tasks.EPIC_DIGEST_SECTIONS:
-                text = _tasks.normalised(_tasks.sections(t.get("_body") or "", name))
-                print(f"      {name.capitalize()}: " + ("\n        ".join(text.split("\n")) if text else "(empty)"))
+            print_brief(t)
             continue
         print(_tasks.line(t, tasks) + (f"  (approve again: {again[t['id']]})" if t["id"] in again else "")
               + (f"  (two-person: {apr.tally(t)})" if _tasks.two_person(t) else ""))
@@ -419,13 +424,55 @@ def write_policy(t):
     return True
 
 
+def review_brief(e, at, tasks, apr, tally):
+    """One epic brief in the interactive review, while its approval is due (`brief_due`): show
+    its Goal, Out of scope and Constraints and offer to approve it, which approves the brief
+    alone as `ergon approve E-NNN` does (signed in shared mode; its tasks stay proposed), edit
+    it, or skip it. Returns False on quit."""
+    while brief_due(e, apr):
+        why = apr.problem(e) if e["status"] == "open" else ""
+        print(f"\n{'=' * 78}\n{at}  {e['id']}  {e['title']}  (epic brief, {e['status']})"
+              + (f"\n(approve again: {why})" if why else "") + "\n")
+        print_brief(e)
+        kids = sum(t.get("epic") == e["id"] and t["status"] == "proposed" for t in tasks.values())
+        if kids:
+            print(f"\n(approving it approves the brief only: its {kids} proposed task(s) stay proposed)")
+        choice = ask(f"\n{e['id']} [epic]  [a]pprove  [e]dit  [s]kip  [q]uit > ").lower()
+        if choice == "a":
+            try:  # shared mode: refuses, approving nothing, unless the approval would verify
+                approve_ready()
+                stamp_approved([e])
+            except SystemExit as err:
+                print(err)
+                continue
+            tally["approved"] += 1
+            if _config.SHARED and _config.TWO_PERSON:  # publish it, as `approve` does
+                sync_for_count([e["id"]], after=True)
+            return True
+        if choice == "e":
+            subprocess.run([os.environ.get("EDITOR", "vi"), str(e["_path"])])
+            with _gitops.state_lock():  # shared mode: commits the edit
+                e = _tasks.parse(e["_path"])
+            if not brief_due(e, apr):
+                print(f"{e['id']} is now {e['status']}; moving on")
+        elif choice == "s":
+            tally["skipped"] += 1
+            return True
+        elif choice == "q":
+            return False
+    return True
+
+
 def review_interactive(args):
-    """HUMAN ONLY: walk the proposed queue one task at a time, then tasks waiting on an answer to
-    their worker's question (offering `a`: answer it, as `ergon answer` does), then tasks whose
-    review vetoed them (offering `p`: save the finding as a policy). Every answer lands immediately."""
+    """HUMAN ONLY: walk the proposed queue one item at a time (an epic whose brief is due, by
+    `brief_due`, comes before its tasks, offering `a`: approve the brief alone, as approving the
+    epic's ID does), then tasks waiting on an answer to their worker's question (offering `a`:
+    answer it, as `ergon answer` does), then tasks whose review vetoed them (offering `p`: save
+    the finding as a policy). Every answer lands immediately."""
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     held = _shared.unpublished([t["id"] for t in tasks.values() if t["status"] == "proposed"]
-                               + [t["epic"] for t in tasks.values() if t["status"] == "proposed" and t.get("epic")])
+                               + [t["epic"] for t in tasks.values() if t["status"] == "proposed" and t.get("epic")]
+                               + [e["id"] for e in epics.values() if e.get("status") in ("proposed", "open")])
     if held:  # sync first, then look at the queue again (IDs may have changed)
         print(f"{', '.join(held)} not published yet: syncing first")
         try:
@@ -439,18 +486,27 @@ def review_interactive(args):
     else:
         held = set()
         if _config.SHARED and _config.TWO_PERSON:  # see the latest briefs and approvals, as approve does
-            sync_for_count([t["id"] for t in tasks.values() if t["status"] == "proposed"])
+            sync_for_count([t["id"] for t in tasks.values() if t["status"] == "proposed"]
+                           + [e["id"] for e in epics.values() if e.get("status") == "proposed"])
             tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
-    apr = _gitops.approvals() if any(_tasks.two_person(t) for t in tasks.values()) else None
+    apr = _gitops.approvals()  # None in local mode; in shared mode, which approvals verify
     pick = lambda t: (t["id"] not in held and (not args.epic or t.get("epic") == args.epic) and (not args.tier or t["tier"] == args.tier))
-    order = lambda t: (t.get("epic") or "~", t["id"])
-    queue = sorted((t for t in tasks.values() if t["status"] == "proposed" and pick(t)), key=order)
+    # an epic's brief has no tier, and comes before its own tasks: approving it is what opens them
+    order = lambda t: (t["id"], "") if _tasks.is_epic(t) else (t.get("epic") or "~", t["id"])
+    briefs = [e for e in epics.values() if brief_due(e, apr) and e["id"] not in held
+              and (not args.epic or e["id"] == args.epic) and not args.tier]
+    queue = sorted(briefs + [t for t in tasks.values() if t["status"] == "proposed" and pick(t)], key=order)
     queue += sorted((t for t in tasks.values() if _tasks.is_asking(t) and pick(t)), key=order)
     queue += sorted((t for t in tasks.values() if vetoed(t) and not _tasks.is_asking(t) and pick(t)), key=order)
     if not queue:
         raise SystemExit("nothing awaiting approval or an answer")
     tally = {"approved": 0, "dropped": 0, "answered": 0, "skipped": 0, "policies": 0}
     for i, t in enumerate(queue, 1):
+        if _tasks.is_epic(t):
+            if not review_brief(t, f"[{i}/{len(queue)}]", tasks, apr, tally):
+                print("  ".join(f"{k} {v}" for k, v in tally.items()))
+                return
+            continue
         if _tasks.is_asking(t):
             epic = epics.get(t.get("epic"))
             print(f"\n{'=' * 78}\n[{i}/{len(queue)}]  {t['id']}  {t['title']}  (asking)"

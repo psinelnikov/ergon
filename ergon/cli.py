@@ -13,7 +13,9 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon rules                  print this project's worker rules (worker_rules in .ergon.toml)
   ergon next [--tier T]        approved, unblocked tasks an agent of tier T may take
   ergon review [-i]            everything waiting on human approval (-i: HUMAN ONLY, walk it
-                               task by task: approve / reject / retier / edit / skip)
+                               item by item: tasks to approve / reject / retier / edit / skip;
+                               epic briefs (Goal, Out of scope, Constraints) to approve, which
+                               opens the epic and leaves its tasks proposed / edit / skip)
   ergon show ID
   ergon new task "Title" --tier sonnet [--epic E-001] [--touches a,b] [--source LOG.md:42]
   ergon new epic "Title"
@@ -368,7 +370,7 @@ def main():
     n = sub.add_parser("next")
     n.add_argument("--tier", choices=_tasks.TIERS)
     rv = sub.add_parser("review")
-    rv.add_argument("-i", "--interactive", action="store_true", help="HUMAN ONLY: decide task by task")
+    rv.add_argument("-i", "--interactive", action="store_true", help="HUMAN ONLY: decide item by item (tasks and epic briefs)")
     rv.add_argument("--epic")
     rv.add_argument("--tier", choices=_tasks.TIERS)
     s = sub.add_parser("show")
