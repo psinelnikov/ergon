@@ -105,7 +105,7 @@ def catches(rows, since=None, epic=None, until=None):
     "answers": n, "late": share caught by review + human (None when nothing was caught)}.
     A failed `verify` row counts under its `layer` (an old row with none is `runtime`); a failed
     `review` is `review`; a failed `prove` row (tests green on the base) is `prove`; a `rejected` row
-    going from review is `human`. Answers are counted apart:
+    going from review is `human`; a `guard` row (a refused tool call) is `guard`. Answers are counted apart:
     they're a human's input, not a caught mistake. Layers this reader doesn't know are kept as
     they come. Never raises on odd rows."""
     weeks, totals, answers = {}, {}, 0
@@ -122,6 +122,8 @@ def catches(rows, since=None, epic=None, until=None):
             layer = "prove"
         elif ev == "rejected" and r.get("from") == "review":
             layer = "human"
+        elif ev == "guard":
+            layer = "guard"
         elif ev == "answered":
             answers += 1
             continue

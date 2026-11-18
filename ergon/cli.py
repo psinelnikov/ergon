@@ -27,7 +27,10 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                worktree, <worktrees>/E-ID (also happens on an epic's first `doing`)
   ergon finish E-ID            close the epic and merge its branch into the trunk (also happens
                                when its last task goes done); no checkout needs switching
-  ergon approve ID [ID ...]    HUMAN ONLY, real terminal. An epic ID approves its proposed tasks
+  ergon approve ID [ID ...]    HUMAN ONLY, real terminal. An epic ID approves its brief when it's
+                               proposed, or in shared mode open with no signed approval that
+                               verifies (an old epic with no approved: stamp counts as approved
+                               in local mode only); otherwise it approves its proposed tasks
   ergon reject ID [--reason R] HUMAN ONLY. proposed -> dropped; review -> ready (needs --reason,
                                which the next worker is shown; branch and worktree are kept)
   ergon accept ID [ID ...]     HUMAN ONLY, real terminal. Land a task dispatch held at `review`
@@ -51,7 +54,7 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                in epics/<epic>/, the rest in items/ (idempotent)
   ergon dispatch [--tier T] [--epic E] [--ids T-1,T-2] [--max N] [--jobs J]
                       [--budget-total USD [--budget-pct P]] [--watch [--interval SEC]]
-                      [--dry-run]
+                      [--until-done N] [--dry-run]
                                run ready tasks headless, one worktree + task/<ID> branch each,
                                merge each finished branch into its epic branch (and, for a task
                                touching a companion repo, that repo's local trunk).
@@ -60,6 +63,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                or Ctrl-C (stop launching, let workers finish; a second kills them)
                                A reviewer's fail (`review` in .ergon.toml) goes back to the worker
                                and is reviewed again, up to review_rounds times, then blocks.
+                               --until-done N (default 0): a worker that stops short (timeout,
+                               error, output that isn't JSON, no RESULT line) runs again on the
+                               same branch, up to N more rounds (session resumed, or a fresh
+                               worker); the done checks, verify and review then run as usual.
+                               Not retried: RESULT: blocked or asking, a second Ctrl-C, the cap.
                                An approved open epic with no tasks is broken down first, once
                                (as `breakdown` below; not with --ids or --tier). With [shared],
                                each task is claimed by pushing ready -> doing, and each breakdown
@@ -132,7 +140,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                it out into <state>/ on another clone (which must hold no task
                                files). The state branch is the only thing ergon ever pushes, never
                                code. Never from an agent shell or a task/ branch
-  ergon hook guard|stop        Claude Code hooks (the plugin wires them); not for humans
+  ergon hook guard|stop        Claude Code hooks (the plugin wires them); not for humans.
+                               guard --read-only (the breakdown agent's) also refuses Edit, Write
+                               and any Bash that may write a file or change git state: only
+                               read-only programs (git log/diff/show..., ergon show/next/check...,
+                               ls, cat, grep...), no redirect to a file, and it fails closed
   ergon hook commit-msg FILE   the git hook `init --hooks` installs; not for humans
 """
 import argparse
@@ -463,6 +475,10 @@ def main():
     d.add_argument("--interval", type=float, default=30, help="seconds between rescans with --watch (default 30)")
     d.add_argument("--escalate", action="store_true",
                    help="when a worker reports blocked, retry once one tier up (haiku→sonnet→opus)")
+    d.add_argument("--until-done", type=int, default=0, metavar="N",
+                   help="when a worker stops short (timeout, error, output that isn't JSON, no RESULT line), "
+                        "run up to N more rounds on the same branch, resuming its session or starting a fresh "
+                        "worker (default 0: it blocks)")
     d.add_argument("--dry-run", action="store_true")
     bd = sub.add_parser("breakdown", help="break an approved epic down into proposed tasks (runs claude -p, read-only)")
     bd.add_argument("id", help="the epic, E-NNN")
@@ -472,6 +488,9 @@ def main():
     hk.add_argument("event", choices=["guard", "stop", "commit-msg"])
     hk.add_argument("msgfile", nargs="?", help="commit-msg: the file git passes")
     hk.add_argument("--worker", action="store_true", help="dispatch sets this: guard companion checkouts too")
+    hk.add_argument("--read-only", action="store_true",
+                    help="guard: refuse every tool but Read/Grep/Glob and read-only Bash, and fail closed "
+                         "(dispatch sets it for the breakdown agent)")
     hk.add_argument("--project", help="the project to guard (default: $CLAUDE_PROJECT_DIR, then the event's cwd)")
     args = ap.parse_args()
     if args.cmd == "hook":

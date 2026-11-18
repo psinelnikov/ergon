@@ -1073,7 +1073,7 @@ class TestSignedApprovals(Shared):
         self.assertIn("E-001: open, but its approval doesn't verify: brief changed after approval", r.stdout)
         r = self.ergon(self.a, "dispatch", "--dry-run")
         self.assertIn("skipped  T-002  epic E-001's approval doesn't verify: brief changed", r.stdout)
-        # sync doesn't clear an epic's stamp (an open epic with none counts as approved)
+        # sync leaves an epic's stamp alone: what verifies decides, stamp or no stamp
         self.assertNotIn("restamped: E-001", self.ergon(self.a, "sync").stdout)
         self.assertIn("sha256:", epic.read_text())
         r = self.ergon(self.a, "approve", "E-001", inp="y\n")  # approving it again makes it count
@@ -1095,6 +1095,57 @@ class TestSignedApprovals(Shared):
         r = self.ergon(self.a, "check", check=False)
         self.assertIn("E-001: open, but its approval doesn't verify: no signed approval", r.stdout)
         self.assertNotIn("  T-002  ", self.ergon(self.a, "next").stdout)
+
+    def test_an_open_epic_with_no_stamp_doesnt_count_until_a_human_approves_it(self):
+        # an epic from before epics were approved, or one a clone without the guard pushed (T-124)
+        self.start()
+        home = self.b / "tasks" / "epics" / "E-001-old"
+        home.mkdir(parents=True)
+        epic = home / "EPIC.md"
+        epic.write_text("---\nid: E-001\ntitle: Old\nstatus: open\ncreated: 2026-01-01\n---\n\n## Goal\nG\n")
+        self.ergon(self.b, "set", "T-001", "epic=E-001")
+        self.ergon(self.b, "approve", "T-001", inp="y\n")  # the task's own approval verifies
+        self.ergon(self.b, "sync")
+        self.ergon(self.a, "sync")
+        for where in (self.a, self.b):
+            why = "epic E-001's approval doesn't verify: no signed approval"
+            r = self.ergon(where, "next")
+            self.assertNotIn("  T-001  ", r.stdout)
+            self.assertIn(f"left out because {why}", r.stdout)
+            r = self.ergon(where, "check", check=False)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("E-001: open, but its approval doesn't verify: no signed approval", r.stdout)
+            r = self.ergon(where, "dispatch", "--dry-run")
+            self.assertNotIn("would run  T-001", r.stdout)
+            self.assertIn(f"skipped  T-001  {why}", r.stdout)
+        # `approve E-001` approves its brief again, with a signed stamp that verifies
+        from ergon import tasks as T
+        self.assertIn("(approve again: no signed approval", self.ergon(self.a, "approve", "E-001", inp="y\n").stdout)
+        epic = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        d = T.brief_digest(T.parse(epic))
+        self.assertIn(f"\n\nErgon-Approve: E-001 sha256:{d}\n", self.head(self.a))
+        self.assertTrue(self.signed(self.a))
+        self.assertRegex(epic.read_text(), rf"\nstatus: open\n(.*\n)*approved: Tester \d{{4}}-\d\d-\d\d sha256:{d[:8]}\n")
+        self.counts(self.a, "T-001")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        self.counts(self.b, "T-001")
+
+    def test_brief_due_for_an_open_epic_with_no_stamp_only_in_shared_mode(self):
+        from ergon import gates as G
+
+        class Apr:  # approvals as gitops.approvals() gives them: nothing for E-001 verifies
+            def problem(self, e):
+                return "no signed approval"
+
+        old = {"id": "E-001", "status": "open", "approved": ""}
+        self.assertTrue(G.brief_due(old, Apr()))
+        self.assertFalse(G.brief_due(old, None))  # local mode: the exemption stays
+        self.assertFalse(G.brief_due(dict(old, status="done"), Apr()))
+        from ergon import tasks as T
+        self.assertIn("no signed approval", T.epic_problem(old, Apr()))
+        self.assertIsNone(T.epic_problem(old, None))
+        self.assertIsNone(T.epic_problem(dict(old, status="done"), Apr()))
 
     def test_an_approvers_file_only_in_the_working_tree_doesnt_count(self):
         self.start()
