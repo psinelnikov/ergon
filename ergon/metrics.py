@@ -191,7 +191,7 @@ def stacked(weeks, layers, esc, label="chart"):
                 continue
             hh = max(round(90 * n / top), 1)
             y -= hh
-            out.append(f'<rect class=b{j % 4 + 1} x={x} y={y} width={bw} height={hh}><title>{esc(k)}: {n}</title></rect>')
+            out.append(f'<rect class=b{j % 7 + 1} x={x} y={y} width={bw} height={hh}><title>{esc(k)}: {n}</title></rect>')
         out.append(f'<text class=m x={x + bw // 2} y=136 text-anchor=middle>{esc(wk[5:])}</text>')
     out.append("</svg>")
     return "".join(out)

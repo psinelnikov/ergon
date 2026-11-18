@@ -1,11 +1,13 @@
 :root {
   --bg: #fbfbfa; --fg: #1d1d1f; --muted: #6b6b70; --line: #e3e3e0; --card: #ffffff;
   --accent: #2f5fd0; --ok: #1f7a3d; --bad: #b3261e; --warn: #9a6200; --code: #f1f1ee;
+  --b5: #7b4fb8; --b6: #178a9b; --b7: #b8457f;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #141416; --fg: #e8e8ea; --muted: #9a9aa2; --line: #2c2c31; --card: #1c1c20;
     --accent: #8ab0ff; --ok: #6fd08f; --bad: #ff8a80; --warn: #f0c060; --code: #26262b;
+    --b5: #c3a2ff; --b6: #5fd3e0; --b7: #f09ac6;
   }
 }
 * { box-sizing: border-box; }
@@ -108,6 +110,9 @@ form.filter input, form.filter select, form.filter button { font: inherit; paddi
 .chart .b2 { fill: var(--bad); }
 .chart .b3 { fill: var(--ok); }
 .chart .b4 { fill: var(--warn); }
+.chart .b5 { fill: var(--b5); }
+.chart .b6 { fill: var(--b6); }
+.chart .b7 { fill: var(--b7); }
 .pair { display: flex; flex-wrap: wrap; gap: 4px 20px; align-items: flex-start; }
 .pair > * { flex: 1 1 300px; min-width: 0; }
 h2 .more { text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: 8px; }
