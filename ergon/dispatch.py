@@ -69,9 +69,9 @@ that passes without your change proves nothing and goes back to you.
 """
 
 WORKER_WEAKEN = """
-Before any gate, dispatch vetoes a branch that changes a gate file ({files}){markers},
-unless this task's approved touches: names that file. Fix the code, not the gate; if a rule is
-wrong, say so on a FOUND line. Don't edit this task's touches: or tier: (that's a re-plan).
+Before any gate, dispatch vetoes a branch that changes a gate file ({files})
+unless this task's approved touches: names that file{markers}. Fix the code, not the gate; if a
+rule is wrong, say so on a FOUND line. Don't edit this task's touches: or tier: (that's a re-plan).
 """
 
 WORKER_POLICIES = """
@@ -613,7 +613,9 @@ def gates_text(t):
     cmds = gate_cmds(t)
     sup = [f"`{rx.pattern}`" for rx in _config.SUPPRESS]
     weak = WORKER_WEAKEN.format(files=", ".join(f"`{p}`" for p in _config.GATE_FILES),
-                                markers=f" or adds a line matching a suppression marker ({', '.join(sup)}) to any file" if sup else "")
+                                markers=(f", and one that adds a line matching a suppression marker ({', '.join(sup)}) to any "
+                                         f"file, named or not, unless this is a harden task whose approved "
+                                         f"touches: names it") if sup else "")
     return (weak + (WORKER_GATES.format(cmds="\n".join(f"- {layer}: `{cmd}`" for layer, cmd in cmds)) if cmds else "")
             + (WORKER_PROVE.format(patterns=", ".join(f"`{p}`" for p in _config.TESTS)) if not prove_skip(t) else "")
             + harden_text(t))
@@ -971,8 +973,12 @@ def gate_cmds(t):
 # The cheapest way past a gate is to edit the gate: turn a lint rule off, add a `# noqa`, skip a
 # test. So before static, a deterministic check reads the branch's diff against its base (and each
 # companion's against its trunk): a changed gate file ([gates] protect, and .ergon.toml always) or
-# an added line matching a [gates] suppress regex, in any file, is a veto unless the task's
-# touches: names that file. That is what a harden task is: approved, naming the file. It reads the
+# an added line matching a [gates] suppress regex, in any file, is a veto. Naming a gate file in
+# touches: exempts its change: that is what a harden task is, approved, naming the file. Naming a
+# file exempts a marker added to it only in a harden task (`harden:` set, T-118): most of what an
+# ordinary task edits is in its touches:, so if naming were enough it could silence a check in
+# nearly any file it changes. `harden:` is human-only like touches: (`set` and the guard refuse
+# it, and it is in the brief digest), so a worker can't opt itself in. It reads the
 # task as it was at launch (like accept), so a worker that adds the file to its own touches: since
 # gets nowhere in that run. Nor in the next (T-117): only an entry a human approved counts. Each
 # `approved` history row records the touches: it approved, and a launch records them too when no
@@ -1050,8 +1056,10 @@ def added_lines(rng, path, repo=None):
 def weakening(t, base, branch, pubs=()):
     """The weakening check on t's branch: [] if it passes, else one finding per file, each naming
     the file as touches: would. `t` is the task as it was at launch; only its touches: entries a
-    human approved (unapproved_touches) exempt a file."""
+    human approved (unapproved_touches) exempt a file: from the gate-file check in any task, and
+    from the suppression-marker check only in a harden task (T-118)."""
     found, late = [], {touch_key(x) for x in unapproved_touches(t)}
+    harden = bool(harden_ids(t))
     ok = dict(t, touches=[x for x in t.get("touches") or [] if touch_key(x) not in late])
     since = (f" (touches: names it only since its approval, so it doesn't count: a human approves the new "
              f"touches: with `ergon approve {t.get('id')}`)")
@@ -1061,14 +1069,16 @@ def weakening(t, base, branch, pubs=()):
         for path in (p for p in files.split("\0") if p):
             shown = path if c is None else f"{c['name']}/{path}"
             pattern = gate_file_hit(path, c)
-            if names_file(ok, path, c, pattern):
+            named = names_file(ok, path, c, pattern)
+            note = since if late and not named and names_file(t, path, c, pattern) else ""
+            if pattern and not named:
+                found.append(f"{shown} changed (a gate file: protect `{pattern}`){note}")
                 continue
-            named = since if late and names_file(t, path, c, pattern) else ""
-            if pattern:
-                found.append(f"{shown} changed (a gate file: protect `{pattern}`){named}")
+            if not _config.SUPPRESS or (harden and named):
                 continue
-            if not _config.SUPPRESS:
-                continue
+            if not harden:
+                note = (" (touches: names it, but that allows a marker only in a harden task)"
+                        if named else "")
             hits = []
             for line in added_lines(rng, path, repo):
                 rx = next((r for r in _config.SUPPRESS if r.search(line)), None)
@@ -1078,7 +1088,7 @@ def weakening(t, base, branch, pubs=()):
                 rx, line = hits[0]
                 more = f" (and {len(hits) - 1} more line(s))" if len(hits) > 1 else ""
                 found.append(f"{shown} adds a suppression marker (suppress `{rx.pattern}`): "
-                             f"`{line.strip()[:120]}`{more}{named}")
+                             f"`{line.strip()[:120]}`{more}{note}")
     return found
 
 
@@ -1095,8 +1105,8 @@ def run_weakening(t, base, branch, pubs, rnd=None, tier=None):
     _history.record("verify", t, ok=False, cmd="weakening check", layer="weaken",
                     seconds=round(time.monotonic() - start, 1), log=None, findings=found, **_round(rnd))
     more = f"; and {len(found) - WEAKEN_MAX} more" if len(found) > WEAKEN_MAX else ""
-    failed = (f"verify (weakening check) vetoed the branch: it weakens a gate its task's touches: doesn't "
-              f"name: {'; '.join(found[:WEAKEN_MAX])}{more}")
+    failed = (f"verify (weakening check) vetoed the branch: it weakens a gate its task doesn't allow it to: "
+              f"{'; '.join(found[:WEAKEN_MAX])}{more}")
     save_incident(t, "weaken", failed, base, branch, pubs, tier=tier)
     return failed
 
@@ -1846,12 +1856,13 @@ line for each piece of work you find but don't do, then `RESULT: done` or
 
 WEAKEN_FIX_PROMPT = """The weakening check vetoed your work on {id} (fix round {n} of {rounds}): {failed}
 
-Your branch changes a gate file, or adds a suppression marker, in a file this task's touches:
-doesn't name. Revert the change to each file named above on {branch} in {wt}, fix the code
-instead, and commit there citing {id}. If the rule itself is wrong, revert it anyway and end with
-a `FOUND: <title> — <why>` line naming the rule and why: a human approves a task whose touches:
-names the file. Editing your task's touches: changes nothing: the check reads the task as it
-was at launch, and only entries a human approved count on a later launch. The done checks and the gates run again when you finish. End as before: a
+Your branch changes a gate file this task's touches: doesn't name, or adds a suppression marker
+(which only a harden task may, in a file its touches: names). Revert the change to each file named
+above on {branch} in {wt}, fix the code instead, and commit there citing {id}. If the rule itself
+is wrong, revert it anyway and end with a `FOUND: <title> — <why>` line naming the rule and why: a
+human approves a task whose touches: names the file (a harden task, for a marker). Editing your
+task's touches: changes nothing: the check reads the task as it was at launch, and only entries a
+human approved count on a later launch. The done checks and the gates run again when you finish. End as before: a
 `FOUND: <title> — <why>` line for each piece of work you find but don't do, then `RESULT: done`
 or `RESULT: blocked — <why>`.
 """
