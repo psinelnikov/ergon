@@ -613,6 +613,25 @@ class TestEpicApproval(Project):
         self.assertIn("  T-001  ", self.ergon("next").stdout)
         self.assertIn("would run  T-001", self.ergon("dispatch", "--dry-run").stdout)
 
+    def test_guard_refuses_agent_edits_of_an_epics_breakdown(self):
+        self.ergon("new", "epic", "Big thing")
+        ef = self.epic_file()
+        f = str(ef)
+        refused = "an epic's `breakdown:` is dispatch's claim"
+        claim = "breakdown: 2999-01-01T00:00:00 x"
+        why = self.guard("Edit", {"file_path": f, "old_string": "status: proposed",
+                                  "new_string": f"status: proposed\n{claim}"})
+        self.assertIn(refused, why or "")
+        why = self.guard("Write", {"file_path": f, "content": ef.read_text().replace("\n---\n", f"\n{claim}\n---\n", 1)})
+        self.assertIn(refused, why or "")
+        ef.write_text(ef.read_text().replace("\n---\n", f"\n{claim}\n---\n", 1))
+        for new in ("breakdown: 2999-01-02", "breakdown:", ""):
+            why = self.guard("Edit", {"file_path": f, "old_string": claim, "new_string": new})
+            self.assertIn(refused, why or "", new)
+        self.assertIsNone(self.guard("Edit", {"file_path": f, "old_string": "## Goal\n", "new_string": "## Goal\nShip.\n"}))
+        # from the shell, the epics dir is already off limits
+        self.assertIn("don't write task files", self.guard("Bash", {"command": f"echo 'breakdown: x' >> {f}"}) or "")
+
     def test_guard_refuses_agent_edits_of_an_epics_status_and_stamp(self):
         self.ergon("new", "epic", "Big thing")
         f = str(self.epic_file())

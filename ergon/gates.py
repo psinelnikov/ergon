@@ -1371,6 +1371,9 @@ def guard_reason(tool, inp, worker=False, cwd=None):
     fb, fa = frontmatter(before), frontmatter(after)
     if fb.get("approved", "") != fa.get("approved", ""):
         return "`approved:` is written by a human only (the one rule: `ergon guide`)"
+    if (p.name == _config.EPIC_FILE or is_flat_epic(path)) and fb.get("breakdown", "") != fa.get("breakdown", ""):
+        return ("an epic's `breakdown:` is dispatch's claim that it is being broken down: an agent's fake claim "
+                "with a far-future deadline would keep the epic from ever being broken down, so only dispatch writes it")
     if _tasks.is_auto(fb):  # approved by inheritance for what it was filed as: no relabelling, no widening
         for key in ("category", "touches"):
             if fb.get(key, "") != fa.get(key, ""):
