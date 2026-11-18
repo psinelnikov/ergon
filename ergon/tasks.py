@@ -851,5 +851,7 @@ def check(args):
     errs, summary = lint()
     for err in errs:
         print(err)
+    for w in _dispatch.policy_warnings(load(_config.ITEMS)):
+        print(w)
     print(summary)
     sys.exit(1 if errs else 0)

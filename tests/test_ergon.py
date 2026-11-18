@@ -1579,6 +1579,45 @@ class TestHarden(DispatchProject):
         wts = sh("git", "worktree", "list", cwd=self.root).stdout
         self.assertNotIn("T-001-harden", wts)
 
+    def test_landed_harden_marks_the_policy_and_prompts_drop_it(self):
+        """T-108: the policy citing the incident's task gets `Enforced by:`; prompts show one line; the
+        age warning fires for an unenforced policy and clears with a harden task or the mark."""
+        self.incident({"app.py": "x = eval(input())\n"})  # first: it switches branches, dropping untracked files
+        pol = self.root / "tasks" / "policies.md"
+        pol.write_text("# Policies\n\n## Stances\n\n"
+                       "### P-1 No eval\n- **Why:** unsafe\n- **Applies to:** all\n- **Examples:** T-050: eval on input\n"
+                       "- **Decided:** Tester 2026-01-01\n\n"
+                       "### P-2 No shims\n- **Why:** pre-1.0\n- **Applies to:** all\n- **Examples:** T-077: shim\n"
+                       "- **Decided:** Tester 2026-01-01\n\n"
+                       "### P-3 Fresh\n- **Why:** new\n- **Applies to:** all\n- **Examples:** T-078: x\n"
+                       "- **Decided:** Tester 2999-01-01\n")
+        out = self.ergon("check").stdout
+        self.assertIn("P-1 is", out)
+        self.assertIn("P-2 is", out)
+        self.assertNotIn("P-3 is", out)
+        self.task()
+        out = self.ergon("check").stdout  # an open harden task covers P-1
+        self.assertNotIn("P-1 is", out)
+        self.assertIn("P-2 is", out)
+        self.env["FAKE_WEAKEN"] = "rules.txt|eval("
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "done")
+        p1, p2 = pol.read_text().split("### P-2")
+        self.assertIn("- **Enforced by:** T-001", p1)
+        self.assertNotIn("Enforced by", p2)
+        out = self.ergon("check").stdout
+        self.assertNotIn("P-1 is", out)
+        self.assertIn("P-2 is", out)
+        self.env.pop("FAKE_WEAKEN")
+        self.ergon("new", "task", "Next", "--tier", "haiku")
+        stamp(self.task_file("T-002"))
+        self.ergon("dispatch")
+        prompt = self.calls()[-1]["prompt"]
+        self.assertIn("P-1 is enforced by T-001; the gate will catch it", prompt)
+        self.assertNotIn("### P-1", prompt)
+        self.assertNotIn("unsafe", prompt)
+        self.assertIn("### P-2 No shims", prompt)
+
     def test_a_rule_that_flags_the_incident_lands(self):
         self.incident({"app.py": "x = eval(input())\n"})
         self.task()

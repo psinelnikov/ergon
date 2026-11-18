@@ -327,9 +327,82 @@ def worker_rules():
     return _config.WORKER_RULES.read_text().strip() if _config.WORKER_RULES and _config.WORKER_RULES.exists() else ""
 
 
+POLICY_SPLIT = re.compile(r"^(?=### P-\d+\b)", re.M)
+POLICY_ENFORCED = re.compile(r"^- \*\*Enforced by:\*\*[ \t]*(\S.*?)[ \t]*$", re.M)
+
+
+def policy_entries():
+    """The policies file as (head, [entry text, ...]): the text before the first `### P-n`, then each entry."""
+    if not _config.POLICIES.exists():
+        return "", []
+    parts = POLICY_SPLIT.split(_config.POLICIES.read_text())
+    return parts[0], parts[1:]
+
+
+def policy_info(entry):
+    """(number, enforced-by or None, task IDs its Examples cite, Decided date or None) of one entry."""
+    n = int(re.match(r"### P-(\d+)", entry).group(1))
+    m = POLICY_ENFORCED.search(entry)
+    ex = re.search(r"^- \*\*Examples:\*\*(.*(?:\n(?!- \*\*|### ).*)*)", entry, re.M)
+    d = re.search(r"^- \*\*Decided:\*\*.*?(\d{4}-\d\d-\d\d)\s*$", entry, re.M)
+    return (n, m.group(1) if m else None, set(re.findall(r"\bT-\d+\b", ex.group(1) if ex else "")),
+            d.group(1) if d else None)
+
+
 def policies_text():
-    """The policies file's text, or ''. Written by a human only: the guard refuses agent writes."""
-    return _config.POLICIES.read_text().strip() if _config.POLICIES.exists() else ""
+    """The policies file's text, or ''. Written by a human only: the guard refuses agent writes.
+    A policy a check enforces (`- **Enforced by:**`) shows as one line, not its body."""
+    if not _config.POLICIES.exists():
+        return ""
+    head, entries = policy_entries()
+    out = [head.rstrip("\n")]
+    for e in entries:
+        n, by, _, _ = policy_info(e)
+        out.append(f"P-{n} is enforced by {by}; the gate will catch it\n" if by else e.rstrip("\n") + "\n")
+    return "\n\n".join(x for x in out if x.strip()).strip()
+
+
+def incident_task(iid):
+    """The task an incident id (<task ID>-<time>) came from."""
+    m = re.match(r"(.+?)-\d{8}-\d{6}", iid)
+    return m.group(1) if m else iid
+
+
+def mark_enforced(t):
+    """A harden task landed: write `- **Enforced by:** <ID>` into every unenforced policy whose
+    Examples cite a task one of its incidents came from. The one write dispatch makes to the
+    policies file (a worker never does). Returns the P-numbers marked."""
+    srcs = {incident_task(i) for i in harden_ids(t)}
+    if not srcs or not _config.POLICIES.exists():
+        return []
+    head, entries = policy_entries()
+    marked = []
+    for i, e in enumerate(entries):
+        n, by, cited, _ = policy_info(e)
+        if not by and cited & srcs:
+            entries[i] = e.rstrip("\n") + f"\n- **Enforced by:** {t['id']}\n" + ("\n" if e.endswith("\n\n") else "")
+            marked.append(n)
+    if marked:
+        _config.POLICIES.write_text(head + "".join(entries))
+    return marked
+
+
+def policy_warnings(tasks, today=None):
+    """Policies older than 14 days with no `Enforced by:` and no open harden task covering them."""
+    today = today or datetime.date.today()
+    open_src = {incident_task(i) for t in tasks.values() if t.get("status") not in ("done", "dropped")
+                for i in harden_ids(t)}
+    out = []
+    for e in policy_entries()[1]:
+        n, by, cited, decided = policy_info(e)
+        try:
+            age = (today - datetime.date.fromisoformat(decided)).days if decided else 0
+        except ValueError:
+            age = 0
+        if not by and age > 14 and not cited & open_src:
+            out.append(f"warning: P-{n} is {age} days old with no `Enforced by:` and no open harden task; "
+                       f"run `learn` to turn it into a check")
+    return out
 
 
 def base_branch(t, epics):
@@ -1989,6 +2062,12 @@ def dispatch(args):
                         t2["tier"] = up
                         _tasks.dump(t2, _tasks.TASK_KEYS)
                     print(f"  {verdict:<8} {t['id']}  {why}")
+                    if verdict == "done":
+                        try:
+                            for n in mark_enforced(t):
+                                print(f"  policy   P-{n} is now enforced by {t['id']}")
+                        except OSError as err:
+                            print(f"  couldn't mark policies enforced by {t['id']}: {err}")
                     e = epics.get(t.get("epic"))
                     if verdict == "done" and e and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
                         try:
