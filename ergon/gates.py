@@ -57,6 +57,10 @@ def setf(args):
         if key == "prove" and val.strip().lower() in _tasks.PROVE_NO:
             raise SystemExit("`prove: no` skips the red-on-base proof, so set won't write it: a human edits the "
                              "task file (it's in the brief digest, so an approved task needs approving again)")
+        if key in ("harden", "harden_layer"):  # a harden task skips the red-on-base proof; the layer picks its gate
+            raise SystemExit(f"`{key}:` decides what a harden task must prove (and a harden task skips the "
+                             f"red-on-base proof), so set won't write it: a human edits the task file (it's in "
+                             f"the brief digest, so an approved task needs approving again)")
         if is_task and key == "pin":
             raise SystemExit("`pin:` is human-only: use `ergon pin ID first|last|clear` from a real terminal")
         if is_task and key in ("asking", "answered"):

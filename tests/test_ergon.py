@@ -3245,6 +3245,31 @@ class TestHardenInDigest(Project):
             f.write_text(text)
         self.assertEqual(brief_digest(parse(f)), base)
 
+    def test_set_refuses_harden_and_its_layer(self):
+        """A harden task skips the red-on-base proof and `harden_layer:` picks the gate its own proof
+        runs, so set won't write either, not even to clear one (T-149)."""
+        from ergon.tasks import brief_digest, parse
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        f = self.task_file("T-001")
+        stamp(f)
+        plain = f.read_text()
+        for env in (None, clean_env(CLAUDECODE="1")):
+            for kv in (f"harden={self.I1}", f"harden=[{self.I1}]", "harden=", "harden_layer=runtime",
+                       "harden_layer=static", "harden_layer=", " harden =x", "harden_layer =runtime"):
+                r = self.ergon("set", "T-001", kv, check=False, env=env)
+                self.assertNotEqual(r.returncode, 0, kv)
+                self.assertIn("set won't write it", r.stderr, kv)
+                r = self.ergon("set", "T-001", "tier=opus", kv, check=False, env=env)  # nothing of a refused set lands
+                self.assertNotEqual(r.returncode, 0, kv)
+        self.assertEqual(f.read_text(), plain)
+        f.write_text(plain.replace("\n---\n", f"\nharden: [{self.I1}]\n---\n", 1))  # a harden task can't be loosened
+        hard = f.read_text()
+        base = brief_digest(parse(f))
+        for kv in ("harden=", f"harden={self.I2}", "harden_layer=runtime"):
+            self.assertNotEqual(self.ergon("set", "T-001", kv, check=False).returncode, 0, kv)
+        self.assertEqual(f.read_text(), hard)
+        self.assertEqual(brief_digest(parse(f)), base)
+
 
 class TestHardenInDigestSigned(unittest.TestCase):
     """Shared mode: changing an approved harden task's `harden:` or `harden_layer:` after its signed
