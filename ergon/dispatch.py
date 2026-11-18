@@ -2935,7 +2935,9 @@ def dispatch(args):
                   + also(t) + (f", reviewed by {reviewer_tier(t['tier'])} ({rounds})"
                                if t["tier"] in _config.REVIEW else "")
                   + (f", up to {_config.VERIFY_ROUNDS} verify fix round{'s' if _config.VERIFY_ROUNDS != 1 else ''}"
-                     if _config.VERIFY_ROUNDS and gate_cmds(t) else "")
+                     + (" (a red verify, a weakening veto or a failed harden proof each take one)"
+                        if gate_cmds(t) else " (a weakening veto or a failed harden proof takes one; no gate command set)")
+                     if _config.VERIFY_ROUNDS else "")
                   + "".join(f", {layer} gate `{cmd}`" for layer, cmd in gate_cmds(t))
                   + (f", harden proof of {len(harden_ids(t))} incident(s) on the {harden_layer(t)} gate"
                      if harden_ids(t) else "")
@@ -2969,9 +2971,10 @@ def dispatch(args):
             def max_calls(t):
                 """Calls `t` may make, each capped at --budget: its worker; a second worker a tier up
                 if --escalate retries it; then fix_loop's calls: per verify fix round a fix worker
-                (when a verify is set), and for a reviewed tier the review plus every fix round
+                (a red verify, a weakening veto or a failed harden proof, so with or without a gate
+                command), and for a reviewed tier the review plus every fix round
                 (a fix worker and a review again); and a worker per conflict round."""
-                verified = bool(vr and gate_cmds(t))
+                verified = bool(vr)
                 if verified:
                     counted.add("verify")
 
@@ -2995,7 +2998,7 @@ def dispatch(args):
                 ("review", f"the review and {rounds}" + (" (a fix and a review each)" if rr else "")
                            + " for a reviewed tier"),
                 ("verify", f"up to {vr} verify fix round{'s' if vr != 1 else ''} (a fix each) "
-                           "if a verify is set"),
+                           "(with or without a verify: a weakening veto or failed harden proof takes one too)"),
                 ("conflict", f"{crounds} (a worker each) if the branch conflicts")) if k in counted]
             print(f"  cap        ${cap:.2f} total ({args.budget_pct:g}% of ${args.budget_total:.2f}): "
                   "no new task launches once finished workers' cost reaches it"
