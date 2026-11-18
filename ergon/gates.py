@@ -69,6 +69,12 @@ def setf(args):
             raise SystemExit("`pin:` is human-only: use `ergon pin ID first|last|clear` from a real terminal")
         if is_task and key in ("asking", "answered"):
             raise SystemExit(f"`{key}:` is written by dispatch and a human's `ergon answer` only")
+        if is_task and key == "limited":
+            raise SystemExit("`limited:` is written by dispatch only: it parks a task the usage limit stopped and "
+                             "resumes it after the reset")
+        if is_task and key == "status" and item.get("limited"):
+            raise SystemExit(f"{args.id} is parked by the usage limit (`limited: {item['limited']}`): the next "
+                             f"dispatch at or after the reset resumes it (a human's `close` gives it up)")
         if is_task and key == "status" and _tasks.is_asking(item):
             raise SystemExit(f"{args.id} waits on an answer to its worker's question: a human runs "
                              f"`ergon answer {args.id}` in their own terminal (or `ergon close` to give it up)")
@@ -803,6 +809,7 @@ def close(args):
             t["status"] = args.as_
             t.pop("asking", None)
             t.pop("answered", None)
+            t.pop("limited", None)
             t["_body"] = t["_body"].rstrip() + f"\n\nClosed {_tasks.today()} as {args.as_}: {args.reason}\n"
             _tasks.dump(t, _tasks.TASK_KEYS)
         if sign:
@@ -1614,6 +1621,9 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
     for key in ("asking", "answered"):
         if fb.get(key, "") != fa.get(key, ""):
             return f"`{key}:` is written by dispatch and a human's `ergon answer` only"
+    if fb.get("limited", "") != fa.get("limited", ""):
+        return ("`limited:` is written by dispatch only: it parks a task the usage limit stopped and resumes it "
+                "after the reset")
     if fb.get("accept", "").lower() in _tasks.YES and fa.get("accept", "").lower() not in _tasks.YES:
         return "only a human takes `accept:` off a task (it holds the task's landing for their review)"
     return None

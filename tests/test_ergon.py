@@ -43,8 +43,15 @@ harden proof asked for copies the file src to dest and commits it. $FAKE_EVIDENC
 nothing), commit it and end with an EVIDENCE: line each, on every run, or with $FAKE_EVIDENCE_FIX only
 when asked again for its evidence. $FAKE_WRITES = "<path>|<line>;..." has its first run write each
 file as that one line (a line of "-" deletes the file), and $FAKE_PROVE_FIX, in the same form, has a
-fix round the red-on-base proof asked for write those files, commit them and end RESULT: done."""
+fix round the red-on-base proof asked for write those files, commit them and end RESULT: done.
+A $FAKE_STOPS kind `limit`, or a $FAKE_REVIEWS verdict `LIMIT`, ends the call the way the plan's
+usage limit does (is_error, a 429, the message $FAKE_LIMIT_TEXT) without committing anything."""
 import json, os, re, subprocess, sys, time
+def limit_stop():
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+                      "api_error_status": 429, "session_id": "s-1", "total_cost_usd": 0.01,
+                      "result": os.environ.get("FAKE_LIMIT_TEXT", "You've hit your 5-hour limit \u00b7 resets 10pm")}))
+    sys.exit()
 if "--agent" not in sys.argv:
     n = 0
     if os.environ.get("FAKE_PROBES"):
@@ -75,6 +82,8 @@ if tier == "REVIEW":
         subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "sneaky"], check=True)
     seq = os.environ.get("FAKE_REVIEWS", "").split("|") if os.environ.get("FAKE_REVIEWS") else None
     verdict = seq[min(nth, len(seq) - 1)] if seq else os.environ.get("FAKE_REVIEW", "REVIEW: pass")
+    if verdict == "LIMIT":
+        limit_stop()
     print(json.dumps({"result": "looked\n" + verdict, "session_id": "r-1", "total_cost_usd": 0.02}))
     sys.exit()
 if tier == "BREAKDOWN":  # the task-breakdown agent: replies $FAKE_BREAKDOWN; logs its call to $FAKE_BREAKDOWN_SEEN
@@ -121,6 +130,8 @@ if os.environ.get("FAKE_STOPS"):  # nth worker call: nojson (what a timeout leav
     kind = seq[min(n, len(seq) - 1)]
     if kind == "nojson":
         print("garbage"); sys.exit()
+    if kind == "limit":
+        limit_stop()
     if kind == "error":
         print(json.dumps({"is_error": True, "subtype": "error_during_execution", "result": "boom", "session_id": "s-1",
                           "total_cost_usd": 0.01})); sys.exit()
@@ -4719,6 +4730,284 @@ class TestLimits(DispatchProject):
         self.assertEqual(self.status("T-002"), "done", out)
         self.assertNotIn("5-hour", out)
         self.assertEqual(probes.read_text(), "p")
+
+
+class TestUsageLimitShapes(unittest.TestCase):
+    """T-166: the shapes a stop by the plan's usage limit takes in `claude -p --output-format json`."""
+    LISBON = "You've hit your 5-hour limit · resets 10pm (Europe/Lisbon)"
+
+    def setUp(self):
+        from ergon import limits
+        self.limits = limits
+
+    def at(self, *when, tz=None):
+        import datetime
+        return datetime.datetime(*when, tzinfo=tz).timestamp()
+
+    def test_each_shape_is_a_limit_stop(self):
+        from zoneinfo import ZoneInfo
+        lisbon = ZoneInfo("Europe/Lisbon")
+        now = self.at(2026, 11, 18, 12, 0, tz=lisbon)
+        local_now = self.at(2026, 11, 18, 12, 0)
+        shapes = [  # (the result, its reset, `now` to read it at)
+            # what dispatch's own run logs hold: is_error, subtype success, a 429
+            ({"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+              "api_error_status": 429, "num_turns": 16, "total_cost_usd": 0.67, "result": self.LISBON},
+             self.at(2026, 11, 18, 22, 0, tz=lisbon), now),
+            ({"is_error": True, "api_error_status": 429, "result": "You've hit your 5-hour limit · resets 6:30pm (Europe/Lisbon)"},
+             self.at(2026, 11, 18, 18, 30, tz=lisbon), now),
+            ({"is_error": True, "result": "You've hit your limit · resets 3pm (America/New_York)"},
+             self.at(2026, 11, 18, 15, 0, tz=ZoneInfo("America/New_York")), now),
+            ({"is_error": True, "result": "5-hour limit reached ∙ resets 6:30pm"},
+             self.at(2026, 11, 18, 18, 30), local_now),
+            ({"is_error": True, "result": "You've hit your weekly limit · resets Nov 21, 3pm (Europe/Lisbon)"},
+             self.at(2026, 11, 21, 15, 0, tz=lisbon), now),
+            # an older Claude Code: no error flag, the reset as epoch seconds
+            ({"type": "result", "subtype": "success", "is_error": False, "result": "Claude AI usage limit reached|1794935400"},
+             1794935400, now),
+            # a time already past (by more than the hour's slack) is tomorrow's
+            ({"is_error": True, "result": "You've hit your 5-hour limit · resets 9am (Europe/Lisbon)"},
+             self.at(2026, 11, 19, 9, 0, tz=lisbon), now),
+        ]
+        for d, reset, at in shapes:
+            got = self.limits.stop(d, now=at)
+            self.assertIsNotNone(got, d)
+            self.assertEqual(got["text"], d["result"])
+            self.assertEqual(got["resets_at"], int(reset), d)
+        got = self.limits.stop({"is_error": True, "api_error_status": 429, "result": "You've hit your limit"})
+        self.assertEqual(got, {"text": "You've hit your limit", "resets_at": None})  # dispatch asks probe(), then waits 30 min
+
+    def test_an_ordinary_error_or_reply_is_not(self):
+        for d in ({"is_error": True, "subtype": "error_during_execution", "result": "boom"},
+                  {"is_error": True, "subtype": "error_max_turns", "result": ""},
+                  {"is_error": True, "api_error_status": 429,
+                   "result": 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'},
+                  {"is_error": True, "api_error_status": 529, "result": "API Error: 529 Overloaded"},
+                  {"result": "Parked tasks the 5-hour limit reached.\nRESULT: done"},
+                  {"result": "I raised the limit reached by the cache, see notes. " * 5},
+                  {"result": None}, "not a dict"):
+            self.assertIsNone(self.limits.stop(d), d)
+
+    def test_when_to_try_again(self):  # the message's reset, else probe()'s, else 30 minutes; never one gone by
+        orig = self.limits.probe
+        try:
+            self.limits.probe = lambda: None
+            self.assertEqual(self.limits.resets_at({"resets_at": 5000}, now=1000), 5000)
+            self.assertEqual(self.limits.resets_at({"resets_at": None}, now=1000), 1000 + 30 * 60)
+            self.assertEqual(self.limits.resets_at({"resets_at": 900}, now=1000), 1000 + 30 * 60)
+            self.limits.probe = lambda: {"utilization": 1.0, "resets_at": 4000, "cost": 0}
+            self.assertEqual(self.limits.resets_at({"resets_at": None}, now=1000), 4000)
+            self.limits.probe = lambda: {"utilization": 0.2, "resets_at": 500, "cost": 0}
+            self.assertEqual(self.limits.resets_at({"resets_at": None}, now=1000), 1000 + 30 * 60)
+        finally:
+            self.limits.probe = orig
+
+    def test_mark_round_trip(self):
+        from ergon import tasks
+        at = 1795039200
+        mark = f"{self.limits.iso(at)} fix 2"
+        self.assertEqual(mark, "2026-11-18T22:00:00Z fix 2")
+        self.assertEqual(tasks.limited_mark(mark), (at, "fix 2"))
+        self.assertEqual(tasks.limited({"status": "blocked", "limited": mark}), (at, "fix 2"))
+        self.assertIsNone(tasks.limited({"status": "ready", "limited": mark}))
+        for bad in ("soon worker", "2026-11-18T22:00:00Z", "2026-11-18T22:00:00Z lunch", "2026-11-18 worker"):
+            self.assertIsNone(tasks.limited_mark(bad), bad)
+
+
+class TestUsageLimit(DispatchProject):
+    """T-166: a task the usage limit stops parks `blocked` with a `limited:` mark; a scan at or
+    after the reset restarts the step it stopped at."""
+
+    def setUp(self):
+        super().setUp()
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0",
+                        FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"))
+        self.env.pop("CLAUDE_CONFIG_DIR", None)
+        self.ergon("new", "task", "Job", "--tier", "sonnet", "--touches", "a.py")
+        stamp(self.task_file("T-001"))
+
+    def limit_at(self, secs):
+        """The fake's limit message, resetting `secs` from now (epoch seconds: exact in a test)."""
+        at = int(time.time() + secs)
+        self.env["FAKE_LIMIT_TEXT"] = f"Claude AI usage limit reached|{at}"
+        return at
+
+    def calls(self):
+        return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+
+    def rows(self, event, tid="T-001"):
+        return [r for r in history(self.root) if r["task"] == tid and r["event"] == event]
+
+    def text(self, tid="T-001"):
+        return self.task_file(tid).read_text()
+
+    def mark(self, tid="T-001"):
+        m = re.search(r"(?m)^limited: (.*)$", self.text(tid))
+        return m and m[1]
+
+    def reset_passes(self, tid="T-001"):
+        """What the clock does: the mark's reset is now in the past."""
+        f = self.task_file(tid)
+        f.write_text(re.sub(r"(?m)^limited: \S+", "limited: 2026-01-01T00:00:00Z", f.read_text()))
+
+    def clock(self, at):
+        from ergon import limits
+        return limits.clock(at)
+
+    def test_worker_hit_parks_files_nothing_uses_no_round_then_resumes_after_the_reset(self):
+        at = self.limit_at(3600)
+        self.env["FAKE_STOPS"] = "limit|ok"
+        out = self.ergon("dispatch", "--escalate", "--until-done", "2").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertEqual(self.mark(), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at)) + " worker")
+        self.assertIn("limited  T-001  its run stopped by the usage limit", out)
+        self.assertIn(f"paused by the 5-hour limit until {self.clock(at)}: T-001", out)
+        self.assertIn("1 stopped by the usage limit", out)
+        self.assertFalse(list(self.root.glob("tasks/**/T-002*")))  # no human task
+        self.assertEqual(self.rows("escalated"), [])  # --escalate doesn't retry it
+        self.assertEqual(self.rows("blocked"), [])
+        self.assertEqual([(r["verdict"], r.get("round")) for r in self.rows("worker_end")], [("limited", None)])
+        self.assertEqual([r for r in self.rows("dispatched") if r.get("after")], [])  # no until-done round
+        lim = self.rows("limited")
+        self.assertEqual([(r["resets_at"], r["step"], r["session"], r["tier"]) for r in lim], [(at, "worker", "s-1", "sonnet")])
+        self.assertIn("limited: the usage limit stopped its run (Claude AI usage limit reached|", self.text())
+        self.assertIn("approved: Tester 2026-01-01", self.text())
+        self.assertTrue((self.root / ".claude" / "worktrees" / "T-001").is_dir())
+        self.assertIn(f"limited until {self.clock(at)}", self.ergon("board").stdout)
+        self.ergon("check")
+
+        # Before the reset a scan skips it, and says until when.
+        out = self.ergon("dispatch").stdout
+        self.assertIn(f"skipped  T-001  limited until {self.clock(at)}", out)
+        self.assertIn(f"limited until {self.clock(at)}", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertEqual(len(self.calls()), 1)
+
+        # After it, the scan moves it to doing and resumes the worker's session; it lands.
+        self.reset_passes()
+        self.assertIn("restarts its run (the usage limit has reset)", self.ergon("dispatch", "--dry-run").stdout)
+        time.sleep(1.1)  # run logs are named to the second
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIsNone(self.mark())
+        self.assertIn("approved: Tester 2026-01-01", self.text())
+        calls = self.calls()
+        self.assertEqual([(c["agent"], c["resume"]) for c in calls], [("SONNET", None), ("SONNET", "s-1")])
+        self.assertIn("The usage limit stopped your work on T-001 during its run", calls[1]["prompt"])
+        self.assertEqual([(r["after"], r["step"]) for r in self.rows("dispatched") if r.get("after")], [("limit", "worker")])
+        self.assertEqual([(r["after"], r["session"]) for r in self.rows("resumed")], [("limit", "s-1")])
+        self.assertEqual([r.get("after") for r in self.rows("worker_end")], [None, "limit"])
+        self.ergon("check")
+
+    def test_no_reset_in_the_message_waits_half_an_hour(self):
+        self.env.update(FAKE_STOPS="limit", FAKE_LIMIT_TEXT="You've hit your limit")
+        start = time.time()
+        self.ergon("dispatch")
+        at = self.rows("limited")[0]["resets_at"]
+        self.assertTrue(start + 29 * 60 <= at <= time.time() + 31 * 60, at - start)
+
+    def test_the_run_launches_nothing_after_the_hit(self):
+        self.ergon("new", "task", "Other", "--tier", "sonnet", "--touches", "b.py")
+        stamp(self.task_file("T-002"))
+        at = self.limit_at(3600)
+        self.env["FAKE_STOPS"] = "limit|ok"
+        out = self.ergon("dispatch", "--jobs", "1").stdout
+        statuses = sorted([self.status("T-001"), self.status("T-002")])
+        self.assertEqual(statuses, ["blocked", "ready"], out)
+        hit = "T-001" if self.status("T-001") == "blocked" else "T-002"
+        self.assertEqual(len(self.calls()), 1)
+        self.assertIn(f"nothing launches before {self.clock(at)}", out)
+        self.assertIn(f"paused by the 5-hour limit until {self.clock(at)}: {hit}.", out)
+
+    def test_watch_waits_for_the_reset_then_goes_on(self):
+        import signal
+        self.ergon("new", "task", "Other", "--tier", "sonnet", "--touches", "b.py")
+        stamp(self.task_file("T-002"))
+        self.env["FAKE_STOPS"] = "limit|ok"
+        at = self.limit_at(4)
+        p = subprocess.Popen([sys.executable, str(ERGON), "dispatch", "--watch", "--interval", "0.2", "--jobs", "1",
+                              "--budget-total", "5"], cwd=self.root, env=self.env, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            for tid in ("T-001", "T-002"):
+                TestDispatch.wait_status(self, tid, "done", p, secs=60)
+        finally:
+            p.send_signal(signal.SIGINT)
+        out = p.communicate(timeout=30)[0]
+        self.assertIn("--watch waits for it", out)
+        import datetime
+        launches = [datetime.datetime.fromisoformat(r["at"]).timestamp()
+                    for r in history(self.root) if r["event"] == "dispatched"]
+        self.assertEqual(len(launches), 3, out)  # the hit, then both after the reset
+        self.assertTrue(all(x >= at for x in launches[1:]), (launches, at))
+
+    def test_reviewer_hit_reruns_only_the_review(self):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text('review = ["sonnet"]\nverify = "true"\n' + cfg.read_text())
+        self.limit_at(3600)
+        self.env["FAKE_REVIEWS"] = "LIMIT|REVIEW: pass"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertTrue(self.mark().endswith(" review"), self.mark())
+        self.assertIn("stopped by the usage limit", out)
+        self.assertEqual([r["verdict"] for r in self.rows("review")], ["limited"])
+        self.assertEqual(self.rows("incident"), [])  # not a finding
+        self.assertFalse(list(self.root.glob("tasks/**/T-002*")))
+        self.reset_passes()
+        time.sleep(1.1)
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual([c["agent"] for c in self.calls()], ["SONNET", "REVIEW", "REVIEW"])
+        self.assertEqual([r["verdict"] for r in self.rows("review")], ["limited", "pass"])
+
+    def test_fix_round_hit_parks_at_that_round(self):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text('review = ["sonnet"]\nverify = "true"\n' + cfg.read_text())
+        self.limit_at(3600)
+        self.env.update(FAKE_STOPS="ok|limit|ok", FAKE_REVIEWS="REVIEW: fail — name it better|REVIEW: pass")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertTrue(self.mark().endswith(" fix 1"), self.mark())
+        self.assertIn("review (opus) failed: name it better", self.rows("limited")[0]["fixing"])
+        self.reset_passes()
+        time.sleep(1.1)
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        calls = self.calls()
+        self.assertEqual([(c["agent"], c["resume"]) for c in calls],
+                         [("SONNET", None), ("REVIEW", None), ("SONNET", "s-1"), ("SONNET", "s-1"), ("REVIEW", None)])
+        self.assertIn("during review fix round 1", calls[3]["prompt"])
+
+    def test_only_dispatch_writes_the_mark(self):
+        self.limit_at(3600)
+        self.env["FAKE_STOPS"] = "limit"
+        self.ergon("dispatch")
+        mark = self.mark()
+        f = str(self.task_file("T-001"))
+        self.assertIn("dispatch only", self.guard("Edit", {"file_path": f, "old_string": f"limited: {mark}\n",
+                                                           "new_string": ""}))
+        self.assertIn("dispatch only", self.guard("Edit", {"file_path": f, "old_string": f"limited: {mark}",
+                                                           "new_string": "limited: 2026-01-01T00:00:00Z worker"}))
+        self.assertIn("dispatch only", self.ergon("set", "T-001", "limited=x", check=False).stderr)
+        r = self.ergon("set", "T-001", "status=ready", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("parked by the usage limit", r.stderr)
+        self.assertEqual(self.status("T-001"), "blocked")
+        # a mark on a task that isn't blocked fails check
+        text = self.text()
+        self.task_file("T-001").write_text(text.replace("status: blocked", "status: ready"))
+        r = self.ergon("check", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("limited: is set but status is ready", r.stdout + r.stderr)
+        self.task_file("T-001").write_text(text)
+        self.ergon("check")
+        code, out = TestAccept.human(self, "close", "T-001", "--as", "dropped", "--reason", "re-plan")
+        self.assertEqual(code, 0, out)
+        self.assertIsNone(self.mark())
+        self.ergon("check")
 
 
 class TestReport(Project):

@@ -167,16 +167,18 @@ def sync_state():
     return None
 
 
-def claim(tid):
+def claim(tid, limited=None):
     """Shared mode, under the state lock, after the scan's sync: move tid ready -> doing (dropping
-    `answered:`, as every launch does) in a commit naming this clone, and push it. Returns None if
-    this dispatcher holds the task now, else why not: then the task is as the remote has it, or
-    back at ready if the claim couldn't be pushed."""
+    `answered:`, as every launch does) in a commit naming this clone, and push it. With `limited`
+    (its `limited:` mark as the scan saw it) the move is blocked -> doing, and the mark goes too.
+    Returns None if this dispatcher holds the task now, else why not: then the task is as the
+    remote has it, or back where it was if the claim couldn't be pushed."""
     cur = _tasks.load(_config.ITEMS).get(tid)
-    if not cur or cur["status"] != "ready":
+    if not cur or (cur["status"] != "ready" if not limited
+                   else cur["status"] != "blocked" or cur.get(LIMITED) != limited):
         return f"now {cur['status'] if cur else 'gone'} here, since the scan; not launched"
     answered = cur.get("answered")
-    put_status(tid, "doing", drop=("answered",))
+    put_status(tid, "doing", drop=("answered", LIMITED))
     # The body makes each claim its own commit: two clones claiming from the same tip in the same
     # second would otherwise make the very same commit, and both pushes would "succeed".
     _shared.commit_pending("dispatch", body=f"Claimed by {_tasks.clone_id()} in {_config.HOME} "
@@ -186,30 +188,34 @@ def claim(tid):
         _shared.push_rounds(say_sync, dropped, quiet=True)
     except SystemExit as err:
         if tid not in dropped:
-            unclaim(tid, answered)
-            return f"couldn't push the claim, so it's back at ready and not launched: {err}"
+            unclaim(tid, answered, limited=limited)
+            return (f"couldn't push the claim, so it's back at {'blocked' if limited else 'ready'} and not "
+                    f"launched: {err}")
     if tid in dropped:
         now = _tasks.load(_config.ITEMS).get(tid, {}).get("status")
         return f"another dispatcher claimed it first ({_shared.remote()} has it {now}); not launched"
     return None
 
 
-def unclaim(tid, answered=None, push=False):
-    """Undo this clone's claim on tid: back to ready, with its `answered:` mark if it had one, in a
-    commit; pushed if `push` (best effort). Caller holds the state lock."""
+def unclaim(tid, answered=None, push=False, limited=None):
+    """Undo this clone's claim on tid: back to ready, with its `answered:` mark if it had one, or
+    back to blocked with its `limited:` mark, in a commit; pushed if `push` (best effort). Caller
+    holds the state lock."""
     cur = _tasks.load(_config.ITEMS).get(tid)
     if not cur or cur["status"] != "doing":
         return
-    cur["status"] = "ready"
+    cur["status"] = "blocked" if limited else "ready"
     if answered:
         cur["answered"] = answered
+    if limited:
+        cur[LIMITED] = limited
     _tasks.dump(cur, _tasks.TASK_KEYS)
     _shared.commit_pending("dispatch")
     if push:
         try:
             _shared.push_rounds(say_sync, quiet=True)
         except SystemExit as err:
-            say_sync(f"{tid} back at ready, not pushed yet: {err}")
+            say_sync(f"{tid} back at {cur['status']}, not pushed yet: {err}")
 
 
 # A breakdown has no status to move, so its claim is a field on the epic: `breakdown: <user>@<host>
@@ -401,6 +407,74 @@ def park(t, info, wt, branch, pubs):
     _tasks.dump(cur, _tasks.TASK_KEYS)
     _history.record("question", t, questions=[{"text": q, "options": o} for q, o in qs],
                     session=info.get("session"), log=info.get("log"), tier=t["tier"])
+
+
+# ---------- the usage limit ----------
+# A worker or reviewer the plan's usage limit stops (limits.stop()) parks its task: `blocked`, with
+# `limited: <reset, UTC ISO> <step>` in its frontmatter, a Notes line and a `limited` history row
+# holding what a restart needs (session, tier, what a round was fixing, FOUND and EVIDENCE lines
+# so far). No human task, no --escalate, no round used up; the worktree and branch stay. The run
+# launches nothing more before the reset. A scan at or after it moves the task back to doing
+# (the mark goes) and restarts that step: `worker` (its first worker, an answered one, an
+# escalated one or an until-done round), `fix N` (review fix round), `verify N` (verify, weaken,
+# prove, harden or evidence round), `conflict N`, or `review` (the gate runs again from the top,
+# the worker doesn't). `approved:` is never touched, and only dispatch and a human's close
+# write the mark.
+
+LIMITED = "limited"
+
+LIMIT_PROMPT = ("The usage limit stopped your work on {id} during {what} ({text}). It has reset now.\n"
+                "Carry on from where you were on branch `{branch}` in {wt}: check `git status` and `git log`, then "
+                "finish.\n{tail}")
+
+LIMIT_LINES = ("An earlier run on this task was stopped by the usage limit during {what} ({text}); the limit has "
+               "reset. Its commits are on this branch: carry on from where it was and finish the task.\n{round}")
+
+
+def limit_step_text(step):
+    """A `limited:` step in words: `fix 2` -> `review fix round 2`."""
+    kind, _, n = str(step or "worker").partition(" ")
+    return {"worker": "its run", "review": "the review", "fix": f"review fix round {n}",
+            "verify": f"verify fix round {n}", "conflict": f"conflict round {n}"}.get(kind, str(step))
+
+
+def limit_round_lines(lim):
+    """Prompt lines for a fresh worker restarting a round the usage limit stopped: what the
+    round was fixing, as that round's own fresh worker would have been told."""
+    kind, fixing = lim.get("kind"), lim.get("fixing")
+    if not fixing:
+        return ""
+    if kind == "conflict":
+        return ("The round it stopped in: the branch conflicts with its base, which moved since the work "
+                f"started.\n\n{fixing}\n")
+    if kind == "review":
+        return veto_lines(fixing)
+    return {"weaken": weaken_lines, "prove": prove_lines, "harden": harden_lines,
+            "evidence": evidence_lines}.get(kind, verify_lines)(fixing)
+
+
+def limited_row(t):
+    """The newest `limited` history row of task t (what its restart needs), or None."""
+    return next((r for r in reversed(_history.read()) if r.get("event") == LIMITED and r.get("task") == t["id"]),
+                None)
+
+
+def park_limited(t, info, wt, branch, pubs, tier, at, escalated=None):
+    """A worker or reviewer the usage limit stopped (info["limited"]): set t blocked with a
+    `limited:` mark (reset `at`, epoch seconds, and the step), a Notes line and a `limited` history
+    row. Worktree and branch stay; `approved:` is untouched. Caller holds the state lock."""
+    lim, step, session = info.get("limited") or {}, info.get("step") or "worker", info.get("session")
+    cur = _tasks.load(_config.ITEMS)[t["id"]]
+    cur["status"], cur[LIMITED] = "blocked", f"{_limits.iso(at)} {step}"
+    cur.pop("answered", None)
+    add_note(cur, f"limited: the usage limit stopped {limit_step_text(step)} ({lim.get('text', '')}); dispatch "
+                  f"resumes it at or after {_limits.clock(at)}, nothing to do. {kept_note(wt, branch, pubs)} "
+                  f"(log {info.get('log')}" + (f", `claude --resume {session}` in {wt}" if session else "") + ")")
+    _tasks.dump(cur, _tasks.TASK_KEYS)
+    _history.record(LIMITED, t, resets_at=int(at), step=step, session=session, log=info.get("log"), tier=tier,
+                    text=lim.get("text"), kind=info.get("kind"), fixing=info.get("fixing"),
+                    found=[[a, b, c] for a, b, c in info.get("found") or []],
+                    evidence=[list(e) for e in info.get("evidence") or []], escalated=escalated)
 
 
 def worker_agents():
@@ -822,6 +896,10 @@ def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
         return "blocked", "worker output wasn't JSON" + (f" ({err.strip().splitlines()[0]})" if err.strip() else ""), info
     info.update(session=d.get("session_id"), cost=d.get("total_cost_usd") or 0)
     text = d.get("result") or ""
+    lim = _limits.stop(d)
+    if lim:  # the plan's usage limit: dispatch parks the task until it resets (park_limited)
+        info["limited"] = lim
+        return "limited", f"stopped by the usage limit: {lim['text']}", info
     if d.get("is_error"):
         info["stopped"] = True
         return "blocked", f"worker errored ({d.get('subtype') or d.get('terminal_reason')}): {text[:200]}", info
@@ -1798,16 +1876,18 @@ def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None,
     """Run the reviewer on a finished task branch and record its review event. Returns (failure
     reason or None, cost, reviewer tier, fixable). Only a last line of `REVIEW: pass` passes: no
     such line, a fail, output that isn't JSON, an error, a kill, a timeout, or a reviewer that
-    changed the branch or worktree all block the landing. Only a `REVIEW: fail` is `fixable`:
-    the rest leave the worker no findings to fix."""
+    changed the branch or worktree all block the landing. Only a `REVIEW: fail` is `fixable`
+    (True): the rest leave the worker no findings to fix. A reviewer the usage limit stopped
+    returns {"limited": limits.stop()'s dict} as `fixable`: the task parks, to review again."""
     start = time.monotonic()
     log = _config.RUNS / (f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-review"
                           + (str(rnd) if rnd and rnd > 1 else "") + ".json")
     failed, cost, who, fixable = _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log,
                                              found, evidence, waived)
-    _history.record("review", t, verdict="fail" if failed else "pass", reviewer=who, tier=tier,
-                    reason=failed, cost=cost, seconds=round(time.monotonic() - start, 1), log=log, **_round(rnd))
-    if failed and fixable:
+    _history.record("review", t, verdict="limited" if isinstance(fixable, dict) else "fail" if failed else "pass",
+                    reviewer=who, tier=tier, reason=failed, cost=cost, seconds=round(time.monotonic() - start, 1),
+                    log=log, **_round(rnd))
+    if failed and fixable is True:
         save_incident(t, "review", failed, base, branch, pubs, log=log, tier=tier)
     return failed, cost, who, fixable
 
@@ -1858,6 +1938,9 @@ def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log, fou
     if changed:
         return fail("the reviewer changed the branch or worktree; it must stay read-only", cost)
     text = d.get("result") or ""
+    lim = _limits.stop(d)
+    if lim:
+        return fail(f"stopped by the usage limit: {lim['text']}", cost, fixable={"limited": lim})
     if d.get("is_error"):
         return fail(f"reviewer errored ({d.get('subtype') or d.get('terminal_reason')}): {text[:200]}", cost)
     last = next((l for l in reversed(text.strip().splitlines()) if l.strip()), "")
@@ -1901,7 +1984,8 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, ev
     weakening veto ("weaken"), a test that passes on the base ("prove") and a failed harden
     proof ("harden"), each by a fix round (fix_loop). The weakening check runs first, on `t` as
     it was at launch; the red-on-base proof (unless `prove` is False: the worker waived it) and a
-    harden task's proof run after its gates pass. The caller adds kept_note."""
+    harden task's proof run after its gates pass. A reviewer the usage limit stopped returns
+    {"limited": …} as `fixable` (run_review's). The caller adds kept_note."""
     for tree in [wt] + [pub for _, pub in pubs]:
         if _gitops.dirty_paths(tree):
             return f"worker said done but left uncommitted changes in {tree}", 0, False
@@ -1931,7 +2015,8 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, ev
         return None, 0, False
     failed, cost, who, fixable = run_review(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd,
                                             found, evidence, waived)
-    print(f"  review   {t['id']}  {who}: " + ("pass" if not failed else "fail")
+    print(f"  review   {t['id']}  {who}: " + ("pass" if not failed else "stopped by the usage limit"
+                                                  if isinstance(fixable, dict) else "fail")
           + (f" (round {rnd})" if rnd and rnd > 1 else ""), flush=True)
     return failed, cost, fixable
 
@@ -2804,6 +2889,7 @@ def dispatch(args):
     learns, learn_asked = [], set()  # this run's learn runs (their info), and the incidents they sent
     cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
     capped = stopped = False
+    paused = 0.0
     probing = not args.dry_run and _limits.enabled()  # the 5-hour window, read before and after
     window = None
 
@@ -2816,11 +2902,18 @@ def dispatch(args):
     def eligible(tasks):
         epics.update(_tasks.load(_config.EPICS))  # another run or session may have closed one
         apr = _gitops.approvals()  # shared mode: verified now, after the scan's sync; None otherwise
+        now = time.time()
         for t in sorted(tasks.values(), key=lambda t: _priority.sort_key(t, tasks)):
-            if (t["id"] in tried or t["status"] != "ready" or not _tasks.deps_done(t, tasks)
+            lim = _tasks.limited(t)  # blocked by the usage limit: back in once it has reset
+            if (t["id"] in tried or (t["status"] != "ready" and not lim) or not _tasks.deps_done(t, tasks)
                     or (ids and t["id"] not in ids) or (args.tier and t["tier"] != args.tier)
                     or (args.epic and t.get("epic") != args.epic)):
                 continue
+            if lim and lim[0] > now:
+                skipped[t["id"]] = (f"limited until {_limits.clock(lim[0])}: the usage limit stopped "
+                                    f"{limit_step_text(lim[1])}; a dispatch at or after then resumes it")
+                continue
+            skipped.pop(t["id"], None)
             if t["tier"] == "human":
                 continue
             why = apr.problem(t) if apr else None
@@ -2976,6 +3069,9 @@ def dispatch(args):
             nonlocal rnd, round_cost
             rnd += 1
             info["rnd"] = rnd
+            # where a usage-limit stop would park the task, and what the round was fixing
+            info.update(step=f"verify {verify[0]}" if verify else f"fix {n}", kind=kind if verify else "review",
+                        fixing=failed)
             try:
                 tips = [_gitops.git("rev-parse", branch, cwd=r) for r in repos]
             except _gitops.GitError:
@@ -2989,7 +3085,7 @@ def dispatch(args):
             info["evidence"] = (info.get("evidence") or []) + (finfo.get("evidence") or [])
             info.update(log=finfo["log"], session=finfo.get("session") or info.get("session"),
                         asked=finfo.get("asked"), questions=finfo.get("questions"),
-                        stopped=finfo.get("stopped"))
+                        stopped=finfo.get("stopped"), limited=finfo.get("limited"))
             with live_lock:
                 live[t["id"]] = info["cost"]
             if args.until_done and v == "blocked" and finfo.get("stopped"):
@@ -3020,6 +3116,9 @@ def dispatch(args):
             info["round_cost"] = round_cost
             with live_lock:
                 live[t["id"]] = info["cost"]
+            if isinstance(fixable, dict):  # the reviewer hit the usage limit: park, to review again
+                info.update(limited=fixable["limited"], step="review", kind=None, fixing=None)
+                return "limited", failed
             if not failed:
                 if vetoes or vfixes or outside:
                     info["fixed"] = "; ".join(x for x in (info.get("fixed"),
@@ -3049,6 +3148,8 @@ def dispatch(args):
                 if stop or vfixes >= _config.VERIFY_ROUNDS:
                     return "blocked", f"{failed}{stop}. {kept}"
                 v, w = fix(failed, (vfixes + 1, _config.VERIFY_ROUNDS), kind=fixable)
+                if v == "limited":  # uses up no round: the task parks at this one
+                    return v, w
                 if fixable == "verify" and v == "blocked" and w.lower().startswith("outside:"):
                     outside, info["asked"] = w, False
                     print(f"  verify   {t['id']}  worker says outside the branch ({w}): rerunning as is", flush=True)
@@ -3075,6 +3176,8 @@ def dispatch(args):
                 return "blocked", f"{rounds_note(failed, vetoes, stop)}. {kept}"
             vetoes.append(failed)
             v, w = fix(failed, n=len(vetoes))
+            if v == "limited":  # uses up no round: the task parks at this one
+                return v, w
             if v != "done":
                 info["rounds"] = (f" (fix round {len(vetoes)}, after "
                                   + "; ".join(f"round {i}: {x}" for i, x in enumerate(vetoes, 1)) + ")")
@@ -3102,6 +3205,7 @@ def dispatch(args):
         info["rnd"] = rnd = info.get("rnd", 1) + 1
         info.setdefault("conflicts", []).append(what)
         body, rounds, session = conflict_body(t, found, branch), _config.CONFLICT_ROUNDS, info.get("session")
+        info.update(step=f"conflict {n}", kind="conflict", fixing=body)
         resume, fresh_because = resume_choice(session, wt)
         tt = dict(t, tier=tier)
         if resume:
@@ -3123,13 +3227,15 @@ def dispatch(args):
         info["evidence"] = (info.get("evidence") or []) + (finfo.get("evidence") or [])
         info.update(log=finfo["log"], session=finfo.get("session") or session,
                     asked=finfo.get("asked"), questions=finfo.get("questions"),
-                    stopped=finfo.get("stopped"))
+                    stopped=finfo.get("stopped"), limited=finfo.get("limited"))
         with live_lock:
             live[t["id"]] = info["cost"]
         if args.until_done and v == "blocked" and finfo.get("stopped"):
             v, w = until_done(t, base, wt, branch, pubs, v, w, info, tier=tier,
                               extra="The round it stopped in: the branch conflicts with its base, which moved "
                                     f"since the work started.\n\n{body}\n")
+        if v == "limited":  # uses up no round: the task parks at this one
+            return v, w
         if v != "done":
             info["rounds"] = f" (conflict round {n}, after: {what})"
             return v, w
@@ -3172,7 +3278,8 @@ def dispatch(args):
         """A worker that stopped short (info["stopped"]: it timed out, errored, printed no JSON or
         no RESULT line) runs again on the same branch, up to --until-done times: its session
         resumed if resume_choice() allows, else a fresh worker. Also used for a fix-round or
-        conflict-round worker that stopped short. Returns (verdict, reason)."""
+        conflict-round worker that stopped short. A stop by the usage limit isn't one: it ends the
+        loop as verdict `limited`, and uses up no round. Returns (verdict, reason)."""
         halts, tier, limit = [], tier or t["tier"], args.until_done
         while verdict == "blocked" and info.get("stopped"):
             halts.append(why)
@@ -3205,7 +3312,7 @@ def dispatch(args):
             for k in ("found", "policy", "evidence"):
                 info[k] = (info.get(k) or []) + (finfo.get(k) or [])
             info.update(log=finfo["log"], session=finfo.get("session") or session, asked=finfo.get("asked"),
-                        questions=finfo.get("questions"), stopped=finfo.get("stopped"))
+                        questions=finfo.get("questions"), stopped=finfo.get("stopped"), limited=finfo.get("limited"))
             with live_lock:
                 live[t["id"]] = info["cost"]
             verdict, why = v, w
@@ -3213,12 +3320,52 @@ def dispatch(args):
             if verdict == "done":
                 info["fixed"] = "; ".join(x for x in (info.get("fixed"),
                     f"finished after {len(halts)} stop(s): " + "; ".join(halts)) if x)
-            else:
+            elif verdict != "limited":
                 info["rounds"] = f" (until-done round {len(halts)}, after: " + "; ".join(halts) + ")"
         return verdict, why
 
-    def one(t, base, wt, branch, pubs, answered=None):
-        if answered:  # a human answered its question: resume that session, or a fresh worker
+    def resume_limited(t, base, wt, branch, pubs, lim):
+        """Restart the step the usage limit stopped (`lim`: its `limited` history row). A worker
+        or round: the worker's session resumed if resume_choice() allows (after a long wait it
+        rarely does), else a fresh worker told what the round was fixing. `review`: no worker,
+        the gate runs again. Returns (verdict, reason, info, the escalated tier or None)."""
+        step = str(lim.get("step") or "worker")
+        tier = lim.get("tier") if lim.get("tier") in _config.WORKER_TIERS else t["tier"]
+        up = tier if tier != t["tier"] else None
+        carried = {"found": [tuple(x) for x in lim.get("found") or [] if isinstance(x, list) and len(x) == 3],
+                   "evidence": [tuple(x) for x in lim.get("evidence") or [] if isinstance(x, list) and len(x) == 2]}
+        session = lim.get("session")
+        if step == "review":
+            print(f"  limit    {t['id']}  the limit has reset: reviewing again (the worker's commits are on {branch})",
+                  flush=True)
+            return "done", "", dict(carried, session=session, log=lim.get("log") or "(none)", cost=0), up
+        what, text = limit_step_text(step), lim.get("text") or "the usage limit"
+        resume, fresh_because = resume_choice(session, wt)
+        tt = dict(t, tier=tier, escalated=True) if up else t
+        if resume:
+            _history.record("resumed", t, session=session, tier=tier, after="limit", step=step)
+            print(f"  limit    {t['id']}  the limit has reset: {what}, resumed {session}", flush=True)
+            prompt = LIMIT_PROMPT.format(id=t["id"], what=what, text=text, branch=branch, wt=wt, tail=UNTIL_DONE_TAIL)
+            v, w, info = run_worker(tt, base, wt, branch, pubs, args, agents, settings, prompt=prompt, resume=session,
+                                    after="limit")
+        else:
+            print(f"  limit    {t['id']}  the limit has reset: {what}, fresh session ({fresh_because})", flush=True)
+            lines = LIMIT_LINES.format(what=what, text=text, round=limit_round_lines(lim)) + UNTIL_DONE_TAIL
+            v, w, info = run_worker(tt, base, wt, branch, pubs, args, agents, settings, lines=lines, after="limit")
+        info["resumed"], info["fresh_because"] = resume, fresh_because
+        for k in ("found", "evidence"):
+            info[k] = carried[k] + (info.get(k) or [])
+        info.update(step=step, kind=lim.get("kind"), fixing=lim.get("fixing"),
+                    session=info.get("session") or session)
+        return v, w, info, up
+
+    def one(t, base, wt, branch, pubs, answered=None, lim=None):
+        up = first = why1 = None
+        if lim is not None:  # the usage limit stopped it and has reset: restart that step
+            verdict, why, info, up = resume_limited(t, base, wt, branch, pubs, lim)
+            if up:
+                first, why1 = t["tier"], lim.get("escalated") or "(before the usage limit stopped it)"
+        elif answered:  # a human answered its question: resume that session, or a fresh worker
             resume, fresh_because = resume_choice(None if answered == NO_SESSION else answered, wt)
             if resume:
                 _history.record("resumed", t, session=answered, tier=t["tier"], after="answer")
@@ -3236,9 +3383,8 @@ def dispatch(args):
         if args.until_done:
             with live_lock:
                 live[t["id"]] = info.get("cost", 0)
-            verdict, why = until_done(t, base, wt, branch, pubs, verdict, why, info)
-        up = None
-        if (args.escalate and verdict == "blocked" and info.get("asked")
+            verdict, why = until_done(t, base, wt, branch, pubs, verdict, why, info, tier=up)
+        if (args.escalate and not up and verdict == "blocked" and info.get("asked")
                 and t["tier"] in _config.WORKER_TIERS[:-1]):
             # the worker itself reported blocked: retry once a tier up on the same branch
             up = _config.WORKER_TIERS[_config.WORKER_TIERS.index(t["tier"]) + 1]
@@ -3259,6 +3405,8 @@ def dispatch(args):
         while True:  # a conflict found under the lock loops back here for another round
             if verdict == "done" and _config.CONFLICT_ROUNDS:
                 verdict, why = resolve(t, tier, base, wt, branch, pubs, info)
+            if verdict == "limited" and "resets_at" not in info:  # may probe: not under the lock
+                info["resets_at"] = _limits.resets_at(info.get("limited") or {})
             with _gitops.state_lock():  # also serializes every merge into a companion's trunk
                 # `t` is the task as it was at launch, so nothing the worker did to its file since
                 # (dropping `accept:`, retiering) lets the branch skip a human's acceptance.
@@ -3287,6 +3435,10 @@ def dispatch(args):
                 if verdict == "asking":
                     park(t, info, wt, branch, pubs)
                     print(f"  asking   {t['id']}  {why}: `ergon answer {t['id']}`")
+                elif verdict == "limited":
+                    park_limited(t, info, wt, branch, pubs, tier, info["resets_at"], escalated=why1 if up else None)
+                    print(f"  limited  {t['id']}  {limit_step_text(info.get('step'))} {why}; resumes at or after "
+                          f"{_limits.clock(info['resets_at'])}")
                 elif verdict in ("done", "review"):
                     put_status(t["id"], verdict, "; ".join(x for x in (
                         f"escalated {first}→{up}: {why1}" if up else "", info.get("fixed", ""),
@@ -3321,7 +3473,9 @@ def dispatch(args):
                     _tasks.dump(cur, _tasks.TASK_KEYS)
                 # a follow-up is approved by inheritance only from a run that finished, i.e. that
                 # passed its reviewer when one is set: a vetoed or blocked run's findings wait for you
-                for fid, title, st in file_found(t, info.get("found") or [], epics, vouch=verdict in ("done", "review")):
+                # a limit stop keeps its FOUND lines in its `limited` row: the restart carries them on
+                for fid, title, st in file_found(t, [] if verdict == "limited" else info.get("found") or [], epics,
+                                                 vouch=verdict in ("done", "review")):
                     if st == "ready":
                         print(f"  ready    {fid}  (found by {t['id']}, approved by inheritance)  {title}")
                     else:
@@ -3401,7 +3555,9 @@ def dispatch(args):
                      if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1] else "")
                   + (", held for your accept" if _tasks.needs_accept(t) else "")
                   + (f", up to {args.until_done} until-done rounds if its worker stops short" if args.until_done else "")
-                  + (", resumes with your answer" if t.get("answered") else "") + f"  {t['title']}")
+                  + (", resumes with your answer" if t.get("answered") else "")
+                  + (f", restarts {limit_step_text(_tasks.limited(t)[1])} (the usage limit has reset)"
+                     if _tasks.limited(t) else "") + f"  {t['title']}")
         bplan = to_break(tasks)
         bmodel = breakdown_agent()["model"] if bplan else ""
         for e in bplan:
@@ -3507,10 +3663,11 @@ def dispatch(args):
                         if unsynced:
                             say_sync(f"failed, so nothing launches this scan: {unsynced}")
                         # the lock is held only for the scan, so `approve` works between scans
+                        limit_wait = paused > time.time()  # the usage limit: nothing launches before its reset
                         with _gitops.state_lock():
                             if cap is not None and spent() >= cap:
                                 capped = True
-                            queue = [] if capped or unsynced else list(eligible(_tasks.load(_config.ITEMS)))
+                            queue = [] if capped or unsynced or limit_wait else list(eligible(_tasks.load(_config.ITEMS)))
                             while queue and len(running) < args.jobs:
                                 t = queue.pop(0)
                                 # an auto-approved follow-up isn't one of the --max, but follow_ups bounds them
@@ -3529,8 +3686,10 @@ def dispatch(args):
                                 # An answered question rides along to the worker; the mark goes with
                                 # the launch, so a retry after this run starts over.
                                 answered = t.get("answered") or None
+                                lim = _tasks.limited(t)  # the usage limit stopped it and has reset
+                                mark = t.get(LIMITED) if lim else None
                                 if claims:  # pushed ready -> doing before anything else
-                                    lost = claim(t["id"])
+                                    lost = claim(t["id"], mark)
                                     if lost:
                                         skipped[t["id"]] = lost
                                         print(f"  claimed  {t['id']}  {lost}", flush=True)
@@ -3547,32 +3706,35 @@ def dispatch(args):
                                     if why:
                                         skipped[t["id"]] = why
                                         print(f"  skipped  {t['id']}  {why.split(':')[0]}", flush=True)
-                                        unclaim(t["id"], answered, push=True)
+                                        unclaim(t["id"], answered, push=True, limited=mark)
                                         continue
                                 try:
                                     base, wt, branch, pubs = prepare(t, epics)
                                 except _gitops.GitError as err:
                                     skipped[t["id"]] = f"couldn't make a worktree: {err}"
                                     if claims:
-                                        unclaim(t["id"], answered, push=True)
+                                        unclaim(t["id"], answered, push=True, limited=mark)
                                     continue
                                 if not claims:
-                                    put_status(t["id"], "doing", drop=("answered",))
+                                    put_status(t["id"], "doing", drop=("answered", LIMITED))
                                 _history.record("dispatched", t, tier=t["tier"], model=agents[f"task-{t['tier']}"]["model"],
                                                 base=base, branch=branch, worktree=wt,
                                                 companions=[c["name"] for c, _ in pubs],
                                                 **approval_record(t),  # approved_touches, _harden, _suppress_ok
-                                                **({"answered": True} if answered else {}))
+                                                **({"answered": True} if answered else {}),
+                                                **({"after": "limit", "step": lim[1]} if lim else {}))
                                 print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
-                                      + also(t) + f"  {t['title']}")
-                                running[pool.submit(one, t, base, wt, branch, pubs, answered)] = t["id"]
+                                      + also(t) + (f"  (after the usage limit: {limit_step_text(lim[1])})" if lim else "")
+                                      + f"  {t['title']}")
+                                row = (limited_row(t) or {"step": lim[1]}) if lim else None
+                                running[pool.submit(one, t, base, wt, branch, pubs, answered, row)] = t["id"]
                                 active[t["id"]] = t
                                 if follow:
                                     fu_launched += 1
                                 else:
                                     launched += 1
                             # an approved epic with no tasks: break it down (a slot, not a launch)
-                            bq = [] if capped or unsynced or len(running) >= args.jobs else \
+                            bq = [] if capped or unsynced or limit_wait or len(running) >= args.jobs else \
                                 to_break(_tasks.load(_config.ITEMS))
                             while bq and len(running) < args.jobs:
                                 e = bq.pop(0)
@@ -3587,10 +3749,11 @@ def dispatch(args):
                                 print(f"  breakdown {e['id']}  read-only in {_config.HOME}  {e['title']}", flush=True)
                                 running[pool.submit(break_down, e, mine)] = e["id"]
                             # --watch: new incidents become proposed harden tasks each scan (learn = true)
-                            if (args.watch and not capped and not unsynced and len(running) < args.jobs
+                            if (args.watch and not capped and not unsynced and not limit_wait and len(running) < args.jobs
                                     and "learn" not in running.values() and learn_due()):
                                 running[pool.submit(learn_job)] = "learn"
-                        next_scan = time.monotonic() + args.interval
+                        # --watch: while the usage limit holds, the next scan is at its reset
+                        next_scan = time.monotonic() + max(args.interval, paused - time.time())
                     scan = False
                     # nothing running means no worker can file a follow-up now, and the scan above has launched any ready
                     over = stopping or capped or launched >= args.max
@@ -3613,9 +3776,17 @@ def dispatch(args):
                             scan = True
                             continue
                         active.pop(tid, None)
+                        res = f.result()
                         with live_lock:  # the cost moves from live to results in one step
-                            results.append(f.result())
+                            results.append(res)
                             live.pop(tid, None)
+                        if res[1] == "limited":
+                            tried.discard(tid)  # its mark holds it until the reset; a scan after it resumes it
+                            if res[3].get("resets_at", 0) > paused:
+                                paused = res[3]["resets_at"]
+                                print(f"  limit    the usage limit is hit: nothing launches before "
+                                      f"{_limits.clock(paused)}" + ("; --watch waits for it" if args.watch else
+                                                                    "; running workers finish"), flush=True)
                         scan = True
                     if args.watch and time.monotonic() >= next_scan:
                         scan = True
@@ -3624,7 +3795,7 @@ def dispatch(args):
         stopped = bool(stops)
         if before and (results or breaks) and not KILL_ALL.is_set():
             window = _limits.measure(before, _limits.probe(), spent())
-        if not stopped and learn_due():  # the run's incidents, as proposed harden tasks (learn = true)
+        if not stopped and paused <= time.time() and learn_due():  # the run's incidents, as proposed harden tasks (learn = true)
             learns.append(learn_job())
     for tid, why in sorted(skipped.items()):
         print(f"  skipped  {tid}  {why}")
@@ -3634,8 +3805,10 @@ def dispatch(args):
         rcost = sum(r[3].get("review_cost", 0) for r in results)
         held = sum(r[1] == "review" for r in results)
         asking = sum(r[1] == "asking" for r in results)
+        limited = sum(r[1] == "limited" for r in results)
         print(f"\n{done}/{len(results)} done" + (f", {held} awaiting your accept" if held else "")
               + (f", {asking} asking you a question" if asking else "")
+              + (f", {limited} stopped by the usage limit" if limited else "")
               + f", ${cost:.2f}" + (f" (reviews ${rcost:.2f} of it)" if rcost else "")
               + f". Logs in {_config.RUNS.relative_to(_config.HOME)}/")
         print_limit(results, window)
@@ -3662,6 +3835,10 @@ def dispatch(args):
                       f"`ergon breakdown {b['epic']}` does")
     if stopped:
         print("\ninterrupted: stopped launching" + ("; killed running workers" if KILL_ALL.is_set() else ""))
+    held_back = sorted(i for i, t in _tasks.load(_config.ITEMS).items() if _tasks.limited(t)) if paused else []
+    if held_back:
+        print(f"\npaused by the 5-hour limit until {_limits.clock(paused)}: {', '.join(held_back)}. "
+              "The next `ergon dispatch` at or after then resumes them")
     if capped:
         left = [t["id"] for t in eligible(_tasks.load(_config.ITEMS))]
         mean = sum(r[3].get("cost", 0) for r in results) / len(results) if results else 0

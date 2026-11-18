@@ -69,6 +69,14 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                worker); the done checks, verify and review then run as usual. A fix-round or
                                conflict-round worker that stops short is retried the same way.
                                Not retried: RESULT: blocked or asking, a second Ctrl-C, the cap.
+                               The usage limit (5-hour, or weekly): a worker or reviewer it stops
+                               parks its task blocked with `limited: <reset> <step>`; no human
+                               task, no --escalate, no round used up, branch kept. The run then
+                               launches nothing before the reset (--watch waits for it; a plain
+                               run ends `paused by the 5-hour limit until HH:MM: T-…`), and the
+                               first scan after it restarts that step: the worker or round
+                               (session resumed, or a fresh worker), or just the review. The
+                               board and --dry-run show `limited until HH:MM`
                                An approved open epic with no tasks is broken down first, once
                                (as `breakdown` below; not with --ids or --tier). With [shared],
                                each task is claimed by pushing ready -> doing, and each breakdown
@@ -457,7 +465,15 @@ def main():
     once = sy.add_mutually_exclusive_group()
     once.add_argument("--init", action="store_true", help="create the state branch from local state and push it")
     once.add_argument("--join", action="store_true", help="make <state>/ a worktree of the remote's state branch")
-    d = sub.add_parser("dispatch")
+    d = sub.add_parser("dispatch", description=(
+        "Run ready tasks headless, one worktree and task/<ID> branch each, and land each finished branch. "
+        "A worker or reviewer the plan's usage limit stops (5-hour or weekly) parks its task blocked with a "
+        "`limited: <reset> <step>` mark: no human task, no --escalate retry, no fix/verify/conflict/until-done "
+        "round used up, worktree and branch kept. The run launches nothing more before the reset (--watch "
+        "waits for it; a plain run ends with `paused by the 5-hour limit until HH:MM: T-…`), and any dispatch "
+        "scan at or after it moves the task back to doing and restarts the step it stopped at: the worker or "
+        "round (its session resumed, or a fresh worker), or only the review. --dry-run and the board show "
+        "`limited until HH:MM`; only dispatch writes the mark, and a human's close clears it."))
     d.add_argument("--tier", choices=_config.WORKER_TIERS)
     d.add_argument("--epic")
     d.add_argument("--ids", help="comma-separated task IDs (still only ready ones)")
@@ -472,7 +488,8 @@ def main():
     d.add_argument("--budget-pct", type=float, default=100,
                    help="use only this %% of --budget-total as the cap (default 100)")
     d.add_argument("--watch", action="store_true",
-                   help="keep running: rescan for newly ready tasks until Ctrl-C or --budget-total is reached")
+                   help="keep running: rescan for newly ready tasks until Ctrl-C or --budget-total is reached; "
+                        "after a usage-limit stop it waits for the reset, then resumes the parked tasks")
     d.add_argument("--interval", type=float, default=30, help="seconds between rescans with --watch (default 30)")
     d.add_argument("--escalate", action="store_true",
                    help="when a worker reports blocked, retry once one tier up (haiku→sonnet→opus)")

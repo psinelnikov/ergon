@@ -281,6 +281,10 @@ def line(t, tasks):
     pin = str(t.get("pin") or "").strip()
     if pin in ("first", "last"):
         flags.append(f"pinned {pin}")
+    lim = limited(t)
+    if lim:
+        from . import limits as _limits
+        flags.append(f"limited until {_limits.clock(lim[0])}")
     tail = f"  ({'; '.join(flags)})" if flags else ""
     return f"  {t['id']}  {t['tier']:<6}  {t['title']}{tail}"
 
@@ -291,6 +295,30 @@ YES = ("yes", "true", "1")
 def is_asking(t):
     """Is t parked on a worker's question, waiting for a human's `ergon answer`?"""
     return t.get("status") == "blocked" and bool(t.get("asking"))
+
+
+LIMITED_AT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def limited_mark(v):
+    """A `limited:` value, `<reset, UTC ISO> <step>`, as (reset epoch seconds, step), or None
+    when it doesn't read as one."""
+    import datetime
+    at, _, step = str(v or "").strip().partition(" ")
+    try:
+        when = datetime.datetime.strptime(at, LIMITED_AT).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    step = step.strip()
+    if not re.fullmatch(r"worker|review|(?:fix|verify|conflict) \d+", step):
+        return None
+    return when.timestamp(), step
+
+
+def limited(t):
+    """(reset epoch seconds, step) when t is parked by the usage limit (blocked, with a `limited:`
+    mark that reads), else None. Dispatch resumes it at a scan at or after that time."""
+    return limited_mark(t.get("limited")) if t.get("status") == "blocked" else None
 
 
 # In shared mode a task dispatch held at `review` has its task/<ID> branch in one clone only (task
@@ -1051,6 +1079,12 @@ def lint(warns=None):
         if t.get("asking") and t.get("status") not in ("blocked", "done", "dropped"):
             errs.append(f"{where}: asking: is set but status is {t.get('status')}; a task waiting on an answer "
                         f"is blocked until a human runs `ergon answer {t['id']}`")
+        if t.get("limited") and t.get("status") != "blocked":
+            errs.append(f"{where}: limited: is set but status is {t.get('status')}; dispatch parks a task the usage "
+                        f"limit stopped as blocked, and clears the mark when it resumes it")
+        elif t.get("limited") and not limited_mark(t["limited"]):
+            errs.append(f"{where}: limited: {t['limited']!r} isn't `<UTC time, {LIMITED_AT}> <step>` (step: worker, "
+                        f"review, or fix/verify/conflict and a round number)")
         if t.get("answered") and t.get("status") not in ("ready", "done", "dropped"):
             errs.append(f"{where}: answered: is set but status is {t.get('status')}; `ergon answer` leaves it ready")
         if t.get("pin") and t.get("status") in ("done", "dropped"):
