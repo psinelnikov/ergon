@@ -2297,8 +2297,8 @@ def land(t, base, wt, branch, pubs=(), accepted=None):
 
 BREAKDOWN_AGENT = "task-breakdown"
 BREAKDOWN_ALLOW = ["Read", "Grep", "Glob"] + [f"Bash({c}:*)" for c in (
-    "git log", "git show", "git grep", "git ls-files", "git blame", "git status", "ls", "cat", "head",
-    "tail", "wc", "grep")]
+    "git log", "git show", "git diff", "git grep", "git ls-files", "git blame", "git status",
+    "ergon show", "ergon next", "ergon check", "ls", "cat", "head", "tail", "wc", "grep")]
 BREAKDOWN_DENY = ["Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent"]
 BREAKDOWN_MAX = 30  # TASK blocks filed per run; past that every block is refused
 BREAKDOWN_SOURCE = "breakdown {eid}"

@@ -451,6 +451,8 @@ class TestBasics(Project):
                    "ls 'a'#' > f '"]
         from ergon.dispatch import BREAKDOWN_ALLOW
         from ergon.gates import read_only_reason
+        for rule in ("Bash(git diff:*)", "Bash(ergon show:*)", "Bash(ergon next:*)", "Bash(ergon check:*)"):
+            self.assertIn(rule, BREAKDOWN_ALLOW)
         # every command the breakdown allowlist lets run passes the read-only guard too
         allowed += [rule[5:-3] + " README.md" for rule in BREAKDOWN_ALLOW if rule.startswith("Bash(")]
         for cmd in allowed:
