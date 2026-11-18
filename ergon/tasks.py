@@ -272,6 +272,97 @@ def two_person(t):
     return bool(_config.SHARED) and any(rule_hit(rule, t) for rule in _config.TWO_PERSON)
 
 
+# ---------- approval by inheritance (T-136) ----------
+# A worker's FOUND follow-up that isn't a feature is approved by the human approval of the task
+# that found it: it goes straight to ready with an `auto` stamp instead of waiting at proposed.
+# All of these must hold when it is filed, and `check` holds the stamp to them for as long as
+# the task is open:
+#   1. category: is bugfix, refactor or chore (empty or unknown reads as feature);
+#   2. its tier isn't human;
+#   3. its touches: is non-empty and no entry falls under a [[protect]] rule, whatever min_tier;
+#   4. its depth, the length of its source: chain of auto-approved tasks back to a human-approved
+#      root, is at most follow_up_depth (a follow-up of a human-approved task is depth 1; 0: off);
+#   5. local mode: in shared mode an approval is a signed commit, and a parent's signature can't
+#      vouch for a task that didn't exist when it was signed.
+# The guard refuses an agent's edit to category: or touches: of an auto-approved task, so a
+# follow-up can't be relabelled or widened after it was approved.
+
+AUTO_CATEGORIES = ("bugfix", "refactor", "chore")
+AUTO_STAMP = re.compile(r"^auto (\S+) follow-up of (T-\d+) \(root (T-\d+), (.*)\)$")
+
+
+def is_auto(t):
+    """Was t approved by inheritance (an `auto …` stamp) rather than by a human?"""
+    return str(t.get("approved") or "").startswith("auto ")
+
+
+def auto_problem(t):
+    """Why t, as filed, can't be approved by inheritance (conditions 1, 2, 3 and 5), or None."""
+    if _config.SHARED:
+        return "shared mode: approvals must be signed by an approver"
+    cat = str(t.get("category") or "").strip()
+    if cat not in AUTO_CATEGORIES:
+        return f"category {cat or '(empty)'} is a feature: a human approves it"
+    if t.get("tier") not in TIERS or t.get("tier") == "human":
+        return f"tier {t.get('tier')}"
+    touches = [str(x).strip() for x in t.get("touches") or [] if str(x).strip()]
+    if not touches:
+        return "no touches: declared"
+    for pr in _config.PROTECT:
+        hit = next(((x, p) for x in touches for p in pr["touches"] if _config.protect_hit(x, p)), None)
+        if hit:
+            return f"touches {hit[0]} (protect {hit[1]})"
+    return None
+
+
+def approval_of(t, tasks, _seen=()):
+    """How t's approval stands: (root ID, depth, None) when it holds, depth 0 for a human stamp
+    and n for an `auto` stamp n follow-ups from its human-approved root; else (None, None, why).
+    An auto stamp holds only if the task as filed meets conditions 1-5, it names the task's
+    source: as its parent and category: as its category, and that parent's approval holds too."""
+    stamp = str(t.get("approved") or "").strip()
+    if not stamp:
+        return None, None, "not approved"
+    if t.get("status") == "proposed":  # unapproved whatever its stamp says
+        return None, None, "it is proposed"
+    if not is_auto(t):
+        return t.get("id"), 0, None
+    m = AUTO_STAMP.match(stamp)
+    if not m:
+        return None, None, f"can't read the auto stamp {stamp!r}"
+    if t.get("id") in _seen:
+        return None, None, "its source: chain loops"
+    cat, parent = m[1], m[2]
+    if cat != str(t.get("category") or "").strip():
+        return None, None, f"stamped as a {cat} follow-up, but category is {t.get('category') or '(empty)'}"
+    if parent != str(t.get("source") or "").strip():
+        return None, None, f"stamped as a follow-up of {parent}, but source is {t.get('source') or '(empty)'}"
+    why = auto_problem(t)
+    if why:
+        return None, None, why
+    if parent not in tasks:
+        return None, None, f"its parent {parent} doesn't exist"
+    root, depth, why = approval_of(tasks[parent], tasks, _seen + (t.get("id"),))
+    if why:
+        return None, None, f"its parent {parent} isn't approved ({why})"
+    if depth + 1 > _config.FOLLOW_UP_DEPTH:
+        return None, None, f"depth {depth + 1} is past follow_up_depth = {_config.FOLLOW_UP_DEPTH}"
+    return root, depth + 1, None
+
+
+def auto_approval(t, parent, tasks):
+    """Is t, a follow-up `parent` found, approved by inheritance as it is filed? (stamp, root ID,
+    depth), or None when it waits at proposed for a human. tasks: the ancestors to walk."""
+    if auto_problem(t):
+        return None
+    root, depth, why = approval_of(parent, tasks)
+    if why or depth + 1 > _config.FOLLOW_UP_DEPTH:
+        return None
+    root_task = parent if root == parent.get("id") else tasks.get(root) or {}
+    by = re.sub(r"\s*sha256:\S+\s*$", "", str(root_task.get("approved") or "")).strip()
+    return f"auto {t['category']} follow-up of {parent['id']} (root {root}, {by})", root, depth + 1
+
+
 def board(args):
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     shown = [t for t in tasks.values()
@@ -803,6 +894,11 @@ def lint():
             errs.append(f"{where}: {t['status']}, but its approval doesn't verify: {why}")
         elif t.get("status") in NEEDS_APPROVAL and not t.get("approved"):
             errs.append(f"{where}: status {t['status']} without a human `approved:` stamp")
+        elif is_auto(t) and t.get("status") not in ("done", "dropped"):
+            why = approval_of(t, tasks)[2]
+            if why:
+                errs.append(f"{where}: its `approved: auto …` stamp doesn't hold: {why}; a human edits it "
+                            f"back to proposed (status and approved:) and approves it, or drops it")
         # shared mode: only the clone that holds the branch can tell it's gone
         if (t.get("status") == "review" and not held_elsewhere(t)
                 and not _gitops.branch_exists(_config.TASK_BRANCH + t["id"])):

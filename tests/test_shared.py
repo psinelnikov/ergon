@@ -680,6 +680,19 @@ class TestDispatchClaims(Shared):
         self.assertIn("in review but branch task/T-001 is gone", r.stdout)
         self.assertEqual(self.ergon(self.b, "check", check=False, env=self.env_b).returncode, 0)
 
+    def test_a_bugfix_follow_up_stays_proposed_in_shared_mode(self):
+        # T-136: a parent's signature can't vouch for a task that didn't exist when it was signed
+        self.start()
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        env = dict(self.env_a, FAKE_FOUND="Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix")
+        r = self.ergon(self.a, "dispatch", env=env)
+        self.assertEqual(self.status(self.a, "T-001"), "done", r.stdout)
+        text = self.task(self.a, "T-002").read_text()
+        self.assertEqual(self.status(self.a, "T-002"), "proposed", text)
+        self.assertIn("category: bugfix\n", text)
+        self.assertRegex(text, r"(?m)^approved:\s*$")
+        self.assertIn("proposed T-002  (found by T-001)", r.stdout)
+
     def test_accept_lands_on_the_holding_clone(self):
         self.start()
         self.ergon(self.a, "set", "T-001", "accept=yes")

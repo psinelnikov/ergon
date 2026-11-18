@@ -44,6 +44,7 @@ This note designs an **opt-in** shared mode. A project that doesn't turn it on b
 - **Dispatch claims** a task by pushing `ready → doing` before launching a worker, so two dispatchers never run the same task.
 - **Approvals are signed commits.** In shared mode `approve` makes an SSH-signed commit with an `Ergon-Approve: T-NNN <digest>` trailer. The digest covers the brief, so editing an approved brief needs a new approval. A task counts as approved only if a commit signed by a key listed in `.ergon/approvers`, read from the remote trunk, approves its current digest. Dispatch, `next` and `check` verify that. The `approved:` field becomes a display copy.
 - **Two-person rule:** `[[two_person]]` rules, matched like `[[accept]]`, require approvals from two different signers before a task leaves `proposed`.
+- **No approval by inheritance.** In local mode a worker's non-feature FOUND follow-up (a bugfix, refactor or chore with declared, unprotected touches, within `follow_up_depth`) goes straight to `ready`, approved by inheritance from the task that found it (SKILL.md, "The one rule"). In shared mode it stays `proposed`. An approval here is a signed commit over one task's digest, and a parent's signature can't vouch for a task that didn't exist when it was signed. An `approved: auto …` stamp has no signed commit behind it, so dispatch, `next` and `check` treat it like any unsigned stamp.
 
 ## Design
 

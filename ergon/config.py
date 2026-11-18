@@ -59,6 +59,11 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 #                               # call, shown on /e/E-NNN); false: only `ergon journal` writes them
 # limit_probe = true            # read the plan's 5-hour window before and after each dispatch (two
 #                               # tiny haiku calls) to show each task's cost as a % of the limit
+# follow_up_depth = 3           # a worker's FOUND follow-up that is a bugfix, refactor or chore, not
+#                               # tier human, with touches: none under [[protect]], goes straight to
+#                               # ready, approved by inheritance from the task that found it, up to
+#                               # this many follow-ups from a human-approved task (0: off; never in
+#                               # shared mode, where approvals are signed). A feature waits for you
 
 # Tasks whose finished branch waits at status `review` for a human `ergon accept` instead of landing.
 # A task matches a rule if its tier is in tiers (when given) and a touches: entry matches (when
@@ -102,6 +107,7 @@ SHARED = None  # [shared]: {remote, branch}, or None for local-only state
 PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
 ACCEPT = []  # [[accept]] rules: {tiers, touches}
 TWO_PERSON = []  # [[two_person]] rules: {tiers, touches}; shared mode only
+FOLLOW_UP_DEPTH = 3  # follow_up_depth: see tasks.auto_approval
 
 
 def protect_hit(touch, pattern):
@@ -184,7 +190,8 @@ def configure(start=None, need_config=True):
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, \
-        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL
+        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, \
+        FOLLOW_UP_DEPTH
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -232,6 +239,9 @@ def configure(start=None, need_config=True):
     CONFLICT_ROUNDS = count("conflict_rounds", 1)  # a branch that conflicts with its base goes back to its worker (T-095)
     RESUME_SECS = count("review_resume_secs", 3300)
     RESUME_TOKENS = count("review_resume_tokens", 80000)
+    # How many FOUND follow-ups deep a non-feature follow-up is approved by inheritance (T-136);
+    # 0 turns that off. tasks.auto_approval has the rule.
+    FOLLOW_UP_DEPTH = count("follow_up_depth", 3)
     JOURNAL = CFG.get("journal", True)  # write an epic's journal entry (`ergon journal`) when it finishes
     if not isinstance(JOURNAL, bool):
         raise NotConfigured(f"{CONFIG_FILE}: journal is true or false")

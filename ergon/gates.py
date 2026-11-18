@@ -59,6 +59,9 @@ def setf(args):
                 raise SystemExit(f"{args.id}: {item['status']} -> {val} not allowed via set"
                                  + (" (needs human approve)" if item["status"] == "proposed" else "")
                                  + (" (a human accepts or rejects it)" if item["status"] == "review" else ""))
+        if is_task and key in ("category", "touches") and _tasks.is_auto(item) and in_agent_shell():
+            raise SystemExit(f"{args.id} was approved by inheritance (`approved: auto …`), so its `{key}:` is fixed: "
+                             f"file a new task, or ask a human to change it")
         if is_task and key == "tier" and val not in _tasks.TIERS:
             raise SystemExit(f"tier must be one of {_tasks.TIERS}")
         if is_task and key == "category" and val and val not in _tasks.CATEGORIES:
@@ -1293,6 +1296,11 @@ def guard_reason(tool, inp, worker=False, cwd=None):
     fb, fa = frontmatter(before), frontmatter(after)
     if fb.get("approved", "") != fa.get("approved", ""):
         return "`approved:` is written by a human only (the one rule: `ergon guide`)"
+    if _tasks.is_auto(fb):  # approved by inheritance for what it was filed as: no relabelling, no widening
+        for key in ("category", "touches"):
+            if fb.get(key, "") != fa.get(key, ""):
+                return (f"`{key}:` of a task approved by inheritance (`approved: auto …`) is fixed: its approval "
+                        f"holds only for what it was filed as. File a new task, or ask a human to change it")
     if fb.get("status", "") != fa.get("status", "") and not (not before and fa.get("status") in ("proposed", "open")):
         if fb.get("status") == "review":
             return "a task in review leaves it only by a human's `ergon accept` or `ergon reject`, run in their own terminal"
@@ -1387,6 +1395,8 @@ def commit_msg_reason(msg, tasks):
             bad.append(f"{tid}: {t.get('status') or 'no status'}, and no human has approved it")
         elif apr is not None and apr.problem(t):
             bad.append(f"{tid}: approval doesn't verify: {apr.problem(t)}")
+        elif _tasks.is_auto(t) and _tasks.approval_of(t, tasks)[2]:  # approved by inheritance, no longer holds
+            bad.append(f"{tid}: its auto approval doesn't hold: {_tasks.approval_of(t, tasks)[2]}")
     if not bad:
         return None
     return ("ergon: commit refused. It cites tasks no human has approved:\n  " + "\n  ".join(bad) +

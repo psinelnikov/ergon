@@ -44,7 +44,7 @@ WORKER_PROMPT = """You are dispatched on {id}.
 Working tree: {wt} (a git worktree of this repo), on branch {branch}, cut from {base}.
 {retry}{nested}{companions}{rules}
 Work you find but don't do: end your final message with one line per item, before the RESULT line,
-`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)). The dispatcher files each as a proposed task.
+`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)). The dispatcher files each as a task: a feature as proposed, for a human to approve. A bugfix, refactor or chore with TOUCHES may go straight to ready, approved by inheritance from this task, so label each one honestly: new behaviour is a feature, and the reviewer fails a branch that dresses one up.
 
 The task file, read-only to you (it lives in the main checkout):
 
@@ -554,10 +554,16 @@ def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
     return verdict, why.strip(" *`") or "(no reason given)", info
 
 
-def file_found(t, found, epics):
-    """Create each FOUND line a worker emitted as a `proposed` task: its TIER line's tier or the finder's, same epic and a
-    source: of the task that found it. Never ready. Caller holds the state lock."""
+def file_found(t, found, epics, vouch=True):
+    """Create each FOUND line a worker emitted as a task: its TIER line's tier or the finder's, same epic and a
+    source: of the task that found it. It is `proposed`, unless it is approved by inheritance from t
+    (tasks.auto_approval: a bugfix, refactor or chore, not human, declared touches none of them
+    protected, within follow_up_depth, local mode): then it is `ready` with an `auto …` stamp and an
+    `approved` history row by auto. vouch=False files every one proposed (the run that found them
+    didn't finish done or held for accept, so no reviewer passed what it reported). Returns
+    [(id, title, status)]. Caller holds the state lock."""
     made = []
+    tasks = _tasks.load(_config.ITEMS) if vouch and found else {}
     for title, why, extra in found:
         tid = _tasks.next_id(_config.ITEMS, "T")
         why = why[:1].upper() + why[1:] if why else ""
@@ -576,9 +582,17 @@ def file_found(t, found, epics):
                 "tier_why": (extra.get("tier_why") or "") if sized else
                 f"tier of the task that found it ({t['id']}); size it before approving",
                 "_path": _tasks.task_home(t, epics) / f"{tid}-{_tasks.slug(title)}.md", "_body": body}
+        auto = _tasks.auto_approval(meta, t, tasks) if vouch else None
+        if auto:
+            meta["status"], meta["approved"] = "ready", auto[0]
+            if not sized:  # nobody approves it, so nobody sizes it then
+                meta["tier_why"] = f"tier of the task that found it ({t['id']})"
         _tasks.dump(meta, _tasks.TASK_KEYS)
         _history.record("created", meta, tier=meta["tier"], title=title, source=t["id"], by="found")
-        made.append((tid, title))
+        if auto:
+            _history.record("approved", meta, by="auto", tier=meta["tier"], category=meta["category"],
+                            parent=t["id"], root=auto[1], depth=auto[2])
+        made.append((tid, title, meta["status"]))
     return made
 
 
@@ -650,6 +664,17 @@ The task file:
 The diff, `git diff {base}...{branch}`{size}:
 
 {diff}
+{found}"""
+REVIEW_FOUND = """
+The worker's FOUND lines, which dispatch files as follow-up tasks once this branch passes:
+
+{lines}
+A follow-up whose category is bugfix, refactor or chore, with declared touches, none under a \
+[[protect]] rule, and a tier below human, goes straight to `ready` with no human reading it: it is \
+approved by inheritance from this task. A missing category reads as feature, which waits for a \
+human. Fail the branch (`REVIEW: fail`) if one of those non-feature follow-ups is really new \
+behaviour a user would notice (a feature), or hides security-sensitive work (auth, signing, \
+secrets, permissions, audit logging, safety settings) behind `bugfix`, and say which line and why.
 """
 REVIEW_DIFF_MAX = 100_000  # characters inlined per diff; past that the reviewer runs git diff itself
 REVIEW_LINE = re.compile(r"^\W*REVIEW:\s*(pass|fail)\b[\s—:–-]*(.*)$")
@@ -688,7 +713,23 @@ def tree_state(trees, branch, repos):
             + [_gitops.git("rev-parse", branch, cwd=r) for r in repos])
 
 
-def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None):
+FINDERS = "(the finder's)"
+
+
+def found_lines(found):
+    """The REVIEW_FOUND section for a worker's FOUND lines (parse_found's), or '' for none."""
+    if not found:
+        return ""
+    out = []
+    for title, why, extra in found:
+        touches = ", ".join(extra.get("touches") or []) or "none declared"
+        out.append(f"- {title}" + (f" — {why}" if why else "")
+                   + f"\n  category: {extra.get('category') or '(none: reads as feature)'}; "
+                   + f"tier: {extra.get('tier') or FINDERS}; touches: {touches}\n")
+    return REVIEW_FOUND.format(lines="".join(out))
+
+
+def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None, found=()):
     """Run the reviewer on a finished task branch and record its review event. Returns (failure
     reason or None, cost, reviewer tier, fixable). Only a last line of `REVIEW: pass` passes: no
     such line, a fail, output that isn't JSON, an error, a kill, a timeout, or a reviewer that
@@ -697,13 +738,13 @@ def run_review(t, tier, base, wt, branch, pubs, args, agent, settings, rnd=None)
     start = time.monotonic()
     log = _config.RUNS / (f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-review"
                           + (str(rnd) if rnd and rnd > 1 else "") + ".json")
-    failed, cost, who, fixable = _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log)
+    failed, cost, who, fixable = _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log, found)
     _history.record("review", t, verdict="fail" if failed else "pass", reviewer=who, tier=tier,
                     reason=failed, cost=cost, seconds=round(time.monotonic() - start, 1), log=log, **_round(rnd))
     return failed, cost, who, fixable
 
 
-def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log):
+def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log, found=()):
     who = reviewer_tier(tier)
     trees, repos = [wt] + [pub for _, pub in pubs], [None] + [c["path"] for c, _ in pubs]
     before = tree_state(trees, branch, repos)
@@ -718,7 +759,7 @@ def _run_review(t, tier, base, wt, branch, pubs, args, agent, settings, log):
     prompt = REVIEW_PROMPT.format(id=t["id"], wt=wt, branch=branch, base=base, tier=tier, companions=companions,
                                   rules=(f"\nThe worker followed these project rules:\n\n{rules}\n" if rules else "")
                                   + (REVIEW_POLICIES.format(policies=pol) if pol else ""),
-                                  text=t["_path"].read_text(), diff=diff, size=size)
+                                  text=t["_path"].read_text(), diff=diff, size=size, found=found_lines(found))
     cmd = ["claude", "-p", "--agents", json.dumps({"task-review": dict(agent, model=who)}),
            "--agent", "task-review", "--permission-mode", args.permission_mode, "--settings", settings,
            "--output-format", "json"]
@@ -778,7 +819,7 @@ def veto_lines(failed):
             + "Fix what it raised on this branch; it reviews again before this lands.\n")
 
 
-def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None):
+def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, found=()):
     """After a worker says done, before the merge lock: its done claim holds, verify passes,
     then the reviewer passes if `review` names the task's tier or `tier`, the one that finished
     (after --escalate the lower tier's commits are on the branch too). The reviewer is one tier
@@ -797,7 +838,7 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None):
         return failed, 0, "verify"
     if t["tier"] not in _config.REVIEW and tier not in _config.REVIEW:
         return None, 0, False
-    failed, cost, who, fixable = run_review(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd)
+    failed, cost, who, fixable = run_review(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd, found)
     print(f"  review   {t['id']}  {who}: " + ("pass" if not failed else "fail")
           + (f" (round {rnd})" if rnd and rnd > 1 else ""), flush=True)
     return failed, cost, fixable
@@ -1153,6 +1194,10 @@ def dispatch(args):
             if why:
                 skipped[t["id"]] = f"approval doesn't verify: {why}"
                 continue
+            why = _tasks.approval_of(t, tasks)[2] if _tasks.is_auto(t) else None
+            if why:
+                skipped[t["id"]] = f"its auto approval doesn't hold: {why}"
+                continue
             nested = nested_touch(t, links)
             if nested:
                 skipped[t["id"]] = f"touches nested repo {nested}: work it interactively"
@@ -1231,7 +1276,8 @@ def dispatch(args):
 
         while True:
             try:
-                failed, rcost, fixable = gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd)
+                failed, rcost, fixable = gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd,
+                                              info.get("found") or [])
             except _gitops.GitError as err:
                 failed, rcost, fixable = str(err), 0, False
             info["cost"] = info.get("cost", 0) + rcost
@@ -1458,9 +1504,14 @@ def dispatch(args):
                     for title, why in info["policy"]:
                         add_note(cur, f"policy proposed: {title}" + (f" — {why}" if why else ""), who="worker")
                     _tasks.dump(cur, _tasks.TASK_KEYS)
-                for fid, title in file_found(t, info.get("found") or [], epics):
-                    print(f"  proposed {fid}  (found by {t['id']})  {title}")
-                    info.setdefault("filed", []).append(fid)
+                # a follow-up is approved by inheritance only from a run that finished, i.e. that
+                # passed its reviewer when one is set: a vetoed or blocked run's findings wait for you
+                for fid, title, st in file_found(t, info.get("found") or [], epics, vouch=verdict in ("done", "review")):
+                    if st == "ready":
+                        print(f"  ready    {fid}  (found by {t['id']}, approved by inheritance)  {title}")
+                    else:
+                        print(f"  proposed {fid}  (found by {t['id']})  {title}")
+                    info.setdefault("filed", []).append((fid, st))
                 if verdict == "blocked" and info.get("asked"):
                     hid, title = file_human(t, why, epics)
                     print(f"  proposed {hid}  (human, {t['id']} now depends on it)  {title}")
@@ -1686,8 +1737,10 @@ def dispatch(args):
               + f". Logs in {_config.RUNS.relative_to(_config.HOME)}/")
         print_limit(results, window)
         filed = [f for r in results for f in r[3].get("filed", [])]
-        if filed:
-            print(f"{len(filed)} proposed from workers' FOUND lines: {', '.join(filed)}")
+        for st, what in (("proposed", "proposed"), ("ready", "ready (approved by inheritance)")):
+            ids = [fid for fid, s in filed if s == st]
+            if ids:
+                print(f"{len(ids)} {what} from workers' FOUND lines: {', '.join(ids)}")
     if stopped:
         print("\ninterrupted: stopped launching" + ("; killed running workers" if KILL_ALL.is_set() else ""))
     if capped:
