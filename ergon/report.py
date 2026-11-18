@@ -109,6 +109,9 @@ def stats(args):
     if per is not None and r["tiers"]:
         print(f"\n5h%: share of the 5-hour limit at {per:.1f}% per $, measured by dispatch over its last "
               f"{measured} run{'s' if measured != 1 else ''} (an upper bound: other use of the plan counts too)")
+    from . import metrics as _metrics
+    print("\ndone tasks per category: " + "  ".join(
+        f"{k} {n}" for k, n in _metrics.done_by_category(tasks, args.epic).items()))
     if r["repeat"]:
         print("\nblocked more than once:")
         for tid, n in r["repeat"].items():

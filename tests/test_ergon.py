@@ -746,6 +746,15 @@ class TestDispatch(DispatchProject):
         self.assertIn("tier: opus\n", text)
         self.assertIn("tier_why: tier of the task that found it (T-001); size it before approving", text)
 
+    def test_found_category_line(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="A — a\nCATEGORY: refactor\nFOUND: B — b\nFOUND: C — c\nCATEGORY: nope")
+        self.ergon("dispatch")
+        self.assertIn("category: refactor\n", self.task_file("T-002").read_text())
+        for tid in ("T-003", "T-004"):
+            self.assertRegex(self.task_file(tid).read_text(), r"(?m)^category:\s*$")
+
     def test_found_bare_line_gets_prefix_and_fallback_tier_why(self):
         self.ergon("new", "task", "Source", "--tier", "sonnet")
         stamp(self.task_file("T-001"))
@@ -1845,6 +1854,34 @@ class TestHistory(DispatchProject):
         r = self.ergon("new", "task", "Still made", "--tier", "haiku")
         self.assertIn("couldn't record created", r.stderr)
         self.assertEqual(self.status("T-001"), "proposed")
+
+
+class TestCategory(Project):
+    def test_new_writes_and_refuses(self):
+        self.ergon("new", "task", "X", "--tier", "sonnet", "--category", "bugfix")
+        self.assertIn("category: bugfix\n", self.task_file("T-001").read_text())
+        r = self.ergon("new", "task", "Y", "--tier", "sonnet", "--category", "nope", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--category", r.stderr)
+
+    def test_check_set_and_stats(self):
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        self.ergon("set", "T-001", "category=chore")
+        self.assertIn("category: chore\n", self.task_file("T-001").read_text())
+        self.assertNotEqual(self.ergon("set", "T-001", "category=nope", check=False).returncode, 0)
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("category: chore", "category: nope"))
+        r = self.ergon("check", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("category 'nope'", r.stdout + r.stderr)
+        f.write_text(f.read_text().replace("category: nope", "category: chore").replace("status: proposed", "status: done"))
+        self.assertIn("chore 1", self.ergon("stats").stdout)
+        self.assertIn("CATEGORY  chore", self.ergon("show", "T-001").stdout)
+
+    def test_digest_ignores_category(self):
+        from ergon.tasks import brief_digest
+        t = {"id": "T-1", "title": "x", "tier": "sonnet", "touches": [], "_body": "\n## What\na\n"}
+        self.assertEqual(brief_digest({**t, "category": "bugfix"}), brief_digest(t))
 
 
 class TestStats(Project):

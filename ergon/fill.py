@@ -15,7 +15,10 @@ What counts as a gap, per task (`gaps`):
 - tier: `tier_why:` is empty or one of the placeholders that mean nobody sized it (a FOUND line
   with no TIER line, an import with no --tier). Filling it writes `tier:` and `tier_why:`.
 
-Only proposed tasks are filled, and only their blank parts: nothing already written is replaced.
+- category: `category:` is empty. Unlike the rest it is filled on a task of any status, since
+  category is not in the brief digest: one `ergon fill` backfills the existing tasks.
+
+Only proposed tasks are filled (any task, for category alone), and only their blank parts: nothing already written is replaced.
 An approved brief is what a human approved (in shared mode its digest is signed), so `fill` never
 edits one. The briefs are someone else's text, so they're fenced with a random marker and labelled
 as data; the reply is trusted only for the tasks and parts that were asked, and each value is
@@ -42,7 +45,7 @@ from . import tasks as _tasks
 
 BATCH = 8  # tasks per claude call: enough shared context, short enough to stay focused
 TIMEOUT = 1200  # it reads code, so it gets longer than grade's no-tool call
-PARTS = ("what", "done_when", "touches", "tier")
+PARTS = ("what", "done_when", "touches", "tier", "category")
 UNSIZED = ("size it before approving", "not sized: pick the tier")  # file_found's and import's placeholders
 MAX_DONE = 8
 MAX_TOUCHES = 12
@@ -68,6 +71,9 @@ that passes, a grep, a line in a doc. Name the test or the file where you can.
 - touches: the repo paths (files, or a directory when the change spreads across it, relative to \
 the checkout) the change will edit, plus the name of any host or outside system it changes. No \
 globs. Include the test and doc files the change has to update.
+- category: one of feature (new behaviour a user would notice), bugfix (existing behaviour is \
+wrong, security holes included), refactor (same behaviour, better code), chore (docs, help text, \
+tests, config, tooling). When in doubt, feature.
 - tier and tier_why: the cheapest tier that will get it right, and one line of at most 120 \
 characters on why. When in doubt, go one tier up.
   haiku: mechanical and fully specified; one file or a few; checking it is trivial.
@@ -80,7 +86,7 @@ on-chain or legal actions, risk or policy calls.
 {protect}{rules}
 Reply with only a JSON object, no prose and no code fence:
 {{"tasks": {{"T-NNN": {{"what": "...", "done_when": ["..."], "touches": ["..."], "tier": "sonnet", \
-"tier_why": "..."}}}}}}
+"tier_why": "...", "category": "feature"}}}}}}
 Leave out a task or a part you couldn't work out from the brief and the code: a gap is better \
 than a guess.
 
@@ -96,6 +102,7 @@ def gaps(t):
         ("done_when", _serve.blank(_serve.section(body, "Done when"))),
         ("touches", not [x for x in t.get("touches") or [] if str(x).strip()]),
         ("tier", _serve.blank(why) or any(u in why for u in UNSIZED)),
+        ("category", _serve.blank(str(t.get("category") or ""))),
     ) if missing]
 
 
@@ -119,7 +126,8 @@ def pick(tasks, ids=(), epic=None):
     out = {}
     for i in dict.fromkeys(want):
         t = tasks[i]
-        g = gaps(t) if t.get("status") == "proposed" else None
+        g = gaps(t) if t.get("status") == "proposed" else [p for p in gaps(t) if p == "category"] \
+            if t.get("status") in _tasks.TASK_STATUSES else None
         if g:
             out[i] = g
         elif i in named:
@@ -129,7 +137,7 @@ def pick(tasks, ids=(), epic=None):
 
 
 def brief(t, fence, parts):
-    keys = ("title", "tier", "epic", "depends", "touches", "source", "tier_why")
+    keys = ("title", "tier", "category", "epic", "depends", "touches", "source", "tier_why")
     head = "\n".join(f"{k}: {', '.join(t[k]) if isinstance(t.get(k), list) else t.get(k) or ''}" for k in keys)
     body = (head + "\n" + (t.get("_body") or "").strip()).replace(fence, "")
     fill = ", ".join("tier, tier_why" if p == "tier" else p for p in parts)
@@ -197,6 +205,8 @@ def clean(got, want):
         why = _grade.one_line(got["tier_why"])
         if why:
             out["tier"], out["tier_why"] = got["tier"], why
+    if "category" in want and str(got.get("category") or "").strip().lower() in _tasks.CATEGORIES:
+        out["category"] = str(got["category"]).strip().lower()
     return out
 
 
@@ -262,8 +272,13 @@ def apply(text, got, model):
     if why is not None:
         fields["tier"], fields["tier_why"] = tier, _grade.one_line(why)
         wrote.append("tier")
+    if "category" in got and not str(meta.get("category") or "").strip():  # never overwrites one
+        fields["category"] = got["category"]
+        wrote.append("category")
     if not wrote:
         return text, [], ""
+    if wrote == ["category"]:  # not part of the brief: no Notes line to read before approving
+        return _grade.set_fields(head + body, fields), wrote, note
     body = add_note(body, f"- fill: {', '.join(wrote)} written by {model} on {_tasks.today()}; "
                           f"read them before approving.")
     return _grade.set_fields(head + body, fields), wrote, note
@@ -315,7 +330,8 @@ def run_batch(batch, tasks, epics, args, where=None, folder=None):
             t = now.get(i)
             if not part:
                 continue
-            if not t or t.get("status") != "proposed" or _tasks.brief_digest(t) != digests[i]:
+            if not t or (t.get("status") != "proposed" and set(part) != {"category"}) \
+                    or _tasks.brief_digest(t) != digests[i]:
                 skipped.append(i)
                 continue
             path = t["_path"]

@@ -198,7 +198,7 @@ array, no prose and no code fence:
 
 
 def quiz_brief(t):
-    keys = ("title", "tier", "tier_why", "depends", "touches", "epic")
+    keys = ("title", "tier", "category", "tier_why", "depends", "touches", "epic")
     head = "\n".join(f"{k}: {', '.join(t[k]) if isinstance(t.get(k), list) else t.get(k) or ''}" for k in keys)
     return f"=== {t['id']} ===\n{head}\n{t['_body'].strip()}\n=== end of {t['id']} ===\n"
 
@@ -321,12 +321,14 @@ def main():
     nw.add_argument("kind", choices=["task", "epic"])
     nw.add_argument("title")
     nw.add_argument("--tier")
+    nw.add_argument("--category", help="feature, bugfix, refactor or chore (default: empty, reads as feature)")
     nw.add_argument("--epic")
     nw.add_argument("--touches")
     nw.add_argument("--source")
     im = sub.add_parser("import", help="a GitHub issue as a proposed task: gh#123 or gh:OWNER/REPO#123")
     im.add_argument("ref", metavar="gh#N")
     im.add_argument("--tier", help="default: human, until someone sizes it")
+    im.add_argument("--category", help="feature, bugfix, refactor or chore")
     im.add_argument("--epic")
     im.add_argument("--touches")
     st = sub.add_parser("set")
