@@ -1185,6 +1185,60 @@ class TestReviewRounds(DispatchProject):
             self.assertIn("is a whole number, 0 or more", r.stderr, line)
 
 
+class TestGateLayers(DispatchProject):
+    """[gates] static then runtime: first red stops the rest; rounds count per task."""
+    config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
+                                            '        verify_rounds = 2')
+
+    def setUp(self):
+        super().setUp()
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0",
+                        FAKE_FIX_RESULT="tried\nRESULT: done")
+        self.env.pop("CLAUDE_CONFIG_DIR", None)
+        self.ergon("new", "task", "Layered", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+
+    def gates(self, body):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + "\n[gates]\n" + body)
+
+    def rows(self):
+        return [r for r in history(self.root) if r["task"] == "T-001" and r["event"] == "verify"]
+
+    def test_red_static_never_runs_runtime(self):
+        self.gates('static = "echo lint-bad; exit 1"\nruntime = "touch runtime-ran"\n')
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertFalse(list(self.root.glob("**/runtime-ran")))
+        rows = self.rows()
+        self.assertEqual([(r["layer"], r["ok"]) for r in rows], [("static", False)] * 3)  # 1 + 2 rounds, per task
+        calls = [json.loads(l) for l in self.seen.read_text().splitlines()]
+        self.assertIn("static", calls[1]["prompt"])
+        self.assertIn("static gate", calls[1]["prompt"])
+
+    def test_static_green_then_runtime(self):
+        self.gates('static = "true"\nruntime = "true"\n')
+        self.assertEqual(self.status("T-001"), "ready")
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "done")
+        self.assertEqual([(r["layer"], r["ok"]) for r in self.rows()], [("static", True), ("runtime", True)])
+
+    def test_verify_alone_is_runtime(self):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text('verify = "true"\n' + cfg.read_text())
+        self.ergon("dispatch")
+        self.assertEqual([(r["layer"], r["ok"]) for r in self.rows()], [("runtime", True)])
+
+    def test_dry_run_prints_gates(self):
+        self.gates('static = "lint-cmd"\nruntime = "test-cmd"\n')
+        out = self.ergon("dispatch", "--dry-run").stdout
+        self.assertIn("static gate `lint-cmd`", out)
+        self.assertIn("runtime gate `test-cmd`", out)
+
+
 class TestVerifyRounds(DispatchProject):
     """verify_rounds (default 2): a red verify goes back to the worker with its output."""
     config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'

@@ -42,13 +42,19 @@ from . import tasks as _tasks
 WORKER_PROMPT = """You are dispatched on {id}.
 
 Working tree: {wt} (a git worktree of this repo), on branch {branch}, cut from {base}.
-{retry}{nested}{companions}{rules}
+{retry}{nested}{companions}{rules}{gates}
 Work you find but don't do: end your final message with one line per item, before the RESULT line,
 `FOUND: <title> — <why>`. The dispatcher files each as a proposed task.
 
 The task file, read-only to you (it lives in the main checkout):
 
 {text}
+"""
+
+WORKER_GATES = """
+Before landing, dispatch runs these gates in the worktree, in order, stopping at the first red:
+{cmds}
+Run them yourself before `RESULT: done`.
 """
 
 WORKER_POLICIES = """
@@ -420,6 +426,11 @@ def _round(rnd):
     return {"round": rnd} if rnd and rnd > 1 else {}
 
 
+def gates_text(t):
+    cmds = gate_cmds(t)
+    return WORKER_GATES.format(cmds="\n".join(f"- {layer}: `{cmd}`" for layer, cmd in cmds)) if cmds else ""
+
+
 def worker_prompt(t, base, wt, branch, pubs, veto=None, lines=None):
     retry = ""
     try:
@@ -449,7 +460,7 @@ def worker_prompt(t, base, wt, branch, pubs, veto=None, lines=None):
     rules = worker_rules()
     pol = policies_text()
     return WORKER_PROMPT.format(id=t["id"], wt=wt, branch=branch, base=base, retry=retry,
-                                nested=nested, companions=companions,
+                                nested=nested, companions=companions, gates=gates_text(t),
                                 rules=(f"\nThis project's worker rules:\n\n{rules}\n" if rules else "")
                                 + (WORKER_POLICIES.format(policies=pol) if pol else ""),
                                 text=t["_path"].read_text())
@@ -561,12 +572,21 @@ def drop_worktree(wt, branch, repo=None):
 VERIFY_TIMEOUT = 15 * 60  # seconds
 
 
-def run_verify(t, wt, rnd=None):
-    """Run the verify command (task `verify:` over config `verify`) in the task worktree.
-    Returns None if it passes or none is set, else a reason; full output goes to <state>/runs/."""
-    cmd = t.get("verify") or _config.CFG.get("verify")
-    if not cmd:
-        return None
+def gate_cmds(t):
+    """The ordered gates dispatch runs: [(layer, command)], static then runtime. `[gates]` in
+    .ergon.toml sets `static` and `runtime`; top-level `verify` is an alias for `runtime`, and a
+    task's `verify:` overrides the runtime layer only."""
+    gates = _config.CFG.get("gates") or {}
+    out = []
+    if gates.get("static"):
+        out.append(("static", gates["static"]))
+    runtime = t.get("verify") or gates.get("runtime") or _config.CFG.get("verify")
+    if runtime:
+        out.append(("runtime", runtime))
+    return out
+
+
+def _run_gate(t, wt, layer, cmd, rnd):
     start = time.monotonic()
     try:
         r = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True, timeout=VERIFY_TIMEOUT)
@@ -576,15 +596,27 @@ def run_verify(t, wt, rnd=None):
         out, code = f"{text_of(e.stdout)}{text_of(e.stderr)}\ntimed out after {VERIFY_TIMEOUT // 60} min\n", None
     seconds = round(time.monotonic() - start, 1)
     if code == 0:
-        _history.record("verify", t, ok=True, cmd=cmd, seconds=seconds, log=None, **_round(rnd))
+        _history.record("verify", t, ok=True, cmd=cmd, layer=layer, seconds=seconds, log=None, **_round(rnd))
         return None
     _config.RUNS.mkdir(parents=True, exist_ok=True)
     log = _config.RUNS / f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-verify.log"
     log.write_text(out)
-    _history.record("verify", t, ok=False, cmd=cmd, seconds=seconds, log=log, exit=code, **_round(rnd))
+    _history.record("verify", t, ok=False, cmd=cmd, layer=layer, seconds=seconds, log=log, exit=code,
+                    **_round(rnd))
     tail = " | ".join(l.strip() for l in out.strip().splitlines()[-5:])[-400:]
     how = "timed out" if code is None else f"failed (exit {code})"
-    return f"verify `{cmd}` {how}: {tail} (full output {log.relative_to(_config.HOME)})"
+    return f"verify ({layer} gate) `{cmd}` {how}: {tail} (full output {log.relative_to(_config.HOME)})"
+
+
+def run_verify(t, wt, rnd=None):
+    """Run the gates (see gate_cmds) in the task worktree, in order, stopping at the first red.
+    Returns None if all pass or none is set, else a reason naming the layer; full output goes
+    to <state>/runs/."""
+    for layer, cmd in gate_cmds(t):
+        failed = _run_gate(t, wt, layer, cmd, rnd)
+        if failed:
+            return failed
+    return None
 
 
 REVIEW_PROMPT = """You are reviewing {id} before it lands.
@@ -1457,7 +1489,8 @@ def dispatch(args):
                   + also(t) + (f", reviewed by {reviewer_tier(t['tier'])} ({rounds})"
                                if t["tier"] in _config.REVIEW else "")
                   + (f", up to {_config.VERIFY_ROUNDS} verify fix round{'s' if _config.VERIFY_ROUNDS != 1 else ''}"
-                     if _config.VERIFY_ROUNDS and (t.get("verify") or _config.CFG.get("verify")) else "")
+                     if _config.VERIFY_ROUNDS and gate_cmds(t) else "")
+                  + "".join(f", {layer} gate `{cmd}`" for layer, cmd in gate_cmds(t))
                   + (f", {crounds} if its branch conflicts" if cr else "")
                   + (f", escalates to {_config.WORKER_TIERS[_config.WORKER_TIERS.index(t['tier']) + 1]} if blocked"
                      if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1] else "")
@@ -1475,7 +1508,7 @@ def dispatch(args):
                 if --escalate retries it; then fix_loop's calls: per verify fix round a fix worker
                 (when a verify is set), and for a reviewed tier the review plus every fix round
                 (a fix worker and a review again); and a worker per conflict round."""
-                verified = bool(vr and (t.get("verify") or _config.CFG.get("verify")))
+                verified = bool(vr and gate_cmds(t))
                 if verified:
                     counted.add("verify")
 

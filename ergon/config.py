@@ -60,6 +60,12 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # limit_probe = true            # read the plan's 5-hour window before and after each dispatch (two
 #                               # tiny haiku calls) to show each task's cost as a % of the limit
 
+# Layered gates, cheapest first: static (lint, types, import boundaries), then runtime (tests); the
+# first red stops the rest. `verify` above is an alias for runtime; a task's `verify:` overrides runtime only.
+# [gates]
+# static = "ruff check ."
+# runtime = "make test"
+
 # Tasks whose finished branch waits at status `review` for a human `ergon accept` instead of landing.
 # A task matches a rule if its tier is in tiers (when given) and a touches: entry matches (when
 # given). A task's own `accept: yes` opts it in too. Nothing opts a task out.
@@ -227,6 +233,10 @@ def configure(start=None, need_config=True):
         if isinstance(v, bool) or not isinstance(v, int) or v < 0:
             raise NotConfigured(f"{CONFIG_FILE}: {key} is a whole number, 0 or more")
         return v
+    GATES = CFG.get("gates") or {}
+    if not isinstance(GATES, dict) or any(k not in ("static", "runtime") or not isinstance(v, str)
+                                          for k, v in GATES.items()):
+        raise NotConfigured(f"{CONFIG_FILE}: [gates] takes static and runtime, each a shell command")
     REVIEW_ROUNDS = count("review_rounds", 2)
     VERIFY_ROUNDS = count("verify_rounds", 2)  # a red verify goes back to the worker this many times (T-027)
     CONFLICT_ROUNDS = count("conflict_rounds", 1)  # a branch that conflicts with its base goes back to its worker (T-095)
