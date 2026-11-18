@@ -3691,6 +3691,23 @@ class TestCommitHook(DispatchProject):
         self.assertEqual(r.returncode, 1)
         self.assertIn("T-001: proposed, and no human has approved it", r.stderr)
 
+    def test_refuses_task_of_unapproved_epic(self):
+        self.ergon("init", "--hooks")
+        self.ergon("new", "epic", "Big thing")
+        self.ergon("new", "task", "Part", "--tier", "haiku", "--epic", "E-001")
+        stamp(next((self.root / "tasks" / "epics").glob("E-001-*/T-003-*.md")))
+        r = self.commit("Part of the epic (T-003)")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("T-003", r.stderr)
+        self.assertIn("epic E-001 is proposed", r.stderr)
+        self.assertEqual(self.commit("No epic (T-002)").returncode, 0)  # a task without an epic still passes
+        approve_epic(self)
+        self.assertEqual(self.commit("Part of the epic (T-003)").returncode, 0)
+        # an old open epic with no stamp is grandfathered
+        f = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        f.write_text(re.sub(r"^approved:.*\n", "", f.read_text(), flags=re.M))
+        self.assertEqual(self.commit("Part of the epic (T-003)").returncode, 0)
+
     def test_worktree_and_merge(self):
         self.ergon("init", "--hooks")
         self.ergon("init", "--hooks")  # idempotent: rewrites its own hook

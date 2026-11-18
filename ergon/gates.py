@@ -1435,11 +1435,13 @@ def cited_tasks(msg):
     return sorted(set(re.findall(r"\bT-\d{3,}\b", "\n".join(kept))))
 
 
-def commit_msg_reason(msg, tasks):
+def commit_msg_reason(msg, tasks, epics=None):
     """Why a commit with this message must not land, or None. Each task it cites must exist, be
     out of `proposed` and carry a human's `approved:` stamp: a proposed task (stamped or not), one
-    rejected to dropped, one hand-edited to ready, or an ID nobody filed are all refused. Epic IDs
-    aren't approved, so aren't checked. In shared mode the stamp is only a display copy, so the
+    rejected to dropped, one hand-edited to ready, or an ID nobody filed are all refused. So is an
+    approved task whose epic's brief isn't approved (`_tasks.epic_problem`: proposed, dropped, or
+    in shared mode a stamp that doesn't verify); a task with no epic, or an old open epic without a
+    stamp, passes. An epic ID cited on its own isn't checked. In shared mode the stamp is only a display copy, so the
     signed approval must verify too (`Approvals.problem`); approvals load once, if a task is cited."""
     bad = []
     apr = None
@@ -1457,6 +1459,8 @@ def commit_msg_reason(msg, tasks):
             bad.append(f"{tid}: approval doesn't verify: {apr.problem(t)}")
         elif _tasks.is_auto(t) and _tasks.approval_of(t, tasks)[2]:  # approved by inheritance, no longer holds
             bad.append(f"{tid}: its auto approval doesn't hold: {_tasks.approval_of(t, tasks)[2]}")
+        elif why := _tasks.epic_problem(_tasks.epic_of(t, epics or {}), apr):
+            bad.append(f"{tid}: {why}")
     if not bad:
         return None
     return ("ergon: commit refused. It cites tasks no human has approved:\n  " + "\n  ".join(bad) +
@@ -1483,7 +1487,8 @@ def commit_msg_hook(args):
         for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_COMMON_DIR",
                     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_QUARANTINE_PATH"):
             os.environ.pop(var, None)
-        why = commit_msg_reason(Path(args.msgfile).read_text(errors="replace"), _tasks.load(_config.ITEMS))
+        why = commit_msg_reason(Path(args.msgfile).read_text(errors="replace"), _tasks.load(_config.ITEMS),
+                               _tasks.load(_config.EPICS))
     except Exception as err:  # fail open, like the Claude Code hooks
         print(f"ergon commit-msg hook error (ignored): {err}", file=sys.stderr)
         sys.exit(0)

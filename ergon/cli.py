@@ -8,7 +8,7 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon                        board: open work grouped by status, then tier
   ergon init [--hooks]         write .ergon.toml, the state folders and .gitignore lines here.
                                --hooks also installs a git commit-msg hook that refuses commits
-                               citing a task no human approved (covers agents other than Claude Code)
+                               citing a task no human approved, or one whose epic isn't (covers agents other than Claude Code)
   ergon guide                  print the workflow guide (also the plugin's `ergon` skill)
   ergon rules                  print this project's worker rules (worker_rules in .ergon.toml)
   ergon next [--tier T]        approved, unblocked tasks an agent of tier T may take

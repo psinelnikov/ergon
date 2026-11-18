@@ -1029,6 +1029,25 @@ class TestSignedApprovals(Shared):
         self.assertEqual(r.returncode, 1)
         self.assertIn("brief changed after approval", r.stderr)
 
+    def test_commit_msg_hook_checks_the_epic(self):
+        self.start()
+        self.ergon(self.a, "new", "epic", "Big")
+        self.ergon(self.a, "set", "T-001", "epic=E-001")
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        r = self.commit_citing(self.a, "T-001")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("epic E-001 is proposed", r.stderr)
+        self.assertIn("T-001", r.stderr)
+        self.ergon(self.a, "approve", "E-001", inp="y\n")
+        r = self.commit_citing(self.a, "T-001")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # the epic's brief changes after approval: its stamp no longer verifies
+        f = next((self.a / "tasks").rglob("EPIC.md"))
+        f.write_text(f.read_text() + "\nAlso drop the production database.\n")
+        r = self.commit_citing(self.a, "T-001")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("epic E-001's approval doesn't verify", r.stderr)
+
     def test_commit_msg_hook_refuses_a_hand_stamped_task(self):
         self.start()
         stamp(self.task(self.a, "T-001"))
