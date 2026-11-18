@@ -75,6 +75,15 @@ if tier == "REVIEW":
     verdict = seq[min(nth, len(seq) - 1)] if seq else os.environ.get("FAKE_REVIEW", "REVIEW: pass")
     print(json.dumps({"result": "looked\n" + verdict, "session_id": "r-1", "total_cost_usd": 0.02}))
     sys.exit()
+if tier == "BREAKDOWN":  # the task-breakdown agent: replies $FAKE_BREAKDOWN; logs its call to $FAKE_BREAKDOWN_SEEN
+    if os.environ.get("FAKE_BREAKDOWN_SEEN"):
+        with open(os.environ["FAKE_BREAKDOWN_SEEN"], "a") as f:
+            f.write(json.dumps({"argv": sys.argv[1:-1], "prompt": prompt, "cwd": os.getcwd()}) + "\n")
+    if os.environ.get("FAKE_BREAKDOWN_WRITE"):  # a breakdown that doesn't stay read-only
+        open(os.environ["FAKE_BREAKDOWN_WRITE"], "a").write("oops\n")
+    print(json.dumps({"result": os.environ.get("FAKE_BREAKDOWN", "nothing\nRESULT: blocked — no reply set"),
+                      "session_id": "b-1", "total_cost_usd": 0.05}))
+    sys.exit()
 if os.environ.get("FAKE_TRANSCRIPT_AGE"):
     import datetime
     d = os.path.join(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"), "projects", re.sub(r"[^A-Za-z0-9]", "-", os.getcwd()))
@@ -2331,6 +2340,281 @@ class TestAccept(DispatchProject):
         (self.root / ".ergon.toml").write_text('[[accept]]\ntiers = ["human"]\n')
         r = self.ergon("board", check=False)
         self.assertIn("[[accept]] #1 needs tiers", r.stderr)
+
+
+BREAKDOWN_REPLY = """Read the code.
+
+TASK: Add the schema
+tier: haiku
+tier_why: the exact change is written below
+touches: db/schema.sql
+depends:
+## What
+Add a `widgets` table to db/schema.sql:1.
+## Done when
+- `widgets` is in db/schema.sql
+END TASK
+
+**TASK: Read widgets in the API**
+tier: sonnet
+tier_why: one subsystem, has to run its tests
+touches: api/widgets.py
+depends: 1
+## What
+Serve the table from api/widgets.py.
+## Done when
+- GET /widgets returns the rows
+## Notes
+Keep it small.
+END TASK
+
+TASK: Sign widget exports
+tier: opus
+tier_why: signing
+touches: server/auth/sign.py, api/export.py
+depends: 1, 2
+## What
+Sign each export.
+## Done when
+- exports verify
+END TASK
+
+TASK: Rotate the signing key
+tier: sonnet
+tier_why: it looks small
+touches: server/auth/keys.py
+depends:
+## What
+Rotate it.
+## Done when
+- rotated
+END TASK
+
+TASK: Announce the rotation
+tier: haiku
+tier_why: a doc row
+touches: docs/keys.md
+depends: 4
+## What
+Say so in docs/keys.md.
+## Done when
+- the row is there
+END TASK
+
+TASK: Something vague
+tier: sonnet
+tier_why: unsure
+touches: api/x.py
+depends:
+## What
+Make it better.
+## Done when
+END TASK
+
+TASK: Guess the owner
+tier: sonnet
+tier_why: easy
+owner: someone
+touches: api/y.py
+depends:
+## What
+x
+## Done when
+- y
+END TASK
+
+TASK: Cut off mid-block
+tier: haiku
+tier_why: truncated
+touches: a.md
+depends:
+## What
+half
+
+RESULT: done
+"""
+
+
+class TestBreakdown(DispatchProject):
+    """An approved epic with no tasks is broken down headlessly into proposed tasks (T-099)."""
+    config = DispatchProject.config + '''
+        [[protect]]
+        touches = ["server/auth/**"]
+        min_tier = "opus"
+        note = "keys"
+    '''
+
+    def setUp(self):
+        super().setUp()
+        self.seen = Path(self.tmp.name) / "breakdown.jsonl"
+        self.env["FAKE_BREAKDOWN_SEEN"] = str(self.seen)
+        self.env["FAKE_BREAKDOWN"] = BREAKDOWN_REPLY
+
+    def new_epic(self, goal="Ship widgets end to end."):
+        self.ergon("new", "epic", "Widgets")
+        f = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        f.write_text(f.read_text().replace("## Goal\n", f"## Goal\n{goal}\n"))
+        return f
+
+    def calls(self):
+        return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+
+    def field(self, tid, key):
+        return re.search(rf"^{key}:[ \t]*(.*)$", self.task_file(tid).read_text(), re.M).group(1)
+
+    def test_approved_empty_epic_gets_proposed_tasks_once(self):
+        self.new_epic()
+        approve_epic(self)
+        dry = self.ergon("dispatch", "--dry-run", "--budget", "2").stdout
+        self.assertIn("would run  breakdown E-001  opus, read-only in the main checkout, "
+                      "estimated at most $2 (one call at --budget)  Widgets", dry)
+        out = self.ergon("dispatch", "--budget", "2").stdout
+        self.assertEqual(len(self.calls()), 1, out)
+        call = self.calls()[0]
+        self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(self.root))  # the main checkout
+        argv = call["argv"]
+        self.assertEqual(argv[argv.index("--agent") + 1], "task-breakdown")
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+        allowed = argv[argv.index("--allowedTools") + 1].split(",")
+        self.assertIn("Read", allowed)
+        self.assertIn("Bash(git log:*)", allowed)
+        self.assertFalse([a for a in allowed if a in ("Edit", "Write", "Bash")], allowed)
+        self.assertIn("Write", argv[argv.index("--disallowedTools") + 1].split(","))
+        self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "2.0")
+        agent = json.loads(argv[argv.index("--agents") + 1])["task-breakdown"]
+        self.assertEqual((agent["model"], agent["tools"]), ("opus", ["Read", "Grep", "Glob", "Bash"]))
+        self.assertIn("Ship widgets end to end.", call["prompt"])  # the brief
+        self.assertIn("Never touch prod.", call["prompt"])  # the worker rules
+        self.assertIn("- server/auth/**: opus+ (keys)", call["prompt"])  # [[protect]]
+        # three good blocks, depends resolved from block numbers to the IDs they got
+        for tid, title, tier in (("T-001", "Add the schema", "haiku"), ("T-002", "Read widgets in the API", "sonnet"),
+                                 ("T-003", "Sign widget exports", "opus")):
+            text = self.task_file(tid).read_text()
+            self.assertIn(f"\ntitle: {title}\n", text)
+            self.assertIn(f"\ntier: {tier}\n", text)
+            self.assertIn("\nstatus: proposed\n", text)
+            self.assertIn("\nepic: E-001\n", text)
+            self.assertIn("\nsource: breakdown E-001\n", text)
+            self.assertIn("\napproved:\n", text)
+            self.assertEqual(self.task_file(tid).parent.name, self.new_epic_dir())
+        self.assertEqual(self.field("T-001", "depends"), "[]")
+        self.assertEqual(self.field("T-002", "depends"), "[T-001]")
+        self.assertEqual(self.field("T-003", "depends"), "[T-001, T-002]")
+        self.assertEqual(self.field("T-003", "touches"), "[server/auth/sign.py, api/export.py]")
+        self.assertEqual(self.field("T-002", "tier_why"), "one subsystem, has to run its tests")
+        text = self.task_file("T-002").read_text()
+        self.assertIn("## What\nServe the table from api/widgets.py.\n", text)
+        self.assertIn("## Done when\n- GET /widgets returns the rows\n", text)
+        self.assertIn("## Notes\nKeep it small.\n", text)
+        # the rest are refused with a warning, never repaired
+        self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 3)
+        self.assertIn("warning: breakdown E-001 block 4 refused (Rotate the signing key): touches "
+                      "server/auth/keys.py (protect server/auth/**) needs tier opus+, is sonnet", out)
+        self.assertIn("block 5 refused (Announce the rotation): depends on block 4, which was refused", out)
+        self.assertIn("block 6 refused (Something vague): empty or missing `## Done when`", out)
+        self.assertIn("block 7 refused (Guess the owner): unknown field `owner:`", out)
+        self.assertIn("block 8 refused (Cut off mid-block): no END TASK line", out)
+        self.assertIn("1 breakdown(s), $0.05: 3 task(s) proposed (T-001, T-002, T-003), 5 block(s) refused", out)
+        row = [r for r in history(self.root) if r["event"] == "breakdown"]
+        self.assertEqual(len(row), 1)
+        row = row[0]
+        self.assertEqual((row["epic"], row["task"], row["by"], row["verdict"], row["cost"]),
+                         ("E-001", None, "dispatch", "done", 0.05))
+        self.assertEqual(row["filed"], ["T-001", "T-002", "T-003"])
+        self.assertEqual(len(row["refused"]), 5)
+        self.assertTrue((self.root / row["log"]).exists())
+        created = [r for r in history(self.root) if r["event"] == "created" and r.get("by") == "breakdown"]
+        self.assertEqual([r["task"] for r in created], ["T-001", "T-002", "T-003"])
+        self.ergon("check")
+        # a second dispatch doesn't break it down again: the epic has tasks now
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.ergon("dispatch")
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_parse_blocks_refuses_what_it_cannot_file_as_is(self):
+        from ergon import dispatch as D
+        head = "TASK: T\ntier: haiku\ntier_why: w\ntouches:\ndepends:\n"
+        got = D.parse_blocks(head + "## What\n# Big\nx\n## Done when\n- y\nEND TASK\n"
+                             + head + "## What\n### fine\nx\n## Done when\n- y\nEND TASK\n"
+                             + head + "## Scope\nx\nEND TASK\n"
+                             + head + "## What\nx\n## What\ny\nEND TASK\n")
+        self.assertEqual([n for n, _, _ in got], [1, 2, 3, 4])
+        self.assertIn("a `# ` heading", got[0][2])
+        self.assertIsNone(got[1][2])
+        self.assertEqual(got[1][1]["what"], "### fine\nx")
+        self.assertIn("unknown section `## Scope`", got[2][2])
+        self.assertIn("two `## What` sections", got[3][2])
+        self.assertEqual(got[0][1]["title"], "T")
+
+    def new_epic_dir(self):
+        return next((self.root / "tasks" / "epics").glob("E-001-*")).name
+
+    def test_proposed_epic_is_never_broken_down(self):
+        self.new_epic()
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertNotIn("breakdown", dry)
+        self.assertIn("nothing to dispatch", dry)
+        self.ergon("dispatch")
+        r = self.ergon("breakdown", "E-001", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("refused: epic E-001 is proposed", r.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        self.assertFalse([r for r in history(self.root) if r["event"] == "breakdown"])
+        # once a human approves the brief, it is broken down; the cap's estimate counts the call
+        approve_epic(self)
+        dry = self.ergon("dispatch", "--dry-run", "--budget", "2", "--budget-total", "10").stdout
+        self.assertIn("would run  breakdown E-001", dry)
+        self.assertIn("estimated at most $2.00 for 0 task(s) and 1 breakdown(s) at --budget $2 per call", dry)
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run", "--tier", "haiku").stdout)
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run", "--epic", "E-009").stdout)
+
+    def test_blocked_breakdown_runs_once_and_by_hand_only_adds(self):
+        self.new_epic()
+        approve_epic(self)
+        self.env["FAKE_BREAKDOWN"] = "The Goal names no repo.\nRESULT: blocked — say which repo the widgets live in"
+        out = self.ergon("dispatch").stdout
+        self.assertIn("breakdown E-001 blocked: say which repo the widgets live in. Dispatch won't run it again", out)
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        self.ergon("dispatch")
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertEqual(len(self.calls()), 1)
+        # by hand it runs again, and again only adds
+        one = "TASK: First\ntier: haiku\ntier_why: w\ntouches: a.md\ndepends:\n## What\nx\n## Done when\n- y\nEND TASK\nRESULT: done\n"
+        self.env["FAKE_BREAKDOWN"] = one
+        out = self.ergon("breakdown", "E-001", "--budget", "1").stdout
+        self.assertIn("proposed T-001  (breakdown E-001)  First", out)
+        before = self.task_file("T-001").read_text()
+        self.env["FAKE_BREAKDOWN"] = one.replace("First", "Second").replace("depends:", "depends: T-001")
+        out = self.ergon("breakdown", "E-001").stdout
+        self.assertIn("proposed T-002  (breakdown E-001)  Second", out)
+        self.assertEqual(self.task_file("T-001").read_text(), before)
+        self.assertEqual(self.field("T-002", "depends"), "[T-001]")
+        self.assertIn("This epic was broken down 2 time(s) before", self.calls()[-1]["prompt"])
+        self.assertIn("- T-001 [proposed, haiku, E-001] First (touches: a.md)", self.calls()[-1]["prompt"])
+        rows = [r for r in history(self.root) if r["event"] == "breakdown"]
+        self.assertEqual([(r["by"], r["verdict"]) for r in rows],
+                         [("dispatch", "blocked"), ("breakdown", "done"), ("breakdown", "done")])
+        self.ergon("check")
+
+    def test_a_breakdown_that_writes_files_nothing(self):
+        self.new_epic()
+        approve_epic(self)
+        self.env["FAKE_BREAKDOWN_WRITE"] = "README.md"
+        r = self.ergon("breakdown", "E-001", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("the checkout's `git status` changed during the breakdown", r.stdout)
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+
+    def test_breakdown_cost_counts_toward_the_cap(self):
+        self.new_epic()
+        approve_epic(self)
+        r = subprocess.run([sys.executable, str(ERGON), "dispatch", "--watch", "--interval", "0.2",
+                            "--budget-total", "0.04"], cwd=self.root, env=self.env, capture_output=True,
+                           text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("budget cap $0.04 reached (spent $0.05)", r.stdout)
+        self.assertEqual(len(self.calls()), 1)
 
 
 def history(root):

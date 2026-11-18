@@ -59,7 +59,15 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                tasks every --interval seconds (default 30) until the cap is hit
                                or Ctrl-C (stop launching, let workers finish; a second kills them)
                                A reviewer's fail (`review` in .ergon.toml) goes back to the worker
-                               and is reviewed again, up to review_rounds times, then blocks
+                               and is reviewed again, up to review_rounds times, then blocks.
+                               An approved open epic with no tasks is broken down first, once
+                               (as `breakdown` below; not with --ids or --tier)
+  ergon breakdown E-ID [--budget USD] [--timeout MIN]
+                               one read-only `claude -p --agent task-breakdown` (opus) in the main
+                               checkout reads the approved epic's brief, rules, policies and open
+                               tasks, and replies with TASK blocks. Each block that passes check's
+                               rules is filed as a proposed task in the epic (source: breakdown
+                               E-ID); a malformed one is refused with a warning. Only adds tasks
   ergon stats [--since DATE] [--epic E] [--approver NAME | --approvers]
                                read-only: per tier, runs / done / blocked / block rate / cost /
                                timeouts from <state>/runs/*.json, and tasks that blocked twice+
@@ -402,6 +410,10 @@ def main():
     d.add_argument("--escalate", action="store_true",
                    help="when a worker reports blocked, retry once one tier up (haiku→sonnet→opus)")
     d.add_argument("--dry-run", action="store_true")
+    bd = sub.add_parser("breakdown", help="break an approved epic down into proposed tasks (runs claude -p, read-only)")
+    bd.add_argument("id", help="the epic, E-NNN")
+    bd.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
+    bd.add_argument("--timeout", type=int, default=60, help="minutes for the call (default 60)")
     hk = sub.add_parser("hook")
     hk.add_argument("event", choices=["guard", "stop", "commit-msg"])
     hk.add_argument("msgfile", nargs="?", help="commit-msg: the file git passes")
@@ -440,7 +452,7 @@ def run(args):
     else:  # dispatch takes the lock itself, around each step (it runs for hours); grade around its
         # writes only, not the minutes claude takes to answer
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
-         "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
+         "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "breakdown": _dispatch.breakdown, "rules": rules,
          "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "journal": journal, "sync": _shared.sync}[args.cmd](args)
 
 

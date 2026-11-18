@@ -816,6 +816,21 @@ def tidy(args):
     print(f"moved {n} file(s)")
 
 
+def protect_problems(t):
+    """Why t's tier is below a [[protect]] minimum for a path it touches: one line per rule it
+    breaks, or []. `check` runs it on every open task; a breakdown on every TASK block."""
+    if t.get("tier") not in TIERS:
+        return []
+    out = []
+    for pr in _config.PROTECT:
+        hit = next(((x, p) for x in t.get("touches") or [] for p in pr["touches"]
+                    if _config.protect_hit(str(x), p)), None)
+        if hit and TIERS.index(t["tier"]) < TIERS.index(pr["min_tier"]):
+            out.append(f"touches {hit[0]} (protect {hit[1]}) needs tier {pr['min_tier']}+, is {t['tier']}"
+                       + (f": {pr['note']}" if pr["note"] else ""))
+    return out
+
+
 def lint():
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     apr = _gitops.approvals()  # None outside shared mode
@@ -881,13 +896,8 @@ def lint():
         for d in t.get("depends") or []:
             if d not in tasks:
                 errs.append(f"{where}: depends on missing {d}")
-        if t.get("status") not in ("done", "dropped") and t.get("tier") in TIERS:
-            for pr in _config.PROTECT:
-                hit = next(((x, p) for x in t.get("touches") or [] for p in pr["touches"]
-                            if _config.protect_hit(str(x), p)), None)
-                if hit and TIERS.index(t["tier"]) < TIERS.index(pr["min_tier"]):
-                    errs.append(f"{where}: touches {hit[0]} (protect {hit[1]}) needs tier "
-                                f"{pr['min_tier']}+, is {t['tier']}" + (f": {pr['note']}" if pr["note"] else ""))
+        if t.get("status") not in ("done", "dropped"):
+            errs += [f"{where}: {why}" for why in protect_problems(t)]
     for e in epics.values():
         if e.get("status") not in EPIC_STATUSES:
             errs.append(f"{e['id']}: status {e.get('status')!r} not in {EPIC_STATUSES}")

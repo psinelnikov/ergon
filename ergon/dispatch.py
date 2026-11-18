@@ -1746,6 +1746,409 @@ def land(t, base, wt, branch, pubs=(), accepted=None):
     return "done", f"merged into {base}" + "".join(f" and {c['name']} {c['trunk']}" for c, _ in pubs) + left
 
 
+# ---------- breakdown ----------
+# An approved epic is broken down into tasks by one headless `claude -p --agent task-breakdown`
+# (opus) in the main checkout. It is read-only: its tools are Read, Grep, Glob and Bash. The
+# permission mode is dontAsk, so only the read-only commands in BREAKDOWN_ALLOW run and every
+# other call is denied. The guard hook runs as it does for workers. If the checkout's `git
+# status` changed during the run, nothing is filed. The agent writes no tracker state. It
+# replies with TASK blocks, and the dispatcher files each block that passes `check`'s rules as
+# a `proposed` task in the epic, with source `breakdown E-NNN`. A malformed block is refused
+# with a warning and never repaired. Running it again only adds tasks: nothing existing is
+# edited. Dispatch runs it once per approved open epic with no tasks (a `breakdown` history row
+# marks it run); `ergon breakdown E-NNN` runs it again by hand.
+
+BREAKDOWN_AGENT = "task-breakdown"
+BREAKDOWN_ALLOW = ["Read", "Grep", "Glob"] + [f"Bash({c}:*)" for c in (
+    "git log", "git show", "git grep", "git ls-files", "git blame", "git status", "ls", "cat", "head",
+    "tail", "wc", "grep")]
+BREAKDOWN_DENY = ["Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent"]
+BREAKDOWN_MAX = 30  # TASK blocks filed per run; past that every block is refused
+BREAKDOWN_SOURCE = "breakdown {eid}"
+BLOCK_START = re.compile(r"^\W*TASK:[ \t]*(.*?)[ \t*`]*$")
+BLOCK_END = re.compile(r"^\W*END TASK\W*$")
+BLOCK_FIELDS = ("tier", "tier_why", "touches", "depends")
+BLOCK_SECTIONS = ("what", "done when", "notes")
+
+BREAKDOWN_PROMPT = """Break down epic {eid} into tasks.
+
+You run in the main checkout, {home}, and you are read-only. The dispatcher files your TASK blocks
+as `proposed` tasks in {eid} with `source: breakdown {eid}`. A human approves each one before it runs.
+{again}
+The epic's brief ({path}):
+
+{brief}
+{rules}{policies}{protect}{companions}
+{existing}
+
+Write one block per task, in the order they should land, and end with `RESULT: done` as your last line.
+If the brief can't be broken down as it stands, write no blocks and end with
+`RESULT: blocked — <what a human must settle>`. Each block is exactly this:
+
+TASK: <title: what changes, one line>
+tier: <haiku | sonnet | opus | human>
+tier_why: <one line: why that tier>
+touches: <comma-separated paths or names it changes; may be empty>
+depends: <comma-separated numbers of earlier blocks in this reply, or existing T-NNN IDs; may be empty>
+## What
+<the change, citing file:line>
+## Done when
+<outcomes a reviewer can check>
+END TASK
+
+Blocks are numbered 1, 2, 3, … in the order you write them, and `depends` may name only an earlier
+block. Each block is checked as `ergon check` would check it. A block with an unknown field, a tier
+below a `[[protect]]` minimum for a path it touches, an empty What or Done when, or a missing
+END TASK line is refused and never repaired. So is a block that depends on a refused one. At most
+{max} blocks are filed.
+"""
+
+
+def breakdown_agent():
+    """The task-breakdown definition (a project's .claude/agents/task-breakdown.md wins over the
+    plugin's). Its tools are always the read-only four, whatever an override's frontmatter says."""
+    path = next(p for p in (_config.AGENTS / f"{BREAKDOWN_AGENT}.md", _config.PLUGIN_AGENTS / f"{BREAKDOWN_AGENT}.md")
+                if p.exists())
+    m = _tasks.parse(path)
+    return {"description": m["description"], "model": m.get("model") or "opus", "prompt": m["_body"].strip(),
+            "tools": ["Read", "Grep", "Glob", "Bash"]}
+
+
+def breakdown_rows(eid=None):
+    """The history's `breakdown` rows (of one epic, with eid)."""
+    return [r for r in _history.read() if r.get("event") == "breakdown" and (not eid or r.get("epic") == eid)]
+
+
+def breakdown_candidates(tasks, epics, apr=None):
+    """Epics dispatch breaks down: open, approved (or from before approvals: epic_problem), with
+    no task at all (a dropped one counts: someone looked), never broken down before."""
+    done = {r.get("epic") for r in breakdown_rows()}
+    have = {t.get("epic") for t in tasks.values()}
+    return [e for _, e in sorted(epics.items()) if e.get("status") == "open" and e["id"] not in have
+            and e["id"] not in done and not _tasks.epic_problem(e, apr)]
+
+
+def protect_text():
+    if not _config.PROTECT:
+        return ""
+    return ("\nProtected paths ([[protect]]): a task touching one needs at least that tier.\n"
+            + "".join(f"- {', '.join(pr['touches'])}: {pr['min_tier']}+" + (f" ({pr['note']})" if pr["note"] else "")
+                      + "\n" for pr in _config.PROTECT))
+
+
+def existing_text(eid, tasks):
+    """The tasks a breakdown must not repeat: the epic's own (any status), then every other open task."""
+    def row(t):
+        return (f"- {t['id']} [{t.get('status')}, {t.get('tier')}{', ' + t['epic'] if t.get('epic') else ''}] "
+                f"{t.get('title')}" + (f" (touches: {', '.join(t['touches'])})" if t.get("touches") else ""))
+    own = [t for _, t in sorted(tasks.items()) if t.get("epic") == eid]
+    other = [t for _, t in sorted(tasks.items()) if t.get("epic") != eid and t.get("status") not in ("done", "dropped")]
+    out = f"Tasks already in {eid}: add only what is missing, never repeat or edit these:\n"
+    out += "\n".join(row(t) for t in own) if own else "(none yet)"
+    out += "\n\nOther open tasks in the tracker (don't duplicate them; depend on one by its ID if it must land first):\n"
+    out += "\n".join(row(t) for t in other) if other else "(none)"
+    return out + "\n"
+
+
+def breakdown_prompt(e, tasks):
+    rules, pol = worker_rules(), policies_text()
+    comps = "".join(f"- {c['name']}: name it in touches: for a change to that repo\n" for c in _config.COMPANIONS)
+    again = breakdown_rows(e["id"])
+    return BREAKDOWN_PROMPT.format(
+        eid=e["id"], home=_config.HOME, path=e["_path"].relative_to(_config.HOME), brief=e["_path"].read_text().strip(),
+        again=(f"\nThis epic was broken down {len(again)} time(s) before. Only add tasks it still needs.\n" if again else ""),
+        rules=f"\nThe project's worker rules, which every task's worker follows:\n\n{rules}\n" if rules else "",
+        policies=REVIEW_POLICIES.format(policies=pol).replace("Do not raise a finding one of them settles",
+                                                                "Don't propose a task one of them rules out") if pol else "",
+        protect=protect_text(), companions=f"\nCompanion repos:\n{comps}" if comps else "",
+        existing=existing_text(e["id"], tasks), max=BREAKDOWN_MAX)
+
+
+def split_list(val):
+    val = val.strip()
+    if val.startswith("[") and val.endswith("]"):
+        val = val[1:-1]
+    return [x.strip().strip("`") for x in val.split(",") if x.strip().strip("`")]
+
+
+def parse_blocks(text):
+    """The TASK blocks of a breakdown's reply: [(number, fields, why it's malformed or None)],
+    numbered from 1 in reply order (a malformed block's fields hold only its `title`). A block
+    runs from a `TASK:` line to an `END TASK` line;
+    one with no END TASK before the next TASK: (or the reply's end) is malformed. Fields are
+    `title`, the BLOCK_FIELDS, and the What / Done when / Notes sections. Nothing is repaired."""
+    out, cur, lines, n = [], None, [], 0
+
+    def close(ended):
+        fields, why = parse_block(cur, lines) if ended else (None, "no END TASK line")
+        out.append((n, fields or {"title": " ".join(cur.split())}, why))  # a refused block keeps its title
+
+    for l in text.replace("\r\n", "\n").split("\n"):
+        m = BLOCK_START.match(l)
+        if m:
+            if cur is not None:
+                close(False)
+            n += 1
+            cur, lines = m.group(1), []
+        elif cur is not None and BLOCK_END.match(l):
+            close(True)
+            cur = None
+        elif cur is not None:
+            lines.append(l)
+    if cur is not None:
+        close(False)
+    return out
+
+
+def parse_block(title, lines):
+    """(fields, None) or (None, why it's malformed) for one TASK block's title and lines."""
+    f, section, seen = {"title": " ".join(title.split())}, None, set()
+    for l in lines:
+        h = _tasks.HEADING.match(l)  # what the brief digest splits sections on
+        if h and not l.startswith("##"):
+            return None, f"a `# ` heading ({l.strip()[:60]!r}) would end the task's What or Done when"
+        if h:
+            section = h.group(1).strip().lower()
+            if section not in BLOCK_SECTIONS:
+                return None, f"unknown section `## {h.group(1).strip()}`"
+            if section in f:
+                return None, f"two `## {h.group(1).strip()}` sections"
+            f[section] = []
+            continue
+        if section:
+            f[section].append(l)
+            continue
+        if not l.strip():
+            continue
+        m = re.match(r"^\s*([A-Za-z_]+)\s*:(.*)$", l)
+        if not m:
+            return None, f"a line before `## What` that isn't a field: {l.strip()[:60]!r}"
+        key = m.group(1).lower()
+        if key not in BLOCK_FIELDS:
+            return None, f"unknown field `{m.group(1)}:` (only {', '.join(BLOCK_FIELDS)})"
+        if key in seen:
+            return None, f"`{key}:` given twice"
+        seen.add(key)
+        f[key] = m.group(2).strip()
+    for s in BLOCK_SECTIONS:
+        if s in f:
+            f[s] = _tasks.normalised("\n".join(f[s]))
+    return f, None
+
+
+def check_block(n, f, tasks, ids, refused):
+    """Why block n mustn't be filed, or None: `check`'s rules for a new proposed task. ids: block
+    number -> the ID it will get (earlier blocks that passed); refused: numbers refused so far."""
+    title = f.get("title") or ""
+    if not title:
+        return "no title on the TASK: line"
+    if len(title) > 120:
+        return f"title is {len(title)} characters (at most 120)"
+    if re.search(r"(?:^|\s)#", title) or title.startswith("["):
+        return "title would not survive frontmatter (a ` #` starts a comment, a leading `[` a list)"
+    for k in BLOCK_FIELDS:
+        if k not in f:
+            return f"no `{k}:` line"
+    if f["tier"] not in _tasks.TIERS:
+        return f"tier {f['tier']!r} not in {_tasks.TIERS}"
+    if not f["tier_why"]:
+        return "empty tier_why"
+    if re.search(r"(?:^|\s)#", f["tier_why"]) or (f["tier_why"].startswith("[") and f["tier_why"].endswith("]")):
+        return "tier_why would not survive frontmatter (a ` #` starts a comment, `[...]` a list)"
+    if not f.get("what"):
+        return "empty or missing `## What`"
+    if not f.get("done when"):
+        return "empty or missing `## Done when`"
+    touches = split_list(f["touches"])
+    if any(re.search(r"[\[\]#]", x) for x in touches):
+        return f"a touches: entry holds `[`, `]` or `#`: {f['touches']}"
+    why = _tasks.protect_problems({"tier": f["tier"], "touches": touches})
+    if why:
+        return why[0]
+    deps = []
+    for d in split_list(f["depends"]):
+        if re.fullmatch(r"#?\d+", d):
+            k = int(d.lstrip("#"))
+            if k >= n:
+                return f"depends on block {k}, which isn't an earlier block"
+            if k in refused:
+                return f"depends on block {k}, which was refused"
+            if k not in ids:
+                return f"depends on block {k}, which doesn't exist"
+            deps.append(ids[k])
+        elif re.fullmatch(r"T-\d{3,}", d):
+            if d not in tasks:
+                return f"depends on {d}, which doesn't exist"
+            if tasks[d].get("status") == "dropped":
+                return f"depends on {d}, which is dropped"
+            deps.append(d)
+        else:
+            return f"depends: {d!r} is neither a block number nor a T-NNN ID"
+    f["_touches"], f["_depends"] = touches, list(dict.fromkeys(deps))
+    return None
+
+
+def checkout_state():
+    """What a read-only breakdown must leave as it found it: the `git status` (untracked files
+    included) of the main checkout, minus the state folder, which dispatch itself writes
+    meanwhile, and of each companion checkout."""
+    try:
+        state = _config.STATE.resolve().relative_to(_config.HOME.resolve()).as_posix() + "/"
+    except ValueError:
+        state = None
+    out = []
+    for name, repo in [("", _config.HOME)] + [(c["name"], c["path"]) for c in _config.COMPANIONS if has_checkout(c)]:
+        st = _gitops.git("status", "--porcelain", "--untracked-files=all", raw=True, cwd=repo)
+        out += [f"{name}:{l}" for l in st.splitlines()
+                if l.strip() and not (not name and state and l[3:].startswith(state))]
+    return sorted(out)
+
+
+def run_breakdown(e, args, by="breakdown", gate=None, sync=None):
+    """One breakdown of epic e: run the agent, then file what passes. Returns info: verdict
+    (`done` / `blocked`), reason, cost, seconds, log, filed [(id, title)], refused [(n, title,
+    why)]. Records the `breakdown` history row. Never raises. sync(), if given, runs just before
+    the state lock is taken to file; gate(), if given, runs under it and returns why not to file
+    anything, or None."""
+    start = time.monotonic()
+    info = {"epic": e["id"], "filed": [], "refused": [], "cost": 0}
+    folder = _config.RUNS / "breakdown"
+    folder.mkdir(parents=True, exist_ok=True)
+    log = folder / f"{e['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}.json"
+    info["log"] = log.relative_to(_config.HOME)
+    try:
+        verdict, why = _run_breakdown(e, args, log, info, gate, sync)
+    except Exception as err:  # noqa: BLE001 - a breakdown never takes dispatch down
+        verdict, why = "blocked", f"breakdown crashed: {err}"
+    info.update(verdict=verdict, reason=why, seconds=round(time.monotonic() - start, 1))
+    _history.record("breakdown", e, by=by, verdict=verdict, reason=why or None, cost=info["cost"],
+                    seconds=info["seconds"], log=info["log"], session=info.get("session"),
+                    filed=[i for i, _ in info["filed"]], refused=[f"block {n}: {w}" for n, _, w in info["refused"]])
+    return info
+
+
+def _run_breakdown(e, args, log, info, gate, sync):
+    tasks = _tasks.load(_config.ITEMS)
+    agent = breakdown_agent()
+    cmd = ["claude", "-p", "--agents", json.dumps({BREAKDOWN_AGENT: agent}), "--agent", BREAKDOWN_AGENT,
+           "--permission-mode", "dontAsk", "--allowedTools", ",".join(BREAKDOWN_ALLOW),
+           "--disallowedTools", ",".join(BREAKDOWN_DENY), "--settings", worker_settings(),
+           "--output-format", "json"]
+    if args.budget:
+        cmd += ["--max-budget-usd", str(args.budget)]
+    before = checkout_state()
+    out, err = run_proc(cmd + [breakdown_prompt(e, tasks)], _config.HOME, args.timeout * 60)
+    log.write_text(out)
+    if err.strip():
+        log.with_suffix(".err").write_text(err)
+    if err.startswith(KILLED):
+        return "blocked", "killed by a second Ctrl-C"
+    try:
+        d = json.loads(out)
+        if not isinstance(d, dict):
+            raise ValueError
+    except ValueError:
+        return "blocked", "breakdown output wasn't JSON" + (f" ({err.strip().splitlines()[0]})" if err.strip() else "")
+    info.update(cost=d.get("total_cost_usd") or 0, session=d.get("session_id"))
+    text = d.get("result") or ""
+    if d.get("is_error"):
+        return "blocked", f"breakdown errored ({d.get('subtype') or d.get('terminal_reason')}): {text[:200]}"
+    try:
+        changed = checkout_state() != before
+    except _gitops.GitError as err:
+        return "blocked", f"couldn't check the checkout after the breakdown: {err}"
+    if changed:
+        return "blocked", f"the checkout's `git status` changed during the breakdown (it must stay read-only); nothing filed"
+    found = re.findall(r"^\W*RESULT:\s*(done|blocked)\b[\s—:–-]*(.*)$", text, re.M)
+    if not found:
+        return "blocked", "breakdown ended without a RESULT line; nothing filed"
+    if found[-1][0] == "blocked":
+        return "blocked", md_trim(found[-1][1].strip(" *`")) or "(no reason given)"
+    blocks = parse_blocks(text)
+    if not blocks:
+        return "blocked", "breakdown ended `RESULT: done` with no TASK block"
+    if sync:
+        sync()
+    with _gitops.state_lock("breakdown"):
+        why = gate() if gate else None
+        if why:
+            return "blocked", why
+        epics = _tasks.load(_config.EPICS)
+        cur = epics.get(e["id"])
+        why = _tasks.epic_problem(cur, _gitops.approvals()) if cur else f"epic {e['id']} is gone"
+        if not why and cur.get("status") != "open":
+            why = f"epic {e['id']} is {cur.get('status')}"
+        if why:
+            return "blocked", f"{why}; nothing filed"
+        file_blocks(cur, blocks, info)
+    if not info["filed"]:
+        return "blocked", f"every one of {len(blocks)} TASK block(s) was refused"
+    return "done", ""
+
+
+def file_blocks(e, blocks, info):
+    """File each block that passes check_block as a proposed task of epic e, in reply order;
+    refused blocks go to info["refused"]. Caller holds the state lock."""
+    tasks, ids, refused = _tasks.load(_config.ITEMS), {}, set()
+    for n, f, why in blocks:
+        title = (f or {}).get("title") or "(no title)"
+        if not why and n > BREAKDOWN_MAX:
+            why = f"past the first {BREAKDOWN_MAX} blocks"
+        why = why or check_block(n, f, tasks, ids, refused)
+        if why:
+            refused.add(n)
+            info["refused"].append((n, title, why))
+            continue
+        tid = _tasks.next_id(_config.ITEMS, "T")
+        body = f"\n## What\n{f['what']}\n\n## Done when\n{f['done when']}\n\n## Notes\n" + (
+            f"{f['notes']}\n" if f.get("notes") else "")
+        source = BREAKDOWN_SOURCE.format(eid=e["id"])
+        meta = {"id": tid, "title": title, "tier": f["tier"], "status": "proposed", "epic": e["id"],
+                "depends": f["_depends"], "touches": f["_touches"], "source": source,
+                "created": _tasks.today(), "approved": "", "tier_why": f["tier_why"],
+                "_path": e["_path"].parent / f"{tid}-{_tasks.slug(title)}.md", "_body": body}
+        _tasks.dump(meta, _tasks.TASK_KEYS)
+        _history.record("created", meta, tier=meta["tier"], title=title, source=source, by="breakdown")
+        tasks[tid] = meta
+        ids[n] = tid
+        info["filed"].append((tid, title))
+
+
+def print_breakdown(info, indent="  "):
+    eid = info["epic"]
+    for tid, title in info["filed"]:
+        print(f"{indent}proposed {tid}  (breakdown {eid})  {title}")
+    for n, title, why in info["refused"]:
+        print(f"{indent}warning: breakdown {eid} block {n} refused ({title}): {why}")
+    print(f"{indent}breakdown {eid}  {info['verdict']}: {len(info['filed'])} proposed, {len(info['refused'])} refused, "
+          f"${info['cost']:.2f}" + (f"; {info['reason']}" if info.get("reason") else "") + f" (log {info['log']})",
+          flush=True)
+
+
+def breakdown(args):
+    """`ergon breakdown E-NNN`: break an approved open epic down now, whether or not it has tasks."""
+    if not shutil.which("claude"):
+        raise SystemExit("no `claude` on PATH")
+    epics = _tasks.load(_config.EPICS)
+    e = epics.get(args.id)
+    if not e:
+        raise SystemExit(f"no such epic: {args.id}")
+    why = _tasks.epic_problem(e, _gitops.approvals())
+    if why:
+        raise SystemExit(f"refused: {why}; a breakdown runs only on an approved epic")
+    if e.get("status") != "open":
+        raise SystemExit(f"refused: epic {args.id} is {e.get('status')}, not open")
+    _config.RUNS.mkdir(exist_ok=True)
+    print(f"breakdown {args.id}: asking {breakdown_agent()['model']} (read-only, in {_config.HOME})"
+          + (f", at most ${args.budget:g}" if args.budget else ""), flush=True)
+    info = run_breakdown(e, args)
+    print_breakdown(info, indent="")
+    if info["filed"]:
+        print(f"review and approve them from your own terminal: ergon review, then ergon approve {args.id}")
+    if info["verdict"] != "done":
+        sys.exit(1)
+
+
 def print_limit(results, window):
     """Each task's cost as a share of the 5-hour limit, at the pooled rate (limits.rate()), after
     this run's own reading of the window. Nothing before any measurement (an API key, probes off)."""
@@ -1793,13 +2196,14 @@ def dispatch(args):
     agents, settings = worker_agents(), worker_settings()
     reviewer = review_agent() if _config.REVIEW else None
     tried, skipped, results = set(), {}, []
+    breaks, broken = [], set()  # this run's breakdowns (their info), and the epics they ran on
     cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
     capped = stopped = False
     probing = not args.dry_run and _limits.enabled()  # the 5-hour window, read before and after
     window = None
 
     def spent():
-        return sum(r[3].get("cost", 0) for r in results)
+        return sum(r[3].get("cost", 0) for r in results) + sum(b.get("cost", 0) for b in breaks)
     NO_TOUCHES = "(none declared)"
     every_touch = {k for c in _config.COMPANIONS for k in c["touches"]}
 
@@ -1835,6 +2239,31 @@ def dispatch(args):
                 skipped[t["id"]] = f"epic {t['epic']} isn't open"
                 continue
             yield t
+
+    def to_break(tasks):
+        """Epics to break down now (breakdown_candidates): none with --ids or --tier, only the
+        --epic one with --epic, and each at most once a run."""
+        if ids or args.tier:
+            return []
+        epics.update(_tasks.load(_config.EPICS))
+        return [e for e in breakdown_candidates(tasks, epics, _gitops.approvals())
+                if e["id"] not in broken and (not args.epic or e["id"] == args.epic)]
+
+    def break_down(e):
+        """A pool job: one breakdown of e. Files nothing if the epic got tasks meanwhile."""
+        eid = e["id"]
+
+        def gate():
+            if any(t.get("epic") == eid for t in _tasks.load(_config.ITEMS).values()):
+                return f"{eid} got tasks while the breakdown ran; nothing filed (`ergon breakdown {eid}` adds more)"
+            return None
+        info = run_breakdown(e, args, by="dispatch", gate=gate, sync=(lambda: sync_state()) if claims else None)
+        print_breakdown(info)
+        if claims and info["filed"]:
+            failed = sync_state()
+            if failed:
+                say_sync(f"breakdown {eid} not pushed yet ({failed}); the next sync pushes it")
+        return info
 
     live, live_lock = {}, threading.Lock()  # running task id -> what its calls have cost so far
 
@@ -2209,7 +2638,13 @@ def dispatch(args):
                      if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1] else "")
                   + (", held for your accept" if _tasks.needs_accept(t) else "")
                   + (", resumes with your answer" if t.get("answered") else "") + f"  {t['title']}")
-        if not plan:
+        bplan = to_break(tasks)
+        bmodel = breakdown_agent()["model"] if bplan else ""
+        for e in bplan:
+            print(f"  would run  breakdown {e['id']}  {bmodel}, read-only in the main checkout, "
+                  + (f"estimated at most ${args.budget:g} (one call at --budget)" if args.budget
+                     else "no --budget, so no estimate") + f"  {e['title']}")
+        if not plan and not bplan:
             print("nothing to dispatch")
         if cap is not None:
             n = min(len(plan), args.max)
@@ -2249,7 +2684,8 @@ def dispatch(args):
                 ("conflict", f"{crounds} (a worker each) if the branch conflicts")) if k in counted]
             print(f"  cap        ${cap:.2f} total ({args.budget_pct:g}% of ${args.budget_total:.2f}): "
                   "no new task launches once finished workers' cost reaches it"
-                  + (f"; estimated at most ${sum(calls) * args.budget:.2f} for {n} task(s) at --budget "
+                  + (f"; estimated at most ${(sum(calls) + len(bplan)) * args.budget:.2f} for {n} task(s)"
+                     + (f" and {len(bplan)} breakdown(s)" if bplan else "") + " at --budget "
                      f"${args.budget:g} per call" + (", counting a task as its worker plus " + ", plus ".join(what)
                                                      if what else "")
                      if args.budget else "; no --budget, so no estimate"))
@@ -2347,6 +2783,14 @@ def dispatch(args):
                                 running[pool.submit(one, t, base, wt, branch, pubs, answered)] = t["id"]
                                 active[t["id"]] = t
                                 launched += 1
+                            # an approved epic with no tasks: break it down (a slot, not a launch)
+                            bq = [] if capped or unsynced or len(running) >= args.jobs else \
+                                to_break(_tasks.load(_config.ITEMS))
+                            while bq and len(running) < args.jobs:
+                                e = bq.pop(0)
+                                broken.add(e["id"])
+                                print(f"  breakdown {e['id']}  read-only in {_config.HOME}  {e['title']}", flush=True)
+                                running[pool.submit(break_down, e)] = e["id"]
                         next_scan = time.monotonic() + args.interval
                     scan = False
                     over = stopping or capped or launched >= args.max
@@ -2359,6 +2803,11 @@ def dispatch(args):
                         finished = ()
                     for f in finished:
                         tid = running.pop(f)
+                        if tid.startswith("E-"):  # a breakdown
+                            with live_lock:
+                                breaks.append(f.result())
+                            scan = True
+                            continue
                         active.pop(tid, None)
                         with live_lock:  # the cost moves from live to results in one step
                             results.append(f.result())
@@ -2369,7 +2818,7 @@ def dispatch(args):
         finally:
             signal.signal(signal.SIGINT, old_handler)
         stopped = bool(stops)
-        if before and results and not KILL_ALL.is_set():
+        if before and (results or breaks) and not KILL_ALL.is_set():
             window = _limits.measure(before, _limits.probe(), spent())
     for tid, why in sorted(skipped.items()):
         print(f"  skipped  {tid}  {why}")
@@ -2387,11 +2836,22 @@ def dispatch(args):
         filed = [f for r in results for f in r[3].get("filed", [])]
         if filed:
             print(f"{len(filed)} proposed from workers' FOUND lines: {', '.join(filed)}")
+    if breaks:
+        filed = [i for b in breaks for i, _ in b["filed"]]
+        refused = sum(len(b["refused"]) for b in breaks)
+        print(f"\n{len(breaks)} breakdown(s), ${sum(b.get('cost', 0) for b in breaks):.2f}: "
+              f"{len(filed)} task(s) proposed" + (f" ({', '.join(filed)})" if filed else "")
+              + (f", {refused} block(s) refused" if refused else "")
+              + ". `ergon review` lists them for your approval")
+        for b in breaks:
+            if b["verdict"] != "done":
+                print(f"  breakdown {b['epic']} {b['verdict']}: {b['reason']}. Dispatch won't run it again; "
+                      f"`ergon breakdown {b['epic']}` does")
     if stopped:
         print("\ninterrupted: stopped launching" + ("; killed running workers" if KILL_ALL.is_set() else ""))
     if capped:
         left = [t["id"] for t in eligible(_tasks.load(_config.ITEMS))]
-        mean = spent() / len(results) if results else 0
+        mean = sum(r[3].get("cost", 0) for r in results) / len(results) if results else 0
         print(f"\nbudget cap ${cap:.2f} reached (spent ${spent():.2f}): stopped launching. "
               f"Not launched: {', '.join(left) or 'none'}"
               + (f". Estimated ~${mean * len(left):.2f} more to run them (mean ${mean:.2f}/task)" if left else ""))
