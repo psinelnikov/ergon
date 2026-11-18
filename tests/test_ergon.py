@@ -1666,6 +1666,63 @@ class TestWeakening(DispatchProject):
         self.assertEqual(self.status("T-001"), "blocked")
         self.assertIn("acme/public/ruff.toml changed (a gate file: protect `ruff.toml`)", self.notes())
 
+    def check(self, task, files):
+        """weakening() on a branch off main that commits each of `files` ({path: text}), for the
+        task `task` (as at launch), run in a fresh process configured for the project."""
+        sh("git", "checkout", "-qb", "probe", cwd=self.root)
+        try:
+            for path, text in files.items():
+                (self.root / path).parent.mkdir(parents=True, exist_ok=True)
+                (self.root / path).write_text(text)
+            sh("git", "add", "-A", cwd=self.root)
+            sh("git", "commit", "-qm", "probe", cwd=self.root)
+        finally:
+            sh("git", "checkout", "-q", "main", cwd=self.root)
+        script = textwrap.dedent(f"""
+            import json, sys
+            sys.path.insert(0, {str(ERGON.parent)!r})
+            from ergon import config, dispatch
+            config.configure({str(self.root)!r})
+            print(json.dumps(dispatch.weakening(json.loads(sys.argv[1]), "main", "probe")))
+        """)
+        r = subprocess.run([sys.executable, "-c", script, json.dumps(task)], cwd=self.root, env=self.env,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sh("git", "branch", "-qD", "probe", cwd=self.root)
+        return json.loads(r.stdout)
+
+    REPRO = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -0,0 +1 @@\n+x = 1  # noqa\n"
+
+    def test_a_harden_tasks_own_reproduction_passes(self):
+        """T-121: the reproduction a harden task commits for an incident in its harden: is the bad
+        diff, marker and all; it passes without a touches: entry. Nothing else under repros does."""
+        harden = {"id": "T-001", "touches": ["tests/lint.py"], "harden": ["I-1"]}
+        self.assertEqual(self.check(harden, {"tests/harden/I-1.patch": self.REPRO}), [])
+        found = self.check(harden, {"tests/harden/I-1.patch": self.REPRO, "tests/harden/I-9.patch": self.REPRO})
+        self.assertEqual(len(found), 1, found)
+        self.assertTrue(found[0].startswith("tests/harden/I-9.patch adds a suppression marker (suppress `# noqa`)"),
+                        found)
+        # a task with no harden: is checked as today
+        found = self.check({"id": "T-001", "touches": ["tests/lint.py"]}, {"tests/harden/I-1.patch": self.REPRO})
+        self.assertEqual(len(found), 1, found)
+        self.assertTrue(found[0].startswith("tests/harden/I-1.patch adds a suppression marker"), found)
+        # no path tricks through a malformed id
+        found = self.check(dict(harden, harden=["../harden/I-1"]), {"tests/harden/I-1.patch": self.REPRO})
+        self.assertEqual(len(found), 1, found)
+
+    def test_a_reproduction_under_a_protected_repros_passes(self):
+        """With [gates] repros under [gates] protect, the own reproduction is exempt from that check
+        too; a sibling file there is still a gate file."""
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text().replace("[gates]\n", '[gates]\nrepros = "tests/arch/repros"\n'))
+        sh("git", "commit", "-qam", "repros", cwd=self.root)
+        harden = {"id": "T-001", "touches": ["tests/lint.py"], "harden": ["I-1"]}
+        self.assertEqual(self.check(harden, {"tests/arch/repros/I-1.patch": self.REPRO}), [])
+        found = self.check(harden, {"tests/arch/repros/I-1.patch": self.REPRO, "tests/arch/repros/I-9.patch": "x\n"})
+        self.assertEqual(found, ["tests/arch/repros/I-9.patch changed (a gate file: protect `tests/arch/**`)"])
+        found = self.check(dict(harden, harden=[]), {"tests/arch/repros/I-1.patch": "x\n"})
+        self.assertEqual(found, ["tests/arch/repros/I-1.patch changed (a gate file: protect `tests/arch/**`)"])
+
     def test_bad_settings_are_refused(self):
         cfg = self.root / ".ergon.toml"
         base = cfg.read_text()

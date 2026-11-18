@@ -981,6 +981,10 @@ def gate_cmds(t):
 # The guard refuses the edit in the first place; this holds when the guard was bypassed, and in
 # local mode, where no brief digest notices. This check is on what lands; guarding gate files at
 # the tool call is the guard hook's side (T-069).
+# One exemption (T-121): a harden task's own reproduction, repro_path(<id>) for each id in its
+# harden: (as at launch), in the main repo. It is the incident's bad diff, so it may well hold the
+# marker the incident was about, and no one can name it in touches: before the proof asks for it.
+# Exactly those files: anything else under [gates] repros, or a task with no harden:, is checked.
 
 def gate_file_hit(path, c=None):
     """The [gates] protect pattern a changed file falls under, or None. `path` is relative to its
@@ -1047,11 +1051,18 @@ def added_lines(rng, path, repo=None):
     return lines
 
 
+def own_repros(t):
+    """The reproductions t's harden: lets past the weakening check: repro_path(id) for each
+    well-formed incident id it names (main repo paths); empty for a task with no harden:."""
+    return {repro_path(i) for i in harden_ids(t) if HARDEN_ID.fullmatch(i)}
+
+
 def weakening(t, base, branch, pubs=()):
     """The weakening check on t's branch: [] if it passes, else one finding per file, each naming
     the file as touches: would. `t` is the task as it was at launch; only its touches: entries a
-    human approved (unapproved_touches) exempt a file."""
-    found, late = [], {touch_key(x) for x in unapproved_touches(t)}
+    human approved (unapproved_touches) exempt a file, and its harden: its own reproductions
+    (own_repros)."""
+    found, late, repros = [], {touch_key(x) for x in unapproved_touches(t)}, own_repros(t)
     ok = dict(t, touches=[x for x in t.get("touches") or [] if touch_key(x) not in late])
     since = (f" (touches: names it only since its approval, so it doesn't count: a human approves the new "
              f"touches: with `ergon approve {t.get('id')}`)")
@@ -1060,6 +1071,8 @@ def weakening(t, base, branch, pubs=()):
         files = _gitops.git("diff", "--name-only", "-z", "--no-renames", rng, raw=True, cwd=repo)
         for path in (p for p in files.split("\0") if p):
             shown = path if c is None else f"{c['name']}/{path}"
+            if c is None and path in repros:
+                continue
             pattern = gate_file_hit(path, c)
             if names_file(ok, path, c, pattern):
                 continue
