@@ -1807,20 +1807,64 @@ class TestVerifyRounds(DispatchProject):
         self.assertIn("outside: the flaky network test", self.task_file("T-001").read_text())
         self.assertEqual(len(list((self.root / "tasks" / "items").glob("T-002*"))), 0)
 
-    def test_outside_then_red_blocks_and_files_a_human_task(self):
+    def red_outside(self, verify):
         cfg = self.root / ".ergon.toml"
-        cfg.write_text(re.sub(r'verify = ".*"', 'verify = "echo broken trunk; exit 1"', cfg.read_text()))
+        cfg.write_text(re.sub(r'verify = ".*"', f'verify = "{verify}"', cfg.read_text()))
         self.env["FAKE_FIX_RESULT"] = "looked\nRESULT: blocked \u2014 outside: trunk is broken"
+
+    def test_outside_then_red_on_a_red_base_files_one_sonnet_fix_task(self):
+        self.red_outside("echo broken trunk; exit 1")
         out = self.ergon("dispatch").stdout
         self.assertEqual(self.status("T-001"), "blocked", out)
         self.assertEqual([c["agent"] for c in self.calls()], ["HAIKU", "HAIKU"])  # no second fix round
         self.assertEqual([r["ok"] for r in self.rows("verify")], [False, False])
         self.assertIn("verify still red on rerun", self.notes())
+        fix = list((self.root / "tasks" / "items").glob("T-002*"))
+        self.assertEqual(len(fix), 1, out)
+        text = fix[0].read_text()
+        self.assertIn("tier: sonnet", text)
+        self.assertIn("status: proposed", text)
+        self.assertIn("source: T-001", text)
+        self.assertRegex(text, r"title: Make runtime gate green on \S+")
+        self.assertIn("outside: trunk is broken", text)
+        self.assertIn("broken trunk", text)  # the base's own log
+        self.assertIn("depends: [T-002]", self.task_file("T-001").read_text())
+
+    def test_blocked_task_runs_again_after_the_fix_lands(self):
+        self.red_outside("echo broken trunk; exit 1")
+        self.ergon("dispatch")
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(re.sub(r'verify = ".*"', 'verify = "true"', cfg.read_text()))
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "gate fixed", cwd=self.root)
+        stamp(self.task_file("T-002"))  # approved
+        self.ergon("set", "T-001", "status=ready")  # the human's retry: it waits on T-002, then runs in the same dispatch
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-002"), "done", out)
+        self.assertEqual(self.status("T-001"), "done", out)
+
+    def test_two_blocked_tasks_share_the_fix_task(self):
+        self.red_outside("echo broken trunk; exit 1")
+        self.ergon("new", "task", "Second", "--tier", "haiku")
+        stamp(self.task_file("T-002"))
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(len(list((self.root / "tasks" / "items").glob("T-003*"))), 1, out)
+        self.assertEqual(len(list((self.root / "tasks" / "items").glob("T-004*"))), 0, out)
+        for tid in ("T-001", "T-002"):
+            self.assertEqual(self.status(tid), "blocked", out)
+            self.assertIn("depends: [T-003]", self.task_file(tid).read_text())
+
+    def test_outside_then_red_on_a_green_base_files_a_human_task(self):
+        self.red_outside("test ! -e T-001.txt")  # the branch's file breaks it, the base has none
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
         human = list((self.root / "tasks" / "items").glob("T-002*"))
         self.assertEqual(len(human), 1, out)
         text = human[0].read_text()
         self.assertIn("tier: human", text)
         self.assertIn("outside: trunk is broken", text)
+        self.assertIn("green", text)
+        self.assertIn("verify (runtime gate)", text)  # the branch's log too
         self.assertIn("depends: [T-002]", self.task_file("T-001").read_text())
 
 

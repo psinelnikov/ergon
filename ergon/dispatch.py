@@ -727,6 +727,52 @@ def file_human(t, why, epics):
     return tid, title
 
 
+def file_gate_fix(t, layer, base, why, log, epics):
+    """The trunk's gate is red: file a proposed sonnet task "Make <layer> gate green on <base>"
+    and make the blocked task depend on it. An open one for that base and layer (not done or
+    dropped) is reused: the blocked task joins its dependents. Returns (id, title, new).
+    Caller holds the state lock."""
+    title = f"Make {layer} gate green on {base}"
+    items = _tasks.load(_config.ITEMS)
+    old = next((x for x in items.values() if x.get("title") == title
+                and x.get("status") not in ("done", "dropped")), None)
+    if old:
+        tid, new = old["id"], False
+    else:
+        tid, new = _tasks.next_id(_config.ITEMS, "T"), True
+        what = (f"The {layer} gate is red on {base} itself, found while working {t['id']}. "
+                f"Worker's reason: {why}\n\nGate output on a clean worktree of {base}:\n\n```\n{log}\n```")
+        body = _tasks.TASK_BODY.replace("## What\n", f"## What\n{what}\n", 1)
+        meta = {"id": tid, "title": title, "tier": "sonnet", "status": "proposed",
+                "epic": t.get("epic") or "", "depends": [], "touches": [],
+                "source": t["id"], "created": _tasks.today(), "approved": "", "tier_why": "",
+                "_path": _tasks.task_home(t, epics) / f"{tid}-{_tasks.slug(title)}.md", "_body": body}
+        _tasks.dump(meta, _tasks.TASK_KEYS)
+        _history.record("created", meta, tier="sonnet", title=title, source=t["id"], by="blocked")
+    cur = _tasks.load(_config.ITEMS)[t["id"]]
+    if tid not in (cur.get("depends") or []):
+        cur["depends"] = list(cur.get("depends") or []) + [tid]
+        _tasks.dump(cur, _tasks.TASK_KEYS)
+    return tid, title, new
+
+
+def base_gate_log(t, failed, base):
+    """Run the gate `failed` names once on a clean worktree of `base`. Returns (layer, output
+    or None if it is green there)."""
+    m = re.search(r"verify \((\w+) gate\)", failed)
+    cmd = dict(gate_cmds(t)).get(m and m[1])
+    if not cmd:
+        return None, None
+    with scratch_tree(t, base) as tree:
+        try:
+            r = subprocess.run(cmd, shell=True, cwd=tree, capture_output=True, text=True, timeout=VERIFY_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return m[1], f"`{cmd}` timed out after {VERIFY_TIMEOUT // 60} min"
+    if r.returncode == 0:
+        return m[1], None
+    return m[1], (r.stdout + r.stderr).strip()[-3000:] or f"`{cmd}` exited {r.returncode}"
+
+
 def drop_worktree(wt, branch, repo=None):
     """Remove a landed task's worktree, then its branch. Returns what's left for you, or ''."""
     try:
@@ -1871,6 +1917,14 @@ def dispatch(args):
                 return "done", ""
             if fixable == "verify" and outside:  # the rerun as it was is red too: the worker's reason goes to a human
                 info.update(asked=True, rounds=f" (verify still red on rerun: {failed})")
+                try:
+                    layer, blog = base_gate_log(t, failed, base)
+                except (_gitops.GitError, OSError):
+                    layer, blog = None, None
+                if blog:  # red on the base too: a sonnet task can fix that
+                    info["base_red"] = (layer, base, blog)
+                elif layer:  # green there: flaky or environmental, a human gets both logs
+                    info["base_green"] = f" Rerun on a clean {base}: green. Branch run: {failed}"
                 return "blocked", f"{outside}. {kept}"
             if fixable in ("verify", "weaken", "harden", "evidence"):  # a weakening veto or harden proof uses up the same rounds
                 stop = ""
@@ -2088,8 +2142,12 @@ def dispatch(args):
                 for fid, title in file_found(t, info.get("found") or [], epics):
                     print(f"  proposed {fid}  (found by {t['id']})  {title}")
                     info.setdefault("filed", []).append(fid)
-                if verdict == "blocked" and info.get("asked"):
-                    hid, title = file_human(t, why, epics)
+                if verdict == "blocked" and info.get("base_red"):
+                    layer, bbase, blog = info["base_red"]
+                    hid, title, new = file_gate_fix(t, layer, bbase, why, blog, epics)
+                    print(f"  proposed {hid}  ({'sonnet' if new else 'already open'}, {t['id']} now depends on it)  {title}")
+                elif verdict == "blocked" and info.get("asked"):
+                    hid, title = file_human(t, why + info.get("base_green", ""), epics)
                     print(f"  proposed {hid}  (human, {t['id']} now depends on it)  {title}")
             break
         if claims:  # publish where it stopped (and what it filed) now, not at the next scan
