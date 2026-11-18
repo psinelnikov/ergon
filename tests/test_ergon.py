@@ -41,7 +41,9 @@ first run overwrite that file with that line. With $FAKE_REPRO = "<dest>|<src>" 
 harden proof asked for copies the file src to dest and commits it. $FAKE_EVIDENCE =
 "<path>|<caption>[|file|symlink|none];..." has a worker write each file (a symlink to /etc/hosts, or
 nothing), commit it and end with an EVIDENCE: line each, on every run, or with $FAKE_EVIDENCE_FIX only
-when asked again for its evidence."""
+when asked again for its evidence. $FAKE_WRITES = "<path>|<line>;..." has its first run write each
+file as that one line (a line of "-" deletes the file), and $FAKE_PROVE_FIX, in the same form, has a
+fix round the red-on-base proof asked for write those files, commit them and end RESULT: done."""
 import json, os, re, subprocess, sys, time
 if "--agent" not in sys.argv:
     n = 0
@@ -142,6 +144,20 @@ if resume and os.environ.get("FAKE_REPRO") and "harden proof" in prompt:
     subprocess.run(["git", "commit", "-qm", f"Add a reproduction ({tid})"], check=True)
     print(json.dumps({"result": "reproduced\nRESULT: done", "session_id": resume, "total_cost_usd": 0.01}))
     sys.exit()
+def write_files(spec):
+    for ent in (x for x in spec.split(";") if x):
+        wpath, _, wline = ent.partition("|")
+        if wline == "-":
+            os.remove(wpath)
+        else:
+            os.makedirs(os.path.dirname(wpath) or ".", exist_ok=True)
+            open(wpath, "w").write(wline + "\n")
+if resume and os.environ.get("FAKE_PROVE_FIX") and "red-on-base proof" in prompt:
+    write_files(os.environ["FAKE_PROVE_FIX"])
+    subprocess.run(["git", "add", "-A"], check=True)
+    subprocess.run(["git", "commit", "-qm", f"Make the test fail on the base ({tid})"], check=True)
+    print(json.dumps({"result": "tested\nRESULT: done", "session_id": resume, "total_cost_usd": 0.02}))
+    sys.exit()
 if resume and os.environ.get("FAKE_FIX_NOTHING"):
     print(json.dumps({"result": "nothing to change\nRESULT: done", "session_id": resume, "total_cost_usd": 0.01}))
     sys.exit()
@@ -162,6 +178,8 @@ if os.environ.get("FAKE_WEAKEN") and not resume and "An earlier attempt" not in 
 if os.environ.get("FAKE_WRITE") and not resume and "An earlier attempt" not in prompt:
     wpath, _, wline = os.environ["FAKE_WRITE"].partition("|")
     open(wpath, "w").write(wline + "\n")
+if os.environ.get("FAKE_WRITES") and not resume and "An earlier attempt" not in prompt:
+    write_files(os.environ["FAKE_WRITES"])
 if os.environ.get("FAKE_EDIT_TOUCHES"):  # a worker widening its own touches: to cover what it did
     common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
                             capture_output=True, text=True).stdout.strip()
@@ -1532,7 +1550,7 @@ class TestWeakening(DispatchProject):
         self.assertIn("isn't a regex", r.stderr + r.stdout)
         cfg.write_text(base.replace('protect = ["ruff.toml", "tests/arch/**"]', 'protect = "ruff.toml"'))
         r = self.ergon("board", check=False)
-        self.assertIn("protect and suppress, each a list of patterns", r.stderr + r.stdout)
+        self.assertIn("protect, suppress and tests, each a list of patterns", r.stderr + r.stdout)
 
 
 class TestEvidence(DispatchProject):
@@ -1838,6 +1856,202 @@ class TestHarden(DispatchProject):
         r = self.ergon("check", check=False)
         self.assertIn("harden: '../x' isn't an incident id", r.stdout)
         self.assertIn("harden_layer: 'unit' isn't one of static, runtime", r.stdout)
+
+
+class TestProveUnits(unittest.TestCase):
+    def test_test_file_patterns(self):
+        from ergon import config as cfg, dispatch as disp
+        old = cfg.TESTS
+        try:
+            cfg.TESTS = ["tests/**", "**/*_test.go", "spec", "test_*.py"]
+            for path in ("tests/a.sh", "tests/x/y.py", "x_test.go", "pkg/a/x_test.go", "spec/a.rb", "src/spec/b.rb",
+                         "test_app.py", "src/test_app.py"):
+                self.assertTrue(disp.test_file_hit(path), path)
+            for path in ("app.py", "x_test.go.orig", "src/tests/a.sh", "pkg/test.go", "specs/a.rb"):
+                self.assertFalse(disp.test_file_hit(path), path)
+        finally:
+            cfg.TESTS = old
+
+
+class TestProve(DispatchProject):
+    """The red-on-base proof (T-102): a branch that adds or changes a test file must make the runtime
+    gate go red on its base with only its test files overlaid. The toy suite runs tests/*.sh, each a
+    line of shell checking app.txt, and lists tests/ first so the proof's log shows the overlay."""
+    config = DispatchProject.config.replace('worker_rules = "WORKER.md"', 'worker_rules = "WORKER.md"\n'
+                                            '        verify_rounds = 1')
+    RUNTIME = 'ls tests; for f in tests/*.sh; do sh "$f" || exit 1; done'
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "app.txt").write_text("old\n")
+        (self.root / "tests").mkdir()
+        (self.root / "tests" / "t_base.sh").write_text("true\n")
+        (self.root / "legacy.txt").write_text("kept\n")
+        (self.root / "tests" / "t_old.sh").write_text("grep -q kept legacy.txt\n")
+        self.gates()
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "toy suite", cwd=self.root)
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0",
+                        FAKE_FIX_RESULT="tried\nRESULT: done")
+        self.env.pop("CLAUDE_CONFIG_DIR", None)
+
+    def gates(self, extra=""):
+        cfg = self.root / ".ergon.toml"
+        text = re.sub(r"\n\[gates\].*", "", cfg.read_text(), flags=re.S)
+        cfg.write_text(text + f"\n[gates]\nruntime = {json.dumps(self.RUNTIME)}\ntests = [\"tests/**\"]\n{extra}")
+
+    def task(self, tier="haiku", extra=""):
+        self.ergon("new", "task", "Change the app", "--tier", tier)
+        p = self.task_file("T-001")
+        if extra:
+            p.write_text(re.sub(r"^touches:.*$", lambda m: m[0] + "\n" + extra, p.read_text(), count=1, flags=re.M))
+        stamp(p)
+
+    def rows(self, event="prove"):
+        return [r for r in history(self.root) if r["task"] == "T-001" and r["event"] == event]
+
+    def calls(self):
+        return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+
+    def notes(self):
+        return self.task_file("T-001").read_text().split("## Notes", 1)[1]
+
+    def scratch_gone(self):
+        self.assertNotIn("T-001-prove", sh("git", "worktree", "list", cwd=self.root).stdout)
+        self.assertFalse((self.root / ".claude" / "worktrees" / "T-001-prove").exists())
+
+    def base_run(self, row):
+        """What the runtime gate printed on the base with the overlay: its section of the proof's log."""
+        return (self.root / row["log"]).read_text().split("===== base + the branch's test files", 1)[1]
+
+    def test_new_test_red_on_base_lands(self):
+        self.task()
+        self.env["FAKE_WRITES"] = "app.txt|new;tests/t_old.sh|grep -q new app.txt;tests/t_app.sh|grep -q new app.txt"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("prove    T-001  red on the base", out)
+        [row] = self.rows()
+        self.assertIs(row["ok"], True)
+        self.assertEqual(sorted(row["files"]), ["tests/t_app.sh", "tests/t_old.sh"])
+        self.assertEqual(row["exit"], 1)
+        self.assertNotIn("round", row)
+        self.assertIsInstance(row["seconds"], (int, float))
+        self.assertIn("exit 1", self.base_run(row))
+        self.assertIn("it must go red", self.calls()[0]["prompt"])  # the worker is told up front
+        self.scratch_gone()
+        # its order: the gates go green on the branch, then the proof
+        events = [r["event"] for r in history(self.root) if r["task"] == "T-001" and r["event"] in ("verify", "prove")]
+        self.assertEqual(events, ["verify", "prove"])
+
+    def test_weak_test_gets_a_fix_round_then_blocks(self):
+        self.task()
+        self.env["FAKE_WRITES"] = "app.txt|new;tests/t_app.sh|grep -q . app.txt"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertEqual([(r["ok"], r.get("round")) for r in self.rows()], [(False, None), (False, 2)])
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("red-on-base proof failed", calls[1]["prompt"])
+        self.assertIn("tests/t_app.sh", calls[1]["prompt"])
+        self.assertIn("RESULT: blocked — outside:", calls[1]["prompt"])
+        notes = self.notes()
+        self.assertIn("red-on-base proof", notes)
+        self.assertIn("pass without its change", notes)
+        self.assertIn("no verify fix rounds left", notes)
+        [fix] = [r for r in self.rows("worker_end") if r.get("after")]
+        self.assertEqual((fix["after"], fix["round"]), ("prove", 2))
+        self.scratch_gone()
+        stats = self.ergon("stats").stdout
+        self.assertIn("red-on-base proof", stats)
+        self.assertIn("runs 2  red (proved) 0  green on the base 2  waived 0", stats)
+        self.assertIn("fix rounds it sent back 1: $0.01", stats)
+        self.assertRegex(stats, r"time \d+\.\d+s \(mean \d+\.\d+s a run\)")
+        pyramid = stats.split("trust pyramid", 1)[1]
+        self.assertIn("prove", pyramid)
+
+    def test_fix_round_that_makes_a_test_fail_on_the_base_lands(self):
+        self.task()
+        self.env.update(FAKE_WRITES="app.txt|new;tests/t_app.sh|true", FAKE_PROVE_FIX="tests/t_app.sh|grep -q new app.txt")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual([r["ok"] for r in self.rows()], [False, True])
+        self.assertIn("verify passed after 1 fix round(s)", self.notes())
+        self.scratch_gone()
+
+    def test_outside_waives_the_proof_and_notes_say_why(self):
+        self.task()
+        self.env.update(FAKE_WRITES="app.txt|new;tests/t_app.sh|true",
+                        FAKE_FIX_RESULT="RESULT: blocked — outside: a pure refactor, no behaviour to pin")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual([(r["ok"], r.get("waived")) for r in self.rows()],
+                         [(False, None), (None, "outside: a pure refactor, no behaviour to pin")])
+        self.assertIn("red-on-base proof waived by the worker: outside: a pure refactor", self.notes())
+        self.assertEqual(len([r for r in history(self.root) if r["task"] == "T-001" and r["event"] == "created"]), 1)
+        self.assertIn("waived 1", self.ergon("stats").stdout)
+        self.scratch_gone()
+
+    def test_no_test_changes_skips_the_proof(self):
+        self.task()
+        self.env["FAKE_WRITES"] = "app.txt|old too"  # tests stay as they are
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.rows(), [])
+        self.assertNotIn("red-on-base proof", self.ergon("stats").stdout)
+        self.scratch_gone()
+
+    def test_deleting_tests_alone_proves_nothing(self):
+        self.task()
+        self.env["FAKE_WRITES"] = "app.txt|new;tests/t_old.sh|-"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.rows(), [])
+
+    def test_rename_overlays_the_deletion_and_the_addition(self):
+        """A renamed test is its old path deleted and its new one added: on the base the old test is
+        gone (or its own pass would hide nothing, and its name could clash) and the new one runs."""
+        self.task()
+        self.env["FAKE_WRITES"] = "app.txt|new;tests/t_old.sh|-;tests/t_renamed.sh|grep -q new app.txt"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        [row] = self.rows()
+        self.assertEqual(sorted(row["files"]), ["tests/t_old.sh", "tests/t_renamed.sh"])
+        seen = self.base_run(row)
+        self.assertIn("t_renamed.sh", seen)
+        self.assertIn("t_base.sh", seen)
+        self.assertNotIn("t_old.sh", seen)
+
+    def test_task_prove_no_opts_out(self):
+        self.task(extra="prove: no")
+        self.env["FAKE_WRITES"] = "app.txt|new;tests/t_app.sh|true"
+        self.assertNotIn("red-on-base proof", self.ergon("dispatch", "--dry-run").stdout)
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.rows(), [])
+        self.assertNotIn("it must go red", self.calls()[0]["prompt"])
+
+    def test_prove_tiers_opts_a_tier_out(self):
+        self.gates('prove_tiers = ["opus"]\n')
+        sh("git", "commit", "-qam", "opus only", cwd=self.root)
+        self.task(tier="haiku")
+        self.env["FAKE_WRITES"] = "app.txt|new;tests/t_app.sh|true"
+        self.assertNotIn("red-on-base proof", self.ergon("dispatch", "--dry-run").stdout)
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.rows(), [])
+
+    def test_dry_run_names_the_proof(self):
+        self.task()
+        self.assertIn("red-on-base proof if it changes tests/**", self.ergon("dispatch", "--dry-run").stdout)
+
+    def test_bad_prove_tiers_is_a_config_error(self):
+        self.gates('prove_tiers = ["human"]\n')
+        r = self.ergon("board", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("prove_tiers", r.stderr + r.stdout)
 
 
 class TestVerifyRounds(DispatchProject):

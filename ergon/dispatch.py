@@ -61,6 +61,12 @@ Before landing, dispatch runs these gates in the worktree, in order, stopping at
 Run them yourself before `RESULT: done`.
 """
 
+WORKER_PROVE = """
+After the gates pass, if this branch adds or changes test files ({patterns}), dispatch runs the
+runtime gate on the base with only those files from the branch overlaid: it must go red. A test
+that passes without your change proves nothing and goes back to you.
+"""
+
 WORKER_WEAKEN = """
 Before any gate, dispatch vetoes a branch that changes a gate file ({files}){markers},
 unless this task's touches: names that file. Fix the code, not the gate; if a rule is wrong, say
@@ -489,10 +495,12 @@ def run_proc(cmd, cwd, timeout):
     return out or "", err or ""
 
 
-def run_worker(t, base, wt, branch, pubs, args, agents, settings, rnd=None, prompt=None, resume=None, veto=None, lines=None):
+def run_worker(t, base, wt, branch, pubs, args, agents, settings, rnd=None, prompt=None, resume=None, veto=None, lines=None,
+               after=None):
     """Run one headless worker and record its worker_end. Returns (verdict, reason, run info);
     never raises. A fix round (rnd, from 2) either resumes the worker's session with `prompt`, or
-    starts a fresh worker whose prompt quotes the reviewer's `veto`."""
+    starts a fresh worker whose prompt quotes the reviewer's `veto`; `after` names what sent it
+    back (fix_round's kind, or "review"), for the worker_end row."""
     start = time.monotonic()
     if prompt is None:
         prompt = worker_prompt(t, base, wt, branch, pubs, veto, lines)
@@ -500,7 +508,7 @@ def run_worker(t, base, wt, branch, pubs, args, agents, settings, rnd=None, prom
     info["seconds"] = round(time.monotonic() - start, 1)
     _history.record("worker_end", t, tier=t["tier"], verdict=verdict, reason=why,
                     session=info.get("session"), cost=info.get("cost", 0), seconds=info["seconds"],
-                    log=info.get("log"), **_round(rnd))
+                    log=info.get("log"), **_round(rnd), **({"after": after} if after else {}))
     return verdict, why, info
 
 
@@ -515,6 +523,7 @@ def gates_text(t):
     weak = WORKER_WEAKEN.format(files=", ".join(f"`{p}`" for p in _config.GATE_FILES),
                                 markers=f" or adds a line matching a suppression marker ({', '.join(sup)}) to any file" if sup else "")
     return (weak + (WORKER_GATES.format(cmds="\n".join(f"- {layer}: `{cmd}`" for layer, cmd in cmds)) if cmds else "")
+            + (WORKER_PROVE.format(patterns=", ".join(f"`{p}`" for p in _config.TESTS)) if not prove_skip(t) else "")
             + harden_text(t))
 
 
@@ -1045,9 +1054,9 @@ def harden_text(t):
 
 
 @contextmanager
-def scratch_tree(t, ref):
-    """A detached worktree of `ref`, removed after."""
-    path = _config.WORKTREES / f"{t['id']}-harden"
+def scratch_tree(t, ref, kind="harden"):
+    """A detached worktree of `ref` at <worktrees>/<ID>-<kind>, removed after."""
+    path = _config.WORKTREES / f"{t['id']}-{kind}"
     if path.exists():
         _gitops.git("worktree", "remove", "--force", str(path))
     _config.WORKTREES.mkdir(parents=True, exist_ok=True)
@@ -1209,6 +1218,110 @@ def run_harden(t, base, branch, rnd=None):
             f"(full output {log.relative_to(_config.HOME)})"), "harden"
 
 
+# ---------- the red-on-base proof ----------
+# A green runtime gate proves little if the branch's tests would pass without its change. So after
+# the gates go green, when a branch adds or changes a test file ([gates] tests), dispatch makes a
+# scratch worktree (<worktrees>/<ID>-prove, always removed) at the branch's merge-base with its
+# base, overlays only the branch's test files there, and runs the runtime gate: it must go red.
+# The overlay is every test file the branch added, changed or deleted since the merge-base, by
+# path: --no-renames, so a renamed test is the old path deleted and the new one added, and a
+# shared fixture counts when it matches the patterns. A branch that only deletes tests has nothing
+# to prove. Green there goes to a fix round; a worker that ends `RESULT: blocked — outside: <why>`
+# (no behaviour to test: docs, a refactor) waives the proof for the rest of that dispatch, and the
+# Notes say why. A task's `prove: no` (as at launch), a tier outside [gates] prove_tiers, a harden
+# task (its own proof replays its incidents) or no runtime gate skips it.
+
+PROVE_NO = ("no", "false", "0")
+PROVE_FILES_MAX = 20  # test files named in the reason and the history row; the rest are counted
+
+
+def test_file_hit(path):
+    """Is `path` (relative to the repo) one of the project's test files? fnmatch against [gates]
+    tests, as protect is matched (a directory pattern covers what's under it), except that a pattern
+    with no `/` matches a file or directory name at any depth, as .gitignore does (`spec` covers
+    `src/spec/a.rb`), and a leading `**/` also matches at the root."""
+    parts = path.split("/")
+    return any(_config.protect_hit(path, p) or ("/" not in p and any(fnmatch.fnmatchcase(x, p) for x in parts))
+               or (p.startswith("**/") and fnmatch.fnmatchcase(path, p[3:])) for p in _config.TESTS)
+
+
+def prove_skip(t, tier=None):
+    """Why the red-on-base proof never runs on t's branch, or None if it runs whenever the branch
+    changes a test file. `t` is the task as it was at launch; `tier` the one that finished."""
+    if not _config.TESTS:
+        return "no [gates] tests"
+    if str(t.get("prove") or "").strip().lower() in PROVE_NO:
+        return "prove: no"
+    if harden_ids(t):
+        return "a harden task, proved by replaying its incidents"
+    if t["tier"] not in _config.PROVE_TIERS and (tier or t["tier"]) not in _config.PROVE_TIERS:
+        return f"tier {tier or t['tier']} isn't in [gates] prove_tiers"
+    if not dict(gate_cmds(t)).get("runtime"):
+        return "no runtime gate"
+    return None
+
+
+def test_changes(mb, tip):
+    """The test files the branch changed since its merge-base: (added or changed, deleted)."""
+    out = _gitops.git("diff", "--name-status", "-z", "--no-renames", "--no-ext-diff", mb, tip, raw=True)
+    fields = out.split("\0")
+    changed, deleted = [], []
+    for st, path in zip(fields[0::2], fields[1::2]):
+        if path and test_file_hit(path):
+            (deleted if st.startswith("D") else changed).append(path)
+    return changed, deleted
+
+
+def overlay(tree, tip, changed, deleted):
+    """Put the branch's versions of these test files into the scratch tree: deletions first, so a
+    file that replaced a directory (or the reverse) lands cleanly."""
+    lit = lambda ps: [f":(literal){p}" for p in ps]
+    for i in range(0, len(deleted), 200):
+        _gitops.git("rm", "-q", "-r", "--ignore-unmatch", "--", *lit(deleted[i:i + 200]), cwd=tree)
+    for i in range(0, len(changed), 200):
+        _gitops.git("checkout", tip, "--", *lit(changed[i:i + 200]), cwd=tree)
+
+
+def files_text(files):
+    more = f" and {len(files) - PROVE_FILES_MAX} more" if len(files) > PROVE_FILES_MAX else ""
+    return ", ".join(files[:PROVE_FILES_MAX]) + more
+
+
+def run_prove(t, base, branch, rnd=None, tier=None):
+    """The red-on-base proof (above) on t's branch, after its gates passed. Returns None if it holds,
+    doesn't apply, or the branch changes no test file; else the reason, for a fix round. Records a
+    `prove` history row whenever the gate runs. Git errors propagate: the caller blocks on them."""
+    if prove_skip(t, tier):
+        return None
+    tip = _gitops.git("rev-parse", branch)
+    mb = _gitops.git("merge-base", base, tip)
+    changed, deleted = test_changes(mb, tip)
+    if not changed:
+        return None
+    cmd = dict(gate_cmds(t))["runtime"]
+    start = time.monotonic()
+    _config.RUNS.mkdir(parents=True, exist_ok=True)
+    log = _config.RUNS / f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-prove.log"
+    log.write_text(f"red-on-base proof of {t['id']}: runtime gate `{cmd}` on base {mb} with the test files of "
+                   f"{tip} overlaid\nchanged: {' '.join(changed)}\ndeleted: {' '.join(deleted) or '-'}\n")
+    with scratch_tree(t, mb, "prove") as tree:
+        overlay(tree, tip, changed, deleted)
+        code = proof_run(tree, cmd, log, "base + the branch's test files")
+    ok = bool(code)  # red: the tests fail without the change. None, a timeout, proves nothing
+    files = changed + deleted
+    _history.record("prove", t, ok=ok, cmd=cmd, files=files[:PROVE_FILES_MAX], nfiles=len(files), exit=code,
+                    seconds=round(time.monotonic() - start, 1), log=log, **_round(rnd))
+    print(f"  prove    {t['id']}  " + ("red on the base" if ok else "timed out on the base" if code is None
+                                       else "GREEN on the base") + (f" (round {rnd})" if rnd and rnd > 1 else ""),
+          flush=True)
+    if ok:
+        return None
+    how = (f"timed out after {VERIFY_TIMEOUT // 60} min, which proves nothing; make a test fail fast instead"
+           if code is None else "passed, so the branch's tests pass without its change")
+    return (f"red-on-base proof: the runtime gate `{cmd}` on the base with only this branch's test files "
+            f"({files_text(files)}) overlaid {how} (full output {log.relative_to(_config.HOME)})")
+
+
 REVIEW_PROMPT = """You are reviewing {id} before it lands.
 
 Working tree: {wt}, on branch {branch}, cut from {base}. A {tier}-tier worker says the task is done.
@@ -1352,16 +1465,17 @@ def veto_lines(failed):
             + "Fix what it raised on this branch; it reviews again before this lands.\n")
 
 
-def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, evidence=None):
+def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, evidence=None, prove=True):
     """After a worker says done, before the merge lock: its done claim holds, verify passes,
     then the reviewer passes if `review` names the task's tier or `tier`, the one that finished
     (after --escalate the lower tier's commits are on the branch too). The reviewer is one tier
     above `tier`. Touches only the task's own worktrees and branch, so a long verify or review
     doesn't hold the state lock. Returns (failure reason or None, review cost, fixable): a
     reviewer's `REVIEW: fail` is fixable (True), and so are a red verify ("verify"), a
-    weakening veto ("weaken") and a failed harden proof ("harden"), each by a fix round
-    (fix_loop). The weakening check runs first, on `t` as it was at launch; a harden task's
-    proof runs after its gates pass. The caller adds kept_note."""
+    weakening veto ("weaken"), a test that passes on the base ("prove") and a failed harden
+    proof ("harden"), each by a fix round (fix_loop). The weakening check runs first, on `t` as
+    it was at launch; the red-on-base proof (unless `prove` is False: the worker waived it) and a
+    harden task's proof run after its gates pass. The caller adds kept_note."""
     for tree in [wt] + [pub for _, pub in pubs]:
         if _gitops.dirty_paths(tree):
             return f"worker said done but left uncommitted changes in {tree}", 0, False
@@ -1377,6 +1491,9 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, ev
             log = re.search(r"\(full output (\S+?)\)\s*$", failed)
             save_incident(t, "runtime", failed, base, branch, pubs, log=log and log[1], tier=tier)
         return failed, 0, "verify"
+    failed = run_prove(t, base, branch, rnd, tier) if prove else None
+    if failed:
+        return failed, 0, "prove"
     failed = run_harden(t, base, branch, rnd)
     if failed:
         return failed[0], 0, failed[1]
@@ -1443,6 +1560,20 @@ find but don't do, then `RESULT: done` or `RESULT: blocked — <why>`.
 """
 
 
+PROVE_FIX_PROMPT = """The red-on-base proof failed on your work on {id} (fix round {n} of {rounds}): {failed}
+
+Dispatch ran the runtime gate on the base with only this branch's test files overlaid, and it
+didn't go red: your tests pass without your change, so they don't prove it. The full output is in
+{log}.
+Make at least one test fail on the base and pass on {branch}: test the behaviour this task adds or
+fixes. Commit in {wt} citing {id}. The done checks, the gates and the proof run again when you
+finish. If the change has no behaviour a test could pin (docs, a pure refactor), change nothing
+and end `RESULT: blocked — outside: <why>`: the proof is waived, your reason goes in the task's
+Notes, and the task goes on. Otherwise end as before: a `FOUND: <title> — <why>` line for each
+piece of work you find but don't do, then `RESULT: done` or `RESULT: blocked — <why>`.
+"""
+
+
 EVIDENCE_FIX_PROMPT = """Your work on {id} is missing its evidence (fix round {n} of {rounds}): {failed}
 
 This task requires proof that the work runs: test output, a screenshot, a recording. Produce it
@@ -1459,6 +1590,16 @@ def evidence_lines(failed):
     return (f"The last attempt lacked its evidence: {failed}\nEnd with a line `EVIDENCE: <path in the worktree> — "
             "<what it shows>` for each artifact (test output, screenshot, recording) that proves the work runs; "
             "regular files inside the worktree only, no symlinks. The check runs again before this lands.\n")
+
+
+def prove_lines(failed):
+    """Prompt lines for a fresh worker told that its tests passed on the base."""
+    _tail, log = verify_detail(failed)
+    return (f"The red-on-base proof failed on the last attempt: {failed}\nThe full output is in {log}.\n"
+            "Make at least one test fail on the base and pass on this branch: test the behaviour this task adds "
+            "or fixes. The proof runs again before this lands. If the change has no behaviour a test could pin "
+            "(docs, a pure refactor), change nothing and end `RESULT: blocked — outside: <why>`: the proof is "
+            "waived and your reason goes in the task's Notes.\n")
 
 
 def harden_lines(failed):
@@ -1530,15 +1671,20 @@ def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, 
     resume_choice() allows, else a fresh worker with the retry prompt. Returns run_worker's
     (verdict, reason, info), with info["resumed"] and, for a fresh one, info["fresh_because"].
     `verify` = (n, rounds) makes it a round for a red verify (`veto` is run_verify's reason), or
-    with kind="weaken" for a weakening veto (run_weakening's) or kind="harden" for a failed
-    harden proof (run_harden's). `rnd` numbers every worker run
+    with kind="weaken" for a weakening veto (run_weakening's), kind="prove" for tests that pass on
+    the base (run_prove's) or kind="harden" for a failed harden proof (run_harden's). `rnd` numbers
+    every worker run
     (logs, history); a review fix round's own count is `n`."""
     n, rounds = verify or (n, _config.REVIEW_ROUNDS)
     weaken = bool(verify) and kind == "weaken"
     harden = bool(verify) and kind == "harden"
     evid = bool(verify) and kind == "evidence"
-    what = "evidence fix" if evid else "weaken fix" if weaken else "harden fix" if harden else "verify fix" if verify else "fix"
-    lines = ((evidence_lines if evid else weaken_lines if weaken else harden_lines if harden else verify_lines)(veto)) if verify else None
+    prove = bool(verify) and kind == "prove"
+    what = ("evidence fix" if evid else "weaken fix" if weaken else "harden fix" if harden else "prove fix" if prove
+            else "verify fix" if verify else "fix")
+    lines = ((evidence_lines if evid else weaken_lines if weaken else harden_lines if harden else prove_lines if prove
+              else verify_lines)(veto)) if verify else None
+    after = kind if verify else "review"
     resume, fresh_because = resume_choice(session, wt)
     tt = dict(t, tier=tier)
     if resume:
@@ -1549,6 +1695,9 @@ def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, 
                                                 evmax=EVIDENCE_MAX // 1_000_000)
         elif weaken:
             prompt = WEAKEN_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, branch=branch, wt=wt)
+        elif prove:
+            prompt = PROVE_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, branch=branch, wt=wt,
+                                             log=verify_detail(veto)[1])
         elif harden:
             prompt = HARDEN_FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, failed=veto, branch=branch, wt=wt,
                                               log=verify_detail(veto)[1])
@@ -1561,14 +1710,14 @@ def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, 
             prompt = FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, veto=veto, branch=branch, wt=wt,
                                        log=f"Its full review is in {_config.HOME / log[1]}.\n" if log else "")
         verdict, why, info = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd,
-                                        prompt=prompt, resume=session)
+                                        prompt=prompt, resume=session, after=after)
     else:
         _history.record("dispatched", t, tier=tier, model=agents[f"task-{tier}"]["model"], base=base,
                         branch=branch, worktree=wt, companions=[c["name"] for c, _ in pubs],
                         round=rnd, fresh_because=fresh_because)
         print(f"  {what:<8} {t['id']}  round {n}/{rounds}: fresh session ({fresh_because})", flush=True)
         verdict, why, info = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd,
-                                        veto=veto, lines=lines)
+                                        veto=veto, lines=lines, after=after)
     info["resumed"], info["fresh_because"] = resume, fresh_because
     return verdict, why, info
 
@@ -2288,7 +2437,9 @@ def dispatch(args):
         """gate() the finished branch; on a red verify or a reviewer's `REVIEW: fail`, hand it back
         to a worker (fix_round) and gate again: up to verify_rounds and review_rounds times. A
         worker that ends `blocked — outside: <why>` on a verify round costs no round: verify reruns
-        once as it is, and a second red blocks the task and files a human task with that reason.
+        once as it is, and a second red blocks the task and files a human task with that reason. On
+        a prove round it waives the red-on-base proof for the rest of this dispatch (info["prove_waived"]),
+        noted in info["fixed"], also at no round's cost.
         Returns (verdict, reason). Folds every call's cost and FOUND lines, and the last worker's
         log and session, into info; info["rounds"] gets the earlier vetoes when a fix worker blocks.
         Worker runs are numbered on from info["rnd"] (after a conflict round, say), and what the
@@ -2331,7 +2482,8 @@ def dispatch(args):
         while True:
             try:
                 ev = copy_evidence(t, wt, info.get("evidence") or [], rnd) if info.get("evidence") else None
-                failed, rcost, fixable = gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd, ev)
+                failed, rcost, fixable = gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd, ev,
+                                              prove=not info.get("prove_waived"))
             except _gitops.GitError as err:
                 failed, rcost, fixable = str(err), 0, False
             info["cost"] = info.get("cost", 0) + rcost
@@ -2360,7 +2512,7 @@ def dispatch(args):
                 elif layer:  # green there: flaky or environmental, a human gets both logs
                     info["base_green"] = f" Rerun on a clean {base}: green. Branch run: {failed}"
                 return "blocked", f"{outside}. {kept}"
-            if fixable in ("verify", "weaken", "harden", "evidence"):  # a weakening veto or harden proof uses up the same rounds
+            if fixable in ("verify", "weaken", "prove", "harden", "evidence"):  # each uses up the same rounds
                 stop = ""
                 if vfixes >= _config.VERIFY_ROUNDS:
                     stop = f"; no verify fix rounds left (verify_rounds = {_config.VERIFY_ROUNDS})" if vfixes else ""
@@ -2372,6 +2524,14 @@ def dispatch(args):
                 if fixable == "verify" and v == "blocked" and w.lower().startswith("outside:"):
                     outside, info["asked"] = w, False
                     print(f"  verify   {t['id']}  worker says outside the branch ({w}): rerunning as is", flush=True)
+                    continue
+                if fixable == "prove" and v == "blocked" and w.lower().startswith("outside:"):
+                    # no behaviour to test (docs, a refactor): waive the proof for this dispatch, say so in Notes
+                    info["prove_waived"], info["asked"] = w, False
+                    info["fixed"] = "; ".join(x for x in (info.get("fixed"),
+                                                          f"red-on-base proof waived by the worker: {w}") if x)
+                    _history.record("prove", t, ok=None, waived=w, round=rnd)
+                    print(f"  prove    {t['id']}  waived by the worker ({w}); checking again without it", flush=True)
                     continue
                 vfixes += 1
                 if v != "done":
@@ -2633,6 +2793,7 @@ def dispatch(args):
                   + "".join(f", {layer} gate `{cmd}`" for layer, cmd in gate_cmds(t))
                   + (f", harden proof of {len(harden_ids(t))} incident(s) on the {harden_layer(t)} gate"
                      if harden_ids(t) else "")
+                  + (f", red-on-base proof if it changes {', '.join(_config.TESTS)}" if not prove_skip(t) else "")
                   + (f", {crounds} if its branch conflicts" if cr else "")
                   + (f", escalates to {_config.WORKER_TIERS[_config.WORKER_TIERS.index(t['tier']) + 1]} if blocked"
                      if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1] else "")

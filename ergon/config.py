@@ -71,6 +71,10 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # protect = ["ruff.toml", ".eslintrc*", "tests/arch/**"]
 # suppress = ['# noqa', 'eslint-disable', '@pytest\\.mark\\.skip']   # regexes ('literal' strings)
 # repros = "tests/harden"       # where a harden task commits <incident id>.patch when an incident's patch is stale
+# tests = ["tests/**", "**/*_test.go"]   # the project's test files (fnmatch, like protect). A branch that adds or
+#                               # changes one must prove it: on its base with only its test files overlaid,
+#                               # runtime goes red, or the worker gets a fix round (a task's `prove: no` opts out)
+# prove_tiers = ["sonnet", "opus"]   # worker tiers whose branches get that proof (default: every worker tier)
 
 # Tasks whose finished branch waits at status `review` for a human `ergon accept` instead of landing.
 # A task matches a rule if its tier is in tiers (when given) and a touches: entry matches (when
@@ -122,6 +126,8 @@ SHARED = None  # [shared]: {remote, branch}, or None for local-only state
 GATE_FILES = [CONFIG_FILE]  # [gates] protect, plus the config itself
 SUPPRESS = []  # [gates] suppress, compiled
 REPROS = "tests/harden"  # [gates] repros: a harden task's reproductions, <incident id>.patch
+TESTS = []  # [gates] tests: the project's test files, for the red-on-base proof
+PROVE_TIERS = list(WORKER_TIERS)  # [gates] prove_tiers: worker tiers whose branches get that proof
 PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
 ACCEPT = []  # [[accept]] rules: {tiers, touches}
 EVIDENCE = []  # [[evidence]] rules: {tiers, touches}; a matching task's done needs EVIDENCE: files
@@ -209,7 +215,7 @@ def configure(start=None, need_config=True):
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, EVIDENCE, \
         REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, \
-        GATE_FILES, SUPPRESS, REPROS
+        GATE_FILES, SUPPRESS, REPROS, TESTS, PROVE_TIERS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -255,10 +261,11 @@ def configure(start=None, need_config=True):
     GATES = CFG.get("gates") or {}
     strings = lambda v: isinstance(v, list) and all(isinstance(x, str) and x.strip() for x in v)
     if not isinstance(GATES, dict) or any(
-            k not in ("static", "runtime", "protect", "suppress", "repros")
+            k not in ("static", "runtime", "protect", "suppress", "repros", "tests", "prove_tiers")
             or not (isinstance(v, str) if k in ("static", "runtime", "repros") else strings(v)) for k, v in GATES.items()):
         raise NotConfigured(f"{CONFIG_FILE}: [gates] takes static and runtime, each a shell command, "
-                            f"protect and suppress, each a list of patterns, and repros, a directory")
+                            f"protect, suppress and tests, each a list of patterns, repros, a directory, "
+                            f"and prove_tiers, a list of worker tiers")
     # The weakening check (T-101): gate files a branch may change, and markers it may add, only
     # where its task's touches: names the file. The config itself is always a gate file.
     GATE_FILES = list(dict.fromkeys([CONFIG_FILE] + [x.strip().strip("/") for x in GATES.get("protect") or []]))
@@ -272,6 +279,13 @@ def configure(start=None, need_config=True):
     REPROS = (GATES.get("repros") or "tests/harden").strip().strip("/")
     if not REPROS or any(x in (".", "..", "") for x in REPROS.split("/")):
         raise NotConfigured(f"{CONFIG_FILE}: [gates] repros is a directory inside the repo")
+    # The red-on-base proof (T-102): a branch that adds or changes a test file must go red on its
+    # base with only those files overlaid. Off without tests; prove_tiers narrows it (an empty list
+    # turns it off for every tier).
+    TESTS = list(dict.fromkeys(x.strip().strip("/") for x in GATES.get("tests") or []))
+    PROVE_TIERS = list(GATES["prove_tiers"]) if "prove_tiers" in GATES else list(WORKER_TIERS)
+    if any(x not in WORKER_TIERS for x in PROVE_TIERS):
+        raise NotConfigured(f"{CONFIG_FILE}: [gates] prove_tiers lists worker tiers, from {WORKER_TIERS}")
     REVIEW_ROUNDS = count("review_rounds", 2)
     VERIFY_ROUNDS = count("verify_rounds", 2)  # a red verify goes back to the worker this many times (T-027)
     CONFLICT_ROUNDS = count("conflict_rounds", 1)  # a branch that conflicts with its base goes back to its worker (T-095)

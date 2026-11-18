@@ -115,12 +115,25 @@ def stats(args):
             print(f"  {tid} x{n}  {tasks[tid].get('title', '')}")
     if r["skipped"]:
         print(f"\nskipped {r['skipped']} unreadable or unmatched log(s)")
+    prove_section(args)
     pyramid_section(args)
     approver_section(tasks, args)
 
 
 def layer_order(totals):
     return [*(k for k in _history.LAYERS if k in totals), *sorted(k for k in totals if k not in _history.LAYERS)]
+
+
+def prove_section(args):
+    """The red-on-base proof's runs, time and the fix rounds it caused. Prints nothing if it never ran."""
+    p = _history.prove_stats(_history.read(), since=args.since, epic=args.epic)
+    if not p["runs"] and not p["waived"]:
+        return
+    mean = p["seconds"] / p["runs"] if p["runs"] else 0
+    print(f"\nred-on-base proof (tests run on the base with only the branch's test files)")
+    print(f"  runs {p['runs']}  red (proved) {p['red']}  green on the base {p['green']}  waived {p['waived']}")
+    print(f"  time {p['seconds']:.1f}s (mean {mean:.1f}s a run)")
+    print(f"  fix rounds it sent back {p['fixes']}: ${p['fix_cost']:.2f}, {p['fix_seconds']:.0f}s")
 
 
 def pyramid_section(args):
