@@ -1609,6 +1609,52 @@ class TestWeakening(DispatchProject):
         self.assertEqual(self.status("T-001"), "blocked", out)
         self.assertIn("ruff.toml changed", self.notes())
 
+    def test_a_widened_touches_gets_no_exemption_on_the_next_dispatch(self):
+        """T-117: with the guard bypassed, a worker adds the gate file to its own touches: and ends
+        blocked. The next run reads the file again, but only the touches: a human approved count
+        (here recorded at the first launch: the task was stamped by hand), until a human approves
+        the new entry."""
+        self.task("T-001.txt")
+        self.env.update(FAKE_WEAKEN='ruff.toml|ignore = ["E501"]', FAKE_EDIT_TOUCHES="T-001.txt, ruff.toml")
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertEqual(self.rows("dispatched")[0]["touches"], ["T-001.txt"])
+        del self.env["FAKE_EDIT_TOUCHES"]
+        self.ergon("set", "T-001", "status=ready")
+        self.assertIn("touches: [T-001.txt, ruff.toml]", self.task_file("T-001").read_text())
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("ruff.toml changed (a gate file: protect `ruff.toml`) (touches: names it only since its "
+                      "approval", self.notes())
+        self.assertNotIn("E501", sh("git", "show", "main:ruff.toml", cwd=self.root).stdout)
+        # a human approves the wider touches: and the next run lands
+        r = self.ergon("approve", "T-001", env=dict(self.env, ERGON_ASK_STDIN="1"), inp="y\n")
+        self.assertIn("approve again: touches: gained ruff.toml since its approval", r.stdout)
+        self.assertEqual(self.rows("approved")[-1]["touches"], ["T-001.txt", "ruff.toml"])
+        self.ergon("set", "T-001", "status=ready")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("E501", sh("git", "show", "main:ruff.toml", cwd=self.root).stdout)
+
+    def test_touches_edited_after_approval_exempt_nothing(self):
+        """An approved row records the touches: it approved; a hand edit after it (the guard
+        bypassed) names a gate file in vain, while dropping an entry still narrows."""
+        self.ergon("new", "task", "Weak", "--tier", "haiku", "--touches", "T-001.txt,src/app.py")
+        self.ergon("approve", "T-001", env=dict(self.env, ERGON_ASK_STDIN="1"), inp="y\n")
+        self.assertEqual(self.rows("approved")[-1]["touches"], ["T-001.txt", "src/app.py"])
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("touches: [T-001.txt, src/app.py]", "touches: [T-001.txt, ruff.toml]"))
+        self.env["FAKE_WEAKEN"] = 'ruff.toml|ignore = ["E501"]'
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("only since its approval", self.notes())
+        from ergon import dispatch
+        rows = self.rows("approved") + self.rows("dispatched")
+        t = {"id": "T-001", "touches": ["T-001.txt", "ruff.toml"]}
+        self.assertEqual(dispatch.unapproved_touches(t, rows), ["ruff.toml"])
+        self.assertEqual(dispatch.approved_touches(t, rows), {"T-001.txt", "src/app.py"})
+        self.assertEqual(dispatch.approved_touches(t, []), None)  # nothing recorded: the launch records it
+
     def test_a_companion_gate_file_is_caught(self):
         self.task("acme/public")
         pub = self.root / "pub" / "src"
@@ -3316,6 +3362,46 @@ class TestGateWeakeningFields(Project):
         for line in ("harden: [I-1]", "harden_layer: unit"):
             why = self.guard("Write", {"file_path": new, "content": fresh.replace("approved:", f"approved:\n{line}")})
             self.assertIn("decides what a harden task must prove", why or "", line)
+
+
+class TestApprovedTouchesAndTier(Project):
+    """A task's touches: and tier: are part of what a human approved: past proposed, the guard and
+    `set` refuse an agent's change to either (T-117)."""
+
+    def test_guard_refuses_changing_touches_or_tier_past_proposed(self):
+        self.ergon("new", "task", "X", "--tier", "sonnet", "--touches", "a.py")
+        f = self.task_file("T-001")
+        widen = {"file_path": str(f), "old_string": "touches: [a.py]", "new_string": "touches: [a.py, ruff.toml]"}
+        retier = {"file_path": str(f), "old_string": "tier: sonnet", "new_string": "tier: opus"}
+        self.assertIsNone(self.guard("Edit", widen))  # proposed: still being planned
+        self.assertIsNone(self.guard("Edit", retier))
+        stamp(f)
+        for status in ("ready", "doing", "blocked"):
+            f.write_text(re.sub(r"^status: \w+$", f"status: {status}", f.read_text(), flags=re.M))
+            why = self.guard("Edit", widen) or ""
+            self.assertIn(f"`touches:` of a {status} task is part of what a human approved", why)
+            self.assertIn("RESULT: blocked — re-plan", why)
+            self.assertIn("`tier:`", self.guard("Edit", retier) or "", status)
+            self.assertIn("`touches:`", self.guard("Write", {"file_path": str(f), "content": f.read_text().replace(
+                "touches: [a.py]", "touches: []")}) or "", status)
+        # the same entries reordered or re-spaced, or an edit elsewhere, changes nothing approved
+        f.write_text(f.read_text().replace("touches: [a.py]", "touches: [a.py, b.py]"))
+        self.assertIsNone(self.guard("Edit", {"file_path": str(f), "old_string": "touches: [a.py, b.py]",
+                                              "new_string": "touches: [ b.py,a.py/ ]"}))
+        self.assertIsNone(self.guard("Edit", {"file_path": str(f), "old_string": "## What", "new_string": "## What\nx"}))
+        # set refuses it from an agent shell or on a task/ branch; a human's own terminal may
+        for key in ("touches=a.py,ruff.toml", "tier=opus"):
+            r = self.ergon("set", "T-001", key, check=False, env=clean_env(CLAUDECODE="1"))
+            self.assertNotEqual(r.returncode, 0, key)
+            self.assertIn("re-plan", r.stderr, key)
+        sh("git", "checkout", "-qb", "task/T-001", cwd=self.root)
+        r = self.ergon("set", "T-001", "touches=a.py,ruff.toml", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("re-plan", r.stderr)
+        sh("git", "checkout", "-q", "main", cwd=self.root)
+        self.assertIn("touches: [a.py, b.py]\n", f.read_text())
+        self.ergon("set", "T-001", "touches=a.py,ruff.toml")
+        self.assertIn("touches: [a.py, ruff.toml]\n", f.read_text())
 
 
 class TestGateWeakeningFieldsSigned(unittest.TestCase):

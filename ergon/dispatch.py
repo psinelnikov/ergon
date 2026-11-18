@@ -70,8 +70,8 @@ that passes without your change proves nothing and goes back to you.
 
 WORKER_WEAKEN = """
 Before any gate, dispatch vetoes a branch that changes a gate file ({files}){markers},
-unless this task's touches: names that file. Fix the code, not the gate; if a rule is wrong, say
-so on a FOUND line.
+unless this task's approved touches: names that file. Fix the code, not the gate; if a rule is
+wrong, say so on a FOUND line. Don't edit this task's touches: or tier: (that's a re-plan).
 """
 
 WORKER_POLICIES = """
@@ -871,7 +871,7 @@ def file_found(t, found, epics, vouch=True):
         _history.record("created", meta, tier=meta["tier"], title=title, source=t["id"], by="found")
         if auto:
             _history.record("approved", meta, by="auto", tier=meta["tier"], category=meta["category"],
-                            parent=t["id"], root=auto[1], depth=auto[2])
+                            parent=t["id"], root=auto[1], depth=auto[2], touches=list(meta["touches"]))
         made.append((tid, title, meta["status"]))
     return made
 
@@ -974,8 +974,13 @@ def gate_cmds(t):
 # an added line matching a [gates] suppress regex, in any file, is a veto unless the task's
 # touches: names that file. That is what a harden task is: approved, naming the file. It reads the
 # task as it was at launch (like accept), so a worker that adds the file to its own touches: since
-# gets nowhere. This check is on what lands; guarding gate files at the tool call is the guard
-# hook's side (T-069).
+# gets nowhere in that run. Nor in the next (T-117): only an entry a human approved counts. Each
+# `approved` history row records the touches: it approved, and a launch records them too when no
+# row since the last approval has (a task stamped by hand, or approved before rows held them), so
+# an entry added to the file after that is no exemption until a human runs `ergon approve` again.
+# The guard refuses the edit in the first place; this holds when the guard was bypassed, and in
+# local mode, where no brief digest notices. This check is on what lands; guarding gate files at
+# the tool call is the guard hook's side (T-069).
 
 def gate_file_hit(path, c=None):
     """The [gates] protect pattern a changed file falls under, or None. `path` is relative to its
@@ -1000,6 +1005,34 @@ def names_file(t, path, c=None, pattern=None):
     return bool(names & cands)
 
 
+def touch_key(x):
+    """A touches: entry as names_file and the brief digest compare it."""
+    return str(x).strip().strip("/")
+
+
+def approved_touches(t, rows=None):
+    """The touches: entries (as touch_key) a human approved for t, or None if nothing recorded
+    them. The last `approved` row decides; one without a touches list (from before rows held them)
+    resets the record, and then the first `dispatched` row after it that has one stands in for it."""
+    rec = None
+    for r in _history.read() if rows is None else rows:
+        if r.get("task") != t.get("id"):
+            continue
+        touches = r.get("touches") if isinstance(r.get("touches"), list) else None
+        if r.get("event") == "approved":
+            rec = touches
+        elif r.get("event") == "dispatched" and rec is None:
+            rec = touches
+    return None if rec is None else {touch_key(x) for x in rec}
+
+
+def unapproved_touches(t, rows=None):
+    """t's touches: entries no human approved (added to the file since approved_touches), in file
+    order; [] when nothing is recorded yet (the launch records them)."""
+    ok = approved_touches(t, rows)
+    return [] if ok is None else [x for x in t.get("touches") or [] if touch_key(x) not in ok]
+
+
 def added_lines(rng, path, repo=None):
     """The lines `git diff <rng>` adds to `path`, as text. --text so no .gitattributes setting
     hides a file's lines as binary."""
@@ -1016,18 +1049,23 @@ def added_lines(rng, path, repo=None):
 
 def weakening(t, base, branch, pubs=()):
     """The weakening check on t's branch: [] if it passes, else one finding per file, each naming
-    the file as touches: would. `t` is the task as it was at launch."""
-    found = []
+    the file as touches: would. `t` is the task as it was at launch; only its touches: entries a
+    human approved (unapproved_touches) exempt a file."""
+    found, late = [], {touch_key(x) for x in unapproved_touches(t)}
+    ok = dict(t, touches=[x for x in t.get("touches") or [] if touch_key(x) not in late])
+    since = (f" (touches: names it only since its approval, so it doesn't count: a human approves the new "
+             f"touches: with `ergon approve {t.get('id')}`)")
     for c, repo, trunk in [(None, None, base)] + [(c, c["path"], c["trunk"]) for c, _ in pubs]:
         rng = f"{trunk}...{branch}"
         files = _gitops.git("diff", "--name-only", "-z", "--no-renames", rng, raw=True, cwd=repo)
         for path in (p for p in files.split("\0") if p):
             shown = path if c is None else f"{c['name']}/{path}"
             pattern = gate_file_hit(path, c)
-            if names_file(t, path, c, pattern):
+            if names_file(ok, path, c, pattern):
                 continue
+            named = since if late and names_file(t, path, c, pattern) else ""
             if pattern:
-                found.append(f"{shown} changed (a gate file: protect `{pattern}`)")
+                found.append(f"{shown} changed (a gate file: protect `{pattern}`){named}")
                 continue
             if not _config.SUPPRESS:
                 continue
@@ -1040,7 +1078,7 @@ def weakening(t, base, branch, pubs=()):
                 rx, line = hits[0]
                 more = f" (and {len(hits) - 1} more line(s))" if len(hits) > 1 else ""
                 found.append(f"{shown} adds a suppression marker (suppress `{rx.pattern}`): "
-                             f"`{line.strip()[:120]}`{more}")
+                             f"`{line.strip()[:120]}`{more}{named}")
     return found
 
 
@@ -1739,8 +1777,8 @@ Your branch changes a gate file, or adds a suppression marker, in a file this ta
 doesn't name. Revert the change to each file named above on {branch} in {wt}, fix the code
 instead, and commit there citing {id}. If the rule itself is wrong, revert it anyway and end with
 a `FOUND: <title> — <why>` line naming the rule and why: a human approves a task whose touches:
-names the file. Editing your task's touches: changes nothing, since the check reads the task as it
-was at launch. The done checks and the gates run again when you finish. End as before: a
+names the file. Editing your task's touches: changes nothing: the check reads the task as it
+was at launch, and only entries a human approved count on a later launch. The done checks and the gates run again when you finish. End as before: a
 `FOUND: <title> — <why>` line for each piece of work you find but don't do, then `RESULT: done`
 or `RESULT: blocked — <why>`.
 """
@@ -3227,6 +3265,7 @@ def dispatch(args):
                                 _history.record("dispatched", t, tier=t["tier"], model=agents[f"task-{t['tier']}"]["model"],
                                                 base=base, branch=branch, worktree=wt,
                                                 companions=[c["name"] for c, _ in pubs],
+                                                touches=list(t.get("touches") or []),  # approved_touches
                                                 **({"answered": True} if answered else {}))
                                 print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
                                       + also(t) + f"  {t['title']}")

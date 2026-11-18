@@ -78,6 +78,9 @@ def setf(args):
         if is_task and key in ("category", "touches") and _tasks.is_auto(item) and in_agent_shell():
             raise SystemExit(f"{args.id} was approved by inheritance (`approved: auto …`), so its `{key}:` is fixed: "
                              f"file a new task, or ask a human to change it")
+        if (is_task and key in ("touches", "tier") and item.get("status") != "proposed"
+                and (in_agent_shell() or _gitops.current_branch().startswith(_config.TASK_BRANCH))):
+            raise SystemExit(f"{args.id}: " + replan_reason(key, item.get("status")).replace("<ID>", args.id))
         if is_task and key == "tier" and val not in _tasks.TIERS:
             raise SystemExit(f"tier must be one of {_tasks.TIERS}")
         if is_task and key == "category" and val and val not in _tasks.CATEGORIES:
@@ -220,7 +223,7 @@ def stamp_approved(todo):
         apr = _gitops.approvals() if shared else None
         for t in todo:
             if t["id"] not in two:
-                _history.record("approved", t, by=approver(), tier=t.get("tier") or None)
+                _history.record("approved", t, by=approver(), tier=t.get("tier") or None, **approved_touches_field(t))
                 continue
             # the files change after the signed commit, from what it verifies as: committed
             # unsigned as the lock is released, like sync's restamp, since they grant nothing
@@ -229,7 +232,8 @@ def stamp_approved(todo):
             if len(who) >= apr.needed(t):
                 t["status"] = "ready" if old == "proposed" else old
                 t["approved"] = apr.stamp(t)
-                _history.record("approved", t, by=approver(), tier=t["tier"], approvers=[n for _, n, _ in who])
+                _history.record("approved", t, by=approver(), tier=t["tier"], approvers=[n for _, n, _ in who],
+                                **approved_touches_field(t))
             else:
                 if old == "ready":  # approved before, under another brief: it waits for its second approver
                     t["status"] = "proposed"
@@ -252,6 +256,12 @@ def stamp_approved(todo):
             elif why:
                 print(f"warning: {t['id']}'s approval doesn't verify: {why}")
     return waiting
+
+
+def approved_touches_field(t):
+    """The `touches` field of t's `approved` history row (dispatch.approved_touches reads it): a
+    task's touches: as approved; nothing for an epic."""
+    return {} if _tasks.is_epic(t) else {"touches": list(t.get("touches") or [])}
 
 
 def brief_due(e, apr):
@@ -282,11 +292,18 @@ def approve(args):
     again = {t["id"]: why for t in named if apr and t["id"] in args.ids and t["status"] in ("ready", "blocked")
              and (why := apr.problem(t))}
     again.update((e["id"], apr.problem(e)) for e in briefs if e["status"] == "open")
+    # local mode: no digest, so an approved task whose touches: gained an entry since its approval
+    # (a hand edit) is approved again by naming it, or the weakening check won't count the entry
+    if not apr:
+        again.update({t["id"]: f"touches: gained {', '.join(new)} since its approval" for t in named
+                      if t["id"] in args.ids and t["status"] in ("ready", "blocked")
+                      and (new := _dispatch.unapproved_touches(t))})
     todo += [t for t in named if t["id"] in again]
     todo = briefs + todo
     if not todo:
         raise SystemExit("nothing in `proposed` among those ids" + (
-            ", nor an approved task or epic whose approval doesn't verify" if apr else ""))
+            ", nor an approved task or epic whose approval doesn't verify" if apr else
+            ", nor an approved task whose touches: gained an entry since its approval"))
     # shared mode: an unpublished ID can still be renumbered, so sync first (or refuse)
     _shared.ensure_published([t["id"] for t in todo] + [i for i in args.ids if i in epics])
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
@@ -1379,6 +1396,14 @@ def guard_reason(tool, inp, worker=False, cwd=None):
             if fb.get(key, "") != fa.get(key, ""):
                 return (f"`{key}:` of a task approved by inheritance (`approved: auto …`) is fixed: its approval "
                         f"holds only for what it was filed as. File a new task, or ask a human to change it")
+    # touches: (it names the gate files the weakening check lets the task change) and tier: are
+    # part of what a human approved: past proposed, an agent changing either is a re-plan (T-117).
+    # Shared mode's digest un-approves such an edit; local mode has only this and dispatch's record
+    # of the approved touches: (dispatch.approved_touches).
+    if not (p.name == _config.EPIC_FILE or is_flat_epic(path)) and before and fb.get("status", "") != "proposed":
+        for key in ("touches", "tier"):
+            if fm_value(fb, key) != fm_value(fa, key):
+                return replan_reason(key, fb.get("status") or "approved")
     # The two fields that weaken a gate, as `set` refuses them: the digest catches them in shared
     # mode only, so in local mode this is what stops an edit to an approved task's gate (T-150).
     # A new file counts too: a brief that arrives with its own gate is a human's to write.
@@ -1410,6 +1435,23 @@ def guard_reason(tool, inp, worker=False, cwd=None):
     if fb.get("accept", "").lower() in _tasks.YES and fa.get("accept", "").lower() not in _tasks.YES:
         return "only a human takes `accept:` off a task (it holds the task's landing for their review)"
     return None
+
+
+def fm_value(fm, key):
+    """A frontmatter value as the guard compares it: touches: as its set of entries (dispatch.touch_key),
+    so reordering or re-spacing the list changes nothing; anything else stripped."""
+    val = fm.get(key, "")
+    if key != "touches":
+        return val.strip()
+    return frozenset(x for x in (_dispatch.touch_key(v) for v in val.strip().strip("[]").split(",")) if x)
+
+
+def replan_reason(key, status):
+    """Why an agent may not change `key` (touches or tier) of a task that is `status`, past proposed."""
+    return (f"`{key}:` of a {status} task is part of what a human approved (touches: names the gate files the "
+            f"weakening check lets it change; tier: picks the model), so an agent doesn't change it: that's a "
+            f"re-plan. A dispatched worker ends `RESULT: blocked — re-plan: <why>`; otherwise ask the user to "
+            f"edit it and run `ergon approve <ID>` again")
 
 
 def hook(args):
