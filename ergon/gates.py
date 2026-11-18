@@ -427,8 +427,9 @@ def write_policy(t):
 def review_brief(e, at, tasks, apr, tally):
     """One epic brief in the interactive review, while its approval is due (`brief_due`): show
     its Goal, Out of scope and Constraints and offer to approve it, which approves the brief
-    alone as `ergon approve E-NNN` does (signed in shared mode; its tasks stay proposed), edit
-    it, or skip it. Returns False on quit."""
+    alone as `ergon approve E-NNN` does (signed in shared mode; its tasks stay proposed), reject
+    it (a proposed brief only: drops it as `ergon reject E-NNN` does), edit it, or skip it.
+    Returns False on quit."""
     while brief_due(e, apr):
         why = apr.problem(e) if e["status"] == "open" else ""
         print(f"\n{'=' * 78}\n{at}  {e['id']}  {e['title']}  (epic brief, {e['status']})"
@@ -437,7 +438,28 @@ def review_brief(e, at, tasks, apr, tally):
         kids = sum(t.get("epic") == e["id"] and t["status"] == "proposed" for t in tasks.values())
         if kids:
             print(f"\n(approving it approves the brief only: its {kids} proposed task(s) stay proposed)")
-        choice = ask(f"\n{e['id']} [epic]  [a]pprove  [e]dit  [s]kip  [q]uit > ").lower()
+        can_reject = e["status"] == "proposed"  # an open epic is already approved: not a drop
+        choice = ask(f"\n{e['id']} [epic]  [a]pprove  " + ("[r]eject  " if can_reject else "")
+                     + "[e]dit  [s]kip  [q]uit > ").lower()
+        if choice == "r" and can_reject:
+            try:
+                sign = signing()
+            except SystemExit as err:
+                print(err)
+                continue
+            reason = ask("reason (optional): ")
+            e["status"] = "dropped"
+            if reason:
+                e["_body"] = e["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {reason}\n"
+            with _gitops.state_lock():
+                if sign:
+                    _shared.commit_pending()  # hand edits go in a commit of their own
+                _tasks.dump(e, _tasks.EPIC_KEYS)
+                if sign:
+                    _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {e['id']}"], [e["_path"]])
+            _history.record("rejected", e, by=approver(), reason=reason or None, **{"from": "proposed", "to": "dropped"})
+            tally["dropped"] += 1
+            return True
         if choice == "a":
             try:  # shared mode: refuses, approving nothing, unless the approval would verify
                 approve_ready()

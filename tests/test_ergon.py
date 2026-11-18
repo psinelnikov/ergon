@@ -771,6 +771,21 @@ class TestEpicApproval(Project):
         self.assertIn("[1/2]", r.stdout)
         self.ergon("check")
 
+    def test_interactive_walk_rejects_an_epic_brief(self):
+        """T-175: `r` on a brief in the interactive walk drops it, as `ergon reject E-NNN` does."""
+        self.ergon("new", "epic", "Unwanted")
+        self.ergon("new", "task", "Part one", "--tier", "haiku", "--epic", "E-001")
+        r = self.ergon("review", "-i", "--epic", "E-001", inp="r\nnot now\nq\n", check=False,
+                       env=clean_env(ERGON_ASK_STDIN="1"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("[a]pprove  [r]eject  [e]dit", r.stdout)
+        text = self.epic_file().read_text()
+        self.assertIn("\nstatus: dropped\n", text)
+        self.assertRegex(text, r"Rejected \d{4}-\d\d-\d\d: not now")
+        self.assertEqual(self.status("T-001"), "proposed")
+        rows = [e for e in history(self.root) if e["event"] == "rejected" and e.get("epic") == "E-001"]
+        self.assertEqual((rows[0]["from"], rows[0]["to"], rows[0]["reason"]), ("proposed", "dropped", "not now"))
+
     def test_reject_drops_a_proposed_epic_brief(self):
         """T-126: rejecting a proposed epic's ID drops its brief alone, as approving one approves
         the brief alone; its tasks are then never offered or started. Naming the dropped epic
