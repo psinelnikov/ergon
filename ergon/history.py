@@ -97,6 +97,75 @@ def _week(at):
     return f"{y}-W{w:02d}"
 
 
+LAYERS = ("guard", "static", "runtime", "prove", "weaken", "review", "human")
+
+
+def catches(rows, since=None, epic=None, until=None):
+    """Where mistakes were caught, from the history: {"weeks": {week: {layer: n}}, "totals": {layer: n},
+    "answers": n, "late": share caught by review + human (None when nothing was caught)}.
+    A failed `verify` row counts under its `layer` (an old row with none is `runtime`); a failed
+    `review` is `review`; a failed `prove` row (tests green on the base) is `prove`; a `rejected` row
+    going from review is `human`; a `guard` row (a refused tool call) is `guard`. Answers are counted apart:
+    they're a human's input, not a caught mistake. Layers this reader doesn't know are kept as
+    they come. Never raises on odd rows."""
+    weeks, totals, answers = {}, {}, 0
+    for r in rows:
+        d = str(r.get("at") or "")[:10]
+        if (since and d < since) or (until and d > until) or (epic and r.get("epic") != epic):
+            continue
+        ev = r.get("event")
+        if ev == "verify" and r.get("ok") is False:
+            layer = str(r.get("layer") or "runtime")
+        elif ev == "review" and r.get("verdict") == "fail":
+            layer = "review"
+        elif ev == "prove" and r.get("ok") is False:
+            layer = "prove"
+        elif ev == "rejected" and r.get("from") == "review":
+            layer = "human"
+        elif ev == "guard":
+            layer = "guard"
+        elif ev == "answered":
+            answers += 1
+            continue
+        else:
+            continue
+        wk = _week(r.get("at"))
+        if not wk:
+            continue
+        w = weeks.setdefault(wk, {})
+        w[layer] = w.get(layer, 0) + 1
+        totals[layer] = totals.get(layer, 0) + 1
+    n = sum(totals.values())
+    late = (totals.get("review", 0) + totals.get("human", 0)) / n if n else None
+    return {"weeks": dict(sorted(weeks.items())), "totals": totals, "answers": answers, "late": late}
+
+
+def prove_stats(rows, since=None, epic=None, until=None):
+    """What the red-on-base proof (T-102) did and cost, from the history: {"runs", "red", "green"
+    (green on the base, or timed out there), "waived", "seconds" (the proof runs' own time),
+    "fixes", "fix_cost", "fix_seconds" (the worker rounds it sent back: worker_end rows with
+    after "prove")}. Never raises on odd rows."""
+    out = {"runs": 0, "red": 0, "green": 0, "waived": 0, "seconds": 0.0, "fixes": 0, "fix_cost": 0.0,
+           "fix_seconds": 0.0}
+    num = lambda v: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+    for r in rows:
+        d = str(r.get("at") or "")[:10]
+        if (since and d < since) or (until and d > until) or (epic and r.get("epic") != epic):
+            continue
+        if r.get("event") == "prove":
+            if r.get("waived"):
+                out["waived"] += 1
+                continue
+            out["runs"] += 1
+            out["red" if r.get("ok") is True else "green"] += 1
+            out["seconds"] += num(r.get("seconds"))
+        elif r.get("event") == "worker_end" and r.get("after") == "prove":
+            out["fixes"] += 1
+            out["fix_cost"] += num(r.get("cost"))
+            out["fix_seconds"] += num(r.get("seconds"))
+    return out
+
+
 def approver_signals(tasks, rows, since=None, epic=None, until=None):
     """How the tasks each approver approved went, as counts of tasks:
     {name: {"approved", "tiers", "landed", "escalated", "blocked", "asked", "fails", "sent_back",

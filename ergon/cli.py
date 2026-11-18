@@ -8,12 +8,14 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon                        board: open work grouped by status, then tier
   ergon init [--hooks]         write .ergon.toml, the state folders and .gitignore lines here.
                                --hooks also installs a git commit-msg hook that refuses commits
-                               citing a task no human approved (covers agents other than Claude Code)
+                               citing a task no human approved, or one whose epic isn't (covers agents other than Claude Code)
   ergon guide                  print the workflow guide (also the plugin's `ergon` skill)
   ergon rules                  print this project's worker rules (worker_rules in .ergon.toml)
   ergon next [--tier T]        approved, unblocked tasks an agent of tier T may take
   ergon review [-i]            everything waiting on human approval (-i: HUMAN ONLY, walk it
-                               task by task: approve / reject / retier / edit / skip)
+                               item by item: tasks to approve / reject / retier / edit / skip;
+                               epic briefs (Goal, Out of scope, Constraints) to approve, which
+                               opens the epic and leaves its tasks proposed / edit / skip)
   ergon show ID
   ergon new task "Title" --tier sonnet [--epic E-001] [--touches a,b] [--source LOG.md:42]
   ergon new epic "Title"
@@ -27,9 +29,15 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                worktree, <worktrees>/E-ID (also happens on an epic's first `doing`)
   ergon finish E-ID            close the epic and merge its branch into the trunk (also happens
                                when its last task goes done); no checkout needs switching
-  ergon approve ID [ID ...]    HUMAN ONLY, real terminal. An epic ID approves its proposed tasks
+  ergon approve ID [ID ...]    HUMAN ONLY, real terminal. An epic ID approves its brief when it's
+                               proposed, or in shared mode open with no signed approval that
+                               verifies (an old epic with no approved: stamp counts as approved
+                               in local mode only); otherwise it approves its proposed tasks
   ergon reject ID [--reason R] HUMAN ONLY. proposed -> dropped; review -> ready (needs --reason,
-                               which the next worker is shown; branch and worktree are kept)
+                               which the next worker is shown; branch and worktree are kept).
+                               An epic ID drops its brief when it's proposed (its tasks stay
+                               proposed, never offered; naming the epic again drops them);
+                               otherwise it drops its proposed tasks
   ergon accept ID [ID ...]     HUMAN ONLY, real terminal. Land a task dispatch held at `review`
                                (merge its branch like dispatch would, close the epic if last).
                                An epic ID accepts its tasks in review
@@ -51,7 +59,7 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                in epics/<epic>/, the rest in items/ (idempotent)
   ergon dispatch [--tier T] [--epic E] [--ids T-1,T-2] [--max N] [--jobs J]
                       [--budget-total USD [--budget-pct P]] [--watch [--interval SEC]]
-                      [--dry-run]
+                      [--until-done N] [--dry-run]
                                run ready tasks headless, one worktree + task/<ID> branch each,
                                merge each finished branch into its epic branch (and, for a task
                                touching a companion repo, that repo's local trunk).
@@ -62,10 +70,38 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                tasks every --interval seconds (default 30) until the cap is hit
                                or Ctrl-C (stop launching, let workers finish; a second kills them)
                                A reviewer's fail (`review` in .ergon.toml) goes back to the worker
-                               and is reviewed again, up to review_rounds times, then blocks
+                               and is reviewed again, up to review_rounds times, then blocks.
+                               --until-done N (default 0): a worker that stops short (timeout,
+                               error, output that isn't JSON, no RESULT line) runs again on the
+                               same branch, up to N more rounds (session resumed, or a fresh
+                               worker); the done checks, verify and review then run as usual. A fix-round or
+                               conflict-round worker that stops short is retried the same way.
+                               Not retried: RESULT: blocked or asking, a second Ctrl-C, the cap.
+                               The usage limit (5-hour, or weekly): a worker or reviewer it stops
+                               parks its task blocked with `limited: <reset> <step>`; no human
+                               task, no --escalate, no round used up, branch kept. The run then
+                               launches nothing before the reset (--watch waits for it; a plain
+                               run ends `paused by the 5-hour limit until HH:MM: T-…`), and the
+                               first scan after it restarts that step: the worker or round
+                               (session resumed, or a fresh worker), or just the review. The
+                               board and --dry-run show `limited until HH:MM`
+                               An approved open epic with no tasks is broken down first, once
+                               (as `breakdown` below; not with --ids or --tier). With [shared],
+                               each task is claimed by pushing ready -> doing, and each breakdown
+                               by pushing a `breakdown:` claim on the epic, before anything runs:
+                               a clone that sees another's claim skips it and says who holds it,
+                               a claim that can't be pushed launches nothing, and a breakdown's
+                               claim comes off when it ends (or lapses after --timeout + 15 min)
+  ergon breakdown E-ID [--budget USD] [--timeout MIN]
+                               one read-only `claude -p --agent task-breakdown` (opus) in the main
+                               checkout reads the approved epic's brief, rules, policies and open
+                               tasks, and replies with TASK blocks. Each block that passes check's
+                               rules is filed as a proposed task in the epic (source: breakdown
+                               E-ID); a malformed one is refused with a warning. Only adds tasks
   ergon stats [--since DATE] [--epic E] [--approver NAME | --approvers]
                                read-only: per tier, runs / done / blocked / block rate / cost /
-                               timeouts from <state>/runs/*.json, and tasks that blocked twice+
+                               timeouts from <state>/runs/*.json, epic breakdown runs and cost from
+                               <state>/runs/breakdown/, and tasks that blocked twice+
   ergon serve [--port 4300] [--bind 127.0.0.1]
                                read-only web board, task pages (brief, runs, reviews, logs, resume
                                commands) and live dispatch state. GET/HEAD only; writes nothing.
@@ -99,6 +135,15 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                a concern; done tasks it builds on (Jaccard overlap of components);
                                missing depends (a component an open task introduces, not in its
                                depends: closure). /t/T-ID shows the same
+  ergon learn [--since D] [--model sonnet] [--budget USD] [--dry-run]
+                               one `claude -p` (no tools) groups the incidents no task's harden:
+                               cites yet into mistake classes, each with the lowest layer that
+                               could catch it (constraint, static, runtime, review, human) and a
+                               sketch of the check, and files each as a proposed harden task
+                               (source: learn), or adds its incidents to an open proposed one.
+                               Asks only when an incident is new; only proposes, so agents may
+                               run it. Record in <state>/runs/learn/. `learn = true` in
+                               .ergon.toml runs it after each dispatch run and --watch scan
   ergon journal [E-ID ...] [--all] [--model sonnet] [--budget USD]
                                one `claude -p` (no tools) per epic writes its journal entry: what it
                                set out to do, what landed, how the work went (from its history rows
@@ -112,7 +157,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                it out into <state>/ on another clone (which must hold no task
                                files). The state branch is the only thing ergon ever pushes, never
                                code. Never from an agent shell or a task/ branch
-  ergon hook guard|stop        Claude Code hooks (the plugin wires them); not for humans
+  ergon hook guard|stop        Claude Code hooks (the plugin wires them); not for humans.
+                               guard --read-only (the breakdown agent's) also refuses Edit, Write
+                               and any Bash that may write a file or change git state: only
+                               read-only programs (git log/diff/show..., ergon show/next/check...,
+                               ls, cat, grep...), no redirect to a file, and it fails closed
   ergon hook commit-msg FILE   the git hook `init --hooks` installs; not for humans
 """
 import argparse
@@ -140,6 +189,7 @@ from . import gates as _gates
 from . import gitops as _gitops
 from . import grade as _grade
 from . import history as _history
+from . import learn as _learn
 from . import report as _report
 from . import serve as _serve
 from . import shared as _shared
@@ -326,7 +376,7 @@ def main():
     n = sub.add_parser("next")
     n.add_argument("--tier", choices=_tasks.TIERS)
     rv = sub.add_parser("review")
-    rv.add_argument("-i", "--interactive", action="store_true", help="HUMAN ONLY: decide task by task")
+    rv.add_argument("-i", "--interactive", action="store_true", help="HUMAN ONLY: decide item by item (tasks and epic briefs)")
     rv.add_argument("--epic")
     rv.add_argument("--tier", choices=_tasks.TIERS)
     s = sub.add_parser("show")
@@ -407,6 +457,11 @@ def main():
     tg.add_argument("--budget", type=float, help="max USD per call (--max-budget-usd)")
     tg.add_argument("--dry-run", action="store_true", help="list the tasks; ask nothing, write nothing")
     sub.add_parser("related", help="tasks related to this one through the concept map").add_argument("id")
+    ln = sub.add_parser("learn", help="propose harden tasks from recurring incidents (runs claude -p; only proposes)")
+    ln.add_argument("--since", metavar="YYYY-MM-DD", help="only incidents caught on or after this day")
+    ln.add_argument("--model", default="sonnet", help="default sonnet")
+    ln.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
+    ln.add_argument("--dry-run", action="store_true", help="list the incidents it would send; ask nothing, write nothing")
     jn = sub.add_parser("journal", help="write each epic's journal entry, shown on /e/E-NNN (runs claude -p)")
     jn.add_argument("ids", nargs="*", metavar="E-ID", help="epics to write (default: those with no entry or newer history)")
     jn.add_argument("--all", action="store_true", help="every epic, not only those with a missing or stale entry")
@@ -418,7 +473,15 @@ def main():
     once = sy.add_mutually_exclusive_group()
     once.add_argument("--init", action="store_true", help="create the state branch from local state and push it")
     once.add_argument("--join", action="store_true", help="make <state>/ a worktree of the remote's state branch")
-    d = sub.add_parser("dispatch")
+    d = sub.add_parser("dispatch", description=(
+        "Run ready tasks headless, one worktree and task/<ID> branch each, and land each finished branch. "
+        "A worker or reviewer the plan's usage limit stops (5-hour or weekly) parks its task blocked with a "
+        "`limited: <reset> <step>` mark: no human task, no --escalate retry, no fix/verify/conflict/until-done "
+        "round used up, worktree and branch kept. The run launches nothing more before the reset (--watch "
+        "waits for it; a plain run ends with `paused by the 5-hour limit until HH:MM: T-…`), and any dispatch "
+        "scan at or after it moves the task back to doing and restarts the step it stopped at: the worker or "
+        "round (its session resumed, or a fresh worker), or only the review. --dry-run and the board show "
+        "`limited until HH:MM`; only dispatch writes the mark, and a human's close clears it."))
     d.add_argument("--tier", choices=_config.WORKER_TIERS)
     d.add_argument("--epic")
     d.add_argument("--ids", help="comma-separated task IDs (still only ready ones)")
@@ -433,15 +496,27 @@ def main():
     d.add_argument("--budget-pct", type=float, default=100,
                    help="use only this %% of --budget-total as the cap (default 100)")
     d.add_argument("--watch", action="store_true",
-                   help="keep running: rescan for newly ready tasks until Ctrl-C or --budget-total is reached")
+                   help="keep running: rescan for newly ready tasks until Ctrl-C or --budget-total is reached; "
+                        "after a usage-limit stop it waits for the reset, then resumes the parked tasks")
     d.add_argument("--interval", type=float, default=30, help="seconds between rescans for newly approved tasks while workers run, and with --watch (default 30)")
     d.add_argument("--escalate", action="store_true",
                    help="when a worker reports blocked, retry once one tier up (haiku→sonnet→opus)")
+    d.add_argument("--until-done", type=int, default=0, metavar="N",
+                   help="when a worker stops short (timeout, error, output that isn't JSON, no RESULT line), "
+                        "run up to N more rounds on the same branch, resuming its session or starting a fresh "
+                        "worker, also for a fix-round or conflict-round worker (default 0: it blocks)")
     d.add_argument("--dry-run", action="store_true")
+    bd = sub.add_parser("breakdown", help="break an approved epic down into proposed tasks (runs claude -p, read-only)")
+    bd.add_argument("id", help="the epic, E-NNN")
+    bd.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
+    bd.add_argument("--timeout", type=int, default=60, help="minutes for the call (default 60)")
     hk = sub.add_parser("hook")
     hk.add_argument("event", choices=["guard", "stop", "commit-msg"])
     hk.add_argument("msgfile", nargs="?", help="commit-msg: the file git passes")
     hk.add_argument("--worker", action="store_true", help="dispatch sets this: guard companion checkouts too")
+    hk.add_argument("--read-only", action="store_true",
+                    help="guard: refuse every tool but Read/Grep/Glob and read-only Bash, and fail closed "
+                         "(dispatch sets it for the breakdown agent)")
     hk.add_argument("--project", help="the project to guard (default: $CLAUDE_PROJECT_DIR, then the event's cwd)")
     args = ap.parse_args()
     if args.cmd == "hook":
@@ -476,8 +551,8 @@ def run(args):
     else:  # dispatch takes the lock itself, around each step (it runs for hours); grade around its
         # (and tag) around their writes only, not the minutes claude takes to answer
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
-         "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
-         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "journal": journal, "sync": _shared.sync}[args.cmd](args)
+         "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "breakdown": _dispatch.breakdown, "rules": rules,
+         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "learn": _learn.learn, "journal": journal, "sync": _shared.sync}[args.cmd](args)
 
 
 if __name__ == "__main__":

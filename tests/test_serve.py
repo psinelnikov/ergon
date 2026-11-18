@@ -146,6 +146,19 @@ class TestServe(ServeFixture):
         self.assertEqual(re.findall(r"<script[^>]*>", page), [f'<script nonce="{nonce}">'])
         self.assertIn("&lt;script&gt;", page)  # T-004's title, escaped
 
+    def test_limited_and_asking_marks(self):
+        f = self.task_file("T-002")
+        f.write_text(re.sub(r"^status: \w+$", "status: blocked\nlimited: 2030-01-01T09:30:00Z worker",
+                            f.read_text(), flags=re.M))
+        f = self.task_file("T-003")
+        f.write_text(re.sub(r"^status: \w+$", "status: blocked\nasking: sess-1", f.read_text(), flags=re.M))
+        want = S._limits.clock(S._tasks.limited_mark("2030-01-01T09:30:00Z worker")[0])
+        self.assertIn(f"limited until {want}", self.req("GET", "/")[2])
+        self.assertIn(f"limited until {want}", self.req("GET", "/t/T-002")[2])
+        self.assertIn("<span class=park>asking</span>", self.req("GET", "/")[2])
+        self.assertIn("<span class=park>asking</span>", self.req("GET", "/t/T-003")[2])
+        self.assertNotIn("class=park", self.req("GET", "/t/T-001")[2])
+
     def test_live_json(self):
         code, headers, body = self.req("GET", "/live.json")
         self.assertEqual(code, 200)
@@ -175,6 +188,52 @@ class TestServe(ServeFixture):
         self.assertIn("<td>landed</td>", page)  # the journal
         self.assertEqual(self.req("GET", "/t/T-999")[0], 404)
         self.assertEqual(self.req("GET", "/t/E-001")[0], 404)
+
+    def test_task_page_evidence(self):
+        d = self.runs / "T-001-evidence"
+        d.mkdir()
+        (d / "shot.png").write_bytes(b"\x89PNG\x00fake")
+        (d / "out.txt").write_text("3 passed <b>\n")
+        files = [{"name": "shot.png", "caption": HOSTILE}, {"name": "out.txt", "caption": "tests"}]
+        journal = self.runs / ("history" + ".jsonl")
+        with journal.open("a") as f:
+            f.write(json.dumps(row("2026-11-16T12:08:00+00:00", "T-001", "evidence", files=files,
+                                   refused=["../x: outside the worktree"])) + "\n")
+        code, _, page = self.req("GET", "/t/T-001")
+        self.assertEqual(code, 200)
+        section = page.split("<h2>Evidence</h2>")[1].split("<h2>")[0]
+        self.assertIn('<img src="/runs/T-001-evidence/shot.png"', section)
+        self.assertIn('<a href="/runs/T-001-evidence/out.txt">out.txt</a>', section)
+        self.assertNotIn("<script>", section)
+        self.assertNotIn("<img src=x", section)
+        self.assertIn("&lt;script&gt;alert", section)
+        self.assertIn("refused: ../x: outside the worktree", section)
+        code, _, body = self.req("GET", "/runs/T-001-evidence/out.txt")
+        self.assertEqual(code, 200)
+        self.assertIn("3 passed", body)
+        self.assertEqual(self.req("GET", "/runs/T-001-evidence/..%2fsecret.txt")[0], 404)
+        self.assertEqual(self.req("GET", "/runs/T-001-evidence/missing.png")[0], 404)
+
+    def test_epic_page_breakdown_runs(self):
+        d = self.runs / "breakdown"
+        d.mkdir()
+        (d / "E-001-20261116-100000.json").write_text("bd log <b>\n")
+        journal = self.runs / ("history" + ".jsonl")
+        with journal.open("a") as f:
+            f.write(json.dumps(row("2026-11-16T10:00:00+00:00", None, "breakdown", verdict="blocked", cost=1.25,
+                                   seconds=30, log="tasks/runs/breakdown/E-001-20261116-100000.json")) + "\n")
+        code, _, page = self.req("GET", "/e/E-001")
+        self.assertEqual(code, 200)
+        sec = page.split("<h2>Breakdown runs</h2>")[1].split("<h2")[0]
+        self.assertIn('<span class="v-blocked">blocked</span>', sec)
+        self.assertIn("$1.25", sec)
+        self.assertIn('<a href="/runs/breakdown/E-001-20261116-100000.json">', sec)
+        code, _, body = self.req("GET", "/runs/breakdown/E-001-20261116-100000.json")
+        self.assertEqual(code, 200)
+        self.assertIn("bd log", body)
+        for bad in ("/runs/breakdown/..%2fT-001-20261116-120000.json", "/runs/breakdown/missing.json",
+                    "/runs/breakdown/.hidden", "/runs/breakdown/%2e%2e/x"):
+            self.assertEqual(self.req("GET", bad)[0], 404, bad)
 
     def test_follow_ups_open_on_board_and_task_page(self):
         f = self.task_file("T-004")
@@ -211,6 +270,19 @@ class TestServe(ServeFixture):
         _, _, review = self.req("GET", "/review")
         card = re.search(r'<section class=card id="T-004">(.*?)</section>', review, re.S)[1]
         self.assertIn(">bugfix<", card)
+
+    def test_review_lists_proposed_epic(self):
+        self.ergon("new", "epic", "Evil epic " + HOSTILE)
+        f = next(p for p in (self.root / "tasks" / "epics").rglob("*.md") if "E-002" in str(p))
+        f.write_text(f.read_text().replace("## Goal\n", f"## Goal\n{HOSTILE}\n", 1))
+        _, _, review = self.req("GET", "/review")
+        sec = review.split("<h2 id=epics>")[1].split("<h2")[0]
+        self.assertIn("E-002", sec)
+        self.assertIn("&lt;script&gt;", sec)
+        self.assertNotIn("<script>alert", sec)
+        self.assertNotIn("<img src=x", sec)
+        self.assertIn("ergon approve E-001 E-002", sec)
+        self.assertNotIn("Nothing is waiting", review)
 
     def test_priority_on_board_and_task_page(self):
         f = self.task_file("T-004")
@@ -700,6 +772,12 @@ class TestMetrics(ServeFixture):
         _, _, empty = self.req("GET", "/metrics?until=2020-01-01")
         self.assertIn("No runs yet", empty)
         self.assertEqual(self.snapshot(), self.before)
+
+    def test_metrics_trust_pyramid(self):
+        _, _, page = self.req("GET", "/metrics")
+        self.assertIn("Trust pyramid", page)
+        self.assertIn("caught by review + human", page)
+        self.assertIn("<title>review: 2</title>", page)  # the fixture's two failed reviews
 
     def test_metrics_veto_and_filter(self):
         _, _, page = self.req("GET", "/metrics?epic=E-001&since=2026-11-16")

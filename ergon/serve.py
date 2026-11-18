@@ -18,6 +18,8 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
                journal, transcript usage, links to the raw logs, `claude --resume` commands,
                and (with a concept map) the tasks it relates to, as `ergon related` lists them
   /runs/NAME   one file directly inside <state>/runs/, as plain text
+  /runs/breakdown/NAME   an epic breakdown's log (listed on the epic page)
+  /runs/T-NNN-evidence/NAME   a worker's evidence file (images by type, the rest plain text)
 
 The read-only guarantee:
 - GET and HEAD only. Every other method, known or not, gets 405.
@@ -56,6 +58,7 @@ from . import concepts as _concepts
 from . import config as _config
 from . import gitops as _gitops
 from . import history as _history
+from . import limits as _limits
 from . import metrics as _metrics
 from . import priority as _priority
 from . import report as _report
@@ -65,6 +68,8 @@ from . import transcripts as _transcripts
 
 DEFAULT_PORT = 4300
 LOG_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+EV_NAME = LOG_NAME
+EV_DIR = re.compile(r"T-\d{3,}-evidence")
 TASK_ID = re.compile(r"T-\d{3,}")
 SESSION = re.compile(r"[A-Za-z0-9_-]{1,128}")
 COST_EVENTS = ("worker_end", "review")
@@ -273,7 +278,10 @@ def log_href(path):
     if not path:
         return None
     p = _config.HOME / str(path)
-    if p.parent.resolve() != _config.RUNS.resolve() or not LOG_NAME.fullmatch(p.name):
+    parent = p.parent.resolve()
+    if parent == (_config.RUNS / "breakdown").resolve() and LOG_NAME.fullmatch(p.name):
+        return "/runs/breakdown/" + urllib.parse.quote(p.name)
+    if parent != _config.RUNS.resolve() or not LOG_NAME.fullmatch(p.name):
         return None
     return "/runs/" + urllib.parse.quote(p.name)
 
@@ -481,8 +489,18 @@ def bar(done, total):
             f'<rect class=fg width={w} height=8 rx=4 /></svg>')
 
 
+def park_mark(t):
+    """`limited until HH:MM` / `asking` for a task dispatch parked, else ""."""
+    lim = _tasks.limited(t)
+    if lim:
+        return f"limited until {_limits.clock(lim[0])}"
+    return "asking" if _tasks.is_asking(t) else ""
+
+
 def task_li(t, tasks, extra=""):
     flags = []
+    if park_mark(t):
+        flags.append(f'<span class=park>{esc(park_mark(t))}</span>')
     if t.get("epic"):
         flags.append(f'<a href="/e/{esc(t["epic"])}">{esc(t["epic"])}</a>')
     if t["status"] == "ready" and not _tasks.deps_done(t, tasks):
@@ -593,6 +611,19 @@ def journal_block(eid, tasks):
             + (f' · {money(cost)}' if isinstance(cost, (int, float)) and not isinstance(cost, bool) else "") + "</p>")
 
 
+def breakdown_block(eid):
+    """The epic's breakdown runs (history `breakdown` rows): verdict, cost, time, log link. '' if none."""
+    rows = [r for r in _history.read() if r.get("event") == "breakdown" and r.get("epic") == eid]
+    if not rows:
+        return ""
+    cost = sum(r["cost"] for r in rows if isinstance(r.get("cost"), (int, float)) and not isinstance(r["cost"], bool))
+    items = "".join(
+        f'<li><span class="v-{esc(r.get("verdict"))}">{esc(r.get("verdict"))}</span> · {money(r.get("cost"))} · '
+        f'{esc(secs(r.get("seconds")))} · <span class=muted>{esc(r.get("at"))}</span>'
+        + (f' · log {log_link(r["log"])}' if r.get("log") else "") + "</li>" for r in rows)
+    return f"<h2>Breakdown runs</h2><p>{len(rows)} run(s), {money(cost)}</p><ul>{items}</ul>"
+
+
 def epic_page(eid, nonce, now=None):
     epics = _tasks.load(_config.EPICS)
     e = epics.get(eid)
@@ -609,7 +640,7 @@ def epic_page(eid, nonce, now=None):
     tl = _timeline.build(rows, tasks, eid, now or time.time(), tokens)
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
          f'<h1>{esc(eid)} {esc(e.get("title"))}</h1>']
-    jb = journal_block(eid, tasks)
+    jb = journal_block(eid, tasks) + breakdown_block(eid)
     if not tl["lanes"]:
         b.append(jb)
         b.append("<p class=muted>no task of this epic has a journal yet</p>")
@@ -691,6 +722,34 @@ def unjournaled(tid, trail, tier=None):
     return out
 
 
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+               ".webp": "image/webp"}  # not .svg: it can carry script
+
+
+def evidence_section(tid, trail):
+    """The worker's evidence from the latest `evidence` row: images inline, other files linked
+    through /runs/; every caption and name escaped. '' when there is none."""
+    rows = [r for r in trail if r.get("event") == "evidence"]
+    if not rows:
+        return ""
+    files, refused = rows[-1].get("files") or [], rows[-1].get("refused") or []
+    d = _config.RUNS / f"{tid}-evidence"
+    out = []
+    for f in files:
+        name = str(f.get("name") or "") if isinstance(f, dict) else ""
+        if not name or not (d / name).is_file() or not EV_NAME.fullmatch(name):
+            continue
+        href = f"/runs/{urllib.parse.quote(d.name)}/{urllib.parse.quote(name)}"
+        cap = esc(f.get("caption") or "(no caption)")
+        if Path(name).suffix.lower() in IMAGE_TYPES:
+            out.append(f'<figure><a href="{href}"><img src="{href}" alt="{cap}" style="max-width:100%"></a>'
+                       f"<figcaption>{cap}</figcaption></figure>")
+        else:
+            out.append(f'<p><a href="{href}">{esc(name)}</a> · {cap}</p>')
+    out += [f'<p class=muted>refused: {esc(r)}</p>' for r in refused]
+    return "<h2>Evidence</h2>" + "".join(out) if out else ""
+
+
 def related_block(t, tasks):
     """The task page's Related section (concepts.links), as HTML parts: nothing without a
     `concepts` key, a note when the map doesn't load or the task has no tags."""
@@ -736,7 +795,8 @@ def task_page(tid, nonce):
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
          f'<h1>{esc(tid)} {esc(t.get("title"))}</h1>',
          f'<p><span class="status st-{esc(t["status"])}">{esc(t["status"])}</span> · '
-         f'<span class=tier>{esc(t.get("tier"))}</span> <span class=tier>{esc(_tasks.category(t))}</span></p>']
+         f'<span class=tier>{esc(t.get("tier"))}</span> <span class=tier>{esc(_tasks.category(t))}</span>'
+         + (f' · <span class=park>{esc(park_mark(t))}</span>' if park_mark(t) else "") + '</p>']
 
     fus = _tasks.follow_ups(t, tasks, open_only=False)
     if fus:
@@ -829,6 +889,7 @@ def task_page(tid, nonce):
                      f'<td class=num>{esc(r.get("round") or "")}</td><td class=why>{link_ids(esc(detail), tasks)}{log}</td></tr>')
         b.append("</tbody></table></div>")
 
+    b.append(evidence_section(tid, trail))
     logs = sorted(p.name for p in _config.RUNS.glob(f"{tid}-*") if p.is_file() and LOG_NAME.fullmatch(p.name))
     if logs:
         b.append("<h2>Logs</h2><ul>" + "".join(
@@ -1182,13 +1243,43 @@ def group_header(ts, tasks):
     return "".join(h)
 
 
+EPIC_ID = re.compile(r"E-\d{3,}")
+
+
+def epic_briefs(epics):
+    """Epics whose brief awaits a human: proposed, or (shared mode) open with no signed approval that verifies, stamped or not."""
+    apr = _gitops.approvals()  # None outside shared mode; never raises
+    return sorted((e for e in epics.values()
+                   if e.get("status") not in ("dropped", "done") and _tasks.epic_problem(e, apr)
+                   and EPIC_ID.fullmatch(str(e.get("id")))), key=lambda e: e["id"])
+
+
+def epic_cards(briefs):
+    b = [f"<h2 id=epics>Proposed epics ({len(briefs)})</h2>",
+         "<p class=muted>Approving an epic approves its brief and opens it; its tasks wait until then. "
+         "This page approves nothing. From your own terminal:</p>",
+         f"<code class=cmd>{esc('ergon approve ' + ' '.join(e['id'] for e in briefs))}</code>"]
+    for e in briefs:
+        b.append(f'<section class=card id="{esc(e["id"])}"><h3>{esc(e["id"])} {esc(e.get("title"))}'
+                 f' <span class=tier>{esc(e.get("status"))}</span></h3>')
+        for name in ("Goal", "Out of scope", "Constraints"):
+            text = section(e.get("_body") or "", name)
+            b.append(f"<h4>{name}</h4>" + (f"<pre>{esc(text)}</pre>" if text and not blank(text) else "<p class=muted>empty</p>"))
+        b.append("</section>")
+    return b
+
+
 def review_page(nonce):
     tasks = _tasks.load(_config.ITEMS)
+    briefs = epic_briefs(_tasks.load(_config.EPICS))
     proposed = sorted((t for t in tasks.values() if t["status"] == "proposed"), key=tier_key)
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)} · review · read-only</span></div>',
          f"<h1>Proposed tasks ({len(proposed)})</h1>"]
+    if briefs:
+        b.extend(epic_cards(briefs))
     if not proposed:
-        b.append("<p class=muted>Nothing is waiting for approval.</p>")
+        if not briefs:
+            b.append("<p class=muted>Nothing is waiting for approval.</p>")
         return page("ergon · review", "".join(b), nonce)
     found = {t["id"]: findings(t, tasks) for t in proposed}
     flagged = {i: f for i, f in found.items() if f}
@@ -1341,6 +1432,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             m = re.fullmatch(r"/runs/([^/]+)", path)
             if m:
                 return self._log(m[1], head)
+            m = re.fullmatch(r"/runs/(breakdown|T-\d{3,}-evidence)/([^/]+)", path)
+            if m:
+                return self._log(m[2], head, m[1])
             return self._text(404, "404: not found", head)
         except (Exception, SystemExit) as err:  # noqa: BLE001 - a bad task file is a 500, not a dead thread
             print(f"ergon serve: {self.path}: {err!r}", file=sys.stderr)
@@ -1349,9 +1443,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def _log(self, name, head):
-        """A file directly inside <state>/runs/, by bare name; 404 for anything else."""
+    def _log(self, name, head, sub=None):
+        """A file directly inside <state>/runs/ (or its <ID>-evidence/ directory), by bare name;
+        404 for anything else. Evidence images get their image type, the rest is plain text."""
         runs = _config.RUNS.resolve()
+        if sub:
+            runs = (runs / sub).resolve()
+            if runs.parent != _config.RUNS.resolve():
+                return self._text(404, "404: not found", head)
         if not LOG_NAME.fullmatch(name):
             return self._text(404, "404: not found", head)
         p = (runs / name).resolve()
@@ -1363,7 +1462,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._text(404, "404: not found", head)
         with f:
             size = os.fstat(f.fileno()).st_size
-            self._send(200, b"", "text/plain; charset=utf-8", True, length=size)
+            ctype = (IMAGE_TYPES.get(p.suffix.lower()) if sub else None) or "text/plain; charset=utf-8"
+            self._send(200, b"", ctype, True, length=size)
             if not head:
                 shutil.copyfileobj(f, self.wfile)
 

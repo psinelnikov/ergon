@@ -15,7 +15,9 @@ On an API key there is no window: probe() returns None and nothing is shown. `li
 false` in .ergon.toml turns the probes off.
 """
 import json
+import re
 import tempfile
+import time
 
 from . import config as _config
 from . import history as _history
@@ -103,3 +105,115 @@ def pct(cost, per_dollar):
     """'6.3%' for a cost at a rate, '<0.1%' for a sliver."""
     p = cost * per_dollar
     return "<0.1%" if 0 < p < 0.05 else f"{p:.1f}%"
+
+
+# ---------- limit stops ----------
+# When the plan's limit runs out mid-run, `claude -p --output-format json` still prints a result,
+# in one of these shapes (the first one is what dispatch's own logs show today):
+#   {"is_error": true, "subtype": "success", "terminal_reason": "api_error", "api_error_status": 429,
+#    "result": "You've hit your 5-hour limit · resets 10pm (Europe/Lisbon)"}
+#   the same with "You've hit your limit · resets 3pm (America/New_York)", "5-hour limit reached ∙
+#   resets 6:30pm", or a weekly one, "You've hit your weekly limit · resets Nov 21, 3pm (…)"
+#   {"is_error": false, "subtype": "success", "result": "Claude AI usage limit reached|1794935400"}
+#   (older Claude Code: the reset as epoch seconds, and no error flag)
+# The text alone decides, and only when it is the whole reply (one short line): a worker's long
+# report that talks about limits is never one. stop() is the one place these patterns live.
+
+RETRY_MINUTES = 30  # no reset in the message and none from probe(): try again this much later
+_EPOCH = re.compile(r"^Claude AI usage limit reached\|(\d{9,11})\s*$")
+_LIMIT = re.compile(r"(?i)^(?:you(?:'|’)ve hit|you have hit|you(?:'|’)ve reached|you have reached)\s+your\s+"
+                    r"(?:[\w-]+\s+){0,3}limit\b|^(?:[\w-]+\s+){0,3}limit reached\b|^claude ai usage limit reached\b")
+_RESETS = re.compile(r"(?i)\bresets\s+(?:at\s+)?(?:(?P<mon>[A-Z][a-z]{2,8})\.?\s+(?P<day>\d{1,2}),?\s+(?:at\s+)?)?"
+                     r"(?P<h>\d{1,2})(?::(?P<m>\d\d))?\s*(?P<ap>am|pm)?\b(?:\s*\((?P<tz>[\w/+-]+)\))?")
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def stop(d, now=None):
+    """Is a `claude -p --output-format json` result `d` (the parsed dict) a stop by the plan's
+    usage limit? {"text": the message, "resets_at": epoch seconds, or None when the message gives
+    no reset that can be read} if so, else None. An ordinary error, a 429 without a limit message
+    and a reply that merely mentions a limit are not."""
+    if not isinstance(d, dict):
+        return None
+    text = str(d.get("result") or "").strip()
+    if not text or "\n" in text or len(text) > 200:
+        return None
+    m = _EPOCH.match(text)
+    if m:
+        return {"text": text, "resets_at": int(m[1])}
+    if not _LIMIT.search(text):
+        return None
+    return {"text": text, "resets_at": reset_time(text, now)}
+
+
+def reset_time(text, now=None):
+    """The epoch seconds a limit message's `resets <when>` names, or None. A time alone is the
+    next one at or after now (an hour's slack: the message may be read a little after it was
+    written); a date without a year is this year's, or next year's if that one is long past. The
+    zone in brackets counts when this Python knows it, else local time."""
+    import datetime
+    m = _RESETS.search(text or "")
+    if not m:
+        return None
+    h, mi, ap = int(m["h"]), int(m["m"] or 0), (m["ap"] or "").lower()
+    if ap:
+        if not 1 <= h <= 12:
+            return None
+        h = h % 12 + (12 if ap == "pm" else 0)
+    if h > 23 or mi > 59:
+        return None
+    tz = None
+    if m["tz"]:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(m["tz"])
+        except Exception:  # noqa: BLE001 - an unknown zone, or no tz database: local time
+            tz = None
+    now_dt = datetime.datetime.fromtimestamp(now if now is not None else time.time(), tz).astimezone(tz)
+    if m["mon"]:
+        mon = m["mon"][:3].lower()
+        if mon not in _MONTHS:
+            return None
+        try:
+            at = now_dt.replace(month=_MONTHS.index(mon) + 1, day=int(m["day"]), hour=h, minute=mi,
+                                second=0, microsecond=0)
+        except ValueError:
+            return None
+        if at < now_dt - datetime.timedelta(days=30):
+            at = at.replace(year=at.year + 1)
+        return int(at.timestamp())
+    at = now_dt.replace(hour=h, minute=mi, second=0, microsecond=0)
+    if at < now_dt - datetime.timedelta(hours=1):
+        at += datetime.timedelta(days=1)
+    return int(at.timestamp())
+
+
+def resets_at(lim, now=None):
+    """When to try again after limit stop `lim` (stop()'s): the reset its message names, else the
+    one probe() reads, else RETRY_MINUTES from now; a reset that isn't ahead counts as none (the
+    task would go straight back into the limit). Epoch seconds."""
+    now = time.time() if now is None else now
+    if isinstance(lim.get("resets_at"), (int, float)) and lim["resets_at"] > now:
+        return int(lim["resets_at"])
+    win = probe()
+    at = (win or {}).get("resets_at")
+    if isinstance(at, (int, float)) and at > now:
+        return int(at)
+    return int(now + RETRY_MINUTES * 60)
+
+
+ISO = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def iso(epoch):
+    """Epoch seconds as the UTC ISO time a `limited:` mark holds."""
+    import datetime
+    return datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc).strftime(ISO)
+
+
+def clock(epoch, now=None):
+    """Epoch seconds as local `HH:MM`, with the date in front when it isn't today."""
+    import datetime
+    at = datetime.datetime.fromtimestamp(int(epoch))
+    today = datetime.datetime.fromtimestamp(now if now is not None else time.time()).date()
+    return at.strftime("%H:%M") if at.date() == today else at.strftime("%Y-%m-%d %H:%M")

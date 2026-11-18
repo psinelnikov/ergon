@@ -39,7 +39,8 @@ def category(t):
     c = str(t.get("category") or "").strip().lower()
     return c if c in CATEGORIES else "feature"
 TASK_STATUSES = ["proposed", "ready", "doing", "review", "blocked", "done", "dropped"]
-EPIC_STATUSES = ["open", "done", "dropped"]
+# An epic starts proposed; a human's `approve E-NNN` approves its brief and opens it.
+EPIC_STATUSES = ["proposed", "open", "done", "dropped"]
 # Statuses a task can only reach after a human approved it.
 NEEDS_APPROVAL = {"ready", "doing", "review", "blocked", "done"}
 # Transitions `set` allows. proposed -> ready is approve's job, not set's. Only dispatch moves a
@@ -51,7 +52,7 @@ AGENT_MOVES = {
 }
 TASK_KEYS = ["id", "title", "tier", "category", "status", "epic", "depends", "touches", "source",
              "created", "approved", "tier_why"]
-EPIC_KEYS = ["id", "title", "status", "created"]
+EPIC_KEYS = ["id", "title", "status", "created", "approved"]
 
 
 # ---------- file format ----------
@@ -135,8 +136,10 @@ def today():
 # docs/shared-state.md, "Trusting approval stamps". An approval covers the brief: id, title, tier,
 # touches, accept and the What and Done when sections. status, depends, epic and Notes are left
 # out: dispatch moves status and adds dependencies to blocked tasks, and Notes are scratch.
+# An epic's approval covers its id, title and the Goal, Out of scope and Constraints sections.
 
 DIGEST_SECTIONS = ("what", "done when")
+EPIC_DIGEST_SECTIONS = ("goal", "out of scope", "constraints")
 HEADING = re.compile(r"^#{1,2}\s+(.*?)\s*$")
 
 
@@ -170,10 +173,27 @@ def normalised(text):
     return "\n".join(lines)
 
 
+def is_epic(item):
+    return str(item.get("id") or "").startswith("E-")
+
+
 def brief_digest(t):
-    """sha256 (hex) of what approving t approves. Notes, status, depends and epic don't change it,
-    nor any field a command writes about the brief (cod*, graded, category, concepts, tagged)."""
+    """sha256 (hex) of what approving t (a task or an epic) approves. Notes, status, depends and
+    epic don't change it, nor any field a command writes about the brief (cod*, graded, category,
+    concepts, tagged). A task's gate-weakening fields (a `verify:` override of the runtime gate,
+    `prove: no`) are in it, so writing one after approval un-approves the task. So are a harden
+    task's incidents (`harden:`, as a set) and the gate its proof replays them on (`harden_layer:`,
+    `static` when unset), since together they are what the task must prove it catches. So are the
+    files a task may add a suppression marker to (`suppress_ok:`, as a set, T-160). Each goes in
+    only when set (the layer only with incidents, as it does nothing without them), so a task that
+    has none of these keeps the digest it had before they counted."""
     body = t.get("_body") or ""
+    if is_epic(t):
+        doc = {"kind": "epic", "id": str(t.get("id") or "").strip(),
+               "title": " ".join(str(t.get("title") or "").split())}
+        for name in EPIC_DIGEST_SECTIONS:
+            doc[name] = normalised(sections(body, name))
+        return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     doc = {
         "id": str(t.get("id") or "").strip(),
         "title": " ".join(str(t.get("title") or "").split()),
@@ -181,9 +201,63 @@ def brief_digest(t):
         "touches": sorted({str(x).strip().strip("/") for x in t.get("touches") or [] if str(x).strip()}),
         "accept": "yes" if str(t.get("accept") or "").strip().lower() in YES else "",
     }
+    verify = t.get("verify")
+    verify = " ".join(" ".join(verify) if isinstance(verify, list) else str(verify or "").split())
+    if verify:
+        doc["verify"] = verify
+    if prove_off(t):
+        doc["prove"] = "no"
+    harden = sorted(set(_dispatch.harden_ids(t)))
+    if harden:
+        doc["harden"] = harden
+        doc["harden_layer"] = _dispatch.harden_layer(t)
+    suppress_ok = sorted(set(_dispatch.suppress_ok_paths(t)))
+    if suppress_ok:
+        doc["suppress_ok"] = suppress_ok
     for name in DIGEST_SECTIONS:
         doc[name] = normalised(sections(body, name))
     return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+PROVE_NO = ("no", "false", "0")  # as dispatch.PROVE_NO reads `prove:`
+
+
+def prove_off(t):
+    """Does t's `prove:` waive the red-on-base proof?"""
+    return str(t.get("prove") or "").strip().lower() in PROVE_NO
+
+
+# ---------- is an epic approved? ----------
+# An epic is filed `proposed`; a human's `approve E-NNN` stamps `approved:` and opens it.
+# In shared mode an open epic counts as approved only if a signed approval of its brief verifies,
+# as a task's does, stamp or no stamp: an open epic with no stamp (from before epics were
+# approved, or pushed by a clone without the guard) is refused until a human runs `approve
+# E-NNN` on it (T-124). A done epic is checked only if stamped: nothing is broken down or opened
+# from one. In local mode a stamp can't be verified, so an epic past proposed counts as approved
+# with or without one, which keeps old unstamped epics working; there the guard is what stops an
+# agent opening one (`new epic` writes proposed, `set` won't move an epic out of proposed, and the
+# guard refuses an agent's status edit or a new EPIC.md that isn't proposed).
+
+def epic_problem(e, apr=None):
+    """Why tasks of epic e mustn't be offered or started (its brief isn't approved), or None.
+    apr: gitops.approvals() in shared mode. None for no epic (a task without one)."""
+    if not e:
+        return None
+    eid, status = e["id"], e.get("status")
+    if status == "proposed":
+        return f"epic {eid} is proposed: a human approves its brief with `ergon approve {eid}`"
+    if status == "dropped":
+        return f"epic {eid} is dropped"
+    if not apr:
+        return None  # local mode: nothing to verify a stamp against
+    if status != "open" and not e.get("approved"):
+        return None  # a done epic from before epics were approved
+    why = apr.problem(e)
+    return f"epic {eid}'s approval doesn't verify: {why}" if why else None
+
+
+def epic_of(t, epics):
+    return epics.get(t.get("epic")) if t.get("epic") else None
 
 
 # ---------- views ----------
@@ -207,6 +281,10 @@ def line(t, tasks):
     pin = str(t.get("pin") or "").strip()
     if pin in ("first", "last"):
         flags.append(f"pinned {pin}")
+    lim = limited(t)
+    if lim:
+        from . import limits as _limits
+        flags.append(f"limited until {_limits.clock(lim[0])}")
     tail = f"  ({'; '.join(flags)})" if flags else ""
     return f"  {t['id']}  {t['tier']:<6}  {t['title']}{tail}"
 
@@ -217,6 +295,30 @@ YES = ("yes", "true", "1")
 def is_asking(t):
     """Is t parked on a worker's question, waiting for a human's `ergon answer`?"""
     return t.get("status") == "blocked" and bool(t.get("asking"))
+
+
+LIMITED_AT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def limited_mark(v):
+    """A `limited:` value, `<reset, UTC ISO> <step>`, as (reset epoch seconds, step), or None
+    when it doesn't read as one."""
+    import datetime
+    at, _, step = str(v or "").strip().partition(" ")
+    try:
+        when = datetime.datetime.strptime(at, LIMITED_AT).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    step = step.strip()
+    if not re.fullmatch(r"worker|review|(?:fix|verify|conflict) \d+", step):
+        return None
+    return when.timestamp(), step
+
+
+def limited(t):
+    """(reset epoch seconds, step) when t is parked by the usage limit (blocked, with a `limited:`
+    mark that reads), else None. Dispatch resumes it at a scan at or after that time."""
+    return limited_mark(t.get("limited")) if t.get("status") == "blocked" else None
 
 
 # In shared mode a task dispatch held at `review` has its task/<ID> branch in one clone only (task
@@ -257,6 +359,13 @@ def needs_accept(t, *tiers):
     return any(rule_hit(rule, t, tiers) for rule in _config.ACCEPT)
 
 
+def needs_evidence(t, *tiers):
+    """Does t's done need EVIDENCE: files? Its own `evidence: yes`, or an [[evidence]] rule."""
+    if str(t.get("evidence", "")).lower() in YES:
+        return True
+    return any(rule_hit(rule, t, tiers) for rule in _config.EVIDENCE)
+
+
 def rule_hit(rule, t, tiers=()):
     """Does t match an [[accept]] or [[two_person]] rule? Its tier (or one of `tiers`) is in the
     rule's tiers, when given, and a touches: entry falls under one of its patterns, when given."""
@@ -270,7 +379,7 @@ def two_person(t):
     """Does t need approvals from two different approvers ([[two_person]], shared mode only)? It is
     matched against the task as it is now, so retiering it into or out of a rule changes the answer
     (and its digest, so earlier approvals stop counting either way)."""
-    return bool(_config.SHARED) and any(rule_hit(rule, t) for rule in _config.TWO_PERSON)
+    return bool(_config.SHARED) and not is_epic(t) and any(rule_hit(rule, t) for rule in _config.TWO_PERSON)
 
 
 # ---------- approval by inheritance (T-136) ----------
@@ -411,20 +520,23 @@ def board(args):
             pending = sum(t["status"] == "proposed" for t in kids)
             note = f", {pending} awaiting approval" if pending else ""
             note += "  <- needs breakdown" if not kids and e["status"] == "open" else ""
+            note += "  <- brief awaiting approval" if e["status"] == "proposed" else ""
             note += f"  on {_gitops.epic_branch(e)}" if e["status"] == "open" and _gitops.branch_exists(_gitops.epic_branch(e)) else ""
-            print(f"  {e['id']}  {e['status']:<7} {done}/{len(kids)} done{note}  {e['title']}")
+            print(f"  {e['id']}  {e['status']:<8} {done}/{len(kids)} done{note}  {e['title']}")
     counts = {tier: sum(t["tier"] == tier and t["status"] not in ("done", "dropped")
                         for t in tasks.values()) for tier in TIERS}
     print("\nOPEN BY TIER  " + "  ".join(f"{k}:{v}" for k, v in counts.items()))
 
 
 def nxt(args):
-    tasks = load(_config.ITEMS)
+    tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     ok = [t for t in tasks.values() if t["status"] == "ready" and deps_done(t, tasks)
           and (not args.tier or t["tier"] == args.tier)]
     apr = _gitops.approvals()  # shared mode: only tasks whose signed approval verifies
     hidden = [t for t in ok if apr and apr.problem(t)]
     ok = [t for t in ok if t not in hidden]
+    waiting = [t for t in ok if epic_problem(epic_of(t, epics), apr)]  # its epic's brief isn't approved
+    ok = [t for t in ok if t not in waiting]
     from . import priority as _pri
     for t in sorted(ok, key=lambda t: _pri.sort_key(t, tasks)):
         print(line(t, tasks))
@@ -433,6 +545,12 @@ def nxt(args):
     if hidden:
         print(f"({len(hidden)} ready task(s) left out because their approval doesn't verify: "
               f"{', '.join(sorted(t['id'] for t in hidden))}; `ergon check` says why)")
+    if waiting:
+        why = {}
+        for t in waiting:
+            why.setdefault(epic_problem(epic_of(t, epics), apr), []).append(t["id"])
+        for w, ids in sorted(why.items()):
+            print(f"({len(ids)} ready task(s) left out because {w}: {', '.join(sorted(ids))})")
 
 
 def review(args):
@@ -440,6 +558,14 @@ def review(args):
         return _gates.review_interactive(args)
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     waiting = [t for t in tasks.values() if t["status"] == "proposed"]
+    briefs = sorted((e for e in epics.values() if e.get("status") == "proposed"), key=lambda e: e["id"])
+    if briefs:
+        print(f"\nEPICS AWAITING APPROVAL ({len(briefs)}): approving one approves its brief "
+              f"(Goal, Out of scope, Constraints) and opens it; its tasks wait until then. "
+              f"Rejecting one drops its brief")
+        for e in briefs:
+            kids = sum(t.get("epic") == e["id"] and t["status"] != "dropped" for t in tasks.values())
+            print(f"  {e['id']}  {e['title']}  ({kids} task(s))")
     by_epic = {}
     for t in waiting:
         by_epic.setdefault(t.get("epic") or "", []).append(t)
@@ -453,10 +579,10 @@ def review(args):
                 print(f"         why {t['tier']}: {t['tier_why']}")
             if apr and two_person(t):
                 print(f"         two-person: {apr.tally(t)}")
-    if not waiting:
+    if not waiting and not briefs:
         print("nothing awaiting approval")
     else:
-        print("\napprove from your own terminal:  ergon approve <ID|E-ID> ...")
+        print("\napprove from your own terminal:  ergon approve <ID|E-ID> ...   or drop:  ergon reject <ID|E-ID>")
     asking = sorted((t for t in tasks.values() if is_asking(t)), key=lambda t: t["id"])
     if asking:
         print(f"\nAWAITING ANSWER ({len(asking)}): a worker asked, its branch is kept")
@@ -569,7 +695,7 @@ def new(args):
         eid = next_id(_config.EPICS, "E")
         home = _config.EPICS / f"{eid}-{slug(args.title)}"
         home.mkdir()
-        meta = {"id": eid, "title": args.title, "status": "open", "created": today(),
+        meta = {"id": eid, "title": args.title, "status": "proposed", "created": today(), "approved": "",
                 "_path": home / _config.EPIC_FILE, "_body": EPIC_BODY}
         dump(meta, EPIC_KEYS)
         _history.record("created", meta, title=args.title, by="new")
@@ -887,6 +1013,21 @@ def tidy(args):
     print(f"moved {n} file(s)")
 
 
+def protect_problems(t):
+    """Why t's tier is below a [[protect]] minimum for a path it touches: one line per rule it
+    breaks, or []. `check` runs it on every open task; a breakdown on every TASK block."""
+    if t.get("tier") not in TIERS:
+        return []
+    out = []
+    for pr in _config.PROTECT:
+        hit = next(((x, p) for x in t.get("touches") or [] for p in pr["touches"]
+                    if _config.protect_hit(str(x), p)), None)
+        if hit and TIERS.index(t["tier"]) < TIERS.index(pr["min_tier"]):
+            out.append(f"touches {hit[0]} (protect {hit[1]}) needs tier {pr['min_tier']}+, is {t['tier']}"
+                       + (f": {pr['note']}" if pr["note"] else ""))
+    return out
+
+
 def lint(warns=None):
     """(errors, summary). Warnings that don't fail the check go into `warns`, a list, when given
     (the stop hook passes none: its stdout is JSON)."""
@@ -939,6 +1080,12 @@ def lint(warns=None):
         if t.get("asking") and t.get("status") not in ("blocked", "done", "dropped"):
             errs.append(f"{where}: asking: is set but status is {t.get('status')}; a task waiting on an answer "
                         f"is blocked until a human runs `ergon answer {t['id']}`")
+        if t.get("limited") and t.get("status") != "blocked":
+            errs.append(f"{where}: limited: is set but status is {t.get('status')}; dispatch parks a task the usage "
+                        f"limit stopped as blocked, and clears the mark when it resumes it")
+        elif t.get("limited") and not limited_mark(t["limited"]):
+            errs.append(f"{where}: limited: {t['limited']!r} isn't `<UTC time, {LIMITED_AT}> <step>` (step: worker, "
+                        f"review, or fix/verify/conflict and a round number)")
         if t.get("answered") and t.get("status") not in ("ready", "done", "dropped"):
             errs.append(f"{where}: answered: is set but status is {t.get('status')}; `ergon answer` leaves it ready")
         if t.get("pin") and t.get("status") in ("done", "dropped"):
@@ -946,21 +1093,34 @@ def lint(warns=None):
         if t.get("accept") and str(t["accept"]).lower() not in YES:
             errs.append(f"{where}: accept: {t['accept']!r} isn't `yes` (leave it out for no; config "
                         f"[[accept]] rules can't be opted out of)")
+        if t.get("evidence") and str(t["evidence"]).lower() not in YES:
+            errs.append(f"{where}: evidence: {t['evidence']!r} isn't `yes` (leave it out for no)")
+        harden = _dispatch.harden_ids(t)  # a harden task (T-106)
+        for i in harden:
+            if not _dispatch.HARDEN_ID.fullmatch(i):
+                errs.append(f"{where}: harden: {i!r} isn't an incident id (the file stem in <state>/runs/incidents)")
+        if t.get("harden_layer") and t["harden_layer"] not in _dispatch.HARDEN_LAYERS:
+            errs.append(f"{where}: harden_layer: {t['harden_layer']!r} isn't one of {', '.join(_dispatch.HARDEN_LAYERS)}")
+        if t.get("harden_layer") and not harden:
+            errs.append(f"{where}: harden_layer: is set but harden: names no incident")
+        for x in _dispatch.suppress_ok_paths(t):  # T-160: a file, named on purpose
+            if any(ch in x for ch in "*?["):
+                errs.append(f"{where}: suppress_ok: {x!r} is a glob; it names files one by one (a glob exempts nothing)")
         if t.get("epic") and t["epic"] not in epics:
             errs.append(f"{where}: epic {t['epic']} doesn't exist")
         for d in t.get("depends") or []:
             if d not in tasks:
                 errs.append(f"{where}: depends on missing {d}")
-        if t.get("status") not in ("done", "dropped") and t.get("tier") in TIERS:
-            for pr in _config.PROTECT:
-                hit = next(((x, p) for x in t.get("touches") or [] for p in pr["touches"]
-                            if _config.protect_hit(str(x), p)), None)
-                if hit and TIERS.index(t["tier"]) < TIERS.index(pr["min_tier"]):
-                    errs.append(f"{where}: touches {hit[0]} (protect {hit[1]}) needs tier "
-                                f"{pr['min_tier']}+, is {t['tier']}" + (f": {pr['note']}" if pr["note"] else ""))
+        if t.get("status") not in ("done", "dropped"):
+            errs += [f"{where}: {why}" for why in protect_problems(t)]
     for e in epics.values():
         if e.get("status") not in EPIC_STATUSES:
             errs.append(f"{e['id']}: status {e.get('status')!r} not in {EPIC_STATUSES}")
+        # shared mode: an open epic needs a signed approval of its current brief, stamp or no
+        # stamp (epic_problem). Local mode has nothing to verify, so an unstamped one passes.
+        why = apr.problem(e) if apr and e.get("status") == "open" else None
+        if why:
+            errs.append(f"{e['id']}: open, but its approval doesn't verify: {why}")
     # Map cards link gaps to tasks with a trailing "→ task T-012[, T-013]".
     for card in sorted(_config.MAP.rglob("*.md")) if _config.MAP and _config.MAP.is_dir() else []:
         for n, text in enumerate(card.read_text().splitlines(), 1):
@@ -986,5 +1146,7 @@ def check(args):
         print(f"warning: {w}")
     for err in errs:
         print(err)
+    for w in _dispatch.policy_warnings(load(_config.ITEMS)):
+        print(w)
     print(summary)
     sys.exit(1 if errs else 0)

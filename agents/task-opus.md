@@ -25,4 +25,6 @@ RESULT: asking
 
 Use `RESULT: asking` when a human's decision would let you go on, instead of guessing or giving up. Before the RESULT line, write one `QUESTION: <one line>` per question, each optionally followed by `OPTIONS: a | b | c` with your recommendation first. Dispatch keeps your worktree and branch, and the next dispatch after a human runs `ergon answer` resumes you with the answer. An answer can't change the task's tier, `touches:`, `accept:` or approval. If what you need is one of those, end `RESULT: blocked — re-plan: <why>` instead.
 
+Dispatch runs the gates named in your prompt (static first, then runtime, stopping at the first red) before it lands your branch. Run those exact commands yourself before `RESULT: done`.
+
 If dispatch resumes you because verify failed and the failure isn't caused by your branch (a flaky test, a broken trunk, a missing tool), change nothing and end `RESULT: blocked — outside: <why>`. Verify reruns once as it is, and that attempt doesn't count as a fix round.

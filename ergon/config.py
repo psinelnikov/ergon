@@ -59,6 +59,8 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # review_resume_tokens = 80000  # and its context smaller than these; else a fresh worker on the branch
 # journal = true                # when an epic finishes, have claude write its journal entry (one `claude -p`
 #                               # call, shown on /e/E-NNN); false: only `ergon journal` writes them
+# learn = true                  # after each dispatch run (and each --watch scan) with a newly caught incident,
+#                               # run `ergon learn`: one `claude -p` proposes harden tasks (under --budget-total)
 # limit_probe = true            # read the plan's 5-hour window before and after each dispatch (two
 #                               # tiny haiku calls) to show each task's cost as a % of the limit
 # follow_up_depth = 3           # a worker's FOUND follow-up that is a bugfix, refactor or chore, not
@@ -70,12 +72,38 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 #                               # don't count toward --max, they do count toward --budget-total); past it
 #                               # they stay ready for the next run
 
+# Layered gates, cheapest first: static (lint, types, import boundaries), then runtime (tests); the
+# first red stops the rest. `verify` above is an alias for runtime; a task's `verify:` overrides runtime only.
+# Before both, the weakening check: a branch whose diff changes a gate file (protect, fnmatch; a
+# pattern with no `/` matches that name in any directory; .ergon.toml always) goes back to its worker
+# unless the task's touches: names that file, and so does one that adds a line matching a suppression
+# regex (suppress) to any file, named or not, unless the task is a harden task (harden: set) whose
+# touches: names that file, or unless the file is named in the task's suppress_ok: (human-approved, T-160).
+# [gates]
+# static = "ruff check ."
+# runtime = "make test"
+# protect = ["ruff.toml", ".eslintrc*", "tests/arch/**"]
+# suppress = ['# noqa', 'eslint-disable', '@pytest\\.mark\\.skip']   # regexes ('literal' strings)
+# repros = "tests/harden"       # where a harden task commits <incident id>.patch when an incident's patch is stale
+# tests = ["tests/**", "**/*_test.go"]   # the project's test files (fnmatch, like protect). A branch that adds or
+#                               # changes one must prove it: on its base with only its test files overlaid,
+#                               # runtime goes red, or the worker gets a fix round (a task's `prove: no` opts out)
+# prove_tiers = ["sonnet", "opus"]   # worker tiers whose branches get that proof (default: every worker tier)
+
 # Tasks whose finished branch waits at status `review` for a human `ergon accept` instead of landing.
 # A task matches a rule if its tier is in tiers (when given) and a touches: entry matches (when
 # given). A task's own `accept: yes` opts it in too. Nothing opts a task out.
 # [[accept]]
 # tiers = ["opus"]
 # touches = ["server/**"]       # fnmatch patterns, like [[protect]]
+
+# Tasks whose done needs runtime evidence: the worker ends with `EVIDENCE: <path> — <what it shows>`
+# lines (test output, screenshots), copied to <state>/runs/<ID>-evidence/ for the reviewer and the
+# task page; a done with none goes to a fix round. Matched like [[accept]]; a task's own
+# `evidence: yes` opts it in too.
+# [[evidence]]
+# tiers = ["sonnet"]
+# touches = ["ui/**"]
 
 # A separate repo checked out inside this one that tasks may change, e.g. a public product
 # repo next to a private install. Each dispatched task touching it gets its own worktree of it.
@@ -109,8 +137,14 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 
 
 SHARED = None  # [shared]: {remote, branch}, or None for local-only state
+GATE_FILES = [CONFIG_FILE]  # [gates] protect, plus the config itself
+SUPPRESS = []  # [gates] suppress, compiled
+REPROS = "tests/harden"  # [gates] repros: a harden task's reproductions, <incident id>.patch
+TESTS = []  # [gates] tests: the project's test files, for the red-on-base proof
+PROVE_TIERS = list(WORKER_TIERS)  # [gates] prove_tiers: worker tiers whose branches get that proof
 PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
 ACCEPT = []  # [[accept]] rules: {tiers, touches}
+EVIDENCE = []  # [[evidence]] rules: {tiers, touches}; a matching task's done needs EVIDENCE: files
 TWO_PERSON = []  # [[two_person]] rules: {tiers, touches}; shared mode only
 FOLLOW_UP_DEPTH = 3  # follow_up_depth: see tasks.auto_approval
 FOLLOW_UPS = 10  # follow_ups: auto-approved follow-ups one dispatch run works
@@ -203,9 +237,9 @@ def configure(start=None, need_config=True):
     the main checkout: task state, worktrees, run logs and companion checkouts live there, so
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
-        RETIRED_FILE, WORKER_RULES, CONCEPTS, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, \
-        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, \
-        FOLLOW_UP_DEPTH, FOLLOW_UPS
+        RETIRED_FILE, WORKER_RULES, CONCEPTS, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, EVIDENCE, \
+        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, LEARN, \
+        FOLLOW_UP_DEPTH, FOLLOW_UPS, GATE_FILES, SUPPRESS, REPROS, TESTS, PROVE_TIERS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -251,6 +285,35 @@ def configure(start=None, need_config=True):
         if isinstance(v, bool) or not isinstance(v, int) or v < 0:
             raise NotConfigured(f"{CONFIG_FILE}: {key} is a whole number, 0 or more")
         return v
+    GATES = CFG.get("gates") or {}
+    strings = lambda v: isinstance(v, list) and all(isinstance(x, str) and x.strip() for x in v)
+    if not isinstance(GATES, dict) or any(
+            k not in ("static", "runtime", "protect", "suppress", "repros", "tests", "prove_tiers")
+            or not (isinstance(v, str) if k in ("static", "runtime", "repros") else strings(v)) for k, v in GATES.items()):
+        raise NotConfigured(f"{CONFIG_FILE}: [gates] takes static and runtime, each a shell command, "
+                            f"protect, suppress and tests, each a list of patterns, repros, a directory, "
+                            f"and prove_tiers, a list of worker tiers")
+    # The weakening check (T-101): gate files a branch may change only where its task's touches:
+    # names the file, and markers it may add only there in a harden task (T-118). The config itself
+    # is always a gate file.
+    GATE_FILES = list(dict.fromkeys([CONFIG_FILE] + [x.strip().strip("/") for x in GATES.get("protect") or []]))
+    SUPPRESS = []
+    for x in GATES.get("suppress") or []:
+        try:
+            SUPPRESS.append(re.compile(x))
+        except re.error as err:
+            raise NotConfigured(f"{CONFIG_FILE}: [gates] suppress {x!r} isn't a regex: {err}")
+    # A harden task's reproductions (T-106): a directory in the repo, never outside it.
+    REPROS = (GATES.get("repros") or "tests/harden").strip().strip("/")
+    if not REPROS or any(x in (".", "..", "") for x in REPROS.split("/")):
+        raise NotConfigured(f"{CONFIG_FILE}: [gates] repros is a directory inside the repo")
+    # The red-on-base proof (T-102): a branch that adds or changes a test file must go red on its
+    # base with only those files overlaid. Off without tests; prove_tiers narrows it (an empty list
+    # turns it off for every tier).
+    TESTS = list(dict.fromkeys(x.strip().strip("/") for x in GATES.get("tests") or []))
+    PROVE_TIERS = list(GATES["prove_tiers"]) if "prove_tiers" in GATES else list(WORKER_TIERS)
+    if any(x not in WORKER_TIERS for x in PROVE_TIERS):
+        raise NotConfigured(f"{CONFIG_FILE}: [gates] prove_tiers lists worker tiers, from {WORKER_TIERS}")
     REVIEW_ROUNDS = count("review_rounds", 2)
     VERIFY_ROUNDS = count("verify_rounds", 2)  # a red verify goes back to the worker this many times (T-027)
     CONFLICT_ROUNDS = count("conflict_rounds", 1)  # a branch that conflicts with its base goes back to its worker (T-095)
@@ -263,6 +326,9 @@ def configure(start=None, need_config=True):
     JOURNAL = CFG.get("journal", True)  # write an epic's journal entry (`ergon journal`) when it finishes
     if not isinstance(JOURNAL, bool):
         raise NotConfigured(f"{CONFIG_FILE}: journal is true or false")
+    LEARN = CFG.get("learn", False)  # dispatch runs `ergon learn` when new incidents wait (T-107)
+    if not isinstance(LEARN, bool):
+        raise NotConfigured(f"{CONFIG_FILE}: learn is true or false")
     COMPANIONS = []
     for c in CFG.get("companion") or []:
         if not c.get("path"):
@@ -308,6 +374,7 @@ def configure(start=None, need_config=True):
             out.append({"tiers": list(tiers), "touches": [str(x).strip("/") for x in touches]})
         return out
     ACCEPT = match_rules("accept", WORKER_TIERS)
+    EVIDENCE = match_rules("evidence", WORKER_TIERS)
     # The two-person rule (docs/shared-state.md) counts verified approvals from distinct
     # principals in the approvers file, which only shared mode has. Without [shared] it would
     # silently mean nothing, so it is an error instead.

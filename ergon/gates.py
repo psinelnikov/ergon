@@ -33,6 +33,12 @@ def setf(args):
         raise SystemExit(f"no such id: {args.id}")
     is_task = args.id in tasks
     epic = epics.get(item.get("epic")) if is_task else None
+    if any("\n" in kv or "\r" in kv for kv in args.pairs):  # a line break would write a frontmatter line of its own
+        raise SystemExit("set takes one line per key=value: no line breaks")
+    args.pairs = [kv.partition("=")[0].strip() + "=" + kv.partition("=")[2] for kv in args.pairs]  # the file reads keys stripped
+    bad = [kv.partition("=")[0] for kv in args.pairs if not re.fullmatch(r"[A-Za-z_][\w-]*", kv.partition("=")[0])]
+    if bad:  # `verify:x=…` would be read back as `verify: x: …`
+        raise SystemExit(f"not a field name: {bad[0]!r} (letters, digits, _ and -)")
     new_status = dict(kv.partition("=")[::2] for kv in args.pairs).get("status")
     old_status = item.get("status")
     if new_status and _gitops.current_branch().startswith(_config.TASK_BRANCH):
@@ -45,10 +51,30 @@ def setf(args):
         key, _, val = kv.partition("=")
         if key == "approved":
             raise SystemExit("approval is human-only: use `approve` from a real terminal")
+        if key == "verify":  # a task's verify: replaces the runtime gate (`verify: true` passes anything)
+            raise SystemExit("`verify:` overrides the runtime gate, so set won't write it: a human edits the "
+                             "task file (it's in the brief digest, so an approved task needs approving again)")
+        if key == "prove" and val.strip().lower() in _tasks.PROVE_NO:
+            raise SystemExit("`prove: no` skips the red-on-base proof, so set won't write it: a human edits the "
+                             "task file (it's in the brief digest, so an approved task needs approving again)")
+        if key in ("harden", "harden_layer"):  # a harden task skips the red-on-base proof; the layer picks its gate
+            raise SystemExit(f"`{key}:` decides what a harden task must prove (and a harden task skips the "
+                             f"red-on-base proof), so set won't write it: a human edits the task file (it's in "
+                             f"the brief digest, so an approved task needs approving again)")
+        if key == "suppress_ok":  # the files a task may add a suppression marker to (T-160)
+            raise SystemExit("`suppress_ok:` names the files the weakening check lets a task add a suppression "
+                             "marker to, so set won't write it: a human edits the task file (it's in the brief "
+                             "digest, so an approved task needs approving again)")
         if is_task and key == "pin":
             raise SystemExit("`pin:` is human-only: use `ergon pin ID first|last|clear` from a real terminal")
         if is_task and key in ("asking", "answered"):
             raise SystemExit(f"`{key}:` is written by dispatch and a human's `ergon answer` only")
+        if is_task and key == "limited":
+            raise SystemExit("`limited:` is written by dispatch only: it parks a task the usage limit stopped and "
+                             "resumes it after the reset")
+        if is_task and key == "status" and item.get("limited"):
+            raise SystemExit(f"{args.id} is parked by the usage limit (`limited: {item['limited']}`): the next "
+                             f"dispatch at or after the reset resumes it (a human's `close` gives it up)")
         if is_task and key == "status" and _tasks.is_asking(item):
             raise SystemExit(f"{args.id} waits on an answer to its worker's question: a human runs "
                              f"`ergon answer {args.id}` in their own terminal (or `ergon close` to give it up)")
@@ -62,12 +88,22 @@ def setf(args):
         if is_task and key in ("category", "touches") and _tasks.is_auto(item) and in_agent_shell():
             raise SystemExit(f"{args.id} was approved by inheritance (`approved: auto …`), so its `{key}:` is fixed: "
                              f"file a new task, or ask a human to change it")
+        if (is_task and key in ("touches", "tier") and item.get("status") != "proposed"
+                and (in_agent_shell() or _gitops.current_branch().startswith(_config.TASK_BRANCH))):
+            raise SystemExit(f"{args.id}: " + replan_reason(key, item.get("status")).replace("<ID>", args.id))
         if is_task and key == "tier" and val not in _tasks.TIERS:
             raise SystemExit(f"tier must be one of {_tasks.TIERS}")
         if is_task and key == "category" and val and val not in _tasks.CATEGORIES:
             raise SystemExit(f"category must be one of {_tasks.CATEGORIES}")
         if not is_task and key == "status" and val not in _tasks.EPIC_STATUSES:
             raise SystemExit(f"epic status must be one of {_tasks.EPIC_STATUSES}")
+        if not is_task and key == "status" and "proposed" in (val, item.get("status")) and val != item.get("status"):
+            raise SystemExit(f"{args.id}: {item.get('status')} -> {val} not allowed via set: a proposed epic is "
+                             f"opened by a human's `ergon approve {args.id}` (dropping one is a human's edit too)")
+        if is_task and key == "status" and val == "doing":
+            why = _tasks.epic_problem(epic, _gitops.approvals())
+            if why:
+                raise SystemExit(f"{args.id} can't start: {why}")
         if key in ("depends", "touches"):
             val = [v for v in val.split(",") if v]
         item[key] = val
@@ -187,16 +223,17 @@ def stamp_approved(todo):
             trailers.append(f"{_gitops.APPROVE_TRAILER}: {t['id']} sha256:{digest}")
             if t["id"] in two:
                 continue
+            epic = _tasks.is_epic(t)  # an epic's brief: proposed -> open
             if t["status"] == "proposed":
-                t["status"] = "ready"
+                t["status"] = "open" if epic else "ready"
             t["approved"] = f"{stamp} sha256:{digest[:8]}" if shared else stamp
-            _tasks.dump(t, _tasks.TASK_KEYS)
+            _tasks.dump(t, _tasks.EPIC_KEYS if epic else _tasks.TASK_KEYS)
         if shared:
             _gitops.sign_state("approve", trailers, [t["_path"] for t in todo if t["id"] not in two])
         apr = _gitops.approvals() if shared else None
         for t in todo:
             if t["id"] not in two:
-                _history.record("approved", t, by=approver(), tier=t["tier"])
+                _history.record("approved", t, by=approver(), tier=t.get("tier") or None, **approved_touches_field(t))
                 continue
             # the files change after the signed commit, from what it verifies as: committed
             # unsigned as the lock is released, like sync's restamp, since they grant nothing
@@ -205,7 +242,8 @@ def stamp_approved(todo):
             if len(who) >= apr.needed(t):
                 t["status"] = "ready" if old == "proposed" else old
                 t["approved"] = apr.stamp(t)
-                _history.record("approved", t, by=approver(), tier=t["tier"], approvers=[n for _, n, _ in who])
+                _history.record("approved", t, by=approver(), tier=t["tier"], approvers=[n for _, n, _ in who],
+                                **approved_touches_field(t))
             else:
                 if old == "ready":  # approved before, under another brief: it waits for its second approver
                     t["status"] = "proposed"
@@ -230,6 +268,29 @@ def stamp_approved(todo):
     return waiting
 
 
+def approved_touches_field(t):
+    """The `touches`, `harden` and `suppress_ok` fields of t's `approved` history row
+    (dispatch.approved_touches, approved_harden and approved_suppress_ok read them): a task's
+    touches:, harden: and suppress_ok: as approved; nothing for an epic."""
+    return {} if _tasks.is_epic(t) else _dispatch.approval_record(t)
+
+
+def brief_due(e, apr):
+    """Does approving epic e mean approving its brief? It's proposed, or (shared mode) open
+    without a signed approval of its brief that verifies: a stamp that doesn't verify, or no stamp
+    at all (an old epic, or one a clone pushed). In local mode an open epic is approved already."""
+    if e.get("status") == "proposed":
+        return True
+    return bool(apr and e.get("status") == "open" and apr.problem(e))
+
+
+def print_brief(e):
+    """Print what approving epic e approves: its Goal, Out of scope and Constraints sections."""
+    for name in _tasks.EPIC_DIGEST_SECTIONS:
+        text = _tasks.normalised(_tasks.sections(e.get("_body") or "", name))
+        print(f"      {name.capitalize()}: " + ("\n        ".join(text.split("\n")) if text else "(empty)"))
+
+
 def approve(args):
     approve_ready()
     # With [[two_person]] rules, sync before and after: whether a task matches a rule, and whose
@@ -238,35 +299,74 @@ def approve(args):
     if count:
         sync_for_count(args.ids)
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
-    named = targets(args.ids, tasks, epics)
+    apr = _gitops.approvals()
+    # An epic ID whose brief needs a human's approval (proposed, or in shared mode open without
+    # an approval that verifies) approves the brief alone: its tasks are approved by naming the
+    # epic again once it's open, so each approval is of something the human has read.
+    briefs = [epics[i] for i in dict.fromkeys(args.ids) if i in epics and brief_due(epics[i], apr)]
+    named = targets([i for i in args.ids if i not in {e["id"] for e in briefs}], tasks, epics)
     todo = [t for t in named if t["status"] == "proposed"]
     # shared mode: an approved task whose approval no longer verifies (its brief was edited, or it
     # was stamped by hand) is approved again by naming it; its status stays
-    apr = _gitops.approvals()
     again = {t["id"]: why for t in named if apr and t["id"] in args.ids and t["status"] in ("ready", "blocked")
              and (why := apr.problem(t))}
+    again.update((e["id"], apr.problem(e)) for e in briefs if e["status"] == "open")
+    # local mode: no digest, so an approved task whose touches:, harden: or suppress_ok: gained an
+    # entry since its approval (a hand edit) is approved again by naming it, or the weakening check
+    # won't count the entry
+    if not apr:
+        rows = _history.read()
+        for t in named:
+            if t["id"] in args.ids and t["status"] in ("ready", "blocked"):
+                why = [f"{k}: gained {', '.join(new)} since its approval"
+                       for k, new in (("touches", _dispatch.unapproved_touches(t, rows)),
+                                      ("harden", _dispatch.unapproved_harden(t, rows)),
+                                      ("suppress_ok", _dispatch.unapproved_suppress_ok(t, rows))) if new]
+                if why:
+                    again[t["id"]] = "; ".join(why)
     todo += [t for t in named if t["id"] in again]
+    todo = briefs + todo
     if not todo:
         raise SystemExit("nothing in `proposed` among those ids" + (
-            ", nor an approved task whose approval doesn't verify" if apr else ""))
+            ", nor an approved task or epic whose approval doesn't verify" if apr else
+            ", nor an approved task whose touches:, harden: or suppress_ok: gained an entry since its approval"))
     # shared mode: an unpublished ID can still be renumbered, so sync first (or refuse)
     _shared.ensure_published([t["id"] for t in todo] + [i for i in args.ids if i in epics])
-    tasks = _tasks.load(_config.ITEMS)
-    gone = [t["id"] for t in todo if tasks[t["id"]]["status"] != t["status"]]  # a sync moved it on
+    tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
+    now = lambda t: (epics if _tasks.is_epic(t) else tasks).get(t["id"], {})
+    gone = [t["id"] for t in todo if now(t).get("status") != t["status"]]  # a sync moved it on
     if gone:
         print(f"left out, their status changed in the sync: {', '.join(gone)}")
-    todo = [tasks[t["id"]] for t in todo if t["id"] not in gone]
+    todo = [now(t) for t in todo if t["id"] not in gone]
     if not todo:
         raise SystemExit("nothing left to approve")
     apr = _gitops.approvals() if count else apr
     for t in todo:
+        if _tasks.is_epic(t):
+            print(f"  {t['id']}  epic    {t['title']}  (its brief: Goal, Out of scope, Constraints)"
+                  + (f"  (approve again: {again[t['id']]})" if t["id"] in again else ""))
+            print_brief(t)
+            continue
         print(_tasks.line(t, tasks) + (f"  (approve again: {again[t['id']]})" if t["id"] in again else "")
               + (f"  (two-person: {apr.tally(t)})" if _tasks.two_person(t) else ""))
-    if not human_gate(f"Approve these {len(todo)} task(s) as {approver()}?"):
+        if str(t.get("verify") or "").strip():  # both are signed by the approval, so show them
+            print(f"      verify: {str(t['verify']).strip()}  (replaces the runtime gate)")
+        if _tasks.prove_off(t):
+            print("      prove: no  (skips the red-on-base proof)")
+    n_epics = sum(map(_tasks.is_epic, todo))
+    what = " and ".join(x for x in (f"{n_epics} epic brief(s)" if n_epics else "",
+                                    f"{len(todo) - n_epics} task(s)" if len(todo) > n_epics else "") if x)
+    if not human_gate(f"Approve these {what} as {approver()}?"):
         raise SystemExit("aborted")
     waiting = stamp_approved(todo)
     print(f"approved {len(todo) - len(waiting)}"
           + (f"; {len(waiting)} wait for another approver: {', '.join(waiting)}" if waiting else ""))
+    tasks = _tasks.load(_config.ITEMS)
+    for e in (t for t in todo if _tasks.is_epic(t)):
+        left = sum(t.get("epic") == e["id"] and t["status"] == "proposed" for t in tasks.values())
+        if left:
+            print(f"{e['id']} is {e['status']}; its {left} proposed task(s) aren't approved yet: "
+                  f"`ergon approve {e['id']}` again approves them")
     if count:  # publish, so the other approvers see this approval
         sync_for_count([t["id"] for t in todo], after=True)
 
@@ -324,13 +424,77 @@ def write_policy(t):
     return True
 
 
+def review_brief(e, at, tasks, apr, tally):
+    """One epic brief in the interactive review, while its approval is due (`brief_due`): show
+    its Goal, Out of scope and Constraints and offer to approve it, which approves the brief
+    alone as `ergon approve E-NNN` does (signed in shared mode; its tasks stay proposed), reject
+    it (a proposed brief only: drops it as `ergon reject E-NNN` does), edit it, or skip it.
+    Returns False on quit."""
+    while brief_due(e, apr):
+        why = apr.problem(e) if e["status"] == "open" else ""
+        print(f"\n{'=' * 78}\n{at}  {e['id']}  {e['title']}  (epic brief, {e['status']})"
+              + (f"\n(approve again: {why})" if why else "") + "\n")
+        print_brief(e)
+        kids = sum(t.get("epic") == e["id"] and t["status"] == "proposed" for t in tasks.values())
+        if kids:
+            print(f"\n(approving it approves the brief only: its {kids} proposed task(s) stay proposed)")
+        can_reject = e["status"] == "proposed"  # an open epic is already approved: not a drop
+        choice = ask(f"\n{e['id']} [epic]  [a]pprove  " + ("[r]eject  " if can_reject else "")
+                     + "[e]dit  [s]kip  [q]uit > ").lower()
+        if choice == "r" and can_reject:
+            try:
+                sign = signing()
+            except SystemExit as err:
+                print(err)
+                continue
+            reason = ask("reason (optional): ")
+            e["status"] = "dropped"
+            if reason:
+                e["_body"] = e["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {reason}\n"
+            with _gitops.state_lock():
+                if sign:
+                    _shared.commit_pending()  # hand edits go in a commit of their own
+                _tasks.dump(e, _tasks.EPIC_KEYS)
+                if sign:
+                    _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {e['id']}"], [e["_path"]])
+            _history.record("rejected", e, by=approver(), reason=reason or None, **{"from": "proposed", "to": "dropped"})
+            tally["dropped"] += 1
+            return True
+        if choice == "a":
+            try:  # shared mode: refuses, approving nothing, unless the approval would verify
+                approve_ready()
+                stamp_approved([e])
+            except SystemExit as err:
+                print(err)
+                continue
+            tally["approved"] += 1
+            if _config.SHARED and _config.TWO_PERSON:  # publish it, as `approve` does
+                sync_for_count([e["id"]], after=True)
+            return True
+        if choice == "e":
+            subprocess.run([os.environ.get("EDITOR", "vi"), str(e["_path"])])
+            with _gitops.state_lock():  # shared mode: commits the edit
+                e = _tasks.parse(e["_path"])
+            if not brief_due(e, apr):
+                print(f"{e['id']} is now {e['status']}; moving on")
+        elif choice == "s":
+            tally["skipped"] += 1
+            return True
+        elif choice == "q":
+            return False
+    return True
+
+
 def review_interactive(args):
-    """HUMAN ONLY: walk the proposed queue one task at a time, then tasks waiting on an answer to
-    their worker's question (offering `a`: answer it, as `ergon answer` does), then tasks whose
-    review vetoed them (offering `p`: save the finding as a policy). Every answer lands immediately."""
+    """HUMAN ONLY: walk the proposed queue one item at a time (an epic whose brief is due, by
+    `brief_due`, comes before its tasks, offering `a`: approve the brief alone, as approving the
+    epic's ID does), then tasks waiting on an answer to their worker's question (offering `a`:
+    answer it, as `ergon answer` does), then tasks whose review vetoed them (offering `p`: save
+    the finding as a policy). Every answer lands immediately."""
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     held = _shared.unpublished([t["id"] for t in tasks.values() if t["status"] == "proposed"]
-                               + [t["epic"] for t in tasks.values() if t["status"] == "proposed" and t.get("epic")])
+                               + [t["epic"] for t in tasks.values() if t["status"] == "proposed" and t.get("epic")]
+                               + [e["id"] for e in epics.values() if e.get("status") in ("proposed", "open")])
     if held:  # sync first, then look at the queue again (IDs may have changed)
         print(f"{', '.join(held)} not published yet: syncing first")
         try:
@@ -344,18 +508,27 @@ def review_interactive(args):
     else:
         held = set()
         if _config.SHARED and _config.TWO_PERSON:  # see the latest briefs and approvals, as approve does
-            sync_for_count([t["id"] for t in tasks.values() if t["status"] == "proposed"])
+            sync_for_count([t["id"] for t in tasks.values() if t["status"] == "proposed"]
+                           + [e["id"] for e in epics.values() if e.get("status") == "proposed"])
             tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
-    apr = _gitops.approvals() if any(_tasks.two_person(t) for t in tasks.values()) else None
+    apr = _gitops.approvals()  # None in local mode; in shared mode, which approvals verify
     pick = lambda t: (t["id"] not in held and (not args.epic or t.get("epic") == args.epic) and (not args.tier or t["tier"] == args.tier))
-    order = lambda t: (t.get("epic") or "~", t["id"])
-    queue = sorted((t for t in tasks.values() if t["status"] == "proposed" and pick(t)), key=order)
+    # an epic's brief has no tier, and comes before its own tasks: approving it is what opens them
+    order = lambda t: (t["id"], "") if _tasks.is_epic(t) else (t.get("epic") or "~", t["id"])
+    briefs = [e for e in epics.values() if brief_due(e, apr) and e["id"] not in held
+              and (not args.epic or e["id"] == args.epic) and not args.tier]
+    queue = sorted(briefs + [t for t in tasks.values() if t["status"] == "proposed" and pick(t)], key=order)
     queue += sorted((t for t in tasks.values() if _tasks.is_asking(t) and pick(t)), key=order)
     queue += sorted((t for t in tasks.values() if vetoed(t) and not _tasks.is_asking(t) and pick(t)), key=order)
     if not queue:
         raise SystemExit("nothing awaiting approval or an answer")
     tally = {"approved": 0, "dropped": 0, "answered": 0, "skipped": 0, "policies": 0}
     for i, t in enumerate(queue, 1):
+        if _tasks.is_epic(t):
+            if not review_brief(t, f"[{i}/{len(queue)}]", tasks, apr, tally):
+                print("  ".join(f"{k} {v}" for k, v in tally.items()))
+                return
+            continue
         if _tasks.is_asking(t):
             epic = epics.get(t.get("epic"))
             print(f"\n{'=' * 78}\n[{i}/{len(queue)}]  {t['id']}  {t['title']}  (asking)"
@@ -464,44 +637,64 @@ def review_interactive(args):
 def reject(args):
     """HUMAN ONLY. A proposed task is dropped. A task in `review` goes back to `ready` with the
     reason in its Notes; its branch and worktree stay, so the next dispatch picks up from them
-    and its worker is told why."""
+    and its worker is told why. An epic ID whose brief is proposed drops the brief alone, as
+    approving it approves the brief alone: its proposed tasks stay proposed, and aren't offered
+    or started while the epic is dropped (`_tasks.epic_problem`); naming the epic again drops
+    them. On any other epic, its ID names its proposed tasks."""
     if _config.SHARED:  # act on the latest state, and publish the result
         sync_for_count(args.ids, what="rejection")
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
-    named = targets(args.ids, tasks, epics)
+    briefs = [epics[i] for i in dict.fromkeys(args.ids) if i in epics and epics[i].get("status") == "proposed"]
+    named = targets([i for i in args.ids if i not in {e["id"] for e in briefs}], tasks, epics)
     todo = [t for t in named if t["status"] == "proposed"]
     back = [t for t in named if t["status"] == "review"]
-    if not todo and not back:
+    if not briefs and not todo and not back:
         raise SystemExit("nothing in `proposed` or `review` among those ids")
     if back and not args.reason:
         raise SystemExit("rejecting work in `review` needs --reason: it's what the next worker is told to fix")
     sign = signing()
+    named_ids = {t["id"] for t in todo}
+    for e in briefs:
+        print(f"  {e['id']}  epic    {e['title']}  (its brief: proposed -> dropped)")
+        print_brief(e)
+        kids = sum(t.get("epic") == e["id"] and t["status"] == "proposed" and t["id"] not in named_ids for t in tasks.values())
+        if kids:
+            print(f"      (the brief only: its {kids} proposed task(s) stay proposed, and aren't offered or "
+                  f"started while it's dropped; naming {e['id']} again drops them)")
     for t in todo + back:
         print(_tasks.line(t, tasks) + ("  (review -> ready)" if t in back else ""))
-    what = " and ".join(x for x in (f"drop {len(todo)} proposed" if todo else "",
+    what = " and ".join(x for x in (f"drop {len(briefs)} epic brief(s)" if briefs else "",
+                                    f"drop {len(todo)} proposed" if todo else "",
                                     f"send {len(back)} in review back to ready" if back else "") if x)
     if not human_gate(f"{what[0].upper() + what[1:]}?"):
         raise SystemExit("aborted")
+    for t in back:  # keep the rejected diff before anything moves; only git diff, offline
+        try:
+            ibase, _wt, ibranch, ipubs = held_branch(t, epics)
+            _dispatch.save_incident(t, "reject", args.reason, ibase, ibranch, ipubs)
+        except _gitops.GitError as err:
+            print(f"ergon: no incident saved for {t['id']}: {err}", file=sys.stderr)
     with _gitops.state_lock():  # in shared mode, commits the change on the state branch, signed
         if sign:
             _shared.commit_pending()  # hand edits go in a commit of their own, not the signed one
-        for t in todo:
+        for t in briefs + todo:
             t["status"] = "dropped"
             if args.reason:
                 t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {args.reason}\n"
-            _tasks.dump(t, _tasks.TASK_KEYS)
+            _tasks.dump(t, _tasks.EPIC_KEYS if _tasks.is_epic(t) else _tasks.TASK_KEYS)
         for t in back:
             t["status"] = "ready"
             _dispatch.add_note(t, f"rejected by {approver()}: {args.reason}", who="review")
             _tasks.dump(t, _tasks.TASK_KEYS)
         if sign:
-            _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {t['id']}" for t in todo + back],
-                               [t["_path"] for t in todo + back])
-        for t in todo:
+            _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {t['id']}" for t in briefs + todo + back],
+                               [t["_path"] for t in briefs + todo + back])
+        for t in briefs + todo:
             _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "proposed", "to": "dropped"})
         for t in back:
             _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "review", "to": "ready"})
-    print(", ".join(x for x in (f"dropped {len(todo)}" if todo else "",
+    print(", ".join(x for x in (f"dropped {len(briefs)} epic brief(s)" if briefs else "",
+                                f"dropped {len(todo)}" if todo else "",
                                 f"sent {len(back)} back to ready" if back else "") if x))
     if _config.SHARED:
         sync_for_count(args.ids, after=True, what="rejection")
@@ -708,6 +901,7 @@ def close(args):
             t["status"] = args.as_
             t.pop("asking", None)
             t.pop("answered", None)
+            t.pop("limited", None)
             t["_body"] = t["_body"].rstrip() + f"\n\nClosed {_tasks.today()} as {args.as_}: {args.reason}\n"
             _tasks.dump(t, _tasks.TASK_KEYS)
         if sign:
@@ -1252,8 +1446,182 @@ def state_git_reason(cmd, cwd=None):
     return None
 
 
-def guard_reason(tool, inp, worker=False, cwd=None):
-    """Why this tool call must not run, or None. cwd: where a Bash command runs (the event's)."""
+def is_flat_epic(path):
+    """Is path an epic file written flat in the state's epics/ (`ergon tidy` would move it into a
+    folder as EPIC.md), so the guard's status and approved: rules cover it too?"""
+    try:
+        p = Path(path).resolve()
+        return p.suffix == ".md" and p.parent == _config.EPICS.resolve()
+    except (OSError, ValueError):
+        return False
+
+
+# ---------- read-only guard (`hook guard --read-only`, the breakdown agent's) ----------
+# The breakdown agent is read-only by its dontAsk allowlist and by dispatch's `git status` check
+# after the run. This is a third layer, so it is an allowlist too, not a list of known writes:
+# the tools that only read, and shell commands made only of programs that only read (git and
+# ergon only with their read verbs), with no redirect to a file, no heredoc, no variable
+# assignment and nothing it can't split. Anything else is refused, including text it can't parse.
+
+READ_ONLY_TOOLS = {"Read", "Grep", "Glob", "LS", "TodoWrite"}
+# Programs that only read files and print. Not sed/awk/xargs/env/tee/tree/uniq-with-output and the
+# like: each can write a file or run another program. sort and find are checked for the options that do.
+READ_ONLY_PROGRAMS = {"ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "find", "pwd", "echo",
+                      "printf", "true", "false", "test", "[", "cd", "basename", "dirname", "realpath", "cut",
+                      "tr", "nl", "sort", "uniq", "diff", "cmp", "comm", "stat", "du", "which", "git", "ergon"}
+READ_ONLY_GIT = {"log", "show", "diff", "grep", "ls-files", "ls-tree", "blame", "status", "rev-parse", "rev-list",
+                 "cat-file", "shortlog", "describe", "merge-base", "name-rev", "show-ref", "for-each-ref",
+                 "diff-tree", "diff-index", "diff-files", "whatchanged", "count-objects", "branch", "worktree"}
+GIT_LIST_BRANCH = {"-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current", "-l", "--list",
+                   "--no-color", "--color"}
+READ_ONLY_ERGON = {"board", "show", "next", "review", "rules", "guide", "check", "audit", "stats", "related"}
+FIND_WRITES = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+# Redirects that write nowhere: to /dev/null, or from one descriptor to another (2>&1, >&2, >&-).
+HARMLESS_REDIRECT = re.compile(r"(?:[0-9]*|&)>>?\|?[ \t]*/dev/null(?![^\s;&|()<>])|[0-9]*>&(?:[0-9]+|-)(?![^\s;&|()<>])")
+READ_ONLY_MSG = ("the breakdown agent is read-only: {what}. Read files with Read, Grep and Glob, and run only "
+                 "read-only commands (git log/show/diff/grep/ls-files/blame/status, ergon show/next/board/check, "
+                 "ls, cat, head, tail, wc, grep), one program at a time, with no redirect to a file")
+
+
+def _code_text(cmd):
+    """cmd with its quoted literals blanked out, so what's left is what the shell reads as operators:
+    '...' and $'...' always, "..." unless it holds a $(...) or `...` (that's code, so it stays), and
+    a comment (a # starting a word, as shell_commands reads it) up to its newline: a quote in a
+    comment opens nothing, so it can't hide a redirect after it. None if a quote doesn't close."""
+    out, i, n = [], 0, len(cmd)
+    inword = False  # as shell_commands tracks it: an escaped space or a quote is inside a word
+    while i < n:
+        c = cmd[i]
+        if c == "#" and not inword:
+            j = cmd.find("\n", i)
+            out.append(" ")
+            i = n if j < 0 else j
+            continue
+        inword = c not in " \t\n;&|()<>"
+        if c == "\\":
+            out.append("  ")
+            i += 2
+        elif c == "'" or cmd.startswith("$'", i):
+            j = i + (2 if c == "$" else 1)
+            while j < n and cmd[j] != "'":
+                j += 2 if c == "$" and cmd[j] == "\\" else 1
+            if j >= n:
+                return None
+            out.append(" ")
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and cmd[j] != '"':
+                j += 2 if cmd[j] == "\\" else 1
+            if j >= n:
+                return None
+            span = cmd[i:j + 1]
+            out.append(span if re.search(r"\$\(|`", span) else " ")
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _long_opt(word, *names):
+    """Whether word is one of the long options names, or an abbreviation of one getopt or git would take."""
+    name = word.partition("=")[0]
+    return len(name) > 3 and name.startswith("--") and any(n.startswith(name) for n in names)
+
+
+def _read_only_git(words):
+    """Why a git call (words[0] is git) isn't a read, or None."""
+    i = 1
+    while i < len(words) and words[i].startswith("-"):
+        w = words[i]
+        if w.startswith(("-c", "--config-env", "--exec-path")):
+            return f"`git {w}` sets config or the programs git runs"
+        if w in ("-C", "--git-dir", "--work-tree", "--namespace") and i + 1 < len(words):
+            i += 1
+        i += 1
+    if i >= len(words):
+        return None  # bare `git` prints its usage
+    sub, rest = words[i], words[i + 1:]
+    if sub not in READ_ONLY_GIT:
+        return f"`git {sub}` isn't one of the read-only git commands"
+    if any(_long_opt(a, "--output", "--open-files-in-pager") for a in rest):
+        return f"`git {sub} --output` writes a file and `--open-files-in-pager` runs a program"
+    if sub == "grep" and any(re.match(r"-[^-]*O", a) for a in rest):
+        return "`git grep -O` runs a program"
+    if sub == "branch":
+        listing = any(a in ("-l", "--list") for a in rest)
+        if any(a not in GIT_LIST_BRANCH for a in rest if a.startswith("-")) or (
+                not listing and any(not a.startswith("-") for a in rest)):
+            return "`git branch` only lists here (-a, -r, -v, --list, --show-current)"
+    if sub == "worktree" and rest[:1] != ["list"]:
+        return "`git worktree` only lists here (`git worktree list`)"
+    return None
+
+
+def _read_only_words(words):
+    """Why one simple command (its words) isn't a read, or None."""
+    prog = words[0]
+    if ASSIGNMENT.match(prog):
+        return f"no variable assignments (`{prog}`): one can point git or a program at code to run"
+    if prog not in READ_ONLY_PROGRAMS:
+        return f"`{prog}` isn't one of the read-only programs"
+    rest = words[1:]
+    if prog == "git":
+        return _read_only_git(words)
+    if prog == "ergon":
+        verb = next((a for a in rest if not a.startswith("-")), "board")
+        if verb not in READ_ONLY_ERGON:
+            return f"`ergon {verb}` isn't one of ergon's read commands"
+        if verb == "review" and any(re.match(r"-[^-]*i", a) or _long_opt(a, "--interactive") for a in rest):
+            return "`ergon review -i` is a human's"
+    if prog == "find" and any(a in FIND_WRITES for a in rest):
+        return "`find -exec/-ok/-delete/-fprint/-fls` runs a program or writes a file"
+    if prog == "rg" and any(a == "--pre" or a.startswith("--pre=") for a in rest):
+        return "`rg --pre` runs a program"
+    if prog == "sort" and any(re.match(r"-[^-]*o", a) or (a.startswith("--") and a.startswith(("--o", "--co")))
+                              for a in rest):
+        return "`sort -o` writes a file and `--compress-program` runs one"
+    if prog == "uniq" and len([a for a in rest if not a.startswith("-")]) > 1:
+        return "`uniq IN OUT` writes OUT"
+    return None
+
+
+def read_only_reason(tool, inp):
+    """Why a call by the read-only (breakdown) agent must not run, or None. Refuses every tool but
+    READ_ONLY_TOOLS and Bash, and Bash unless each command it runs passes _read_only_words."""
+    if tool != "Bash":
+        return None if tool in READ_ONLY_TOOLS else READ_ONLY_MSG.format(what=f"{tool} isn't a read-only tool")
+    cmd = inp.get("command", "")
+    code = _code_text(cmd)
+    if code is None:
+        return READ_ONLY_MSG.format(what="a quote doesn't close")
+    if ">" in HARMLESS_REDIRECT.sub(" ", code):
+        return READ_ONLY_MSG.format(what="no redirect to a file (only to /dev/null or another descriptor)")
+    if re.search(r"(?<!<)<<(?!<)", code):
+        return READ_ONLY_MSG.format(what="no heredocs")
+    try:
+        cmds = shell_commands(cmd)[0]
+    except (ValueError, RecursionError):
+        return READ_ONLY_MSG.format(what="a command it can't split into words")
+    if not cmds:
+        return None
+    for words, _ in cmds:
+        why = _read_only_words(words)
+        if why:
+            return READ_ONLY_MSG.format(what=why)
+    return None
+
+
+def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
+    """Why this tool call must not run, or None. cwd: where a Bash command runs (the event's).
+    read_only: the breakdown agent's guard, which refuses anything that may write (read_only_reason)
+    on top of every rule below."""
+    if read_only:
+        why = read_only_reason(tool, inp)
+        if why or tool != "Bash":  # its hook sees every tool; the rules below are for Bash, Edit and Write
+            return why
     if worker:
         why = shared_companion_reason(tool, inp)
         if why:
@@ -1282,7 +1650,7 @@ def guard_reason(tool, inp, worker=False, cwd=None):
         return POLICY_MSG
     if is_runs(path):
         return RUNS_MSG
-    if not _config.TASK_FILE.search(path):
+    if not (_config.TASK_FILE.search(path) or is_flat_epic(path)):
         return None
     p = Path(path)
     before = p.read_text() if p.exists() else ""
@@ -1296,40 +1664,122 @@ def guard_reason(tool, inp, worker=False, cwd=None):
     fb, fa = frontmatter(before), frontmatter(after)
     if fb.get("approved", "") != fa.get("approved", ""):
         return "`approved:` is written by a human only (the one rule: `ergon guide`)"
+    if (p.name == _config.EPIC_FILE or is_flat_epic(path)) and fb.get("breakdown", "") != fa.get("breakdown", ""):
+        return ("an epic's `breakdown:` is dispatch's claim that it is being broken down: an agent's fake claim "
+                "with a far-future deadline would keep the epic from ever being broken down, so only dispatch writes it")
     if _tasks.is_auto(fb):  # approved by inheritance for what it was filed as: no relabelling, no widening
         for key in ("category", "touches"):
             if fb.get(key, "") != fa.get(key, ""):
                 return (f"`{key}:` of a task approved by inheritance (`approved: auto …`) is fixed: its approval "
                         f"holds only for what it was filed as. File a new task, or ask a human to change it")
-    if fb.get("status", "") != fa.get("status", "") and not (not before and fa.get("status") in ("proposed", "open")):
+    # touches: (it names the gate files the weakening check lets the task change) and tier: are
+    # part of what a human approved: past proposed, an agent changing either is a re-plan (T-117).
+    # Shared mode's digest un-approves such an edit; local mode has only this and dispatch's record
+    # of the approved touches: (dispatch.approved_touches).
+    if not (p.name == _config.EPIC_FILE or is_flat_epic(path)) and before and fb.get("status", "") != "proposed":
+        for key in ("touches", "tier"):
+            if fm_value(fb, key) != fm_value(fa, key):
+                return replan_reason(key, fb.get("status") or "approved")
+    # The two fields that weaken a gate, as `set` refuses them: the digest catches them in shared
+    # mode only, so in local mode this is what stops an edit to an approved task's gate (T-150).
+    # A new file counts too: a brief that arrives with its own gate is a human's to write.
+    if fb.get("verify", "") != fa.get("verify", ""):
+        return ("`verify:` overrides the runtime gate (`verify: true` passes anything), so a human writes, "
+                "changes or removes it by editing the task file")
+    if _tasks.prove_off(fa) and not _tasks.prove_off(fb):
+        return "`prove: no` skips the red-on-base proof, so a human writes it by editing the task file"
+    # A harden task skips the red-on-base proof and its layer picks the gate its own proof runs, so
+    # `set` refuses both whatever the value (T-149); the same edit by hand is refused here (T-153).
+    for key in ("harden", "harden_layer"):
+        if fb.get(key, "") != fa.get(key, ""):
+            return (f"`{key}:` decides what a harden task must prove (and a harden task skips the red-on-base "
+                    "proof), so a human writes, changes or removes it by editing the task file")
+    # suppress_ok: names the files a task may add a suppression marker to (T-160): refused by `set`
+    # whatever the value, and the same edit by hand here, a new file arriving with one included.
+    if fm_value(fb, "suppress_ok") != fm_value(fa, "suppress_ok"):
+        return ("`suppress_ok:` names the files the weakening check lets a task add a suppression marker to, "
+                "so a human writes, changes or removes it by editing the task file")
+    # A new task or epic file starts proposed: in local mode an open epic with no stamp counts as
+    # approved (nothing verifies one), so an agent's new EPIC.md can't be open.
+    if fb.get("status", "") != fa.get("status", "") and not (not before and fa.get("status") == "proposed"):
         if fb.get("status") == "review":
             return "a task in review leaves it only by a human's `ergon accept` or `ergon reject`, run in their own terminal"
+        if (p.name == _config.EPIC_FILE or is_flat_epic(path)) and (not before or "proposed" in (fb.get("status"), fa.get("status"))):
+            return ("an epic leaves `proposed` only by a human's `ergon approve E-NNN` (it approves the brief); "
+                    "agents file epics with `ergon new epic`, which writes proposed")
         return "change status with `ergon set ID status=…` (it enforces the allowed moves), not by editing the file"
     if fb.get("pin", "") != fa.get("pin", ""):
         return "`pin:` is written by a human's `ergon pin` only"
     for key in ("asking", "answered"):
         if fb.get(key, "") != fa.get(key, ""):
             return f"`{key}:` is written by dispatch and a human's `ergon answer` only"
+    if fb.get("limited", "") != fa.get("limited", ""):
+        return ("`limited:` is written by dispatch only: it parks a task the usage limit stopped and resumes it "
+                "after the reset")
     if fb.get("accept", "").lower() in _tasks.YES and fa.get("accept", "").lower() not in _tasks.YES:
         return "only a human takes `accept:` off a task (it holds the task's landing for their review)"
     return None
 
 
+def fm_value(fm, key):
+    """A frontmatter value as the guard compares it: touches: and suppress_ok: as their set of
+    entries (dispatch.touch_key), so reordering or re-spacing the list changes nothing; anything
+    else stripped."""
+    val = fm.get(key, "")
+    if key not in ("touches", "suppress_ok"):
+        return val.strip()
+    return frozenset(x for x in (_dispatch.touch_key(v) for v in val.strip().strip("[]").split(",")) if x)
+
+
+def replan_reason(key, status):
+    """Why an agent may not change `key` (touches or tier) of a task that is `status`, past proposed."""
+    return (f"`{key}:` of a {status} task is part of what a human approved (touches: names the gate files the "
+            f"weakening check lets it change; tier: picks the model), so an agent doesn't change it: that's a "
+            f"re-plan. A dispatched worker ends `RESULT: blocked — re-plan: <why>`; otherwise ask the user to "
+            f"edit it and run `ergon approve <ID>` again")
+
+
+def deny(why):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "deny",
+        "permissionDecisionReason": f"ergon guard: {why}"}}))
+
+
+def record_refusal(event, why, worker):
+    """Append a `guard` history row for a refused tool call. Never raises: a failed write only warns."""
+    try:
+        item = None
+        try:
+            br = _gitops.git("branch", "--show-current", cwd=event.get("cwd") or None)
+        except Exception:  # noqa: BLE001 - not a git folder: no task
+            br = ""
+        if br.startswith(_config.TASK_BRANCH):
+            tid = br[len(_config.TASK_BRANCH):]
+            item = _tasks.load(_config.ITEMS).get(tid) or {"id": tid}
+        _history.record("guard", item, tool=event.get("tool_name"), reason=str(why)[:200], worker=bool(worker))
+    except Exception as err:  # noqa: BLE001 - history never turns a deny into an error
+        print(f"ergon: couldn't record guard refusal: {err}", file=sys.stderr)
+
+
 def hook(args):
     if args.event == "commit-msg":
         return commit_msg_hook(args)
+    # The read-only guard (the breakdown agent's) fails closed: with no project, or on a crash, it refuses.
+    read_only = args.event == "guard" and getattr(args, "read_only", False)
     try:
         event = json.load(sys.stdin)
         try:
             _config.configure(args.project or os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd"))
         except _config.NotConfigured:
+            if read_only:
+                deny("the read-only guard found no ergon project, so it refuses everything")
             sys.exit(0)  # not an ergon project
         if args.event == "guard":
-            why = guard_reason(event.get("tool_name"), event.get("tool_input") or {}, args.worker, event.get("cwd"))
+            why = guard_reason(event.get("tool_name"), event.get("tool_input") or {}, args.worker,
+                               event.get("cwd"), read_only)
             if why:
-                print(json.dumps({"hookSpecificOutput": {
-                    "hookEventName": "PreToolUse", "permissionDecision": "deny",
-                    "permissionDecisionReason": f"ergon guard: {why}"}}))
+                record_refusal(event, why, args.worker)
+                deny(why)
         elif args.event == "stop" and not event.get("stop_hook_active"):
             errs, summary = _tasks.lint()
             if errs:
@@ -1337,8 +1787,11 @@ def hook(args):
                     "`ergon check` fails:\n" + "\n".join(errs[:20]) + f"\n{summary}\n"
                     "Fix what your change caused (e.g. a card's `→ task` link to a task you closed). "
                     "If it isn't yours, say so to the user and stop.")}))
-    except Exception as err:  # fail open
-        print(f"ergon hook error (ignored): {err}", file=sys.stderr)
+    except Exception as err:  # fail open, but for the read-only guard
+        if read_only:
+            deny(f"the read-only guard failed ({err}), so it refuses")
+        else:
+            print(f"ergon hook error (ignored): {err}", file=sys.stderr)
     sys.exit(0)
 
 
@@ -1375,12 +1828,15 @@ def cited_tasks(msg):
     return sorted(set(re.findall(r"\bT-\d{3,}\b", "\n".join(kept))))
 
 
-def commit_msg_reason(msg, tasks):
+def commit_msg_reason(msg, tasks, epics=None):
     """Why a commit with this message must not land, or None. Each task it cites must exist, be
     out of `proposed` and carry a human's `approved:` stamp: a proposed task (stamped or not), one
-    rejected to dropped, one hand-edited to ready, or an ID nobody filed are all refused. Epic IDs
-    aren't approved, so aren't checked. In shared mode the stamp is only a display copy, so the
-    signed approval must verify too (`Approvals.problem`); approvals load once, if a task is cited."""
+    rejected to dropped, one hand-edited to ready, or an ID nobody filed are all refused. So is an
+    approved task whose epic's brief isn't approved (`_tasks.epic_problem`: proposed, dropped, or
+    in shared mode open without a signed approval that verifies, stamped or not); a task with no
+    epic passes, and so does one of an open epic without a stamp in local mode. An epic ID cited
+    on its own isn't checked. In shared mode the stamp is only a display copy, so the signed
+    approval must verify too (`Approvals.problem`); approvals load once, if a task is cited."""
     bad = []
     apr = None
     for tid in cited_tasks(msg):
@@ -1397,6 +1853,8 @@ def commit_msg_reason(msg, tasks):
             bad.append(f"{tid}: approval doesn't verify: {apr.problem(t)}")
         elif _tasks.is_auto(t) and _tasks.approval_of(t, tasks)[2]:  # approved by inheritance, no longer holds
             bad.append(f"{tid}: its auto approval doesn't hold: {_tasks.approval_of(t, tasks)[2]}")
+        elif why := _tasks.epic_problem(_tasks.epic_of(t, epics or {}), apr):
+            bad.append(f"{tid}: {why}")
     if not bad:
         return None
     return ("ergon: commit refused. It cites tasks no human has approved:\n  " + "\n  ".join(bad) +
@@ -1423,7 +1881,8 @@ def commit_msg_hook(args):
         for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_COMMON_DIR",
                     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_QUARANTINE_PATH"):
             os.environ.pop(var, None)
-        why = commit_msg_reason(Path(args.msgfile).read_text(errors="replace"), _tasks.load(_config.ITEMS))
+        why = commit_msg_reason(Path(args.msgfile).read_text(errors="replace"), _tasks.load(_config.ITEMS),
+                               _tasks.load(_config.EPICS))
     except Exception as err:  # fail open, like the Claude Code hooks
         print(f"ergon commit-msg hook error (ignored): {err}", file=sys.stderr)
         sys.exit(0)

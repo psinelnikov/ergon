@@ -231,6 +231,23 @@ class TestMerge(Shared):
         self.assertIn("tier_why: Edited on B", text)  # the rest of B's edit still merges (outside the brief, so the approval holds)
         self.assertIn("sync: dropped Tester's ready->blocked, remote had moved to doing", text)
 
+    def test_limited_stays_with_its_status(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from ergon import shared
+        self.assertIn("limited", shared.STATUS_BOUND)
+        def doc(status, limited=None):
+            mark = f"limited: {limited}\n" if limited else ""
+            return f"---\nid: T-001\ntitle: One\ntier: haiku\nstatus: {status}\n{mark}---\n\n## What\nx\n"
+        base = doc("blocked", "2026-01-01T00:00:00Z")
+        ours = doc("doing")  # the claim moved it and cleared the mark
+        theirs = doc("blocked", "2026-02-02T00:00:00Z")  # the remote only re-marked it
+        from unittest import mock
+        with mock.patch.object(shared, "remote", lambda: "origin"), \
+                mock.patch.object(shared, "local_name", lambda: "Tester"):
+            text = shared.merge_item("T-001", base, ours, theirs)[0]
+        self.assertIn("status: doing", text)
+        self.assertNotIn("limited:", text)
+
     def test_a_status_move_the_remote_didnt_race_applies(self):
         self.approved_start()
         self.ergon(self.a, "set", "T-001", "tier_why=Edited on A")
@@ -780,6 +797,169 @@ class TestDispatchClaims(Shared):
         self.assertEqual(self.status(self.a, "T-003"), "dropped")
 
 
+BREAKDOWN_ONE = """TASK: Add the schema
+tier: haiku
+tier_why: the exact change is written below
+touches: db/schema.sql
+depends:
+## What
+Add a `widgets` table to db/schema.sql:1.
+## Done when
+- `widgets` is in db/schema.sql
+END TASK
+RESULT: done
+"""
+
+
+class TestBreakdownClaims(Shared):
+    """Dispatch claims an epic's breakdown by pushing a `breakdown:` field on the epic before the
+    agent launches, and takes it off when the breakdown ends (T-130). Two clones, each a person."""
+
+    def setUp(self):
+        super().setUp()
+        base = Path(self.tmp.name)
+        bindir = base / "bin"
+        bindir.mkdir()
+        (bindir / "claude").write_text(FAKE_CLAUDE.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
+        (bindir / "claude").chmod(0o755)
+        self.calls = base / "breakdowns.jsonl"
+        common = dict(ERGON_ASK_STDIN="1", PATH=f"{bindir}:{os.environ['PATH']}",
+                      FAKE_BREAKDOWN=BREAKDOWN_ONE, FAKE_BREAKDOWN_SEEN=str(self.calls))
+        self.env_a = clean_env(USER="ann", LOGNAME="ann", **common)
+        self.env_b = clean_env(USER="dana", LOGNAME="dana", **common)
+        self.host = socket.gethostname().split(".")[0]
+
+    def breakdowns(self):
+        """The checkout each breakdown agent ran in, from either clone."""
+        if not self.calls.exists():
+            return []
+        return [json.loads(l)["cwd"] for l in self.calls.read_text().splitlines() if l.strip()]
+
+    def epic(self, where):
+        return next((where / "tasks" / "epics").glob("E-001-*/EPIC.md")).read_text()
+
+    def remote_epic(self):
+        names = sh("git", "ls-tree", "-r", "--name-only", "ergon-state", cwd=self.remote).stdout.split()
+        return sh("git", "show", f"ergon-state:{next(n for n in names if n.endswith('/EPIC.md'))}",
+                  cwd=self.remote).stdout
+
+    def remote_tasks(self):
+        names = sh("git", "ls-tree", "-r", "--name-only", "ergon-state", cwd=self.remote).stdout.split()
+        return sorted(re.search(r"(T-\d+)", n).group(1) for n in names if re.search(r"/T-\d+-", n))
+
+    def empty_epic_in_both(self):
+        """A files epic E-001, publishes it and approves it; B joins. It has no tasks."""
+        self.ergon(self.a, "new", "epic", "Widgets", env=self.env_a)
+        f = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        f.write_text(f.read_text().replace("## Goal\n", "## Goal\nShip widgets end to end.\n"))
+        self.ergon(self.a, "sync", "--init", inp="y\n", env=self.env_a)
+        self.assertIn("approved 1", self.ergon(self.a, "approve", "E-001", inp="y\n", env=self.env_a).stdout)
+        self.ergon(self.a, "sync", env=self.env_a)
+        self.ergon(self.b, "sync", "--join", env=self.env_b)
+        self.assertIn("status: open", self.epic(self.b))
+
+    def test_two_dispatchers_racing_for_one_empty_epic_run_one_breakdown(self):
+        self.empty_epic_in_both()
+        # A's whole dispatch (claim, breakdown, filing, release) runs between B's fetch and B's push
+        # of its claim. Without a claim B would push nothing before its own breakdown, so A's
+        # dispatch would run in the middle of B's filing and break the epic down a second time.
+        mark, a_out = Path(self.tmp.name) / "raced", Path(self.tmp.name) / "a-dispatch.txt"
+        hook = self.b / ".git" / "hooks" / "pre-push"
+        hook.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            [ -e "{mark}" ] && exit 0
+            touch "{mark}"
+            unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
+            cd "{self.a}" && USER=ann LOGNAME=ann "{sys.executable}" "{ERGON}" dispatch > "{a_out}" 2>&1
+            exit 0
+            """))
+        hook.chmod(0o755)
+        r = self.ergon(self.b, "dispatch", env=self.env_b)
+        self.assertTrue(mark.exists())
+        a = a_out.read_text()
+        self.assertIn("breakdown E-001  read-only in", a)
+        self.assertIn("proposed T-001  (breakdown E-001)  Add the schema", a)
+        self.assertEqual(self.breakdowns(), [str(self.a)])  # one breakdown: A's
+        self.assertIn("push rejected", r.stdout)
+        self.assertIn("claimed  breakdown E-001  E-001 got tasks from another clone; claim released, not started",
+                      r.stdout)
+        self.assertNotIn("read-only in", r.stdout)
+        self.assertEqual(self.remote_tasks(), ["T-001"])
+        # both claims went out and came off again: the remote holds none
+        self.assertNotIn("\nbreakdown:", self.remote_epic())
+        self.assertNotIn("\nbreakdown:", self.epic(self.b))
+        self.assertEqual(sh("git", "rev-parse", "HEAD", cwd=self.b / "tasks").stdout.strip(), self.remote_tip())
+        log = sh("git", "log", "--format=%B", "ergon-state", cwd=self.remote).stdout
+        self.assertIn(f"Breakdown of E-001 claimed by ann@{self.host} in {self.a}", log)
+        self.assertIn(f"Breakdown of E-001 claimed by dana@{self.host} in {self.b}", log)
+
+    def test_a_second_clone_that_sees_the_claim_leaves_the_epic_alone(self):
+        self.empty_epic_in_both()
+        p = subprocess.Popen([sys.executable, str(ERGON), "dispatch"], cwd=self.a,
+                             env=dict(self.env_a, FAKE_SLEEP="4"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True)
+        try:
+            for _ in range(200):  # until A's claim is on the remote (its breakdown is running then)
+                if "\nbreakdown: ann@" in self.remote_epic():
+                    break
+                time.sleep(0.05)
+            claim = re.search(r"^breakdown: (.*)$", self.remote_epic(), re.M).group(1)
+            self.assertRegex(claim, rf"^ann@{re.escape(self.host)} until \d{{4}}-\d\d-\d\dT\d\d:\d\d:\d\dZ "
+                                    r"\([0-9a-f]{8}\)$")
+            r = self.ergon(self.b, "dispatch", env=self.env_b)
+            self.assertIn(f"claimed  breakdown E-001  another dispatcher holds it (ann@{self.host} until ", r.stdout)
+            self.assertNotIn("read-only in", r.stdout)
+            dry = self.ergon(self.b, "dispatch", "--dry-run", env=self.env_b).stdout
+            self.assertIn("claimed  breakdown E-001  another dispatcher holds it", dry)
+            self.assertNotIn("would run  breakdown", dry)
+            out, err = p.communicate(timeout=120)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        self.assertEqual(p.returncode, 0, out + err)
+        self.assertIn("proposed T-001  (breakdown E-001)", out)
+        self.assertEqual(self.breakdowns(), [str(self.a)])
+        self.assertNotIn("\nbreakdown:", self.remote_epic())  # released as it ended, and pushed
+        self.assertEqual(self.remote_tasks(), ["T-001"])
+
+    def test_a_claim_that_cant_be_pushed_launches_nothing(self):
+        self.empty_epic_in_both()
+        hook = self.b / ".git" / "hooks" / "pre-push"
+        hook.write_text("#!/bin/sh\necho 'no pushing today' >&2\nexit 1\n")
+        hook.chmod(0o755)
+        before = self.remote_tip()
+        r = self.ergon(self.b, "dispatch", env=self.env_b)
+        self.assertIn("claimed  breakdown E-001  couldn't push the claim, so it's dropped and the breakdown "
+                      "not started", r.stdout)
+        self.assertEqual(self.breakdowns(), [])  # no agent, so no cost
+        self.assertNotIn("breakdown(s), $", r.stdout)
+        self.assertNotIn("\nbreakdown:", self.epic(self.b))
+        self.assertEqual(self.remote_tip(), before)
+        hook.unlink()  # it never ran here, so the next dispatch breaks it down
+        r = self.ergon(self.b, "dispatch", env=self.env_b)
+        self.assertIn("proposed T-001  (breakdown E-001)", r.stdout)
+        self.assertEqual(self.breakdowns(), [str(self.b)])
+        self.assertNotIn("\nbreakdown:", self.remote_epic())
+
+    def test_a_failed_breakdown_releases_its_claim_and_a_lapsed_claim_holds_nothing(self):
+        self.empty_epic_in_both()
+        blocked = dict(self.env_a, FAKE_BREAKDOWN="nothing\nRESULT: blocked — say where widgets live")
+        r = self.ergon(self.a, "dispatch", env=blocked)
+        self.assertIn("breakdown E-001 blocked: say where widgets live", r.stdout)
+        self.assertNotIn("\nbreakdown:", self.remote_epic())  # a failed run doesn't hold the epic
+        self.ergon(self.a, "dispatch", env=self.env_a)  # A's own history row: A doesn't run it again
+        self.assertEqual(self.breakdowns(), [str(self.a)])
+        # a dispatcher that died mid-run left a claim; past its deadline it holds nothing
+        f = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        f.write_text(f.read_text().replace("\n---\n", "\nbreakdown: ann@gone until 2020-01-01T00:00:00Z (0badc0de)\n---\n", 1))
+        self.ergon(self.a, "sync", env=self.env_a)
+        self.assertIn("breakdown: ann@gone", self.remote_epic())
+        r = self.ergon(self.b, "dispatch", env=self.env_b)
+        self.assertIn("proposed T-001  (breakdown E-001)", r.stdout)
+        self.assertEqual(self.breakdowns(), [str(self.a), str(self.b)])
+        self.assertNotIn("\nbreakdown:", self.remote_epic())
+
+
 class TestSignedApprovals(Shared):
     """Approvals are SSH-signed state commits, verified against the approvers file on the remote's
     trunk (T-020). Each failing case is left out by `next`, reported by `check` and skipped by
@@ -878,6 +1058,112 @@ class TestSignedApprovals(Shared):
         self.ergon(self.a, "sync")
         self.doesnt_count(self.a, "T-001", "brief changed after approval")
 
+    def test_an_epic_brief_approval_is_signed_and_editing_its_goal_unapproves_it(self):
+        self.start()
+        agent = clean_env(CLAUDECODE="1")
+        self.ergon(self.a, "new", "epic", "Big", env=agent)
+        self.ergon(self.a, "new", "task", "Part", "--tier", "haiku", "--epic", "E-001", env=agent)
+        epic = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        epic.write_text(epic.read_text().replace("## Goal\n", "## Goal\nShip the big thing.\n"))
+        self.ergon(self.a, "approve", "T-002", inp="y\n")  # the task, but not its epic's brief
+        r = self.ergon(self.a, "next")
+        self.assertNotIn("  T-002  ", r.stdout)
+        self.assertIn("left out because epic E-001 is proposed", r.stdout)
+        self.assertIn("skipped  T-002  epic E-001 is proposed", self.ergon(self.a, "dispatch", "--dry-run").stdout)
+        r = self.ergon(self.a, "approve", "E-001", inp="y\n")
+        self.assertIn("approved 1", r.stdout)
+        from ergon import tasks as T
+        d = T.brief_digest(T.parse(epic))
+        self.assertIn(f"\n\nErgon-Approve: E-001 sha256:{d}\n", self.head(self.a))
+        self.assertTrue(self.signed(self.a))
+        self.assertRegex(epic.read_text(), rf"\nstatus: open\n(.*\n)*approved: Tester \d{{4}}-\d\d-\d\d sha256:{d[:8]}\n")
+        self.counts(self.a, "T-002")
+        # Notes and status aren't the brief; the Goal is
+        epic.write_text(epic.read_text() + "\n## Notes\n- a note\n")
+        self.counts(self.a, "T-002")
+        epic.write_text(epic.read_text().replace("Ship the big thing.", "Also drop the production database."))
+        r = self.ergon(self.a, "next")
+        self.assertNotIn("  T-002  ", r.stdout)
+        self.assertIn("left out because epic E-001's approval doesn't verify: brief changed after approval", r.stdout)
+        r = self.ergon(self.a, "check", check=False)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("E-001: open, but its approval doesn't verify: brief changed after approval", r.stdout)
+        r = self.ergon(self.a, "dispatch", "--dry-run")
+        self.assertIn("skipped  T-002  epic E-001's approval doesn't verify: brief changed", r.stdout)
+        # sync leaves an epic's stamp alone: what verifies decides, stamp or no stamp
+        self.assertNotIn("restamped: E-001", self.ergon(self.a, "sync").stdout)
+        self.assertIn("sha256:", epic.read_text())
+        r = self.ergon(self.a, "approve", "E-001", inp="y\n")  # approving it again makes it count
+        self.assertIn("(approve again: brief changed after approval", r.stdout)
+        self.counts(self.a, "T-002")
+        # and it verifies in the other clone too
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        self.counts(self.b, "T-002")
+
+    def test_an_epic_stamp_written_by_hand_doesnt_count(self):
+        self.start()
+        self.ergon(self.a, "new", "epic", "Big")
+        self.ergon(self.a, "new", "task", "Part", "--tier", "haiku", "--epic", "E-001")
+        self.ergon(self.a, "approve", "T-002", inp="y\n")
+        epic = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        epic.write_text(epic.read_text().replace("status: proposed", "status: open")
+                        .replace("approved:", "approved: Tester 2026-01-01"))
+        r = self.ergon(self.a, "check", check=False)
+        self.assertIn("E-001: open, but its approval doesn't verify: no signed approval", r.stdout)
+        self.assertNotIn("  T-002  ", self.ergon(self.a, "next").stdout)
+
+    def test_an_open_epic_with_no_stamp_doesnt_count_until_a_human_approves_it(self):
+        # an epic from before epics were approved, or one a clone without the guard pushed (T-124)
+        self.start()
+        home = self.b / "tasks" / "epics" / "E-001-old"
+        home.mkdir(parents=True)
+        epic = home / "EPIC.md"
+        epic.write_text("---\nid: E-001\ntitle: Old\nstatus: open\ncreated: 2026-01-01\n---\n\n## Goal\nG\n")
+        self.ergon(self.b, "set", "T-001", "epic=E-001")
+        self.ergon(self.b, "approve", "T-001", inp="y\n")  # the task's own approval verifies
+        self.ergon(self.b, "sync")
+        self.ergon(self.a, "sync")
+        for where in (self.a, self.b):
+            why = "epic E-001's approval doesn't verify: no signed approval"
+            r = self.ergon(where, "next")
+            self.assertNotIn("  T-001  ", r.stdout)
+            self.assertIn(f"left out because {why}", r.stdout)
+            r = self.ergon(where, "check", check=False)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("E-001: open, but its approval doesn't verify: no signed approval", r.stdout)
+            r = self.ergon(where, "dispatch", "--dry-run")
+            self.assertNotIn("would run  T-001", r.stdout)
+            self.assertIn(f"skipped  T-001  {why}", r.stdout)
+        # `approve E-001` approves its brief again, with a signed stamp that verifies
+        from ergon import tasks as T
+        self.assertIn("(approve again: no signed approval", self.ergon(self.a, "approve", "E-001", inp="y\n").stdout)
+        epic = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        d = T.brief_digest(T.parse(epic))
+        self.assertIn(f"\n\nErgon-Approve: E-001 sha256:{d}\n", self.head(self.a))
+        self.assertTrue(self.signed(self.a))
+        self.assertRegex(epic.read_text(), rf"\nstatus: open\n(.*\n)*approved: Tester \d{{4}}-\d\d-\d\d sha256:{d[:8]}\n")
+        self.counts(self.a, "T-001")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        self.counts(self.b, "T-001")
+
+    def test_brief_due_for_an_open_epic_with_no_stamp_only_in_shared_mode(self):
+        from ergon import gates as G
+
+        class Apr:  # approvals as gitops.approvals() gives them: nothing for E-001 verifies
+            def problem(self, e):
+                return "no signed approval"
+
+        old = {"id": "E-001", "status": "open", "approved": ""}
+        self.assertTrue(G.brief_due(old, Apr()))
+        self.assertFalse(G.brief_due(old, None))  # local mode: the exemption stays
+        self.assertFalse(G.brief_due(dict(old, status="done"), Apr()))
+        from ergon import tasks as T
+        self.assertIn("no signed approval", T.epic_problem(old, Apr()))
+        self.assertIsNone(T.epic_problem(old, None))
+        self.assertIsNone(T.epic_problem(dict(old, status="done"), Apr()))
+
     def test_an_approvers_file_only_in_the_working_tree_doesnt_count(self):
         self.start()
         # the remote's trunk loses the file; A still has it checked out, and committed on its own main
@@ -953,6 +1239,21 @@ class TestSignedApprovals(Shared):
         self.assertIn("\n\nErgon-Reject: T-002\n", self.head(self.a))
         self.assertTrue(self.signed(self.a))
 
+    def test_rejecting_a_proposed_epic_is_signed_and_the_other_clone_sees_it_dropped(self):
+        self.start()
+        self.ergon(self.a, "new", "epic", "Widgets")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync")
+        self.ergon(self.a, "reject", "E-001", inp="y\n")
+        self.assertIn("\n\nErgon-Reject: E-001\n", self.head(self.a))
+        self.assertTrue(self.signed(self.a))
+        remote_head = sh("git", "cat-file", "commit", "ergon-state", cwd=self.remote).stdout
+        self.assertIn("\n\nErgon-Reject: E-001\n", remote_head)
+        self.assertIn("-----BEGIN SSH SIGNATURE-----", remote_head)
+        self.ergon(self.b, "sync")
+        epic = next((self.b / "tasks" / "epics").glob("E-001-*/EPIC.md")).read_text()
+        self.assertIn("status: dropped", epic)
+
     def test_agents_cant_move_the_ref_the_approvers_file_is_read_from(self):
         self.start()
         for cmd in ["git update-ref refs/ergon/trunk HEAD", "git fetch . main:refs/ergon/trunk"]:
@@ -973,6 +1274,25 @@ class TestSignedApprovals(Shared):
         r = self.commit_citing(self.a, "T-001")
         self.assertEqual(r.returncode, 1)
         self.assertIn("brief changed after approval", r.stderr)
+
+    def test_commit_msg_hook_checks_the_epic(self):
+        self.start()
+        self.ergon(self.a, "new", "epic", "Big")
+        self.ergon(self.a, "set", "T-001", "epic=E-001")
+        self.ergon(self.a, "approve", "T-001", inp="y\n")
+        r = self.commit_citing(self.a, "T-001")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("epic E-001 is proposed", r.stderr)
+        self.assertIn("T-001", r.stderr)
+        self.ergon(self.a, "approve", "E-001", inp="y\n")
+        r = self.commit_citing(self.a, "T-001")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # the epic's brief changes after approval: its stamp no longer verifies
+        f = next((self.a / "tasks").rglob("EPIC.md"))
+        f.write_text(f.read_text() + "\nAlso drop the production database.\n")
+        r = self.commit_citing(self.a, "T-001")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("epic E-001's approval doesn't verify", r.stderr)
 
     def test_commit_msg_hook_refuses_a_hand_stamped_task(self):
         self.start()

@@ -29,14 +29,37 @@ from . import tasks as _tasks
 RUN_LOG = re.compile(r"^(?P<id>[A-Z]+-\d+)-(?P<date>\d{4})(?P<m>\d{2})(?P<d>\d{2})-\d{6}(?:-\w+)?\.json$")
 
 
+BREAKDOWN_LOG = re.compile(r"^(?P<id>E-\d+)-(?P<date>\d{4})(?P<m>\d{2})(?P<d>\d{2})-\d{6}\.json$")
+
+
+def _breakdown_totals(runs_dir, since, until, epic):
+    """{runs, cost} of the breakdown logs in <runs_dir>/breakdown/ (E-NNN-<time>.json), in range;
+    with epic, only that epic's. Never raises on a bad log."""
+    out = {"runs": 0, "cost": 0.0}
+    for log in sorted((Path(runs_dir) / "breakdown").glob("*.json")):
+        m = BREAKDOWN_LOG.match(log.name)
+        if not m or (epic and m["id"] != epic):
+            continue
+        day = f"{m['date']}-{m['m']}-{m['d']}"
+        if (since and day < since) or (until and day > until):
+            continue
+        out["runs"] += 1
+        try:
+            d = json.loads(log.read_text())
+            out["cost"] += float(d.get("total_cost_usd") or 0) if isinstance(d, dict) else 0
+        except (OSError, ValueError, TypeError):
+            pass
+    return out
+
+
 def aggregate_stats(runs_dir, tasks, since=None, epic=None, until=None):
     """Per-tier numbers from the dispatch logs in runs_dir, joined with tasks (id -> meta).
     since / until: 'YYYY-MM-DD' (runs started that day or later / that day or earlier); epic: only that epic's tasks.
-    Returns {"tiers": {tier: {runs, done, blocked, timeouts, cost}}, "repeat": {id: blocked
+    Returns {"breakdown": {runs, cost} of the epic breakdown logs in runs_dir/breakdown/, "tiers": {tier: {runs, done, blocked, timeouts, cost}}, "repeat": {id: blocked
     count} for tasks blocked more than once, "skipped": logs that were unreadable, not JSON
     (and not a timeout) or whose task is gone}. A reviewer's log (<ID>-<time>-review[N].json) and
     a fix round's worker log (<ID>-<time>-fix<N>.json) add their cost to the task's tier but
-    aren't runs. A run that ended `RESULT: asking` is a run, neither done nor blocked. Never raises on a bad log."""
+    aren't runs, and neither is a usage-limit stop (limits.stop). A run that ended `RESULT: asking` is a run, neither done nor blocked. Never raises on a bad log."""
     tiers, per_task, skipped = {}, {}, 0
     for log in sorted(Path(runs_dir).glob("*.json")):
         m = RUN_LOG.match(log.name)
@@ -75,6 +98,9 @@ def aggregate_stats(runs_dir, tasks, since=None, epic=None, until=None):
                 skipped += 1
                 continue
             d = {}
+        if _limits.stop(d):  # a usage-limit stop: not a run, neither blocked nor done; it was retried
+            tier_row()["cost"] += float(d.get("total_cost_usd") or 0)
+            continue
         text = d.get("result") or ""
         found = re.findall(r"^\W*RESULT:\s*(done|blocked|asking)\b", text, re.M)
         verdict = "blocked" if d.get("is_error") or not found else found[-1]
@@ -86,7 +112,7 @@ def aggregate_stats(runs_dir, tasks, since=None, epic=None, until=None):
         row["cost"] += float(d.get("total_cost_usd") or 0)
         if verdict == "blocked":
             per_task[t["id"]] = per_task.get(t["id"], 0) + 1
-    return {"tiers": tiers, "skipped": skipped,
+    return {"tiers": tiers, "skipped": skipped, "breakdown": _breakdown_totals(runs_dir, since, until, epic),
             "repeat": {k: v for k, v in sorted(per_task.items()) if v > 1}}
 
 
@@ -104,8 +130,12 @@ def stats(args):
         print(f"{tier:<8}{row['runs']:>5}{row['done']:>6}{row['blocked']:>8}{100 * row['blocked'] / n:>7.0f}%"
               f"{'$%.2f' % row['cost']:>10}{'$%.2f' % (row['cost'] / n):>9}{row['timeouts']:>9}"
               + (f"{_limits.pct(row['cost'], per):>8}{_limits.pct(row['cost'] / n, per):>9}" if per is not None else ""))
-    if not r["tiers"]:
+    if not r["tiers"] and not r["breakdown"]["runs"]:
         print("(no runs)")
+    if r["breakdown"]["runs"]:
+        b = r["breakdown"]
+        print(f"\nepic breakdowns: {b['runs']} run{'s' if b['runs'] != 1 else ''}, ${b['cost']:.2f}"
+              + " (not in the tier rows above)")
     if per is not None and r["tiers"]:
         print(f"\n5h%: share of the 5-hour limit at {per:.1f}% per $, measured by dispatch over its last "
               f"{measured} run{'s' if measured != 1 else ''} (an upper bound: other use of the plan counts too)")
@@ -118,7 +148,40 @@ def stats(args):
             print(f"  {tid} x{n}  {tasks[tid].get('title', '')}")
     if r["skipped"]:
         print(f"\nskipped {r['skipped']} unreadable or unmatched log(s)")
+    prove_section(args)
+    pyramid_section(args)
     approver_section(tasks, args)
+
+
+def layer_order(totals):
+    return [*(k for k in _history.LAYERS if k in totals), *sorted(k for k in totals if k not in _history.LAYERS)]
+
+
+def prove_section(args):
+    """The red-on-base proof's runs, time and the fix rounds it caused. Prints nothing if it never ran."""
+    p = _history.prove_stats(_history.read(), since=args.since, epic=args.epic)
+    if not p["runs"] and not p["waived"]:
+        return
+    mean = p["seconds"] / p["runs"] if p["runs"] else 0
+    print(f"\nred-on-base proof (tests run on the base with only the branch's test files)")
+    print(f"  runs {p['runs']}  red (proved) {p['red']}  green on the base {p['green']}  waived {p['waived']}")
+    print(f"  time {p['seconds']:.1f}s (mean {mean:.1f}s a run)")
+    print(f"  fix rounds it sent back {p['fixes']}: ${p['fix_cost']:.2f}, {p['fix_seconds']:.0f}s")
+
+
+def pyramid_section(args):
+    c = _history.catches(_history.read(), since=args.since, epic=args.epic)
+    if not c["totals"] and not c["answers"]:
+        return
+    cols = layer_order(c["totals"])
+    print("\ntrust pyramid (catches per layer, per week)")
+    print(f"  {'week':<10}" + "".join(f"{k:>9}" for k in cols))
+    for wk, w in c["weeks"].items():
+        print(f"  {wk:<10}" + "".join(f"{w.get(k, 0):>9}" for k in cols))
+    print(f"  {'total':<10}" + "".join(f"{c['totals'][k]:>9}" for k in cols))
+    if c["late"] is not None:
+        print(f"  caught by review + human: {100 * c['late']:.0f}% (the share hardening should drive down)")
+    print(f"  answers to workers' questions (not catches): {c['answers']}")
 
 
 MIX = {"haiku": "h", "sonnet": "s", "opus": "o", "human": "hu"}

@@ -271,8 +271,9 @@ def call(text, model, budget, who="grade", read_only_in=None, timeout=TIMEOUT):
     """claude's JSON envelope for `text`, from one `claude -p` with no tools, run in an empty
     folder (no project CLAUDE.md or hooks; whatever it needs is inline in `text`). SystemExit
     (nothing written) when the call failed; `who` names the command in the message. `ergon quiz`
-    asks through here too. With `read_only_in` (a folder) it runs there instead, with Read, Grep
-    and Glob only, nothing else allowed and no MCP servers: `ergon fill` reads the code that way."""
+    and `ergon learn` ask through here too. With `read_only_in` (a folder) it runs there instead,
+    with Read, Grep and Glob only, nothing else allowed and no MCP servers: `ergon fill` reads the
+    code that way."""
     if not shutil.which("claude"):
         raise SystemExit(f"ergon {who}: `claude` isn't on PATH")
     tools = ["--tools", ""]
@@ -299,7 +300,8 @@ def call(text, model, budget, who="grade", read_only_in=None, timeout=TIMEOUT):
 
 
 def write_record(out, kind="grade"):
-    """`out` as <state>/runs/<kind>/<kind>-<time>.json. `ergon fill` writes its record here too."""
+    """Write one run's record `out` to <state>/runs/<kind>/<kind>-<time>.json (atomically, never
+    over another). `ergon learn` and `ergon fill` record their runs through here too."""
     folder = _config.RUNS / kind
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{kind}-{datetime.datetime.now():%Y%m%d-%H%M%S}.json"

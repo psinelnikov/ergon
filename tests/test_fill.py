@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_ergon import Project, clean_env, stamp  # noqa: E402
+from test_ergon import Project, approve_epic, clean_env, stamp  # noqa: E402
 
 FAKE_FILL_CLAUDE = r'''#!PYTHON
 """Stands in for `claude -p` under `ergon fill`: replies with $FILL_REPLY (a JSON object for the
@@ -183,6 +183,7 @@ class TestFill(Project):
 
     def test_epic_task_is_read_on_the_epic_branch(self):
         self.ergon("new", "epic", "Big")
+        approve_epic(self)  # epics start proposed; a human's approve opens them (T-098)
         self.ergon("new", "task", "In the epic", "--tier", "sonnet", "--epic", "E-001", "--touches", "x.py")
         self.ergon("start", "E-001")
         wt = self.root / ".claude" / "worktrees" / "E-001"
