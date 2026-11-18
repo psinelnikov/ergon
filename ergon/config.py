@@ -78,7 +78,7 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # pattern with no `/` matches that name in any directory; .ergon.toml always) goes back to its worker
 # unless the task's touches: names that file, and so does one that adds a line matching a suppression
 # regex (suppress) to any file, named or not, unless the task is a harden task (harden: set) whose
-# touches: names that file.
+# touches: names that file, or unless the file is named in the task's suppress_ok: (human-approved, T-160).
 # [gates]
 # static = "ruff check ."
 # runtime = "make test"
