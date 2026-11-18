@@ -109,6 +109,9 @@ def stats(args):
     if per is not None and r["tiers"]:
         print(f"\n5h%: share of the 5-hour limit at {per:.1f}% per $, measured by dispatch over its last "
               f"{measured} run{'s' if measured != 1 else ''} (an upper bound: other use of the plan counts too)")
+    from . import metrics as _metrics
+    print("\ndone tasks per category: " + "  ".join(
+        f"{k} {n}" for k, n in _metrics.done_by_category(tasks, args.epic).items()))
     if r["repeat"]:
         print("\nblocked more than once:")
         for tid, n in r["repeat"].items():
@@ -224,7 +227,10 @@ def report(args):
     landed = []
     for i, t in sorted(tasks.items()):
         if t["status"] == "done" and (not since or i in cited):
-            landed.append(f"  {i}  {t['title']}")
+            landed.append(f"  {i}  {t['title']}"
+                          + ("" if _tasks.status_text(t, tasks) == "done" else f"  ({_tasks.status_text(t, tasks)})"))
+            landed.extend(f"      {c['id']}  {c['status']:<8}  {_tasks.category(c):<8}  {c['title']}"
+                          for c in _tasks.follow_ups(t, tasks))
             landed.extend(f"      {c}" for c in cited.get(i, [])[:3])
     section("Landed", landed)
     asking, full = [], set()

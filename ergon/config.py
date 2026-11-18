@@ -41,6 +41,8 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # log = "TODO.md"               # the log a task's `source: TODO.md:<line>` cites
 # retired = "tasks/audit-retired.txt"   # `term | gate | note` rows for `audit`
 # worker_rules = "tasks/WORKER.md"      # inlined into every dispatched worker's prompt
+# concepts = "concepts.toml"    # concept map: [[concern]]s and [[component]]s that `ergon tag` tags tasks
+#                               # with and `ergon related` links them by (skills/ergon/SKILL.md)
 # policies = "tasks/policies.md"        # settled review findings (human-written; inlined into worker and reviewer prompts)
 # verify = "make test"          # run in the task worktree before landing; non-zero exit blocks the task
 #                               # (a task's `verify:` frontmatter overrides it)
@@ -61,6 +63,14 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 #                               # run `ergon learn`: one `claude -p` proposes harden tasks (under --budget-total)
 # limit_probe = true            # read the plan's 5-hour window before and after each dispatch (two
 #                               # tiny haiku calls) to show each task's cost as a % of the limit
+# follow_up_depth = 3           # a worker's FOUND follow-up that is a bugfix, refactor or chore, not
+#                               # tier human, with touches: none under [[protect]], goes straight to
+#                               # ready, approved by inheritance from the task that found it, up to
+#                               # this many follow-ups from a human-approved task (0: off; never in
+#                               # shared mode, where approvals are signed). A feature waits for you
+# follow_ups = 10               # how many such auto-approved follow-ups one dispatch run works itself (they
+#                               # don't count toward --max, they do count toward --budget-total); past it
+#                               # they stay ready for the next run
 
 # Layered gates, cheapest first: static (lint, types, import boundaries), then runtime (tests); the
 # first red stops the rest. `verify` above is an alias for runtime; a task's `verify:` overrides runtime only.
@@ -134,6 +144,8 @@ PROTECT = []  # [[protect]] rules: {touches, min_tier, note}
 ACCEPT = []  # [[accept]] rules: {tiers, touches}
 EVIDENCE = []  # [[evidence]] rules: {tiers, touches}; a matching task's done needs EVIDENCE: files
 TWO_PERSON = []  # [[two_person]] rules: {tiers, touches}; shared mode only
+FOLLOW_UP_DEPTH = 3  # follow_up_depth: see tasks.auto_approval
+FOLLOW_UPS = 10  # follow_ups: auto-approved follow-ups one dispatch run works
 
 
 def protect_hit(touch, pattern):
@@ -149,9 +161,10 @@ class NotConfigured(Exception):
     pass
 
 
-def mini_toml(text):
-    """Enough TOML for .ergon.toml on Pythons before 3.11 (no tomllib): top-level keys,
-    [table] and [[array-of-tables]] headers, and one-line string / bool / int / array values."""
+def mini_toml(text, name=CONFIG_FILE):
+    """Enough TOML for .ergon.toml (and the concept map) on Pythons before 3.11 (no tomllib):
+    top-level keys, [table] and [[array-of-tables]] headers, and one-line string / bool / int /
+    array values. `name` labels the errors."""
     def strip_comment(line):
         q = None
         for i, ch in enumerate(line):
@@ -181,19 +194,26 @@ def mini_toml(text):
             try:
                 cur[m.group(1)] = value(m.group(2))
             except ValueError:
-                raise NotConfigured(f"{CONFIG_FILE}:{n}: can't read {m.group(2)!r} (one-line values only)")
+                raise NotConfigured(f"{name}:{n}: can't read {m.group(2)!r} (one-line values only)")
         else:
-            raise NotConfigured(f"{CONFIG_FILE}:{n}: can't read {raw!r}")
+            raise NotConfigured(f"{name}:{n}: can't read {raw!r}")
     return out
 
 
-def read_config(path):
+def read_config(path, name=CONFIG_FILE):
+    """The TOML file at `path`, by tomllib where there is one, else by mini_toml. NotConfigured,
+    labelled `name`, when it can't be read."""
     try:
         import tomllib
     except ModuleNotFoundError:
-        return mini_toml(path.read_text())
+        return mini_toml(path.read_text(), name)
     with open(path, "rb") as f:
-        return tomllib.load(f)
+        try:
+            return tomllib.load(f)
+        except tomllib.TOMLDecodeError as err:
+            if name == CONFIG_FILE:
+                raise
+            raise NotConfigured(f"{name}: {err}")
 
 
 def git_toplevels(start):
@@ -215,9 +235,9 @@ def configure(start=None, need_config=True):
     the main checkout: task state, worktrees, run logs and companion checkouts live there, so
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
-        RETIRED_FILE, WORKER_RULES, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, EVIDENCE, \
+        RETIRED_FILE, WORKER_RULES, CONCEPTS, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, EVIDENCE, \
         REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, LEARN, \
-        GATE_FILES, SUPPRESS, REPROS, TESTS, PROVE_TIERS
+        FOLLOW_UP_DEPTH, FOLLOW_UPS, GATE_FILES, SUPPRESS, REPROS, TESTS, PROVE_TIERS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
     # (adopting ergon, say) works before it merges. A worktree cut from a base that predates
@@ -244,6 +264,9 @@ def configure(start=None, need_config=True):
     LOG = opt("log")  # a path relative to the repo, e.g. TODO.md
     RETIRED_FILE = REPO / opt("retired") if opt("retired") else None
     WORKER_RULES = REPO / opt("worker_rules") if opt("worker_rules") else None
+    # The concept map (T-141), tracked repo content like the map cards. Read only by the commands
+    # that use it (concepts.load), so a bad map fails `check`, not every command.
+    CONCEPTS = REPO / opt("concepts") if opt("concepts") else None
     # Settled review findings, written by a human only (the p answer of the interactive review); inlined into prompts.
     POLICIES = HOME / opt("policies") if opt("policies") else STATE / "policies.md"
     # Worker tiers whose finished branches a reviewer must pass before they land. Opt-in: none
@@ -293,6 +316,10 @@ def configure(start=None, need_config=True):
     CONFLICT_ROUNDS = count("conflict_rounds", 1)  # a branch that conflicts with its base goes back to its worker (T-095)
     RESUME_SECS = count("review_resume_secs", 3300)
     RESUME_TOKENS = count("review_resume_tokens", 80000)
+    # How many FOUND follow-ups deep a non-feature follow-up is approved by inheritance (T-136);
+    # 0 turns that off. tasks.auto_approval has the rule.
+    FOLLOW_UP_DEPTH = count("follow_up_depth", 3)
+    FOLLOW_UPS = count("follow_ups", 10)  # auto-approved follow-ups one dispatch run works (T-137)
     JOURNAL = CFG.get("journal", True)  # write an epic's journal entry (`ergon journal`) when it finishes
     if not isinstance(JOURNAL, bool):
         raise NotConfigured(f"{CONFIG_FILE}: journal is true or false")

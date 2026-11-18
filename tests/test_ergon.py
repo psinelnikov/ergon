@@ -901,6 +901,43 @@ class TestDispatch(DispatchProject):
                     self.assertIn(f"title: {title}", text)
                 self.assertIn("2 proposed", out)
 
+    def test_found_lines_carry_touches_done_when_and_tier(self):
+        self.ergon("new", "task", "Source", "--tier", "opus")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="Fix X — y breaks\nTOUCHES: a.py, b.py\nDONE WHEN: z holds\n"
+                                   "DONE WHEN: w too\nTIER: haiku — one line\n"
+                                   "FOUND: Bare — why\nTIER: wild — no")
+        self.ergon("dispatch")
+        text = self.task_file("T-002").read_text()
+        self.assertIn("touches: [a.py, b.py]", text)
+        self.assertIn("## Done when\n- z holds\n- w too\n", text)
+        self.assertIn("tier: haiku\n", text)
+        self.assertIn("tier_why: one line\n", text)
+        self.assertIn("## What\nY breaks. Found by T-001 while working it (", text)
+        text = self.task_file("T-003").read_text()
+        self.assertIn("tier: opus\n", text)
+        self.assertIn("tier_why: tier of the task that found it (T-001); size it before approving", text)
+
+    def test_found_category_line(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="A — a\nCATEGORY: refactor\nFOUND: B — b\nFOUND: C — c\nCATEGORY: nope")
+        self.ergon("dispatch")
+        self.assertIn("category: refactor\n", self.task_file("T-002").read_text())
+        for tid in ("T-003", "T-004"):
+            self.assertRegex(self.task_file(tid).read_text(), r"(?m)^category:\s*$")
+
+    def test_found_bare_line_gets_prefix_and_fallback_tier_why(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="X — y")
+        self.ergon("dispatch")
+        text = self.task_file("T-002").read_text()
+        self.assertIn("tier: sonnet\n", text)
+        self.assertIn("touches: []", text)
+        self.assertIn("Y. Found by T-001 while working it (", text)
+        self.assertIn("tier_why: tier of the task that found it (T-001); size it before approving", text)
+
     def test_found_lines_keep_code_spans(self):
         self.ergon("new", "task", "Source", "--tier", "sonnet")
         stamp(self.task_file("T-001"))
@@ -911,13 +948,13 @@ class TestDispatch(DispatchProject):
         self.assertIn("3 proposed", out)
         text = self.task_file("T-002").read_text()
         self.assertIn("title: `ergon dispatch` filing tasks\n", text)
-        self.assertIn("## What\n`[[two_person]]`, the flow\n", text)
+        self.assertIn("## What\n`[[two_person]]`, the flow. Found by T-001", text)
         text = self.task_file("T-003").read_text()
         self.assertIn("title: Fix alpha\n", text)
-        self.assertIn("## What\nit breaks\n", text)
+        self.assertIn("## What\nIt breaks. Found by T-001", text)
         text = self.task_file("T-004").read_text()
         self.assertIn("title: Fix beta\n", text)
-        self.assertIn("## What\nwrapped whole\n", text)
+        self.assertIn("## What\nWrapped whole. Found by T-001", text)
 
     def test_md_trim(self):
         from ergon.dispatch import md_trim
@@ -3040,6 +3077,307 @@ class TestHistory(DispatchProject):
         r = self.ergon("new", "task", "Still made", "--tier", "haiku")
         self.assertIn("couldn't record created", r.stderr)
         self.assertEqual(self.status("T-001"), "proposed")
+
+
+class TestCategory(Project):
+    def test_new_writes_and_refuses(self):
+        self.ergon("new", "task", "X", "--tier", "sonnet", "--category", "bugfix")
+        self.assertIn("category: bugfix\n", self.task_file("T-001").read_text())
+        r = self.ergon("new", "task", "Y", "--tier", "sonnet", "--category", "nope", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--category", r.stderr)
+
+    def test_check_set_and_stats(self):
+        self.ergon("new", "task", "X", "--tier", "sonnet")
+        self.ergon("set", "T-001", "category=chore")
+        self.assertIn("category: chore\n", self.task_file("T-001").read_text())
+        self.assertNotEqual(self.ergon("set", "T-001", "category=nope", check=False).returncode, 0)
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("category: chore", "category: nope"))
+        r = self.ergon("check", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("category 'nope'", r.stdout + r.stderr)
+        f.write_text(f.read_text().replace("category: nope", "category: chore").replace("status: proposed", "status: done"))
+        self.assertIn("chore 1", self.ergon("stats").stdout)
+        self.assertIn("CATEGORY  chore", self.ergon("show", "T-001").stdout)
+
+    def test_digest_ignores_category(self):
+        from ergon.tasks import brief_digest
+        t = {"id": "T-1", "title": "x", "tier": "sonnet", "touches": [], "_body": "\n## What\na\n"}
+        self.assertEqual(brief_digest({**t, "category": "bugfix"}), brief_digest(t))
+
+
+class TestAutoApprove(DispatchProject):
+    """A FOUND follow-up that is a bugfix, refactor or chore is approved by inheritance (T-136)."""
+    config = DispatchProject.config + '''
+        [[protect]]
+        touches = ["secrets/**"]
+        min_tier = "haiku"
+    '''
+    STAMP = "auto bugfix follow-up of T-001 (root T-001, Tester 2026-01-01)"
+
+    def found(self, lines, result="RESULT: done", tier="sonnet"):
+        """T-001, approved by a human, is dispatched and its worker reports `lines`. Returns the output."""
+        self.ergon("new", "task", "Source", "--tier", tier)
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND=lines, FAKE_RESULT=result)
+        return self.ergon("dispatch", "--ids", "T-001").stdout
+
+    def assert_proposed(self, tid="T-002"):
+        text = self.task_file(tid).read_text()
+        self.assertEqual(self.status(tid), "proposed", text)
+        self.assertRegex(text, r"(?m)^approved:\s*$")
+        self.assertNotIn("approved", events(self.root, tid))
+
+    def test_bugfix_with_touches_from_a_human_approved_task_is_ready(self):
+        out = self.found("Fix X — y breaks\nTOUCHES: a.py, b.py\nCATEGORY: bugfix")
+        self.assertEqual(self.status("T-001"), "done", out)
+        text = self.task_file("T-002").read_text()
+        self.assertEqual(self.status("T-002"), "ready", text)
+        self.assertIn(f"\napproved: {self.STAMP}\n", text)
+        self.assertIn("tier_why: tier of the task that found it (T-001)\n", text)
+        self.assertIn("ready    T-002  (found by T-001, approved by inheritance)  Fix X", out)
+        self.assertIn("1 auto-approved, left ready: T-002", out)  # --ids names T-001 only
+        row = [r for r in history(self.root) if r["task"] == "T-002" and r["event"] == "approved"]
+        self.assertEqual(len(row), 1)
+        self.assertEqual({k: row[0][k] for k in ("by", "parent", "root", "depth", "category", "tier")},
+                         {"by": "auto", "parent": "T-001", "root": "T-001", "depth": 1, "category": "bugfix",
+                          "tier": "sonnet"})
+        self.assertEqual(events(self.root, "T-002"), ["created", "approved"])
+        self.ergon("check")
+        self.assertIn("would run  T-002", self.ergon("dispatch", "--dry-run").stdout)
+
+    def test_follow_up_runs_in_the_same_run_and_shows_the_tree(self):
+        out = self.found("Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix")  # --ids T-001 only, no --max
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.status("T-002"), "ready")  # --ids doesn't name it: not launched
+        self.setUp()
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix")
+        out = self.ergon("dispatch", "--max", "1").stdout
+        self.assertEqual([self.status("T-001"), self.status("T-002")], ["done", "done"], out)
+        self.assertIn("doing    T-002", out)
+        self.assertIn("auto-approved, worked this run: T-002 (done)", out)
+        self.assertNotIn("left ready", out)
+
+    def test_follow_ups_cap_leaves_the_rest_ready(self):
+        self.write_follow_ups(1)
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="A — a\nTOUCHES: a.py\nCATEGORY: bugfix|B — b\nTOUCHES: b.py\nCATEGORY: bugfix")
+        out = self.ergon("dispatch", "--max", "1").stdout
+        done = [t for t in ("T-002", "T-003") if self.status(t) == "done"]
+        left = [t for t in ("T-002", "T-003") if self.status(t) == "ready"]
+        self.assertEqual((len(done), len(left)), (1, 1), out)
+        self.assertIn(f"auto-approved, worked this run: {done[0]} (done)", out)
+        self.assertIn(f"auto-approved, left ready: {left[0]}", out)
+
+    def test_follow_up_stops_at_the_budget_cap(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="A — a\nTOUCHES: a.py\nCATEGORY: bugfix")
+        out = self.ergon("dispatch", "--max", "1", "--budget-total", "0.01", "--budget-pct", "100").stdout
+        self.assertEqual([self.status("T-001"), self.status("T-002")], ["done", "ready"], out)
+        self.assertIn("budget cap", out)
+
+    def test_dry_run_and_proposed_group(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        out = self.ergon("dispatch", "--dry-run", "--budget", "1", "--budget-total", "5").stdout
+        self.assertIn("auto-approved follow-ups", out)
+        self.assertIn("up to 10 (follow_ups), depth 3 (follow_up_depth)", out)
+        self.assertIn("not counting auto-approved follow-ups", out)
+        self.env.update(FAKE_FOUND="New thing — z\nCATEGORY: feature")
+        out = self.ergon("dispatch", "--max", "1").stdout
+        self.assertIn("1 proposed, need your approval: T-002", out)
+        self.assertIn("T-001", self.ergon("show", "T-001").stdout)
+        self.assertIn("FOLLOW-UPS  done, 1 follow-up open", self.ergon("show", "T-001").stdout)
+
+    def write_follow_ups(self, n):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(f"follow_ups = {n}\n" + cfg.read_text())
+
+    def test_refactor_and_chore_too_but_not_from_a_blocked_run(self):
+        self.found("A — a\nTOUCHES: a.py\nCATEGORY: refactor|B — b\nTOUCHES: b.py\nCATEGORY: chore")
+        self.assertEqual([self.status(t) for t in ("T-002", "T-003")], ["ready", "ready"])
+        self.setUp()
+        out = self.found("Fix X — y\nTOUCHES: a.py\nCATEGORY: bugfix", result="RESULT: blocked — nope")
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assert_proposed()  # nothing passed the run, so nothing vouches for what it found
+
+    def test_feature_is_proposed(self):
+        self.found("New X — y\nTOUCHES: a.py\nCATEGORY: feature")
+        self.assert_proposed()
+
+    def test_empty_category_is_proposed(self):
+        self.found("Fix X — y\nTOUCHES: a.py")
+        self.assert_proposed()
+
+    def test_unknown_category_is_proposed(self):
+        self.found("Fix X — y\nTOUCHES: a.py\nCATEGORY: hotfix")
+        self.assert_proposed()
+
+    def test_human_tier_is_proposed(self):
+        self.found("Fix X — y\nTOUCHES: a.py\nCATEGORY: bugfix\nTIER: human — a policy call")
+        self.assert_proposed()
+
+    def test_empty_touches_is_proposed(self):
+        self.found("Fix X — y\nCATEGORY: bugfix")
+        self.assert_proposed()
+
+    def test_protected_touch_is_proposed_whatever_min_tier(self):
+        # min_tier haiku: the sonnet follow-up passes `check`, but a protected path still needs a human
+        self.found("Fix X — y\nTOUCHES: a.py, secrets/keys.py\nCATEGORY: bugfix")
+        self.assert_proposed()
+        self.ergon("check")
+
+    def test_depth_past_follow_up_depth_is_proposed(self):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text("follow_up_depth = 2\n" + cfg.read_text())
+        self.found("Fix X — y\nTOUCHES: a.py\nCATEGORY: bugfix")
+        self.assertEqual(self.status("T-002"), "ready")
+        self.ergon("dispatch", "--ids", "T-002")
+        text = self.task_file("T-003").read_text()
+        self.assertEqual(self.status("T-003"), "ready", text)
+        self.assertIn("approved: auto bugfix follow-up of T-002 (root T-001, Tester 2026-01-01)\n", text)
+        row = [r for r in history(self.root) if r["task"] == "T-003" and r["event"] == "approved"][0]
+        self.assertEqual((row["parent"], row["root"], row["depth"]), ("T-002", "T-001", 2))
+        self.ergon("dispatch", "--ids", "T-003")
+        self.assert_proposed("T-004")  # depth 3
+        self.ergon("check")
+
+    def test_follow_up_depth_0_is_proposed(self):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text("follow_up_depth = 0\n" + cfg.read_text())
+        self.found("Fix X — y\nTOUCHES: a.py\nCATEGORY: bugfix")
+        self.assert_proposed()
+
+    # ---- check ----
+
+    def auto_task(self, category="bugfix", touches="a.py", stamp_text=None):
+        """T-002, filed by hand as an auto-approved follow-up of T-001."""
+        self.ergon("new", "task", "Fix", "--tier", "sonnet", "--category", category, "--touches", touches,
+                   "--source", "T-001")
+        f = self.task_file("T-002")
+        text = f.read_text().replace("status: proposed", "status: ready")
+        f.write_text(re.sub(r"(?m)^approved:.*$", "approved: " + (stamp_text or self.STAMP), text))
+        return f
+
+    def check_fails(self, why):
+        r = self.ergon("check", check=False)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("T-002: its `approved: auto …` stamp doesn't hold: " + why, r.stdout)
+
+    def test_check_passes_a_stamp_that_holds(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.auto_task()
+        self.ergon("check")
+
+    def test_commit_hook_takes_an_auto_stamp_only_while_it_holds(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        f = self.auto_task()
+        self.ergon("init", "--hooks")
+        commit = lambda msg: sh("git", "commit", "--allow-empty", "-m", msg, cwd=self.root, check=False, env=self.env)
+        self.assertEqual(commit("Fix it (T-002)").returncode, 0)
+        f.write_text(f.read_text().replace("category: bugfix", "category: feature"))
+        r = commit("Fix it again (T-002)")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("T-002: its auto approval doesn't hold: stamped as a bugfix follow-up, but category is feature",
+                      r.stderr)
+
+    def test_check_fails_an_auto_stamp_on_a_feature(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.auto_task(category="feature", stamp_text=self.STAMP.replace("bugfix", "feature"))
+        self.check_fails("category feature is a feature")
+
+    def test_check_fails_an_auto_stamp_relabelled_after_approval(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.auto_task(category="chore")
+        self.check_fails("stamped as a bugfix follow-up, but category is chore")
+
+    def test_check_fails_an_auto_stamp_with_a_protected_touch(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.auto_task(touches="a.py,secrets/k.py")
+        self.check_fails("touches secrets/k.py (protect secrets/**)")
+
+    def test_check_fails_an_auto_stamp_whose_parent_isnt_approved(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")  # proposed, no stamp
+        self.auto_task()
+        self.check_fails("its parent T-001 isn't approved (not approved)")
+        f = self.task_file("T-001")  # a stamp on a proposed task approves nothing either
+        f.write_text(re.sub(r"(?m)^approved:.*$", "approved: Tester 2026-01-01", f.read_text()))
+        self.check_fails("its parent T-001 isn't approved (it is proposed)")
+        out = self.ergon("dispatch", "--dry-run").stdout
+        self.assertIn("skipped  T-002  its auto approval doesn't hold", out)
+
+    # ---- guard ----
+
+    def test_guard_refuses_relabelling_or_widening_an_auto_approved_task(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        f = str(self.auto_task())
+        for old, new in (("category: bugfix", "category: feature"), ("touches: [a.py]", "touches: [a.py, b.py]")):
+            why = self.guard("Edit", {"file_path": f, "old_string": old, "new_string": new})
+            self.assertIn("approved by inheritance", why or "", old)
+        self.assertIsNone(self.guard("Edit", {"file_path": f, "old_string": "## Notes", "new_string": "## Notes\n- x"}))
+        agent = dict(self.env, CLAUDECODE="1")
+        r = self.ergon("set", "T-002", "touches=a.py,b.py", env=agent, check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("approved by inheritance", r.stderr)
+        r = self.ergon("set", "T-002", "category=feature", env=agent, check=False)
+        self.assertIn("approved by inheritance", r.stderr)
+        self.assertIn("touches: [a.py]\n", self.task_file("T-002").read_text())
+        # the guard has nothing to say about a human-approved task's category
+        why = self.guard("Edit", {"file_path": str(self.task_file("T-001")), "old_string": "category:",
+                                  "new_string": "category: chore"})
+        self.assertIsNone(why)
+
+
+class TestAutoApproveReview(DispatchProject):
+    """The reviewer sees the worker's FOUND lines and their categories (T-136)."""
+    config = TestReview.config
+    calls = TestReview.calls
+
+    def setUp(self):
+        super().setUp()
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        self.env["FAKE_SEEN"] = str(self.seen)
+
+    def test_review_prompt_lists_found_lines_and_categories(self):
+        self.ergon("new", "task", "Reviewed", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+        self.env["FAKE_FOUND"] = "Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix|New Y — z"
+        self.ergon("dispatch", "--ids", "T-001")
+        prompt = [c for c in self.calls() if c["agent"] == "REVIEW"][0]["prompt"]
+        self.assertIn("The worker's FOUND lines", prompt)
+        self.assertIn("- Fix X — y breaks\n  category: bugfix; tier: (the finder's); touches: a.py\n", prompt)
+        self.assertIn("- New Y — z\n  category: (none: reads as feature); tier: (the finder's); touches: none declared\n",
+                      prompt)
+        self.assertIn("approved by inheritance", prompt)
+        self.assertIn("hides security-sensitive work", prompt)
+        self.assertEqual(self.status("T-002"), "ready")
+
+    def test_review_prompt_without_found_lines_has_no_section(self):
+        self.ergon("new", "task", "Reviewed", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+        self.ergon("dispatch")
+        prompt = [c for c in self.calls() if c["agent"] == "REVIEW"][0]["prompt"]
+        self.assertNotIn("FOUND lines", prompt)
+
+    def test_a_vetoed_branch_files_its_follow_ups_proposed(self):
+        self.ergon("new", "task", "Reviewed", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="Add a login page — z\nTOUCHES: web/login.py\nCATEGORY: bugfix",
+                        FAKE_REVIEW="REVIEW: fail — the bugfix follow-up is a feature")
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertEqual(self.status("T-002"), "proposed")
 
 
 class TestStats(Project):

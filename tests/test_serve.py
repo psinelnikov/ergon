@@ -201,6 +201,42 @@ class TestServe(ServeFixture):
         self.assertEqual(self.req("GET", "/runs/T-001-evidence/..%2fsecret.txt")[0], 404)
         self.assertEqual(self.req("GET", "/runs/T-001-evidence/missing.png")[0], 404)
 
+    def test_follow_ups_open_on_board_and_task_page(self):
+        f = self.task_file("T-004")
+        f.write_text(re.sub(r"(?m)^source:.*$", "source: T-001", f.read_text()))
+        f = self.task_file("T-005")
+        f.write_text(re.sub(r"(?m)^source:.*$", "source: T-004", f.read_text()))  # a follow-up of a follow-up
+        _, _, board = self.req("GET", "/")
+        sec = board.split("<h2 id=followups>")[1].split("<h2")[0]
+        self.assertIn("done, 2 follow-ups open", sec)
+        self.assertIn('href="/t/T-001"', sec)
+        _, _, page = self.req("GET", "/t/T-001")
+        fu = page.split("<h2>Follow-ups</h2>")[1].split("<h2")[0]
+        self.assertIn("done, 2 follow-ups open", fu)
+        self.assertIn('href="/t/T-004"', fu)
+        self.assertIn("proposed", fu)
+        self.assertIn("href=\"/t/T-005\"", fu)
+        f = self.task_file("T-004")
+        f.write_text(re.sub(r"(?m)^status: \w+$", "status: dropped", f.read_text()))
+        f = self.task_file("T-005")
+        f.write_text(re.sub(r"(?m)^status: \w+$", "status: done", f.read_text()))
+        _, _, board = self.req("GET", "/")
+        self.assertNotIn("<h2 id=followups>", board)
+        _, _, page = self.req("GET", "/t/T-001")
+        self.assertIn("dropped", page.split("<h2>Follow-ups</h2>")[1])  # listed, but not open
+
+    def test_category_shown(self):
+        f = self.task_file("T-004")
+        f.write_text(re.sub(r"(?m)^category:.*$", "category: bugfix", f.read_text()))
+        _, _, board = self.req("GET", "/")
+        self.assertIn("bugfix", re.search(r'<li><a class=id href="/t/T-004">.*?</li>', board, re.S)[0])
+        self.assertIn("feature", re.search(r'<li><a class=id href="/t/T-005">.*?</li>', board, re.S)[0])  # unset
+        _, _, page = self.req("GET", "/t/T-004")
+        self.assertIn("<span class=tier>bugfix</span>", page)
+        _, _, review = self.req("GET", "/review")
+        card = re.search(r'<section class=card id="T-004">(.*?)</section>', review, re.S)[1]
+        self.assertIn(">bugfix<", card)
+
     def test_priority_on_board_and_task_page(self):
         f = self.task_file("T-004")
         t = f.read_text()

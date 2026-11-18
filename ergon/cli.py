@@ -88,6 +88,22 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                Only new and changed tasks are graded, against --per anchors
                                spread over the graded ones (all, with under 3 graded, or --all).
                                --dry-run lists the pairs and asks nothing
+  ergon fill [ID ...] [--epic E] [--model sonnet] [--budget USD] [--dry-run]
+                               one `claude -p` per 8 tasks (Read, Grep and Glob in this checkout,
+                               nothing that writes) fills the blank parts of proposed briefs: What,
+                               Done when, touches:, tier and tier_why (when unsized). Never replaces
+                               what's written, never edits an approved task; a Notes line says what
+                               was filled. Record in <state>/runs/fill/. An epic ID means its tasks
+  ergon tag [ID ...] [--all] [--model sonnet] [--budget USD] [--dry-run]
+                               with `concepts` in .ergon.toml: one `claude -p` (no tools) per 10
+                               tasks writes concepts: (component ids from the map; any other id
+                               is dropped) and a tagged: stamp. No IDs: every task not dropped
+                               whose tags are stale (brief changed, or a component left the map);
+                               --all: every one. Not in the brief digest. Record in <state>/runs/tag/
+  ergon related T-ID           read-only, with `concepts`: open tasks sharing a component, then only
+                               a concern; done tasks it builds on (Jaccard overlap of components);
+                               missing depends (a component an open task introduces, not in its
+                               depends: closure). /t/T-ID shows the same
   ergon learn [--since D] [--model sonnet] [--budget USD] [--dry-run]
                                one `claude -p` (no tools) groups the incidents no task's harden:
                                cites yet into mistake classes, each with the lowest layer that
@@ -130,8 +146,10 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import concepts as _concepts
 from . import config as _config
 from . import dispatch as _dispatch
+from . import fill as _fill
 from . import gates as _gates
 from . import gitops as _gitops
 from . import grade as _grade
@@ -209,7 +227,7 @@ array, no prose and no code fence:
 
 
 def quiz_brief(t):
-    keys = ("title", "tier", "tier_why", "depends", "touches", "epic")
+    keys = ("title", "tier", "category", "tier_why", "depends", "touches", "epic")
     head = "\n".join(f"{k}: {', '.join(t[k]) if isinstance(t.get(k), list) else t.get(k) or ''}" for k in keys)
     return f"=== {t['id']} ===\n{head}\n{t['_body'].strip()}\n=== end of {t['id']} ===\n"
 
@@ -332,12 +350,14 @@ def main():
     nw.add_argument("kind", choices=["task", "epic"])
     nw.add_argument("title")
     nw.add_argument("--tier")
+    nw.add_argument("--category", help="feature, bugfix, refactor or chore (default: empty, reads as feature)")
     nw.add_argument("--epic")
     nw.add_argument("--touches")
     nw.add_argument("--source")
     im = sub.add_parser("import", help="a GitHub issue as a proposed task: gh#123 or gh:OWNER/REPO#123")
     im.add_argument("ref", metavar="gh#N")
     im.add_argument("--tier", help="default: human, until someone sizes it")
+    im.add_argument("--category", help="feature, bugfix, refactor or chore")
     im.add_argument("--epic")
     im.add_argument("--touches")
     st = sub.add_parser("set")
@@ -389,6 +409,19 @@ def main():
     gr.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
     gr.add_argument("--all", action="store_true", help="regrade every open task, not only new and changed ones")
     gr.add_argument("--dry-run", action="store_true", help="print the pairs; ask nothing, write nothing")
+    fl = sub.add_parser("fill", help="fill the blank parts of proposed briefs from the code (runs claude -p)")
+    fl.add_argument("ids", nargs="*", metavar="ID", help="tasks, or epics meaning their tasks (default: every proposed task with a gap)")
+    fl.add_argument("--epic")
+    fl.add_argument("--model", default="sonnet", help="default sonnet")
+    fl.add_argument("--budget", type=float, help="max USD per call (--max-budget-usd)")
+    fl.add_argument("--dry-run", action="store_true", help="list each task's gaps; ask nothing, write nothing")
+    tg = sub.add_parser("tag", help="tag tasks with components of the concept map (runs claude -p)")
+    tg.add_argument("ids", nargs="*", metavar="ID", help="tasks, or epics meaning their tasks (default: those with stale tags)")
+    tg.add_argument("--all", action="store_true", help="retag every task that isn't dropped")
+    tg.add_argument("--model", default="sonnet", help="default sonnet")
+    tg.add_argument("--budget", type=float, help="max USD per call (--max-budget-usd)")
+    tg.add_argument("--dry-run", action="store_true", help="list the tasks; ask nothing, write nothing")
+    sub.add_parser("related", help="tasks related to this one through the concept map").add_argument("id")
     ln = sub.add_parser("learn", help="propose harden tasks from recurring incidents (runs claude -p; only proposes)")
     ln.add_argument("--since", metavar="YYYY-MM-DD", help="only incidents caught on or after this day")
     ln.add_argument("--model", default="sonnet", help="default sonnet")
@@ -465,10 +498,10 @@ def run(args):
             {"new": _tasks.new, "set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish,
              "tidy": _tasks.tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours); grade around its
-        # writes only, not the minutes claude takes to answer
+        # (and tag) around their writes only, not the minutes claude takes to answer
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "breakdown": _dispatch.breakdown, "rules": rules,
-         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "learn": _learn.learn, "journal": journal, "sync": _shared.sync}[args.cmd](args)
+         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "learn": _learn.learn, "journal": journal, "sync": _shared.sync}[args.cmd](args)
 
 
 if __name__ == "__main__":

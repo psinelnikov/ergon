@@ -40,6 +40,15 @@ def spread(vals):
     return {"n": len(vals), "median": statistics.median(vals) if vals else None, "p90": pct(vals, 0.9)}
 
 
+def done_by_category(tasks, epic=None):
+    """{category: done tasks}, every category listed; a task with none counts as a feature."""
+    out = dict.fromkeys(_tasks.CATEGORIES, 0)
+    for t in tasks.values():
+        if t.get("status") == "done" and (not epic or t.get("epic") == epic):
+            out[_tasks.category(t)] += 1
+    return out
+
+
 def compute(tasks, rows, runs_dir, since=None, until=None, epic=None, summary=None, worktree_of=None):
     """summary(session, worktree) -> transcript summary or None; worktree_of(rows, tid) -> path."""
     stats = _report.aggregate_stats(runs_dir, tasks, since=since, epic=epic, until=until)
@@ -121,7 +130,7 @@ def compute(tasks, rows, runs_dir, since=None, until=None, epic=None, summary=No
                 rebuilds["tokens"] += wrote
                 rebuilds["usd"] += wrote / 1e6 * REBUILD_USD_PER_MTOK.get(tier_of(tid), 0)
     return {
-        "stats": stats, "escalations": esc, "veto": veto, "fixed": fixed,
+        "stats": stats, "categories": done_by_category(tasks, epic), "escalations": esc, "veto": veto, "fixed": fixed,
         "landed": len(landed), "rounds": rounds,
         "latency": {"proposed → approved": spread(gap(("created",), ("approved",))),
                     "asking → answered": spread(gap(("question",), ("answered",))),
@@ -244,6 +253,8 @@ def render(m, esc, money, filters):
                             lambda v: f"{v:.0f}%", "b2", "block rate per tier"),
                      table(["tier", "runs", "done", "blocked", "block%", "cost", "mean"], rows, esc)
                      + (table(["escalation", "n"], sorted(m["escalations"].items()), esc) if m["escalations"] else "")))
+    b.append(section("Done tasks per category", bars(list(m["categories"].items()), esc, str, "b1", "done per category"),
+                     table(["category", "done"], list(m["categories"].items()), esc)))
     v = m["veto"]
     fx = m["fixed"]
     r = m["rounds"]

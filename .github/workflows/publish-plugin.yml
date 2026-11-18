@@ -1,0 +1,119 @@
+# Publish the Claude Code plugin when a GitHub release is published.
+#
+# Claude Code ignores GitHub releases. Users who added the marketplace from GitHub
+# (`claude plugin marketplace add psinelnikov/ergon`) track the default branch, and
+# `claude plugin update` only replaces their cached copy when the `version` in
+# .claude-plugin/plugin.json changes. So publishing release vX.Y.Z means committing
+# version X.Y.Z (plugin.json, plus pyproject.toml to keep the CLI in step) to the
+# default branch.
+#
+# - Prereleases are skipped.
+# - If the default branch already carries the version (bumped before tagging), nothing is done.
+# - If the default branch has commits after the release tag, the run fails rather than ship
+#   unreleased code under the release's version. Cut a new release from the branch head.
+# - Re-run for an existing release from the Actions tab (workflow_dispatch, with its tag).
+
+name: Publish plugin
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, e.g. v0.2.0
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-plugin
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Set plugin and package version from the release tag
+        id: bump
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys
+          from pathlib import Path
+
+          tag = os.environ["TAG"]
+          branch = os.environ["BRANCH"]
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+          summary = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+
+          def fail(msg):
+              print(f"::error::{msg}")
+              summary.write(f"**Not published:** {msg}\n")
+              sys.exit(1)
+
+          def git(*args):
+              return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+          m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", tag)
+          if not m:
+              fail(f"tag {tag!r} is not vX.Y.Z or X.Y.Z")
+          version = ".".join(m.groups())
+
+          plugin = Path(".claude-plugin/plugin.json")
+          pyproject = Path("pyproject.toml")
+          current = json.loads(plugin.read_text())["version"]
+
+          if current == version:
+              summary.write(f"`{branch}` already carries plugin version {version}; nothing to publish.\n")
+              out.write("changed=false\n")
+              sys.exit(0)
+
+          if tuple(map(int, current.split("."))) > tuple(map(int, m.groups())):
+              fail(f"release {version} is older than the published {current}")
+
+          try:
+              tagged = git("rev-parse", f"refs/tags/{tag}^{{commit}}")
+          except subprocess.CalledProcessError:
+              fail(f"tag {tag} not found")
+          head = git("rev-parse", "HEAD")
+          if tagged != head:
+              extra = git("log", "--oneline", f"{tagged}..HEAD")
+              if extra:
+                  fail(f"`{branch}` has commits after {tag}; they would ship as {version}. "
+                       f"Cut a new release from the head of `{branch}`.\n\n```\n{extra}\n```")
+              fail(f"{tag} is not on `{branch}`")
+
+          text, n = re.subn(r'("version"\s*:\s*")[^"]*(")', rf"\g<1>{version}\g<2>", plugin.read_text(), count=1)
+          if n != 1:
+              fail("no version field in plugin.json")
+          plugin.write_text(text)
+          json.loads(plugin.read_text())
+
+          text, n = re.subn(r'(?m)^(version\s*=\s*")[^"]*(")', rf"\g<1>{version}\g<2>", pyproject.read_text(), count=1)
+          if n != 1:
+              fail("no version line in pyproject.toml")
+          pyproject.write_text(text)
+
+          summary.write(f"Plugin version {current} → {version} (release {tag}).\n")
+          out.write(f"changed=true\nversion={version}\n")
+          PY
+
+      - name: Commit and push
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Publish plugin $VERSION (release $TAG)"
+          git push origin "HEAD:$BRANCH"

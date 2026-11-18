@@ -29,6 +29,15 @@ from . import shared as _shared
 
 
 TIERS = ["haiku", "sonnet", "opus", "human"]
+# feature: new behaviour a user would notice; bugfix: existing behaviour is wrong (security holes
+# too); refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling.
+# Empty or unknown reads as feature (see category()).
+CATEGORIES = ["feature", "bugfix", "refactor", "chore"]
+
+
+def category(t):
+    c = str(t.get("category") or "").strip().lower()
+    return c if c in CATEGORIES else "feature"
 TASK_STATUSES = ["proposed", "ready", "doing", "review", "blocked", "done", "dropped"]
 # An epic starts proposed; a human's `approve E-NNN` approves its brief and opens it.
 EPIC_STATUSES = ["proposed", "open", "done", "dropped"]
@@ -41,7 +50,7 @@ AGENT_MOVES = {
     "doing": {"done", "blocked", "ready"},
     "blocked": {"ready", "doing"},
 }
-TASK_KEYS = ["id", "title", "tier", "status", "epic", "depends", "touches", "source",
+TASK_KEYS = ["id", "title", "tier", "category", "status", "epic", "depends", "touches", "source",
              "created", "approved", "tier_why"]
 EPIC_KEYS = ["id", "title", "status", "created", "approved"]
 
@@ -170,7 +179,8 @@ def is_epic(item):
 
 def brief_digest(t):
     """sha256 (hex) of what approving t (a task or an epic) approves. Notes, status, depends and
-    epic don't change it."""
+    epic don't change it, nor any field a command writes about the brief (cod*, graded, category,
+    concepts, tagged)."""
     body = t.get("_body") or ""
     if is_epic(t):
         doc = {"kind": "epic", "id": str(t.get("id") or "").strip(),
@@ -309,6 +319,121 @@ def two_person(t):
     matched against the task as it is now, so retiering it into or out of a rule changes the answer
     (and its digest, so earlier approvals stop counting either way)."""
     return bool(_config.SHARED) and not is_epic(t) and any(rule_hit(rule, t) for rule in _config.TWO_PERSON)
+
+
+# ---------- approval by inheritance (T-136) ----------
+# A worker's FOUND follow-up that isn't a feature is approved by the human approval of the task
+# that found it: it goes straight to ready with an `auto` stamp instead of waiting at proposed.
+# All of these must hold when it is filed, and `check` holds the stamp to them for as long as
+# the task is open:
+#   1. category: is bugfix, refactor or chore (empty or unknown reads as feature);
+#   2. its tier isn't human;
+#   3. its touches: is non-empty and no entry falls under a [[protect]] rule, whatever min_tier;
+#   4. its depth, the length of its source: chain of auto-approved tasks back to a human-approved
+#      root, is at most follow_up_depth (a follow-up of a human-approved task is depth 1; 0: off);
+#   5. local mode: in shared mode an approval is a signed commit, and a parent's signature can't
+#      vouch for a task that didn't exist when it was signed.
+# The guard refuses an agent's edit to category: or touches: of an auto-approved task, so a
+# follow-up can't be relabelled or widened after it was approved.
+
+AUTO_CATEGORIES = ("bugfix", "refactor", "chore")
+AUTO_STAMP = re.compile(r"^auto (\S+) follow-up of (T-\d+) \(root (T-\d+), (.*)\)$")
+
+
+def is_auto(t):
+    """Was t approved by inheritance (an `auto …` stamp) rather than by a human?"""
+    return str(t.get("approved") or "").startswith("auto ")
+
+
+def auto_problem(t):
+    """Why t, as filed, can't be approved by inheritance (conditions 1, 2, 3 and 5), or None."""
+    if _config.SHARED:
+        return "shared mode: approvals must be signed by an approver"
+    cat = str(t.get("category") or "").strip()
+    if cat not in AUTO_CATEGORIES:
+        return f"category {cat or '(empty)'} is a feature: a human approves it"
+    if t.get("tier") not in TIERS or t.get("tier") == "human":
+        return f"tier {t.get('tier')}"
+    touches = [str(x).strip() for x in t.get("touches") or [] if str(x).strip()]
+    if not touches:
+        return "no touches: declared"
+    for pr in _config.PROTECT:
+        hit = next(((x, p) for x in touches for p in pr["touches"] if _config.protect_hit(x, p)), None)
+        if hit:
+            return f"touches {hit[0]} (protect {hit[1]})"
+    return None
+
+
+def approval_of(t, tasks, _seen=()):
+    """How t's approval stands: (root ID, depth, None) when it holds, depth 0 for a human stamp
+    and n for an `auto` stamp n follow-ups from its human-approved root; else (None, None, why).
+    An auto stamp holds only if the task as filed meets conditions 1-5, it names the task's
+    source: as its parent and category: as its category, and that parent's approval holds too."""
+    stamp = str(t.get("approved") or "").strip()
+    if not stamp:
+        return None, None, "not approved"
+    if t.get("status") == "proposed":  # unapproved whatever its stamp says
+        return None, None, "it is proposed"
+    if not is_auto(t):
+        return t.get("id"), 0, None
+    m = AUTO_STAMP.match(stamp)
+    if not m:
+        return None, None, f"can't read the auto stamp {stamp!r}"
+    if t.get("id") in _seen:
+        return None, None, "its source: chain loops"
+    cat, parent = m[1], m[2]
+    if cat != str(t.get("category") or "").strip():
+        return None, None, f"stamped as a {cat} follow-up, but category is {t.get('category') or '(empty)'}"
+    if parent != str(t.get("source") or "").strip():
+        return None, None, f"stamped as a follow-up of {parent}, but source is {t.get('source') or '(empty)'}"
+    why = auto_problem(t)
+    if why:
+        return None, None, why
+    if parent not in tasks:
+        return None, None, f"its parent {parent} doesn't exist"
+    root, depth, why = approval_of(tasks[parent], tasks, _seen + (t.get("id"),))
+    if why:
+        return None, None, f"its parent {parent} isn't approved ({why})"
+    if depth + 1 > _config.FOLLOW_UP_DEPTH:
+        return None, None, f"depth {depth + 1} is past follow_up_depth = {_config.FOLLOW_UP_DEPTH}"
+    return root, depth + 1, None
+
+
+def auto_approval(t, parent, tasks):
+    """Is t, a follow-up `parent` found, approved by inheritance as it is filed? (stamp, root ID,
+    depth), or None when it waits at proposed for a human. tasks: the ancestors to walk."""
+    if auto_problem(t):
+        return None
+    root, depth, why = approval_of(parent, tasks)
+    if why or depth + 1 > _config.FOLLOW_UP_DEPTH:
+        return None
+    root_task = parent if root == parent.get("id") else tasks.get(root) or {}
+    by = re.sub(r"\s*sha256:\S+\s*$", "", str(root_task.get("approved") or "")).strip()
+    return f"auto {t['category']} follow-up of {parent['id']} (root {root}, {by})", root, depth + 1
+
+
+def follow_ups(t, tasks, open_only=True):
+    """Tasks whose `source:` chain leads to t, nearest first; by default only those not done or
+    dropped (T-137: t is complete when it and every follow-up under it are closed)."""
+    kids, seen, out = {}, {t["id"]}, []
+    for k in sorted(tasks):
+        kids.setdefault(str(tasks[k].get("source") or "").strip(), []).append(tasks[k])
+    todo = [t["id"]]
+    while todo:
+        for c in kids.get(todo.pop(0), []):
+            if c["id"] in seen:
+                continue
+            seen.add(c["id"])
+            todo.append(c["id"])
+            if not open_only or c["status"] not in ("done", "dropped"):
+                out.append(c)
+    return out
+
+
+def status_text(t, tasks):
+    """The task's status; a done one with open follow-ups reads `done, N follow-ups open`."""
+    n = len(follow_ups(t, tasks)) if t["status"] == "done" else 0
+    return f"done, {n} follow-up{'s' if n != 1 else ''} open" if n else t["status"]
 
 
 def board(args):
@@ -452,8 +577,14 @@ def show(args):
     if args.id in tasks:
         from . import priority as _pri
         t = tasks[args.id]
+        print(f"CATEGORY  {category(t)}" + ("" if t.get("category") else " (not set: reads as feature)"))
         print(f"PRIORITY  cod={t.get('cod', '')}  cod_why={t.get('cod_why', '')}  graded={t.get('graded', '')}"
               f"  unblocks={_pri.unblocks(t, tasks)}  p={_pri.score(t, tasks):.1f}")
+        fus = follow_ups(t, tasks, open_only=False)
+        if fus:
+            print(f"FOLLOW-UPS  {status_text(t, tasks)}")
+            for c in fus:
+                print(f"  {c['id']}  {c['status']:<8}  {category(c):<8}  {c['title']}")
         _print_run_usage(args.id)
     if args.id in epics:
         print("TASKS")
@@ -485,12 +616,14 @@ def new(args):
     if args.kind == "task":
         if args.tier not in TIERS:
             raise SystemExit(f"--tier must be one of {TIERS}")
+        if args.category and args.category not in CATEGORIES:
+            raise SystemExit(f"--category must be one of {CATEGORIES}")
         epics = load(_config.EPICS)
         if args.epic and args.epic not in epics:
             raise SystemExit(f"no such epic: {args.epic}")
         tid = next_id(_config.ITEMS, "T")
         home = epics[args.epic]["_path"].parent if args.epic else _config.ITEMS
-        meta = {"id": tid, "title": args.title, "tier": args.tier, "status": "proposed",
+        meta = {"id": tid, "title": args.title, "tier": args.tier, "category": args.category or "", "status": "proposed",
                 "epic": args.epic or "", "depends": [], "touches": args.touches.split(",") if args.touches else [],
                 "source": args.source or "", "created": today(), "approved": "", "tier_why": "",
                 "_path": home / f"{tid}-{slug(args.title)}.md", "_body": TASK_BODY}
@@ -563,6 +696,8 @@ def import_issue(args):
         raise SystemExit(f"expected gh#123 or gh:OWNER/REPO#123, got {ref!r}")
     if args.tier and args.tier not in TIERS:
         raise SystemExit(f"--tier must be one of {TIERS}")
+    if args.category and args.category not in CATEGORIES:
+        raise SystemExit(f"--category must be one of {CATEGORIES}")
     def duplicate(tasks):
         dup = next((t["id"] for t in tasks.values() if t.get("source") == ref), None)
         if dup:
@@ -584,7 +719,7 @@ def import_issue(args):
             raise SystemExit(f"no such epic: {args.epic}")
         tid = next_id(_config.ITEMS, "T")
         home = epics[args.epic]["_path"].parent if args.epic else _config.ITEMS
-        meta = {"id": tid, "title": title, "tier": args.tier or "human", "status": "proposed",
+        meta = {"id": tid, "title": title, "tier": args.tier or "human", "category": args.category or "", "status": "proposed",
                 "epic": args.epic or "", "depends": [], "touches": args.touches.split(",") if args.touches else [],
                 "source": ref, "created": today(), "approved": "",
                 "tier_why": "" if args.tier else "imported, not sized: pick the tier before approving",
@@ -831,7 +966,9 @@ def protect_problems(t):
     return out
 
 
-def lint():
+def lint(warns=None):
+    """(errors, summary). Warnings that don't fail the check go into `warns`, a list, when given
+    (the stop hook passes none: its stdout is JSON)."""
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     apr = _gitops.approvals()  # None outside shared mode
     errs = []
@@ -857,6 +994,8 @@ def lint():
                 errs.append(f"{where}: missing {k}")
         if t.get("tier") not in TIERS:
             errs.append(f"{where}: tier {t.get('tier')!r} not in {TIERS}")
+        if str(t.get("category") or "").strip() and t["category"] not in CATEGORIES:
+            errs.append(f"{where}: category {t.get('category')!r} not in {CATEGORIES}")
         if t.get("status") not in TASK_STATUSES:
             errs.append(f"{where}: status {t.get('status')!r} not in {TASK_STATUSES}")
         # shared mode: an open task's approval must verify (a signed commit from an approver
@@ -866,6 +1005,11 @@ def lint():
             errs.append(f"{where}: {t['status']}, but its approval doesn't verify: {why}")
         elif t.get("status") in NEEDS_APPROVAL and not t.get("approved"):
             errs.append(f"{where}: status {t['status']} without a human `approved:` stamp")
+        elif is_auto(t) and t.get("status") not in ("done", "dropped"):
+            why = approval_of(t, tasks)[2]
+            if why:
+                errs.append(f"{where}: its `approved: auto …` stamp doesn't hold: {why}; a human edits it "
+                            f"back to proposed (status and approved:) and approves it, or drops it")
         # shared mode: only the clone that holds the branch can tell it's gone
         if (t.get("status") == "review" and not held_elsewhere(t)
                 and not _gitops.branch_exists(_config.TASK_BRANCH + t["id"])):
@@ -916,11 +1060,19 @@ def lint():
                         errs.append(f"{where}: links missing task {tid}")
                     elif tasks[tid]["status"] in ("done", "dropped"):
                         errs.append(f"{where}: links {tid}, which is {tasks[tid]['status']}; fix the card")
+    from . import concepts as _concepts  # imports this module
+    cerrs, cwarns = _concepts.lint(tasks)
+    errs += cerrs
+    if warns is not None:  # e.g. a missing depend the map suggests: worth a look, not a failure
+        warns += cwarns
     return errs, f"{len(tasks)} tasks, {len(epics)} epics, {len(errs)} problem(s)"
 
 
 def check(args):
-    errs, summary = lint()
+    warns = []
+    errs, summary = lint(warns)
+    for w in warns:
+        print(f"warning: {w}")
     for err in errs:
         print(err)
     for w in _dispatch.policy_warnings(load(_config.ITEMS)):

@@ -15,7 +15,8 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
   /e/E-NNN     one epic's replay timeline: a lane per task, a bar per phase from the journal,
                human waits hatched, a cost overlay, and a replay player (inline SVG, no libraries)
   /t/T-NNN     one task: its brief, frontmatter, every run and review from the history
-               journal, transcript usage, links to the raw logs, `claude --resume` commands
+               journal, transcript usage, links to the raw logs, `claude --resume` commands,
+               and (with a concept map) the tasks it relates to, as `ergon related` lists them
   /runs/NAME   one file directly inside <state>/runs/, as plain text
   /runs/T-NNN-evidence/NAME   a worker's evidence file (images by type, the rest plain text)
 
@@ -52,6 +53,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from . import concepts as _concepts
 from . import config as _config
 from . import gitops as _gitops
 from . import history as _history
@@ -115,6 +117,11 @@ def host_ok(header):
         return True
     except ValueError:
         return False
+
+
+def cat_span(t):
+    """The task's category as a badge; empty or unknown reads as feature."""
+    return f'<span class="tier cat">{esc(_tasks.category(t))}</span>'
 
 
 def tier_key(t):
@@ -496,7 +503,7 @@ def task_li(t, tasks, extra=""):
                  + (f' <span class=flags>unblocks {n}</span>' if n > 0 else "")
                  + (f' <span class="pin">pin: {esc(pin)}</span>' if pin else ""))
     return (f'<li><a class=id href="/t/{esc(t["id"])}">{esc(t["id"])}</a>'
-            f'<span class=tier>{esc(t.get("tier"))}</span><span class=title>{esc(t.get("title"))}{tail}{extra}</span></li>')
+            f'<span class=tier>{esc(t.get("tier"))}</span>{cat_span(t)}<span class=title>{esc(t.get("title"))}{tail}{extra}</span></li>')
 
 
 def live_rows(rows, now):
@@ -547,6 +554,13 @@ def board_page(nonce):
             b.extend(task_li(t, tasks, last_review(trails.get(t["id"], [])) if status == "review" else "")
                      for t in group)
             b.append("</ul>")
+    parents = [(t, _tasks.follow_ups(t, tasks)) for t in sorted(tasks.values(), key=lambda t: t["id"])
+               if t["status"] == "done"]
+    parents = [(t, f) for t, f in parents if f]
+    if parents:
+        b.append(f'<h2 id=followups>Done, follow-ups open ({len(parents)})</h2><ul class=tasks>')
+        b.extend(task_li(t, tasks, f' <span class=flags>{esc(_tasks.status_text(t, tasks))}</span>') for t, _ in parents)
+        b.append("</ul>")
     asked = asks(tasks)
     if asked:
         b.append(f'<h2 id=answer>Awaiting answer ({len(asked)})</h2><ul class=tasks>')
@@ -708,6 +722,42 @@ def evidence_section(tid, trail):
     return "<h2>Evidence</h2>" + "".join(out) if out else ""
 
 
+def related_block(t, tasks):
+    """The task page's Related section (concepts.links), as HTML parts: nothing without a
+    `concepts` key, a note when the map doesn't load or the task has no tags."""
+    if not _config.CONCEPTS:
+        return []
+    cmap, errs = _concepts.read_map()
+    b = ["<h2>Related</h2>"]
+    if errs:
+        return b + [f'<p class=muted>the concept map does not load ({esc(errs[0])}); `ergon check` lists why</p>']
+    ls = _concepts.links(t, tasks, cmap)
+    note = _concepts.stamp_note(t, cmap)
+    if not ls["components"]:
+        return b + [f'<p class=muted>no concepts: run <code>ergon tag {esc(t["id"])}</code></p>']
+    b.append(f'<p>concepts: <code>{esc(", ".join(ls["components"]))}</code>'
+             + (f' <span class=muted>(stale: {esc(note)})</span>' if note else "") + "</p>")
+
+    def li(o, extra):
+        return (f'<li><a class=id href="/t/{esc(o["id"])}">{esc(o["id"])}</a>'
+                f'<span class="status st-{esc(o.get("status"))}">{esc(o.get("status"))}</span>'
+                f'<span class=title>{esc(o.get("title"))} <span class=flags>{esc(extra)}</span></span></li>')
+
+    for head, rows in (("Open, sharing a component", [li(o, ", ".join(c)) for o, c in ls["sharing"]]),
+                       ("Open, sharing only a concern", [li(o, ", ".join(c)) for o, c in ls["concern"]]),
+                       ("Builds on (done, by component overlap)",
+                        [li(o, f"{j:.2f}: " + ", ".join(c)) for o, j, c in ls["builds_on"]])):
+        b.append(f'<p class=muted>{esc(head)}</p>')
+        b.append('<ul class=tasks>' + "".join(rows) + "</ul>" if rows else "<p>none</p>")
+    if ls["missing"]:
+        b.append('<p class=muted>Missing depends</p><ul class=tasks>')
+        for c, intro in ls["missing"]:
+            o = tasks[intro]
+            b.append(li(o, f"introduces {c}, which this task uses, but isn't in its depends:"))
+        b.append("</ul>")
+    return b
+
+
 def task_page(tid, nonce):
     tasks = _tasks.load(_config.ITEMS)
     t = tasks.get(tid)
@@ -717,7 +767,18 @@ def task_page(tid, nonce):
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
          f'<h1>{esc(tid)} {esc(t.get("title"))}</h1>',
          f'<p><span class="status st-{esc(t["status"])}">{esc(t["status"])}</span> · '
-         f'<span class=tier>{esc(t.get("tier"))}</span></p>']
+         f'<span class=tier>{esc(t.get("tier"))}</span> <span class=tier>{esc(_tasks.category(t))}</span></p>']
+
+    fus = _tasks.follow_ups(t, tasks, open_only=False)
+    if fus:
+        b.append(f'<h2>Follow-ups</h2><p>{esc(_tasks.status_text(t, tasks))}</p><ul class=tasks>')
+        for c in fus:
+            b.append(f'<li><a class=id href="/t/{esc(c["id"])}">{esc(c["id"])}</a>'
+                     f'<span class="status st-{esc(c["status"])}">{esc(c["status"])}</span>{cat_span(c)}'
+                     f'<span class=title>{esc(c.get("title"))}</span></li>')
+        b.append("</ul>")
+
+    b += related_block(t, tasks)
 
     # priority
     sc = prio_score(t, tasks)
@@ -1052,7 +1113,7 @@ def review_card(t, tasks, found):
                 + (f'<tr><th>cod_why</th><td class=why>{link_ids(esc(str(t["cod_why"])), tasks)}</td></tr>'
                    if t.get("cod_why") else ""))
     return (f'<section class=card id="{esc(t["id"])}"><div class=head><a class=id href="/t/{esc(t["id"])}">{esc(t["id"])}</a>'
-            f'<span class=tier>{esc(t.get("tier"))}</span><b class=ctitle>{esc(t.get("title"))}</b>{flag}</div>'
+            f'<span class=tier>{esc(t.get("tier"))}</span>{cat_span(t)}<b class=ctitle>{esc(t.get("title"))}</b>{flag}</div>'
             f'<div class=table><table><tbody>{prio}'
             f'<tr><th>tier_why</th><td class=why>{link_ids(esc(t.get("tier_why") or ""), tasks) or "<span class=muted>empty</span>"}</td></tr>'
             f'<tr><th>depends</th><td class=why>{dep_html}</td></tr>'

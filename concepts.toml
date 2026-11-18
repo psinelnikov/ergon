@@ -1,0 +1,231 @@
+# ergon's own concept map (T-141): what each part of ergon is about. `concepts = "concepts.toml"`
+# in .ergon.toml turns it on; skills/ergon/SKILL.md, "Concept map", says how it's used.
+# Concerns first, then components, as arrays of tables with an id so that config.mini_toml reads
+# it on Pythons without tomllib. `files` are fnmatch patterns (like [[protect]]); `fns` name the
+# functions that implement a component; `introduced_by` is the task that creates it.
+
+[[concern]]
+id = "approval"
+label = "Humans approve, agents execute"
+
+[[concern]]
+id = "dispatch"
+label = "Running workers end to end"
+
+[[concern]]
+id = "gates"
+label = "Catching bad work before it lands"
+
+[[concern]]
+id = "shared"
+label = "Teams sharing one task state"
+
+[[concern]]
+id = "planning"
+label = "Deciding what to work on"
+
+[[concern]]
+id = "visibility"
+label = "Seeing what happened"
+
+[[concern]]
+id = "model"
+label = "The task file itself"
+
+# ---------------------------------------------------------------- approval
+[[component]]
+id = "approval.guard"
+concern = "approval"
+files = ["ergon/gates.py", "hooks/hooks.json"]
+fns = ["guard_reason", "hook", "shell_commands", "git_commands", "human_cmd", "names_outside_data", "state_git_reason"]
+terms = ["guard", "heredoc", "alias", "human-only verb", "refuses", "read-only mode", "agent edits"]
+
+[[component]]
+id = "approval.stamp"
+concern = "approval"
+files = ["ergon/gates.py", "ergon/gitops.py", "ergon/shared.py"]
+fns = ["approve", "stamp_approved", "approve_ready", "approver", "signing", "approvals", "sign_state", "approve_problem"]
+terms = ["approve", "approval", "approver", "signed", "sign ", "two-person", "keys", "stamp"]
+
+[[component]]
+id = "approval.commit-hook"
+concern = "approval"
+files = ["ergon/gates.py"]
+fns = ["commit_msg_reason", "commit_msg_hook", "install_commit_hook", "cited_tasks"]
+terms = ["commit-msg"]
+
+[[component]]
+id = "approval.review"
+concern = "approval"
+files = ["ergon/gates.py", "ergon/cli.py"]
+fns = ["review_interactive", "accept", "reject", "held_branch", "close"]
+terms = ["review -i", "interactive review", "reject", "accept", "review task"]
+
+[[component]]
+id = "approval.auto"
+concern = "approval"
+files = ["ergon/dispatch.py", "ergon/gates.py", "ergon/tasks.py"]
+terms = ["automatically", "auto-approved", "auto-approve"]
+introduced_by = "T-136"
+
+# ---------------------------------------------------------------- dispatch
+[[component]]
+id = "dispatch.worker"
+concern = "dispatch"
+files = ["ergon/dispatch.py", "agents"]
+fns = ["prepare", "run_worker", "worker_prompt", "worker_rules", "worker_agents", "worker_settings"]
+terms = ["worker", "prompt"]
+
+[[component]]
+id = "dispatch.found"
+concern = "dispatch"
+files = ["ergon/dispatch.py", "agents"]
+fns = ["parse_found", "file_found", "file_human"]
+terms = ["found", "follow-up", "file a "]
+
+[[component]]
+id = "dispatch.ask"
+concern = "dispatch"
+files = ["ergon/dispatch.py", "ergon/gates.py"]
+fns = ["parse_questions", "asked", "park", "answer_lines", "answer", "answer_task"]
+terms = ["asks a question", "asking", "answer"]
+
+[[component]]
+id = "dispatch.conflict"
+concern = "dispatch"
+files = ["ergon/dispatch.py", "ergon/gitops.py", "ergon/gates.py"]
+fns = ["find_conflicts", "conflict_body", "conflict_checks", "conflict_note", "resolved_note", "merge_tree", "merge_check"]
+terms = ["conflict"]
+
+[[component]]
+id = "dispatch.budget"
+concern = "dispatch"
+files = ["ergon/dispatch.py", "ergon/limits.py", "ergon/cli.py"]
+fns = ["print_limit", "rounds_note"]
+terms = ["budget", "dry-run", "estimate", "--help"]
+
+[[component]]
+id = "dispatch.claim"
+concern = "shared"
+files = ["ergon/dispatch.py", "ergon/tasks.py", "ergon/shared.py", "ergon/serve.py"]
+fns = ["claim", "unclaim", "held_by", "held_elsewhere", "clone_id"]
+terms = ["claim", "held on", "holds it", "other clones"]
+
+# ---------------------------------------------------------------- gates (E-003)
+[[component]]
+id = "gates.verify"
+concern = "gates"
+files = ["ergon/dispatch.py"]
+fns = ["run_verify", "verify_detail", "verify_lines", "fix_round"]
+terms = ["verify", "fix round"]
+
+[[component]]
+id = "gates.reviewer"
+concern = "gates"
+files = ["ergon/dispatch.py", "agents"]
+fns = ["reviewer_tier", "review_agent", "review_diff", "run_review", "review_retry"]
+terms = ["reviewer"]
+
+[[component]]
+id = "gates.weakening"
+concern = "gates"
+files = ["ergon/dispatch.py", "ergon/config.py", "ergon/gates.py"]
+fns = ["gate", "veto_lines"]
+terms = ["weaken", "weakening", "suppression", "red-on-base", "prove:", "gate file", "gates (`verify:`"]
+
+[[component]]
+id = "gates.harden"
+concern = "gates"
+files = ["ergon/dispatch.py", "ergon/history.py", "ergon/tasks.py", "skills/ergon/SKILL.md"]
+terms = ["harden", "incident", "reproduction"]
+introduced_by = "T-106"
+
+[[component]]
+id = "gates.policies"
+concern = "gates"
+files = ["ergon/gates.py", "ergon/dispatch.py", "ergon/shared.py", "ergon/learn.py"]
+fns = ["write_policy", "policies_text", "is_policies"]
+terms = ["policies", "policy", "learn"]
+
+# ---------------------------------------------------------------- epics / planning
+[[component]]
+id = "epic.lifecycle"
+concern = "planning"
+files = ["ergon/gitops.py", "ergon/gates.py", "ergon/tasks.py", "ergon/cli.py", "ergon/serve.py"]
+fns = ["open_epic", "enter_epic", "finish_epic", "epic_complete", "epic_branch"]
+terms = ["epic"]
+
+[[component]]
+id = "epic.breakdown"
+concern = "planning"
+files = ["ergon/dispatch.py", "ergon/gates.py", "ergon/shared.py", "ergon/serve.py", "ergon/report.py"]
+terms = ["breakdown", "break down"]
+introduced_by = "T-099"
+
+[[component]]
+id = "plan.category"
+concern = "planning"
+files = ["ergon/tasks.py", "ergon/dispatch.py"]
+terms = ["category", "bugfix", "refactor", "chore"]
+introduced_by = "T-135"
+
+[[component]]
+id = "plan.priority"
+concern = "planning"
+files = ["ergon/priority.py", "ergon/tasks.py", "ergon/serve.py", "ergon/grade.py"]
+terms = ["priority", "pin", "grade"]
+
+[[component]]
+id = "plan.concepts"
+concern = "planning"
+files = ["ergon/concepts.py", "concepts.toml"]
+fns = ["links", "missing_depends", "tag", "related"]
+terms = ["concept map", "component", "concern", "related", "tag"]
+introduced_by = "T-141"
+
+# ---------------------------------------------------------------- task model
+[[component]]
+id = "model.digest"
+concern = "model"
+files = ["ergon/tasks.py", "ergon/gitops.py"]
+fns = ["brief_digest", "sections", "normalised"]
+terms = ["digest"]
+
+[[component]]
+id = "model.touches"
+concern = "model"
+files = ["ergon/dispatch.py", "ergon/gates.py", "ergon/shared.py"]
+fns = ["nested_touch", "companion_touch"]
+terms = ["touches", "tasks/` exclusion", "exclusion"]
+
+[[component]]
+id = "model.config"
+concern = "model"
+files = ["ergon/config.py", "ergon/shared.py", "ergon/gates.py"]
+fns = ["read_config", "mini_toml", "configure"]
+terms = [".ergon.toml", "[shared]", "two_person", "remote's url"]
+
+# ---------------------------------------------------------------- visibility
+[[component]]
+id = "ui.serve"
+concern = "visibility"
+files = ["ergon/serve.py", "ergon/serve.css", "ergon/serve.js"]
+terms = ["board", "/review", "review page", "web", "serve", "chart", "colours"]
+
+[[component]]
+id = "ui.stats"
+concern = "visibility"
+files = ["ergon/report.py", "ergon/metrics.py", "ergon/history.py", "ergon/serve.css"]
+terms = ["stats", "report", "metrics", "chart"]
+
+[[component]]
+id = "obs.history"
+concern = "visibility"
+files = ["ergon/history.py", "ergon/gates.py"]
+terms = ["history.jsonl", "history table", "log "]
+
+[[component]]
+id = "docs"
+concern = "model"
+files = ["README.md", "skills/ergon/SKILL.md", "docs/shared-state.md"]
+terms = ["readme", "skill.md", "shared-state.md", "document", "say how", "mention"]
