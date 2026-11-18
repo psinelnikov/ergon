@@ -224,11 +224,15 @@ def prove_off(t):
 
 
 # ---------- is an epic approved? ----------
-# An epic is filed `proposed`; a human's `approve E-NNN` stamps `approved:` and opens it. Epics
-# from before epics were approved (open or done, with no stamp) are grandfathered: they count as
-# approved. Nothing makes a new one: `new epic` writes proposed, `set` won't move an epic out of
-# proposed, and the guard refuses an agent's status edit or a new EPIC.md that isn't proposed.
-# In shared mode a stamp counts only if a signed approval of the brief verifies, as a task's does.
+# An epic is filed `proposed`; a human's `approve E-NNN` stamps `approved:` and opens it.
+# In shared mode an open epic counts as approved only if a signed approval of its brief verifies,
+# as a task's does, stamp or no stamp: an open epic with no stamp (from before epics were
+# approved, or pushed by a clone without the guard) is refused until a human runs `approve
+# E-NNN` on it (T-124). A done epic is checked only if stamped: nothing is broken down or opened
+# from one. In local mode a stamp can't be verified, so an epic past proposed counts as approved
+# with or without one, which keeps old unstamped epics working; there the guard is what stops an
+# agent opening one (`new epic` writes proposed, `set` won't move an epic out of proposed, and the
+# guard refuses an agent's status edit or a new EPIC.md that isn't proposed).
 
 def epic_problem(e, apr=None):
     """Why tasks of epic e mustn't be offered or started (its brief isn't approved), or None.
@@ -240,9 +244,11 @@ def epic_problem(e, apr=None):
         return f"epic {eid} is proposed: a human approves its brief with `ergon approve {eid}`"
     if status == "dropped":
         return f"epic {eid} is dropped"
-    if not e.get("approved"):
-        return None  # grandfathered
-    why = apr.problem(e) if apr else None
+    if not apr:
+        return None  # local mode: nothing to verify a stamp against
+    if status != "open" and not e.get("approved"):
+        return None  # a done epic from before epics were approved
+    why = apr.problem(e)
     return f"epic {eid}'s approval doesn't verify: {why}" if why else None
 
 
@@ -1068,9 +1074,9 @@ def lint(warns=None):
     for e in epics.values():
         if e.get("status") not in EPIC_STATUSES:
             errs.append(f"{e['id']}: status {e.get('status')!r} not in {EPIC_STATUSES}")
-        # shared mode: an open epic's stamp must verify (a signed approval of its current brief).
-        # An open epic with no stamp is from before epics were approved, and counts as approved.
-        why = apr.problem(e) if apr and e.get("status") == "open" and e.get("approved") else None
+        # shared mode: an open epic needs a signed approval of its current brief, stamp or no
+        # stamp (epic_problem). Local mode has nothing to verify, so an unstamped one passes.
+        why = apr.problem(e) if apr and e.get("status") == "open" else None
         if why:
             errs.append(f"{e['id']}: open, but its approval doesn't verify: {why}")
     # Map cards link gaps to tasks with a trailing "→ task T-012[, T-013]".

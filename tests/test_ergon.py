@@ -603,6 +603,9 @@ class TestEpicApproval(Project):
         self.ergon("check")
 
     def test_epics_from_before_approval_count_as_approved(self):
+        # Local mode only (T-124): a stamp can't be verified here, so an open epic with no stamp
+        # counts as approved and `check` doesn't report it; the guard stops an agent opening one.
+        # In shared mode it is refused until a human approves it (test_shared.py).
         home = self.root / "tasks" / "epics" / "E-001-old"
         home.mkdir(parents=True)
         (home / "EPIC.md").write_text("---\nid: E-001\ntitle: Old\nstatus: open\ncreated: 2026-01-01\n---\n\n## Goal\nG\n")
@@ -612,6 +615,14 @@ class TestEpicApproval(Project):
         self.assertNotIn("E-001", r.stdout)
         self.assertIn("  T-001  ", self.ergon("next").stdout)
         self.assertIn("would run  T-001", self.ergon("dispatch", "--dry-run").stdout)
+        # naming the epic approves its proposed tasks: its brief isn't due again
+        self.ergon("new", "task", "Another", "--tier", "haiku", "--epic", "E-001")
+        r = self.ergon("approve", "E-001", env=clean_env(ERGON_ASK_STDIN="1"), inp="y\n")
+        self.assertIn("approved 1", r.stdout)
+        self.assertNotIn("its brief", r.stdout)
+        self.assertIn("status: ready", self.task_file("T-002").read_text())
+        self.assertIn("\nstatus: open\n", (home / "EPIC.md").read_text())
+        self.assertNotIn("approved:", (home / "EPIC.md").read_text())
 
     def test_guard_refuses_agent_edits_of_an_epics_breakdown(self):
         self.ergon("new", "epic", "Big thing")

@@ -27,7 +27,10 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                worktree, <worktrees>/E-ID (also happens on an epic's first `doing`)
   ergon finish E-ID            close the epic and merge its branch into the trunk (also happens
                                when its last task goes done); no checkout needs switching
-  ergon approve ID [ID ...]    HUMAN ONLY, real terminal. An epic ID approves its proposed tasks
+  ergon approve ID [ID ...]    HUMAN ONLY, real terminal. An epic ID approves its brief when it's
+                               proposed, or in shared mode open with no signed approval that
+                               verifies (an old epic with no approved: stamp counts as approved
+                               in local mode only); otherwise it approves its proposed tasks
   ergon reject ID [--reason R] HUMAN ONLY. proposed -> dropped; review -> ready (needs --reason,
                                which the next worker is shown; branch and worktree are kept)
   ergon accept ID [ID ...]     HUMAN ONLY, real terminal. Land a task dispatch held at `review`
