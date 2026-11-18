@@ -86,6 +86,16 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                Done when, touches:, tier and tier_why (when unsized). Never replaces
                                what's written, never edits an approved task; a Notes line says what
                                was filled. Record in <state>/runs/fill/. An epic ID means its tasks
+  ergon tag [ID ...] [--all] [--model sonnet] [--budget USD] [--dry-run]
+                               with `concepts` in .ergon.toml: one `claude -p` (no tools) per 10
+                               tasks writes concepts: (component ids from the map; any other id
+                               is dropped) and a tagged: stamp. No IDs: every task not dropped
+                               whose tags are stale (brief changed, or a component left the map);
+                               --all: every one. Not in the brief digest. Record in <state>/runs/tag/
+  ergon related T-ID           read-only, with `concepts`: open tasks sharing a component, then only
+                               a concern; done tasks it builds on (Jaccard overlap of components);
+                               missing depends (a component an open task introduces, not in its
+                               depends: closure). /t/T-ID shows the same
   ergon journal [E-ID ...] [--all] [--model sonnet] [--budget USD]
                                one `claude -p` (no tools) per epic writes its journal entry: what it
                                set out to do, what landed, how the work went (from its history rows
@@ -119,6 +129,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import concepts as _concepts
 from . import config as _config
 from . import dispatch as _dispatch
 from . import fill as _fill
@@ -386,6 +397,13 @@ def main():
     fl.add_argument("--model", default="sonnet", help="default sonnet")
     fl.add_argument("--budget", type=float, help="max USD per call (--max-budget-usd)")
     fl.add_argument("--dry-run", action="store_true", help="list each task's gaps; ask nothing, write nothing")
+    tg = sub.add_parser("tag", help="tag tasks with components of the concept map (runs claude -p)")
+    tg.add_argument("ids", nargs="*", metavar="ID", help="tasks, or epics meaning their tasks (default: those with stale tags)")
+    tg.add_argument("--all", action="store_true", help="retag every task that isn't dropped")
+    tg.add_argument("--model", default="sonnet", help="default sonnet")
+    tg.add_argument("--budget", type=float, help="max USD per call (--max-budget-usd)")
+    tg.add_argument("--dry-run", action="store_true", help="list the tasks; ask nothing, write nothing")
+    sub.add_parser("related", help="tasks related to this one through the concept map").add_argument("id")
     jn = sub.add_parser("journal", help="write each epic's journal entry, shown on /e/E-NNN (runs claude -p)")
     jn.add_argument("ids", nargs="*", metavar="E-ID", help="epics to write (default: those with no entry or newer history)")
     jn.add_argument("--all", action="store_true", help="every epic, not only those with a missing or stale entry")
@@ -453,10 +471,10 @@ def run(args):
             {"new": _tasks.new, "set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish,
              "tidy": _tasks.tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours); grade around its
-        # writes only, not the minutes claude takes to answer
+        # (and tag) around their writes only, not the minutes claude takes to answer
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
-         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "journal": journal, "sync": _shared.sync}[args.cmd](args)
+         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "journal": journal, "sync": _shared.sync}[args.cmd](args)
 
 
 if __name__ == "__main__":

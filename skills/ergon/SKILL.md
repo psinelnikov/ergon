@@ -73,6 +73,37 @@ Every task has a `category:` (feature, bugfix, refactor or chore; `ergon new --c
 
 `ergon fill [ID|E-ID ...] [--epic E] [--model sonnet] [--budget USD] [--dry-run]` writes the parts a proposed brief left blank: What, Done when, `touches:`, and `tier` with `tier_why:` when nobody sized it (empty, or the placeholder a FOUND line or an import leaves). It runs one `claude -p` per batch of up to 8 tasks in the main checkout with Read, Grep and Glob only, so it can cite `file:line` and name real paths. It never replaces what's written and never edits a task past `proposed`. A tier below a matching `[[protect]]` minimum is raised to it. Each filled task gets a Notes line naming what was machine-written: read it before approving. Agents may run it, since it only proposes. The record goes to `<state>/runs/fill/`.
 
+## Concept map (optional)
+
+`depends:` and shared `touches:` say how tasks are linked by order and by file. A concept map links them by what they are about. `concepts = "concepts.toml"` in `.ergon.toml` names a TOML file in the repo that lists concerns, then components. Each is an array-of-tables entry with an `id`, so the map parses without `tomllib` (Python 3.9):
+
+```toml
+[[concern]]
+id = "approval"
+label = "Humans approve, agents execute"
+
+[[component]]
+id = "approval.guard"             # letters, digits, '.', '_' or '-'
+concern = "approval"              # a [[concern]] id
+files = ["ergon/gates.py", "hooks/*.json"]   # fnmatch patterns, like [[protect]]
+terms = ["guard", "heredoc"]      # words a brief about it tends to use
+fns = ["guard_reason"]            # optional: the functions that implement it
+introduced_by = "T-136"           # optional: the task that creates it
+```
+
+Don't write `[component."approval.guard"]`: the fallback parser has no quoted or dotted table names, and `check` refuses that shape on every Python. ergon's own map is `concepts.toml` in its repo.
+
+A task's `concepts:` lists component ids. `ergon tag [ID|E-ID ...] [--all] [--model sonnet] [--budget USD] [--dry-run]` writes it: one `claude -p` with no tools per batch of up to 10 tasks picks from the map's ids, and any other id in the reply is dropped. A `tagged:` stamp (day and brief-hash prefix, like `graded:`) makes the tags stale once the brief changes or once they name a component the map no longer has. With no IDs, `tag` retags only stale tasks (any status but dropped, so done tasks are tagged too); `--all` retags every one, which is what to run after a big change to the map; named IDs are always retagged. Neither field is in the brief digest, so tagging never un-approves a task. Agents may run it. The record goes to `<state>/runs/tag/`.
+
+`ergon related T-NNN` (read-only) prints, for a tagged task:
+- open tasks that share a component with it, then open tasks that share only a concern;
+- done tasks it builds on, ranked by component overlap (Jaccard), the top 5;
+- missing depends: a component it uses whose `introduced_by` task is still open (not done or dropped) and isn't in its `depends:` closure.
+
+`/t/T-NNN` in `ergon serve` shows the same lists. `ergon check` fails a map that doesn't hold (a missing file, an unknown concern, a duplicate id, an `introduced_by` naming a missing task) and only warns on a missing depend, on tags the map lacks and on a dropped `introduced_by`. A missing depend is a lead, not a rule: add the depend if the task really needs that work first. Scheduling ignores the map; dispatch still holds tasks apart by shared `touches:` only.
+
+Without a `concepts` key, `tag` and `related` say so and nothing else changes.
+
 ## Lifecycle
 
 ```
@@ -116,6 +147,8 @@ accept: yes             # optional: dispatch holds the finished branch at `revie
 cod: 60                 # optional, 0-100 cost of delay: written by `ergon grade` (absent counts as 50)
 cod_why: one line       # optional, why that grade: written by `ergon grade`
 graded: 2026-11-17 3f9a0c1d2e4b   # optional, `ergon grade` stamp: day and brief-hash prefix; stale once the brief changes
+concepts: [approval.guard]   # optional, component ids from the concept map: written by `ergon tag`
+tagged: 2026-11-18 3f9a0c1d2e4b   # optional, `ergon tag` stamp: day and brief-hash prefix; stale once the brief changes
 pin: first              # optional, HUMAN ONLY (`ergon pin ID first|last|clear`): first or last in the order
 ---
 ## What
@@ -200,7 +233,7 @@ ergon dispatch --watch --budget-total 20 --interval 30   # keep running; pick up
 
 ## Web board: `ergon serve`
 
-`ergon serve [--port 4300] [--bind 127.0.0.1]` starts a read-only web view of the tracker (standard library only, no assets fetched). Pages: `/` the board (open work by status and tier, epics with progress, what waits on a human, live `doing` state), `/review` (what to read before approving: proposed tasks grouped by `depends:` (linked chains together in dependency order, each group with its own approve command; unlinked tasks under "Independent" by tier), a dependency map, a card per task with What and Done when, findings from files such as missing `file:line` citations or touches, empty Done when / `tier_why` / touches and dead depends, a multiple-choice quiz scored in the page, and the approve command to copy; the page approves nothing), `/metrics` (stats, review, latency, tokens; `?epic=&since=&until=`), `/e/E-NNN` (the epic's journal entry, then its replay timeline), `/t/T-NNN` (a task's brief, history, runs and `claude --resume` commands), `/runs/NAME` (one raw file from `<state>/runs/`). It only answers GET and HEAD, writes nothing, runs no git and launches no claude. Task text is escaped; the Host header must be `localhost` or an IP literal.
+`ergon serve [--port 4300] [--bind 127.0.0.1]` starts a read-only web view of the tracker (standard library only, no assets fetched). Pages: `/` the board (open work by status and tier, epics with progress, what waits on a human, live `doing` state), `/review` (what to read before approving: proposed tasks grouped by `depends:` (linked chains together in dependency order, each group with its own approve command; unlinked tasks under "Independent" by tier), a dependency map, a card per task with What and Done when, findings from files such as missing `file:line` citations or touches, empty Done when / `tier_why` / touches and dead depends, a multiple-choice quiz scored in the page, and the approve command to copy; the page approves nothing), `/metrics` (stats, review, latency, tokens; `?epic=&since=&until=`), `/e/E-NNN` (the epic's journal entry, then its replay timeline), `/t/T-NNN` (a task's brief, history, runs and `claude --resume` commands, and with a concept map the tasks it relates to), `/runs/NAME` (one raw file from `<state>/runs/`). It only answers GET and HEAD, writes nothing, runs no git and launches no claude. Task text is escaped; the Host header must be `localhost` or an IP literal.
 
 The quiz comes from `ergon quiz [--all] [--per 2] [--model sonnet] [--budget USD]`, since serve can't launch claude. It runs one `claude -p` with no tools over the proposed briefs and writes `<state>/runs/quiz/quiz-<time>.json`. Each question carries its task ID and a hash of that task's brief, and `/review` hides it once the task changes or stops being `proposed`. A second run keeps the questions that are still current and asks only about tasks without one. It's safe for agents to run (it writes only that file), but it costs a sonnet call.
 
@@ -237,6 +270,7 @@ One JSON object per line, appended as things happen, gitignored with `runs/`. Ev
 | `epic_finished` | the epic merged into the trunk and closed (`task` is null) | `branch`, `commit` (the merge commit; both null if it never had a branch) |
 | `graded` | `ergon grade` wrote cost-of-delay grades (`task` is null) | `tasks` (the IDs it wrote), `model`, `cost`, `dropped` (comparison replies it threw away) |
 | `filled` | `ergon fill` wrote blank parts of proposed briefs (`task` is null) | `tasks` ({ID: [parts written]}), `model`, `cost`, `dropped` (reply entries for tasks it wasn't asked about) |
+| `tagged` | `ergon tag` wrote `concepts:` from the concept map (`task` is null) | `tasks` ({ID: [component ids written]}), `model`, `cost`, `dropped` (reply entries it threw away: ids not in the map, tasks it wasn't asked about, malformed answers) |
 | `pinned` | `ergon pin` set or cleared a task's `pin:` (human only) | `by`, `pin`: `first`, `last`, or null on a clear |
 
 `round` (2, 3, …) is on the `dispatched`, `resumed`, `worker_end`, `verify` and `review` rows of a fix round (review round N+1 is fix round N), and on the `conflict` row, the worker rows of the conflict round that follows it and the verify and review rows after that. It numbers worker runs on the branch in order, whatever the kind of round. A row without `round` is round 1. Other loops are to mark their rounds the same way.

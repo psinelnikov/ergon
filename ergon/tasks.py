@@ -171,7 +171,8 @@ def normalised(text):
 
 
 def brief_digest(t):
-    """sha256 (hex) of what approving t approves. Notes, status, depends and epic don't change it."""
+    """sha256 (hex) of what approving t approves. Notes, status, depends and epic don't change it,
+    nor any field a command writes about the brief (cod*, graded, category, concepts, tagged)."""
     body = t.get("_body") or ""
     doc = {
         "id": str(t.get("id") or "").strip(),
@@ -886,7 +887,9 @@ def tidy(args):
     print(f"moved {n} file(s)")
 
 
-def lint():
+def lint(warns=None):
+    """(errors, summary). Warnings that don't fail the check go into `warns`, a list, when given
+    (the stop hook passes none: its stdout is JSON)."""
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     apr = _gitops.approvals()  # None outside shared mode
     errs = []
@@ -968,11 +971,19 @@ def lint():
                         errs.append(f"{where}: links missing task {tid}")
                     elif tasks[tid]["status"] in ("done", "dropped"):
                         errs.append(f"{where}: links {tid}, which is {tasks[tid]['status']}; fix the card")
+    from . import concepts as _concepts  # imports this module
+    cerrs, cwarns = _concepts.lint(tasks)
+    errs += cerrs
+    if warns is not None:  # e.g. a missing depend the map suggests: worth a look, not a failure
+        warns += cwarns
     return errs, f"{len(tasks)} tasks, {len(epics)} epics, {len(errs)} problem(s)"
 
 
 def check(args):
-    errs, summary = lint()
+    warns = []
+    errs, summary = lint(warns)
+    for w in warns:
+        print(f"warning: {w}")
     for err in errs:
         print(err)
     print(summary)

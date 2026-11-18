@@ -15,7 +15,8 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
   /e/E-NNN     one epic's replay timeline: a lane per task, a bar per phase from the journal,
                human waits hatched, a cost overlay, and a replay player (inline SVG, no libraries)
   /t/T-NNN     one task: its brief, frontmatter, every run and review from the history
-               journal, transcript usage, links to the raw logs, `claude --resume` commands
+               journal, transcript usage, links to the raw logs, `claude --resume` commands,
+               and (with a concept map) the tasks it relates to, as `ergon related` lists them
   /runs/NAME   one file directly inside <state>/runs/, as plain text
 
 The read-only guarantee:
@@ -51,6 +52,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from . import concepts as _concepts
 from . import config as _config
 from . import gitops as _gitops
 from . import history as _history
@@ -689,6 +691,42 @@ def unjournaled(tid, trail, tier=None):
     return out
 
 
+def related_block(t, tasks):
+    """The task page's Related section (concepts.links), as HTML parts: nothing without a
+    `concepts` key, a note when the map doesn't load or the task has no tags."""
+    if not _config.CONCEPTS:
+        return []
+    cmap, errs = _concepts.read_map()
+    b = ["<h2>Related</h2>"]
+    if errs:
+        return b + [f'<p class=muted>the concept map does not load ({esc(errs[0])}); `ergon check` lists why</p>']
+    ls = _concepts.links(t, tasks, cmap)
+    note = _concepts.stamp_note(t, cmap)
+    if not ls["components"]:
+        return b + [f'<p class=muted>no concepts: run <code>ergon tag {esc(t["id"])}</code></p>']
+    b.append(f'<p>concepts: <code>{esc(", ".join(ls["components"]))}</code>'
+             + (f' <span class=muted>(stale: {esc(note)})</span>' if note else "") + "</p>")
+
+    def li(o, extra):
+        return (f'<li><a class=id href="/t/{esc(o["id"])}">{esc(o["id"])}</a>'
+                f'<span class="status st-{esc(o.get("status"))}">{esc(o.get("status"))}</span>'
+                f'<span class=title>{esc(o.get("title"))} <span class=flags>{esc(extra)}</span></span></li>')
+
+    for head, rows in (("Open, sharing a component", [li(o, ", ".join(c)) for o, c in ls["sharing"]]),
+                       ("Open, sharing only a concern", [li(o, ", ".join(c)) for o, c in ls["concern"]]),
+                       ("Builds on (done, by component overlap)",
+                        [li(o, f"{j:.2f}: " + ", ".join(c)) for o, j, c in ls["builds_on"]])):
+        b.append(f'<p class=muted>{esc(head)}</p>')
+        b.append('<ul class=tasks>' + "".join(rows) + "</ul>" if rows else "<p>none</p>")
+    if ls["missing"]:
+        b.append('<p class=muted>Missing depends</p><ul class=tasks>')
+        for c, intro in ls["missing"]:
+            o = tasks[intro]
+            b.append(li(o, f"introduces {c}, which this task uses, but isn't in its depends:"))
+        b.append("</ul>")
+    return b
+
+
 def task_page(tid, nonce):
     tasks = _tasks.load(_config.ITEMS)
     t = tasks.get(tid)
@@ -708,6 +746,8 @@ def task_page(tid, nonce):
                      f'<span class="status st-{esc(c["status"])}">{esc(c["status"])}</span>{cat_span(c)}'
                      f'<span class=title>{esc(c.get("title"))}</span></li>')
         b.append("</ul>")
+
+    b += related_block(t, tasks)
 
     # priority
     sc = prio_score(t, tasks)
