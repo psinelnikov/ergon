@@ -2,6 +2,7 @@
 trunk = "main"                  # epics branch from and merge back into this
 state = "tasks"                 # task files: <state>/items, <state>/epics, dispatch logs <state>/runs
 worktrees = ".claude/worktrees" # one per started epic and per dispatched task
+concepts = "concepts.toml"
 # map = "map"                   # cards whose "-> task T-NNN" links `check` keeps honest
 # log = "TODO.md"               # the log a task's `source: TODO.md:<line>` cites
 # retired = "tasks/audit-retired.txt"   # `term | gate | note` rows for `audit`
