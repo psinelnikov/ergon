@@ -83,6 +83,24 @@ if tier == "BREAKDOWN":  # the task-breakdown agent: replies $FAKE_BREAKDOWN; lo
             f.write(json.dumps({"argv": sys.argv[1:-1], "prompt": prompt, "cwd": os.getcwd()}) + "\n")
     if os.environ.get("FAKE_BREAKDOWN_WRITE"):  # a breakdown that doesn't stay read-only
         open(os.environ["FAKE_BREAKDOWN_WRITE"], "a").write("oops\n")
+    # $FAKE_BREAKDOWN_TOOLS: tool calls (a JSON list of {tool_name, tool_input}) as if the allowlist let them
+    # through. As in Claude Code, each runs only if no PreToolUse hook in --settings denies it; each call and
+    # the reasons it was denied go to $FAKE_BREAKDOWN_DECISIONS.
+    for call in json.loads(os.environ.get("FAKE_BREAKDOWN_TOOLS") or "[]"):
+        denied = []
+        for m in json.loads(sys.argv[sys.argv.index("--settings") + 1])["hooks"]["PreToolUse"]:
+            if m["matcher"] in ("*", "") or re.fullmatch(m["matcher"], call["tool_name"]):
+                for h in m["hooks"]:
+                    out = subprocess.run(h["command"], shell=True, capture_output=True, text=True,
+                                         input=json.dumps(dict(call, cwd=os.getcwd()))).stdout
+                    if out.strip() and json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny":
+                        denied.append(json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"])
+        if not denied and call["tool_name"] == "Bash":
+            subprocess.run(call["tool_input"]["command"], shell=True, capture_output=True)
+        elif not denied and call["tool_name"] == "Write":
+            open(call["tool_input"]["file_path"], "w").write(call["tool_input"].get("content", ""))
+        with open(os.environ["FAKE_BREAKDOWN_DECISIONS"], "a") as f:
+            f.write(json.dumps({"call": call, "denied": denied}) + "\n")
     print(json.dumps({"result": os.environ.get("FAKE_BREAKDOWN", "nothing\nRESULT: blocked — no reply set"),
                       "session_id": "b-1", "total_cost_usd": 0.05}))
     sys.exit()
@@ -418,6 +436,69 @@ class TestBasics(Project):
         self.assertIn("CLAUDECODE", self.guard("Bash", {"command": "unset CLAUDECODE; ergon next"}))
         self.assertIn("shell", self.guard("Bash", {"command": f"sed -i '' s/a/b/ {f}"}))
         self.assertIsNone(self.guard("Bash", {"command": "cat tasks/items/*.md"}))
+
+    def test_read_only_guard(self):
+        """T-131: `hook guard --read-only` (the breakdown agent's) refuses Edit/Write and any Bash that may
+        write a file or change git state, and lets the read-only commands through."""
+        ro = "--read-only"
+        allowed = ["git log --oneline -5", "git diff HEAD~1 -- README.md", "git show HEAD:README.md | head -20",
+                   "git status --short 2>&1", "git grep -n hi", "git ls-files", "git blame README.md",
+                   "git log --format='%h -> %s' | wc -l", "git -C . log -1", "git branch -a", "git worktree list",
+                   "ergon show T-001", "ergon next", "ergon", "ergon check", "ergon review", "ergon board --all",
+                   "ls -la tasks", "cat README.md", "head -3 README.md", "tail -n 2 README.md",
+                   "grep -rn guard . 2>/dev/null", "cat <(git log -1)", "find . -name '*.md'", "cd tasks && ls",
+                   'echo "a > b"', "sort -k2 README.md | uniq -c", "git log -1 # it's > here",
+                   "ls 'a'#' > f '"]
+        from ergon.dispatch import BREAKDOWN_ALLOW
+        from ergon.gates import read_only_reason
+        # every command the breakdown allowlist lets run passes the read-only guard too
+        allowed += [rule[5:-3] + " README.md" for rule in BREAKDOWN_ALLOW if rule.startswith("Bash(")]
+        for cmd in allowed:
+            self.assertIsNone(read_only_reason("Bash", {"command": cmd}), cmd)
+        for cmd in ("git log --oneline -5", "ergon show T-001", "cat README.md | wc -l"):  # through the hook
+            self.assertIsNone(self.guard("Bash", {"command": cmd}, ro), cmd)
+        for tool in ("Read", "Grep", "Glob"):
+            self.assertIsNone(self.guard(tool, {"file_path": str(self.root / "README.md"), "pattern": "x"}, ro))
+        refused = ["echo x > README.md", "echo x >> f", "cat README.md 2>err.txt", "cat a &>f", "cat a >| f",
+                   "echo > /dev/null.txt", "cat a >&f", "exec 3<> f", "tee f", "rm -rf x", "mv a b", "cp a b",
+                   "touch f", "mkdir d", "sed -i s/a/b/ README.md", "python3 -c 1", "bash -c 'ls'", "xargs rm",
+                   "git commit -qm x", "git add -A", "git checkout main", "git reset --hard", "git stash list",
+                   "git fetch", "git push", "git branch foo", "git worktree add x", "git log --output=f",
+                   "git log --outp=f", "git grep -O vim hi", "git -c alias.x='!rm f' x", "git --exec-path=. log",
+                   "GIT_EXTERNAL_DIFF=rm git diff", "x=1", "cat $(rm f)", "cat `rm f`", "cat <(rm x)",
+                   'echo "$(rm x)"', "echo $'\\'' > f", "find . -delete", "find . -exec rm {} ;", "sort -o f a",
+                   "sort --comp=sh a", "uniq a b", "rg --pre sh x", "ergon set T-001 status=doing",
+                   "ergon new task x", "ergon review -i", "ergon dispatch", "/bin/rm x", "./ls",
+                   "cat <<EOF\nx\nEOF", "echo 'unclosed", "for f in *; do rm $f; done",
+                   # a quote in a comment opens nothing, so it can't hide the redirect after it
+                   "ls # it's\necho hi > f # it's", "ls a\\ #x > f"]
+        for cmd in refused:
+            self.assertIn("read-only", read_only_reason("Bash", {"command": cmd}) or "", cmd)
+        for cmd in ("echo x > README.md", "git commit -qm x", "rm README.md"):  # through the hook
+            self.assertIn("ergon guard: the breakdown agent is read-only", self.guard("Bash", {"command": cmd}, ro), cmd)
+        p = str(self.root / "README.md")
+        for tool, inp in (("Write", {"file_path": p, "content": "x"}),
+                          ("Edit", {"file_path": p, "old_string": "hi", "new_string": "ho"}),
+                          ("MultiEdit", {"file_path": p, "edits": []}), ("NotebookEdit", {"notebook_path": p}),
+                          ("WebFetch", {"url": "https://example.com"}), ("Task", {"prompt": "x"})):
+            self.assertIn("read-only", self.guard(tool, inp, ro) or "", tool)
+        # without the flag none of this changes: a worker's guard still lets a plain write through
+        self.assertIsNone(self.guard("Bash", {"command": "echo x > README.md"}))
+        self.assertIsNone(self.guard("Write", {"file_path": p, "content": "x"}))
+        self.assertIn("is a human's", self.guard("Bash", {"command": "ergon review --interactive"}, ro))
+        # it fails closed: outside an ergon project it refuses, where the plain guard stays silent
+        bare = Path(self.tmp.name) / "bare"
+        bare.mkdir()
+        event = json.dumps({"tool_name": "Read", "tool_input": {"file_path": "x"}, "cwd": str(bare)})
+        out = sh(sys.executable, str(ERGON), "hook", "guard", ro, cwd=bare, env=self.env, inp=event).stdout
+        self.assertIn('"deny"', out)
+        self.assertEqual(sh(sys.executable, str(ERGON), "hook", "guard", cwd=bare, env=self.env, inp=event).stdout, "")
+        # dispatch installs it for the breakdown agent only (TestBreakdown has a run): a worker's guard isn't read-only
+        code = (f"import sys; sys.path.insert(0, {str(ERGON.parent)!r}); from ergon import config, dispatch; "
+                f"config.configure({str(self.root)!r}); print(dispatch.worker_settings())")
+        worker = json.loads(sh(sys.executable, "-c", code, cwd=self.root, env=self.env).stdout)["hooks"]["PreToolUse"][0]
+        self.assertNotIn("--read-only", worker["hooks"][0]["command"])
+        self.assertEqual(worker["matcher"], "Edit|Write|MultiEdit|Bash")
 
     def test_guard_human_cmd_only_real_calls(self):
         """T-044: a human-only verb in a grep pattern or a commit message is data; a real call is
@@ -2968,6 +3049,38 @@ class TestBreakdown(DispatchProject):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("the checkout's `git status` changed during the breakdown", r.stdout)
         self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+
+    def test_read_only_guard_stops_a_write_the_allowlist_let_through(self):
+        """T-131: the breakdown agent's guard runs in read-only mode on every tool, so a write that got
+        past the dontAsk allowlist is still refused before it runs; reads still run."""
+        self.new_epic()
+        approve_epic(self)
+        head = sh("git", "rev-parse", "HEAD", cwd=self.root).stdout
+        decisions = Path(self.tmp.name) / "decisions.jsonl"
+        calls = [{"tool_name": "Bash", "tool_input": {"command": "echo oops >> README.md"}},
+                 {"tool_name": "Bash", "tool_input": {"command": "git commit -q --allow-empty -m sneaky"}},
+                 {"tool_name": "Bash", "tool_input": {"command": "rm README.md"}},
+                 {"tool_name": "Write", "tool_input": {"file_path": str(self.root / "README.md"), "content": "x\n"}},
+                 {"tool_name": "Bash", "tool_input": {"command": f"git log --oneline -1 > {self.tmp.name}/out"}},
+                 {"tool_name": "Bash", "tool_input": {"command": "git log --oneline -1 && ergon show E-001 | head -3"}},
+                 {"tool_name": "Read", "tool_input": {"file_path": str(self.root / "README.md")}}]
+        self.env.update(FAKE_BREAKDOWN_TOOLS=json.dumps(calls), FAKE_BREAKDOWN_DECISIONS=str(decisions))
+        out = self.ergon("breakdown", "E-001").stdout
+        seen = [json.loads(l) for l in decisions.read_text().splitlines()]
+        self.assertEqual([bool(s["denied"]) for s in seen], [True] * 5 + [False] * 2, seen)
+        for s in seen[:5]:
+            self.assertIn("ergon guard: the breakdown agent is read-only", s["denied"][0])
+        self.assertEqual((self.root / "README.md").read_text(), "hi\n")
+        self.assertEqual(sh("git", "rev-parse", "HEAD", cwd=self.root).stdout, head)
+        self.assertFalse((Path(self.tmp.name) / "out").exists())
+        self.assertIn("proposed T-001  (breakdown E-001)", out)  # the checkout stayed clean, so it filed
+        # A worker's guard lets the same shell writes through (they're its job): read-only mode stopped them.
+        for call in calls[:3]:
+            self.assertIsNone(self.guard("Bash", call["tool_input"], "--worker"))
+        argv = self.calls()[0]["argv"]
+        hooks = json.loads(argv[argv.index("--settings") + 1])["hooks"]["PreToolUse"]
+        self.assertEqual(hooks[0]["matcher"], "*")
+        self.assertIn("hook guard --worker --read-only", hooks[0]["hooks"][0]["command"])
 
     def test_breakdown_cost_counts_toward_the_cap(self):
         self.new_epic()

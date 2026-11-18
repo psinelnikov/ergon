@@ -415,10 +415,12 @@ def worker_agents():
     return out
 
 
-def worker_settings():
-    cmd = f'python3 "{_config.PKG}" hook guard --worker --project "{_config.HOME}"'
+def worker_settings(read_only=False):
+    """The --settings that install the guard hook. read_only (the breakdown agent's, never a
+    worker's): the guard sees every tool call and refuses anything that may write (gates.read_only_reason)."""
+    cmd = f'python3 "{_config.PKG}" hook guard --worker{" --read-only" if read_only else ""} --project "{_config.HOME}"'
     return json.dumps({"hooks": {"PreToolUse": [
-        {"matcher": _gates.GUARD_TOOLS, "hooks": [{"type": "command", "command": cmd}]}]}})
+        {"matcher": "*" if read_only else _gates.GUARD_TOOLS, "hooks": [{"type": "command", "command": cmd}]}]}})
 
 
 def worker_rules():
@@ -2135,8 +2137,9 @@ def land(t, base, wt, branch, pubs=(), accepted=None):
 # An approved epic is broken down into tasks by one headless `claude -p --agent task-breakdown`
 # (opus) in the main checkout. It is read-only: its tools are Read, Grep, Glob and Bash. The
 # permission mode is dontAsk, so only the read-only commands in BREAKDOWN_ALLOW run and every
-# other call is denied. The guard hook runs as it does for workers. If the checkout's `git
-# status` changed during the run, nothing is filed. The agent writes no tracker state. It
+# other call is denied. The guard hook runs in read-only mode (`hook guard --read-only`, on every
+# tool): it refuses any tool but Read/Grep/Glob and any Bash that may write, whatever the allowlist
+# let through. If the checkout's `git status` changed during the run, nothing is filed. The agent writes no tracker state. It
 # replies with TASK blocks, and the dispatcher files each block that passes `check`'s rules as
 # a `proposed` task in the epic, with source `breakdown E-NNN`. A malformed block is refused
 # with a warning and never repaired. Running it again only adds tasks: nothing existing is
@@ -2417,7 +2420,7 @@ def _run_breakdown(e, args, log, info, gate, sync):
     agent = breakdown_agent()
     cmd = ["claude", "-p", "--agents", json.dumps({BREAKDOWN_AGENT: agent}), "--agent", BREAKDOWN_AGENT,
            "--permission-mode", "dontAsk", "--allowedTools", ",".join(BREAKDOWN_ALLOW),
-           "--disallowedTools", ",".join(BREAKDOWN_DENY), "--settings", worker_settings(),
+           "--disallowedTools", ",".join(BREAKDOWN_DENY), "--settings", worker_settings(read_only=True),
            "--output-format", "json"]
     if args.budget:
         cmd += ["--max-budget-usd", str(args.budget)]

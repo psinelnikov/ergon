@@ -1344,8 +1344,172 @@ def is_flat_epic(path):
         return False
 
 
-def guard_reason(tool, inp, worker=False, cwd=None):
-    """Why this tool call must not run, or None. cwd: where a Bash command runs (the event's)."""
+# ---------- read-only guard (`hook guard --read-only`, the breakdown agent's) ----------
+# The breakdown agent is read-only by its dontAsk allowlist and by dispatch's `git status` check
+# after the run. This is a third layer, so it is an allowlist too, not a list of known writes:
+# the tools that only read, and shell commands made only of programs that only read (git and
+# ergon only with their read verbs), with no redirect to a file, no heredoc, no variable
+# assignment and nothing it can't split. Anything else is refused, including text it can't parse.
+
+READ_ONLY_TOOLS = {"Read", "Grep", "Glob", "LS", "TodoWrite"}
+# Programs that only read files and print. Not sed/awk/xargs/env/tee/tree/uniq-with-output and the
+# like: each can write a file or run another program. sort and find are checked for the options that do.
+READ_ONLY_PROGRAMS = {"ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "find", "pwd", "echo",
+                      "printf", "true", "false", "test", "[", "cd", "basename", "dirname", "realpath", "cut",
+                      "tr", "nl", "sort", "uniq", "diff", "cmp", "comm", "stat", "du", "which", "git", "ergon"}
+READ_ONLY_GIT = {"log", "show", "diff", "grep", "ls-files", "ls-tree", "blame", "status", "rev-parse", "rev-list",
+                 "cat-file", "shortlog", "describe", "merge-base", "name-rev", "show-ref", "for-each-ref",
+                 "diff-tree", "diff-index", "diff-files", "whatchanged", "count-objects", "branch", "worktree"}
+GIT_LIST_BRANCH = {"-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current", "-l", "--list",
+                   "--no-color", "--color"}
+READ_ONLY_ERGON = {"board", "show", "next", "review", "rules", "guide", "check", "audit", "stats", "related"}
+FIND_WRITES = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+# Redirects that write nowhere: to /dev/null, or from one descriptor to another (2>&1, >&2, >&-).
+HARMLESS_REDIRECT = re.compile(r"(?:[0-9]*|&)>>?\|?[ \t]*/dev/null(?![^\s;&|()<>])|[0-9]*>&(?:[0-9]+|-)(?![^\s;&|()<>])")
+READ_ONLY_MSG = ("the breakdown agent is read-only: {what}. Read files with Read, Grep and Glob, and run only "
+                 "read-only commands (git log/show/diff/grep/ls-files/blame/status, ergon show/next/board/check, "
+                 "ls, cat, head, tail, wc, grep), one program at a time, with no redirect to a file")
+
+
+def _code_text(cmd):
+    """cmd with its quoted literals blanked out, so what's left is what the shell reads as operators:
+    '...' and $'...' always, "..." unless it holds a $(...) or `...` (that's code, so it stays), and
+    a comment (a # starting a word, as shell_commands reads it) up to its newline: a quote in a
+    comment opens nothing, so it can't hide a redirect after it. None if a quote doesn't close."""
+    out, i, n = [], 0, len(cmd)
+    inword = False  # as shell_commands tracks it: an escaped space or a quote is inside a word
+    while i < n:
+        c = cmd[i]
+        if c == "#" and not inword:
+            j = cmd.find("\n", i)
+            out.append(" ")
+            i = n if j < 0 else j
+            continue
+        inword = c not in " \t\n;&|()<>"
+        if c == "\\":
+            out.append("  ")
+            i += 2
+        elif c == "'" or cmd.startswith("$'", i):
+            j = i + (2 if c == "$" else 1)
+            while j < n and cmd[j] != "'":
+                j += 2 if c == "$" and cmd[j] == "\\" else 1
+            if j >= n:
+                return None
+            out.append(" ")
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and cmd[j] != '"':
+                j += 2 if cmd[j] == "\\" else 1
+            if j >= n:
+                return None
+            span = cmd[i:j + 1]
+            out.append(span if re.search(r"\$\(|`", span) else " ")
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _long_opt(word, *names):
+    """Whether word is one of the long options names, or an abbreviation of one getopt or git would take."""
+    name = word.partition("=")[0]
+    return len(name) > 3 and name.startswith("--") and any(n.startswith(name) for n in names)
+
+
+def _read_only_git(words):
+    """Why a git call (words[0] is git) isn't a read, or None."""
+    i = 1
+    while i < len(words) and words[i].startswith("-"):
+        w = words[i]
+        if w.startswith(("-c", "--config-env", "--exec-path")):
+            return f"`git {w}` sets config or the programs git runs"
+        if w in ("-C", "--git-dir", "--work-tree", "--namespace") and i + 1 < len(words):
+            i += 1
+        i += 1
+    if i >= len(words):
+        return None  # bare `git` prints its usage
+    sub, rest = words[i], words[i + 1:]
+    if sub not in READ_ONLY_GIT:
+        return f"`git {sub}` isn't one of the read-only git commands"
+    if any(_long_opt(a, "--output", "--open-files-in-pager") for a in rest):
+        return f"`git {sub} --output` writes a file and `--open-files-in-pager` runs a program"
+    if sub == "grep" and any(re.match(r"-[^-]*O", a) for a in rest):
+        return "`git grep -O` runs a program"
+    if sub == "branch":
+        listing = any(a in ("-l", "--list") for a in rest)
+        if any(a not in GIT_LIST_BRANCH for a in rest if a.startswith("-")) or (
+                not listing and any(not a.startswith("-") for a in rest)):
+            return "`git branch` only lists here (-a, -r, -v, --list, --show-current)"
+    if sub == "worktree" and rest[:1] != ["list"]:
+        return "`git worktree` only lists here (`git worktree list`)"
+    return None
+
+
+def _read_only_words(words):
+    """Why one simple command (its words) isn't a read, or None."""
+    prog = words[0]
+    if ASSIGNMENT.match(prog):
+        return f"no variable assignments (`{prog}`): one can point git or a program at code to run"
+    if prog not in READ_ONLY_PROGRAMS:
+        return f"`{prog}` isn't one of the read-only programs"
+    rest = words[1:]
+    if prog == "git":
+        return _read_only_git(words)
+    if prog == "ergon":
+        verb = next((a for a in rest if not a.startswith("-")), "board")
+        if verb not in READ_ONLY_ERGON:
+            return f"`ergon {verb}` isn't one of ergon's read commands"
+        if verb == "review" and any(re.match(r"-[^-]*i", a) or _long_opt(a, "--interactive") for a in rest):
+            return "`ergon review -i` is a human's"
+    if prog == "find" and any(a in FIND_WRITES for a in rest):
+        return "`find -exec/-ok/-delete/-fprint/-fls` runs a program or writes a file"
+    if prog == "rg" and any(a == "--pre" or a.startswith("--pre=") for a in rest):
+        return "`rg --pre` runs a program"
+    if prog == "sort" and any(re.match(r"-[^-]*o", a) or (a.startswith("--") and a.startswith(("--o", "--co")))
+                              for a in rest):
+        return "`sort -o` writes a file and `--compress-program` runs one"
+    if prog == "uniq" and len([a for a in rest if not a.startswith("-")]) > 1:
+        return "`uniq IN OUT` writes OUT"
+    return None
+
+
+def read_only_reason(tool, inp):
+    """Why a call by the read-only (breakdown) agent must not run, or None. Refuses every tool but
+    READ_ONLY_TOOLS and Bash, and Bash unless each command it runs passes _read_only_words."""
+    if tool != "Bash":
+        return None if tool in READ_ONLY_TOOLS else READ_ONLY_MSG.format(what=f"{tool} isn't a read-only tool")
+    cmd = inp.get("command", "")
+    code = _code_text(cmd)
+    if code is None:
+        return READ_ONLY_MSG.format(what="a quote doesn't close")
+    if ">" in HARMLESS_REDIRECT.sub(" ", code):
+        return READ_ONLY_MSG.format(what="no redirect to a file (only to /dev/null or another descriptor)")
+    if re.search(r"(?<!<)<<(?!<)", code):
+        return READ_ONLY_MSG.format(what="no heredocs")
+    try:
+        cmds = shell_commands(cmd)[0]
+    except (ValueError, RecursionError):
+        return READ_ONLY_MSG.format(what="a command it can't split into words")
+    if not cmds:
+        return None
+    for words, _ in cmds:
+        why = _read_only_words(words)
+        if why:
+            return READ_ONLY_MSG.format(what=why)
+    return None
+
+
+def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
+    """Why this tool call must not run, or None. cwd: where a Bash command runs (the event's).
+    read_only: the breakdown agent's guard, which refuses anything that may write (read_only_reason)
+    on top of every rule below."""
+    if read_only:
+        why = read_only_reason(tool, inp)
+        if why or tool != "Bash":  # its hook sees every tool; the rules below are for Bash, Edit and Write
+            return why
     if worker:
         why = shared_companion_reason(tool, inp)
         if why:
@@ -1454,21 +1618,30 @@ def replan_reason(key, status):
             f"edit it and run `ergon approve <ID>` again")
 
 
+def deny(why):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "deny",
+        "permissionDecisionReason": f"ergon guard: {why}"}}))
+
+
 def hook(args):
     if args.event == "commit-msg":
         return commit_msg_hook(args)
+    # The read-only guard (the breakdown agent's) fails closed: with no project, or on a crash, it refuses.
+    read_only = args.event == "guard" and getattr(args, "read_only", False)
     try:
         event = json.load(sys.stdin)
         try:
             _config.configure(args.project or os.environ.get("CLAUDE_PROJECT_DIR") or event.get("cwd"))
         except _config.NotConfigured:
+            if read_only:
+                deny("the read-only guard found no ergon project, so it refuses everything")
             sys.exit(0)  # not an ergon project
         if args.event == "guard":
-            why = guard_reason(event.get("tool_name"), event.get("tool_input") or {}, args.worker, event.get("cwd"))
+            why = guard_reason(event.get("tool_name"), event.get("tool_input") or {}, args.worker,
+                               event.get("cwd"), read_only)
             if why:
-                print(json.dumps({"hookSpecificOutput": {
-                    "hookEventName": "PreToolUse", "permissionDecision": "deny",
-                    "permissionDecisionReason": f"ergon guard: {why}"}}))
+                deny(why)
         elif args.event == "stop" and not event.get("stop_hook_active"):
             errs, summary = _tasks.lint()
             if errs:
@@ -1476,8 +1649,11 @@ def hook(args):
                     "`ergon check` fails:\n" + "\n".join(errs[:20]) + f"\n{summary}\n"
                     "Fix what your change caused (e.g. a card's `→ task` link to a task you closed). "
                     "If it isn't yours, say so to the user and stop.")}))
-    except Exception as err:  # fail open
-        print(f"ergon hook error (ignored): {err}", file=sys.stderr)
+    except Exception as err:  # fail open, but for the read-only guard
+        if read_only:
+            deny(f"the read-only guard failed ({err}), so it refuses")
+        else:
+            print(f"ergon hook error (ignored): {err}", file=sys.stderr)
     sys.exit(0)
 
 

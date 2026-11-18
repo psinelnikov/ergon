@@ -131,7 +131,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                it out into <state>/ on another clone (which must hold no task
                                files). The state branch is the only thing ergon ever pushes, never
                                code. Never from an agent shell or a task/ branch
-  ergon hook guard|stop        Claude Code hooks (the plugin wires them); not for humans
+  ergon hook guard|stop        Claude Code hooks (the plugin wires them); not for humans.
+                               guard --read-only (the breakdown agent's) also refuses Edit, Write
+                               and any Bash that may write a file or change git state: only
+                               read-only programs (git log/diff/show..., ergon show/next/check...,
+                               ls, cat, grep...), no redirect to a file, and it fails closed
   ergon hook commit-msg FILE   the git hook `init --hooks` installs; not for humans
 """
 import argparse
@@ -471,6 +475,9 @@ def main():
     hk.add_argument("event", choices=["guard", "stop", "commit-msg"])
     hk.add_argument("msgfile", nargs="?", help="commit-msg: the file git passes")
     hk.add_argument("--worker", action="store_true", help="dispatch sets this: guard companion checkouts too")
+    hk.add_argument("--read-only", action="store_true",
+                    help="guard: refuse every tool but Read/Grep/Glob and read-only Bash, and fail closed "
+                         "(dispatch sets it for the breakdown agent)")
     hk.add_argument("--project", help="the project to guard (default: $CLAUDE_PROJECT_DIR, then the event's cwd)")
     args = ap.parse_args()
     if args.cmd == "hook":
