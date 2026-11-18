@@ -58,6 +58,7 @@ from . import concepts as _concepts
 from . import config as _config
 from . import gitops as _gitops
 from . import history as _history
+from . import limits as _limits
 from . import metrics as _metrics
 from . import priority as _priority
 from . import report as _report
@@ -488,8 +489,18 @@ def bar(done, total):
             f'<rect class=fg width={w} height=8 rx=4 /></svg>')
 
 
+def park_mark(t):
+    """`limited until HH:MM` / `asking` for a task dispatch parked, else ""."""
+    lim = _tasks.limited(t)
+    if lim:
+        return f"limited until {_limits.clock(lim[0])}"
+    return "asking" if _tasks.is_asking(t) else ""
+
+
 def task_li(t, tasks, extra=""):
     flags = []
+    if park_mark(t):
+        flags.append(f'<span class=park>{esc(park_mark(t))}</span>')
     if t.get("epic"):
         flags.append(f'<a href="/e/{esc(t["epic"])}">{esc(t["epic"])}</a>')
     if t["status"] == "ready" and not _tasks.deps_done(t, tasks):
@@ -784,7 +795,8 @@ def task_page(tid, nonce):
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
          f'<h1>{esc(tid)} {esc(t.get("title"))}</h1>',
          f'<p><span class="status st-{esc(t["status"])}">{esc(t["status"])}</span> · '
-         f'<span class=tier>{esc(t.get("tier"))}</span> <span class=tier>{esc(_tasks.category(t))}</span></p>']
+         f'<span class=tier>{esc(t.get("tier"))}</span> <span class=tier>{esc(_tasks.category(t))}</span>'
+         + (f' · <span class=park>{esc(park_mark(t))}</span>' if park_mark(t) else "") + '</p>']
 
     fus = _tasks.follow_ups(t, tasks, open_only=False)
     if fus:
