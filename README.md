@@ -21,6 +21,9 @@ Commands for the ordering:
 ergon grade [--all] [--epic E] [--per 4] [--model sonnet] [--budget USD] [--dry-run]
                         # one claude -p compares tasks in pairs and writes cod:, cod_why: and graded:.
                         # Only stale tasks (new, or brief changed) unless --all
+ergon fill [ID ...] [--epic E] [--model sonnet] [--dry-run]
+                        # claude (read-only tools, in this checkout) fills the blank What, Done when,
+                        # touches: and tier of proposed briefs; never replaces what's written
 ergon pin ID first|last|clear   # HUMAN ONLY: pin a task first or last in the order, or clear the pin
 ```
 

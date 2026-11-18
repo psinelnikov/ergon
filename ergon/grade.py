@@ -43,6 +43,7 @@ WHY_KEEP = 300  # what is stored: models overrun WHY_MAX, and a why cut mid-word
 PRIOR_GAMES = 1  # virtual games, each a tie, against a fixed reference player (see fit)
 SPAN = 6.0  # log-strength spread of the 0-100 scale when anchors are held fixed (see fit)
 MIN_ANCHORS = 3  # fewer graded tasks than this and grade() falls back to a full grade
+READ_ONLY = "Read,Grep,Glob"  # call(read_only_in=...): the tools claude may use
 
 PROMPT = """You are helping order a project's backlog by cost of delay. Below are {n} task briefs, \
 then a list of pairs of them. For each pair, decide which costs more to leave undone for another \
@@ -266,21 +267,27 @@ def set_fields(text, fields):
     return text[:m.start(1)] + "\n".join(lines) + text[m.end(1):]
 
 
-def call(text, model, budget, who="grade"):
+def call(text, model, budget, who="grade", read_only_in=None, timeout=TIMEOUT):
     """claude's JSON envelope for `text`, from one `claude -p` with no tools, run in an empty
     folder (no project CLAUDE.md or hooks; whatever it needs is inline in `text`). SystemExit
     (nothing written) when the call failed; `who` names the command in the message. `ergon quiz`
-    asks through here too."""
+    asks through here too. With `read_only_in` (a folder) it runs there instead, with Read, Grep
+    and Glob only, nothing else allowed and no MCP servers: `ergon fill` reads the code that way."""
     if not shutil.which("claude"):
         raise SystemExit(f"ergon {who}: `claude` isn't on PATH")
-    cmd = ["claude", "-p", "--model", model, "--tools", "", "--output-format", "json"]
+    tools = ["--tools", ""]
+    if read_only_in:
+        tools = ["--tools", READ_ONLY, "--allowedTools", READ_ONLY, "--permission-mode", "dontAsk",
+                 "--strict-mcp-config"]
+    cmd = ["claude", "-p", "--model", model, *tools, "--output-format", "json"]
     if budget:
         cmd += ["--max-budget-usd", str(budget)]
-    with tempfile.TemporaryDirectory() as cwd:
+    with tempfile.TemporaryDirectory() as tmp:
         try:
-            r = subprocess.run(cmd, input=text, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT)
+            r = subprocess.run(cmd, input=text, cwd=read_only_in or tmp, capture_output=True, text=True,
+                               timeout=timeout)
         except subprocess.TimeoutExpired:
-            raise SystemExit(f"ergon {who}: claude took over {TIMEOUT // 60} min; nothing written")
+            raise SystemExit(f"ergon {who}: claude took over {timeout // 60} min; nothing written")
     try:
         d = json.loads(r.stdout)
     except ValueError:
@@ -291,13 +298,14 @@ def call(text, model, budget, who="grade"):
     return d
 
 
-def write_record(out):
-    folder = _config.RUNS / "grade"
+def write_record(out, kind="grade"):
+    """`out` as <state>/runs/<kind>/<kind>-<time>.json. `ergon fill` writes its record here too."""
+    folder = _config.RUNS / kind
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"grade-{datetime.datetime.now():%Y%m%d-%H%M%S}.json"
+    path = folder / f"{kind}-{datetime.datetime.now():%Y%m%d-%H%M%S}.json"
     while path.exists():
         time.sleep(1)
-        path = folder / f"grade-{datetime.datetime.now():%Y%m%d-%H%M%S}.json"
+        path = folder / f"{kind}-{datetime.datetime.now():%Y%m%d-%H%M%S}.json"
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(out, indent=1, ensure_ascii=False) + "\n")
     tmp.replace(path)

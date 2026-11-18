@@ -59,6 +59,10 @@ Order: tasks pinned `first` go to the top, tasks pinned `last` to the bottom, an
 
 `ergon grade [--all] [--epic E] [--per 4] [--model sonnet] [--budget USD] [--dry-run]` sets `cod:` by pairwise comparison (one `claude -p`, no tools). By default only stale tasks are graded: those with no `graded:` stamp, or whose stamp no longer matches the brief. `--all` regrades every open task. Grading writes only `cod:`, `cod_why:` and `graded:`. None of them is in the brief digest, so grading never un-approves a task and a signed approval still holds.
 
+## Filling in thin briefs
+
+`ergon fill [ID|E-ID ...] [--epic E] [--model sonnet] [--budget USD] [--dry-run]` writes the parts a proposed brief left blank: What, Done when, `touches:`, and `tier` with `tier_why:` when nobody sized it (empty, or the placeholder a FOUND line or an import leaves). It runs one `claude -p` per batch of up to 8 tasks in the main checkout with Read, Grep and Glob only, so it can cite `file:line` and name real paths. It never replaces what's written and never edits a task past `proposed`. A tier below a matching `[[protect]]` minimum is raised to it. Each filled task gets a Notes line naming what was machine-written: read it before approving. Agents may run it, since it only proposes. The record goes to `<state>/runs/fill/`.
+
 ## Lifecycle
 
 ```
@@ -221,6 +225,7 @@ One JSON object per line, appended as things happen, gitignored with `runs/`. Ev
 | `window` | a dispatch run ended and both probes read the 5-hour window (`task` and `epic` are null) | `before`, `after` (utilization, 0..1), `resets_at` (epoch seconds), `cost` (the run's workers, reviewers and probes, USD), `same` (false if the window reset in between: no rate from it) |
 | `epic_finished` | the epic merged into the trunk and closed (`task` is null) | `branch`, `commit` (the merge commit; both null if it never had a branch) |
 | `graded` | `ergon grade` wrote cost-of-delay grades (`task` is null) | `tasks` (the IDs it wrote), `model`, `cost`, `dropped` (comparison replies it threw away) |
+| `filled` | `ergon fill` wrote blank parts of proposed briefs (`task` is null) | `tasks` ({ID: [parts written]}), `model`, `cost`, `dropped` (reply entries for tasks it wasn't asked about) |
 | `pinned` | `ergon pin` set or cleared a task's `pin:` (human only) | `by`, `pin`: `first`, `last`, or null on a clear |
 
 `round` (2, 3, …) is on the `dispatched`, `resumed`, `worker_end`, `verify` and `review` rows of a fix round (review round N+1 is fix round N), and on the `conflict` row, the worker rows of the conflict round that follows it and the verify and review rows after that. It numbers worker runs on the branch in order, whatever the kind of round. A row without `round` is round 1. Other loops are to mark their rounds the same way.

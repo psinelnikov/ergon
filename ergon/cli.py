@@ -80,6 +80,12 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                Only new and changed tasks are graded, against --per anchors
                                spread over the graded ones (all, with under 3 graded, or --all).
                                --dry-run lists the pairs and asks nothing
+  ergon fill [ID ...] [--epic E] [--model sonnet] [--budget USD] [--dry-run]
+                               one `claude -p` per 8 tasks (Read, Grep and Glob in this checkout,
+                               nothing that writes) fills the blank parts of proposed briefs: What,
+                               Done when, touches:, tier and tier_why (when unsized). Never replaces
+                               what's written, never edits an approved task; a Notes line says what
+                               was filled. Record in <state>/runs/fill/. An epic ID means its tasks
   ergon journal [E-ID ...] [--all] [--model sonnet] [--budget USD]
                                one `claude -p` (no tools) per epic writes its journal entry: what it
                                set out to do, what landed, how the work went (from its history rows
@@ -115,6 +121,7 @@ from pathlib import Path
 
 from . import config as _config
 from . import dispatch as _dispatch
+from . import fill as _fill
 from . import gates as _gates
 from . import gitops as _gitops
 from . import grade as _grade
@@ -371,6 +378,12 @@ def main():
     gr.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
     gr.add_argument("--all", action="store_true", help="regrade every open task, not only new and changed ones")
     gr.add_argument("--dry-run", action="store_true", help="print the pairs; ask nothing, write nothing")
+    fl = sub.add_parser("fill", help="fill the blank parts of proposed briefs from the code (runs claude -p)")
+    fl.add_argument("ids", nargs="*", metavar="ID", help="tasks, or epics meaning their tasks (default: every proposed task with a gap)")
+    fl.add_argument("--epic")
+    fl.add_argument("--model", default="sonnet", help="default sonnet")
+    fl.add_argument("--budget", type=float, help="max USD per call (--max-budget-usd)")
+    fl.add_argument("--dry-run", action="store_true", help="list each task's gaps; ask nothing, write nothing")
     jn = sub.add_parser("journal", help="write each epic's journal entry, shown on /e/E-NNN (runs claude -p)")
     jn.add_argument("ids", nargs="*", metavar="E-ID", help="epics to write (default: those with no entry or newer history)")
     jn.add_argument("--all", action="store_true", help="every epic, not only those with a missing or stale entry")
@@ -441,7 +454,7 @@ def run(args):
         # writes only, not the minutes claude takes to answer
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "rules": rules,
-         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "journal": journal, "sync": _shared.sync}[args.cmd](args)
+         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "journal": journal, "sync": _shared.sync}[args.cmd](args)
 
 
 if __name__ == "__main__":
