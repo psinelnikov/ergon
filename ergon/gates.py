@@ -1265,15 +1265,51 @@ GIT_CMD_OPTS = {
     "grep": ({"--o|pen-files-in-pager": "cmd="}, {"O": "cmd="}, "efABCm"),
     "send-email": ({"--to-c|md": "cmd", "--cc-c|md": "cmd", "--header-c|md": "cmd", "--sendmail-c|md": "cmd",
                     "--smtp-server|": "cmd"}, {}, ""),
+    "instaweb": ({"--h|ttpd": "cmd"}, {"d": "cmd"}, "bpm"),  # run as `$httpd conf`, word-split
 }
+# Config keys whose value is a remote's URL, and the url.<base>.insteadOf keys whose <base> is one:
+# an ext:: URL there is a command git runs (ext_command) on the next fetch or push.
+GIT_URL_KEYS = re.compile(r"remote\..+\.(url|pushurl)|submodule\..+\.url")
+GIT_INSTEADOF_KEY = re.compile(r"url\.(.+)\.(push)?insteadof", re.I | re.S)
+
+
+def ext_command(url):
+    """The command line git runs for an ext:: URL (git-remote-ext(1)), or None if url isn't one.
+    Its argv is the text after `ext::` split at each unescaped space, with `% ` a literal space,
+    `%%` a percent, `%s`/`%S` the service name, and an argument starting `%G` or `%V` dropped.
+    The transport name is matched case-blind; an escape git would reject is read leniently."""
+    m = re.match(r"(?is)ext::(.*)", url)
+    if not m:
+        return None
+    args, cur, keep, text, i = [], "", True, m.group(1), 0
+    while i <= len(text):
+        c = text[i] if i < len(text) else " "
+        if i == len(text) or c == " ":
+            if keep:
+                args.append(cur)
+            cur, keep = "", True
+        elif c == "%" and i + 1 < len(text):
+            i, e = i + 1, text[i + 1]
+            if e in "GV" and cur == "":
+                keep = False
+            cur += {"s": "upload-pack", "S": "git-upload-pack"}.get(e, e)
+        else:
+            cur += c
+        i += 1
+    return shlex.join(args)
 
 
 def git_config_command(key, val):
     """The command line git runs from config key = val, or None if it runs none: a `!` alias as shell
     text and any other as the git call it expands to, a credential helper as `git credential-<val>`
-    unless it's `!` text or an absolute path, a submodule's update only if it's `!` text, and the
-    value itself for the other GIT_COMMAND_KEYS."""
+    unless it's `!` text or an absolute path, a submodule's update only if it's `!` text, an ext::
+    URL as a remote's or submodule's URL or as the <base> an insteadOf rewrites to (ext_command),
+    and the value itself for the other GIT_COMMAND_KEYS."""
     k = key.lower()
+    if GIT_URL_KEYS.fullmatch(k):
+        return ext_command(val)
+    if m := GIT_INSTEADOF_KEY.fullmatch(key):
+        return ext_command(m.group(1))
     if not GIT_COMMAND_KEYS.fullmatch(k):
         return None
     if k.startswith("alias."):
@@ -1319,9 +1355,12 @@ def _option_values(rest, longs, shorts, valued):
 def git_commands(words):
     """The command lines a git call among words runs from its own arguments, which the lexer saw
     as data: the value of each GIT_CMD_OPTS option (rebase --exec, filter-branch's filters, difftool
-    --extcmd, ...), `submodule foreach`'s command, and each GIT_COMMAND_KEYS value it sets
+    --extcmd, instaweb --httpd, ...), `submodule foreach`'s command, the command of each ext:: URL
+    among its arguments (clone, fetch, push, ls-remote, remote add, archive --remote=...; any
+    subcommand, as a word or an --option= value), and each GIT_COMMAND_KEYS or URL value it sets
     (`git -c key=...`, `git config key ...`, `git clone -c key=...`) as git_config_command reads it.
-    A later `git x` names no verb, so an alias is checked where it is defined."""
+    A later `git x` or `git fetch x` names no verb, so an alias or a remote is checked where it is
+    defined."""
     out = []
 
     def config(key, val):
@@ -1344,6 +1383,9 @@ def git_commands(words):
             sub, rest = prog[4:], words[i:]
         else:
             continue
+        for a in rest:  # an ext:: URL is a command wherever git takes a URL
+            if (c := ext_command(re.sub(r"^--[^=]+=", "", a))) is not None:
+                out.append(c)
         if sub == "config":
             for j, a in enumerate(rest[:-1]):
                 if "=" not in a:
