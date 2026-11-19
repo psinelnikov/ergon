@@ -26,8 +26,9 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                runs) the `gh issue comment/close` commands
   ergon obsidian [--dry-run]   unticked checkbox lines tagged #<tag> in the vault named by [obsidian]
                                in .ergon.toml (vault, tag, exclude, write_back) as proposed tasks,
-                               tier human, source: obsidian:<note>#<key>. Reads the vault, never
-                               writes it; a line already imported is skipped; --dry-run files nothing
+                               tier human, source: obsidian:<note>#<key>. A line already imported is
+                               skipped; --dry-run files nothing. With write_back = true (not in an agent
+                               shell) adds ^ergon-<hash> block ids and ticks lines of done/dropped tasks
   ergon set ID status=doing    agents: ready -> doing -> done | blocked (never approval)
   ergon start E-ID             branch epic/<folder> off the trunk and check it out in its own
                                worktree, <worktrees>/E-ID (also happens on an epic's first `doing`)

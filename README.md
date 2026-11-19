@@ -170,7 +170,7 @@ Epic branches are code and still move through your normal git flow, so `set`'s c
 
 ## Working with Obsidian
 
-`ergon obsidian [--dry-run]` turns tagged checkbox lines in an Obsidian vault into `proposed` tasks. It reads the vault and never writes to it. It needs no plugin and no Obsidian running.
+`ergon obsidian [--dry-run]` turns tagged checkbox lines in an Obsidian vault into `proposed` tasks. It reads the vault, and writes to it only with `write_back = true` (below). It needs no plugin and no Obsidian running.
 
 ```toml
 [obsidian]
@@ -185,6 +185,12 @@ Without the table, `ergon obsidian` says it isn't configured and does nothing.
 **The line format** is the Tasks plugin's: an unticked checkbox (`- [ ]` or `* [ ]`, any indent) carrying the tag as a whole tag, such as `- [ ] Compare the health plans #agent 📅 2026-12-01`. Ticked lines, untagged lines and `#agents` don't match. Each new line becomes a task with `tier: human` and `source: obsidian:<note path>#<key>`. The title is the line without the checkbox, the tag, a trailing `^block-id` and the plugin's emoji fields (📅 ⏳ 🛫 ➕ ✅ 🔁 ⏫ 🔼 🔽 and their values), cut to 70 characters. What quotes the line and names the note, and the 📅 and ⏳ dates go into Notes as `due:` and `scheduled:` lines. Vault text is untrusted, like an issue body: a task is never approved by import, and you rewrite it as a brief before approving. The command prints how many lines it found, filed and skipped as already imported. `--dry-run` prints what it would file and files nothing.
 
 **The key** is `sha256(note path + line text)[:10]`. Editing an imported line's text (or moving it to another note) changes the key, so the link to its task is lost while `write_back` is off, and the edited line imports again as a new task. Edit the task in ergon instead, or leave the line alone.
+
+**Write-back** is off by default; set `write_back = true` in `[obsidian]` to turn it on. Each write changes one line and keeps every other byte of the note (CRLF endings included), goes through a temp file and a rename, and is skipped and reported if the note changed between ergon reading it and writing it.
+
+- *Block ids.* An imported line gets ` ^ergon-<hash>` appended, and `source:` becomes `obsidian:<note>#^ergon-<hash>`, so the link survives edits to the line's text. A line that already ends in a block id keeps it and is keyed on it. A task imported earlier with a hash key keeps that key (ergon finds its line by note path and text).
+- *Ticking.* Each `ergon obsidian` run also looks at the tasks with an `obsidian:` source. A `done` task's line gets `- [ ]` turned into `- [x]` and ` ✅ <date> (ergon T-NNN)`; a `dropped` task's line gets ` (ergon T-NNN dropped)` and keeps its box. A block id stays the last thing on the line, so the mark goes before it. A line already ticked or already carrying an `(ergon T-NNN ...)` mark is left alone, so runs repeat safely. A line ergon can't find is reported (`T-012: line gone from Health/Insurance.md`) and nothing is written for it.
+- *Without write-back, and in agent shells.* With `write_back = false` nothing is looked at. With `write_back = true` inside an agent shell (`CLAUDECODE` or `AI_AGENT` set) ergon never writes the vault: intake still files proposed tasks (with hash keys), the changes it would make are printed, and a line says writes are a human's. `--dry-run` prints them too.
 
 **A view of the tasks in Obsidian.** Symlink `tasks/` into the vault (`ln -s /path/to/repo/tasks ~/Notes/ergon-tasks`) and query it with a Bases view: task files keep their state in YAML frontmatter, including block-style lists. `ergon obsidian` doesn't follow symlinked folders, so it never scans the linked task files.
 

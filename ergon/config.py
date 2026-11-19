@@ -73,7 +73,7 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 #                               # they stay ready for the next run
 
 # Take tasks from an Obsidian vault: `ergon obsidian` files each unticked checkbox line carrying #tag as a
-# proposed task (tier human). Reads the vault only; write_back is acted on from T-156.
+# proposed task (tier human). write_back = true also adds block ids and ticks done/dropped tasks' lines (never in an agent shell).
 # [obsidian]
 # vault = "~/Notes"             # a path, ~ expanded; must exist
 # tag = "agent"                 # lines tagged #agent

@@ -1089,6 +1089,97 @@ class TestObsidian(Project):
         self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 4)
         self.assertEqual(self.hashes(v), before)
 
+    def set_status(self, tid, status):
+        f = self.task_file(tid)
+        f.write_text(f.read_text().replace("status: proposed", f"status: {status}", 1))
+
+    def wb_vault(self, write_back="true"):
+        v = self.root.parent / "vault"
+        (v / "Health").mkdir(parents=True)
+        (v / "Health" / "Insurance.md").write_bytes(
+            b"# Ins\r\n- [ ] Compare plans #agent \xf0\x9f\x93\x85 2026-12-01\r\n- [ ] Call them #agent ^mine\r\n"
+            b"- [ ] Cancel old #agent\r\nplain\r\nlast")
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + f'\n[obsidian]\nvault = "{v}"\nwrite_back = {write_back}\n')
+        return v, v / "Health" / "Insurance.md"
+
+    def test_write_back(self):
+        v, note = self.wb_vault()
+        out = self.ergon("obsidian").stdout
+        self.assertIn("filed 3", out)
+        text = note.read_bytes().decode()
+        self.assertRegex(text, r"Compare plans #agent \U0001F4C5 2026-12-01 \^ergon-[0-9a-f]{10}\r\n")
+        self.assertIn("Call them #agent ^mine\r\n", text)
+        self.assertIn("source: obsidian:Health/Insurance.md#^mine\n", self.task_file("T-002").read_text())
+        self.assertRegex(self.task_file("T-001").read_text(), r"source: obsidian:Health/Insurance\.md#\^ergon-[0-9a-f]{10}\n")
+        self.assertIn("skipped 3", self.ergon("obsidian").stdout)
+        self.assertEqual(note.read_bytes().decode(), text)
+        self.set_status("T-001", "done")
+        self.set_status("T-002", "dropped")
+        before = self.hashes(v)
+        env = clean_env(**{"CLAUDE" + "CODE": "1"})
+        out = self.ergon("obsidian", env=env).stdout
+        self.assertIn("writing the vault is a human's", out)
+        self.assertIn("would change", out)
+        self.assertEqual(self.hashes(v), before)
+        out = self.ergon("obsidian").stdout
+        self.assertIn("2 line(s) ticked", out)
+        new = note.read_bytes().decode()
+        today = __import__("datetime").date.today().isoformat()
+        self.assertRegex(new, rf"- \[x\] Compare plans #agent \U0001F4C5 2026-12-01 \u2705 {today} \(ergon T-001\) \^ergon-[0-9a-f]{{10}}\r\n")
+        self.assertIn("- [ ] Call them #agent (ergon T-002 dropped) ^mine\r\n", new)
+        self.assertEqual(len(new.split("\r\n")), len(text.split("\r\n")))
+        self.assertTrue(new.endswith("\r\nplain\r\nlast"))
+        after = self.hashes(v)
+        out = self.ergon("obsidian").stdout
+        self.assertNotIn("ticked", out)
+        self.assertEqual(self.hashes(v), after)
+
+    def test_write_back_off_and_hash_keys(self):
+        v, note = self.wb_vault("false")
+        self.ergon("obsidian")
+        self.assertRegex(self.task_file("T-001").read_text(), r"source: obsidian:Health/Insurance\.md#[0-9a-f]{10}\n")
+        self.set_status("T-001", "done")
+        self.set_status("T-003", "dropped")
+        before = self.hashes(v)
+        out = self.ergon("obsidian").stdout
+        self.assertNotIn("would change", out)  # write_back off: nothing is looked at
+        self.assertEqual(self.hashes(v), before)
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text().replace("write_back = false", "write_back = true"))
+        self.ergon("obsidian")
+        new = note.read_bytes().decode()
+        self.assertIn("- [x] Compare plans #agent", new)
+        self.assertIn("Cancel old #agent (ergon T-003 dropped)\r\n", new)
+        self.assertNotIn("^ergon-", new)  # earlier hash keys stay, no block ids added to them
+        after = self.hashes(v)
+        out = self.ergon("obsidian").stdout
+        self.assertNotIn("gone", out)
+        self.assertEqual(self.hashes(v), after)
+
+    def test_write_back_missing(self):
+        v, note = self.wb_vault()
+        self.ergon("obsidian")
+        self.set_status("T-001", "done")
+        text = note.read_bytes().decode()
+        note.write_bytes(text.replace("Compare plans", "Compare other").replace(" ^ergon-", " ^x-").encode())
+        r = self.ergon("obsidian")
+        self.assertIn("T-001: line gone from Health/Insurance.md", r.stdout)
+        note.unlink()
+        r = self.ergon("obsidian")
+        self.assertIn("T-001: line gone from Health/Insurance.md", r.stdout)
+
+    def test_rewrite_skips_changed_note(self):
+        from ergon import obsidian as ob
+        v, note = self.wb_vault()
+        old = note.read_bytes()
+        note.write_bytes(old + b"more")
+        self.assertFalse(ob.rewrite(note, old, b"x"))
+        self.assertEqual(note.read_bytes(), old + b"more")
+        self.assertTrue(ob.rewrite(note, old + b"more", b"x"))
+        self.assertEqual(note.read_bytes(), b"x")
+        self.assertEqual([p.name for p in note.parent.iterdir()], ["Insurance.md"])
+
     def test_missing_vault(self):
         cfg = self.root / ".ergon.toml"
         cfg.write_text(cfg.read_text() + '\n[obsidian]\nvault = "/nonexistent/vault"\n')
