@@ -3958,6 +3958,56 @@ class TestRemerge(DispatchProject):
                     self.assertTrue((self.root / "later.txt").exists() and (self.root / "T-002.txt").exists())
                 self.assertEqual(len(self.calls()), 1)
 
+    def test_six_landing_at_once_all_land_in_line(self):
+        # T-209: six finish at once. Run side by side, each landing sent the rest out for another
+        # pass, and the sixth needed five, past remerge_rounds = 3. In line, only the one ahead
+        # merges in its moved base and lands; waiting costs no pass, so each needs one at most.
+        self.add_config('verify = "sleep 0.3"')
+        self.env.pop("FAKE_SLEEP_SONNET")
+        for n in range(1, 7):
+            self.ergon("new", "task", f"Job {n}", "--tier", "sonnet", "--touches", f"j{n}.txt")
+            stamp(self.task_file(f"T-00{n}"))
+        out = self.ergon("dispatch", "--jobs", "6").stdout
+        self.assertIn("6/6 done", out)
+        passes = {f"T-00{n}": [r["round"] for r in self.rows("merged_base", f"T-00{n}")] for n in range(1, 7)}
+        self.assertTrue(all(p in ([], [1]) for p in passes.values()), (passes, out))
+        self.assertEqual(sorted(len(p) for p in passes.values()), [0, 1, 1, 1, 1, 1], (passes, out))
+        self.assertTrue(all((self.root / f"T-00{n}.txt").exists() for n in range(1, 7)))
+        self.assertIn("in line behind", out)
+        self.assertEqual(sum("Merge main into" in s for s in sh("git", "log", "--format=%s", "main",
+                                                                cwd=self.root).stdout.splitlines()), 5)
+
+    def test_landing_line_order(self):
+        # T-209: of tasks on a common branch, one goes at a time; next, the one with the most passes,
+        # then the one in line first. A task that steps out for a worker keeps its place.
+        import threading
+        from ergon.dispatch import LandingLine, landing_targets
+        line, main, order, said = LandingLine(), landing_targets("main", []), [], []
+        info = {k: {"remerges": n} for k, n in (("A", 0), ("B", 0), ("C", 2), ("D", 0))}
+        line.wait("A", main, info["A"])  # nobody in line: its turn at once
+        line.wait("A", main, info["A"])  # already its turn: no-op
+        line.wait("E", landing_targets("E-002", []), {})  # another branch: no wait
+        line.leave("E")
+
+        def go(k):
+            line.wait(k, main, info[k], lambda other: said.append((k, other)))
+            order.append(k)
+            line.leave(k)
+        threads = []
+        for k in ("B", "D", "C"):  # in line in that order; C has made two passes
+            threads.append(threading.Thread(target=go, args=(k,)))
+            threads[-1].start()
+            while k not in line.members:
+                time.sleep(0.01)
+        line.step_out("A")  # A's fix worker runs: C, the most passes, goes; then B, D in line order
+        for th in threads:
+            th.join(5)
+        self.assertEqual(order, ["C", "B", "D"])
+        self.assertEqual(sorted(said), [("B", "A"), ("C", "A"), ("D", "A")])
+        self.assertEqual((line.members, line.places), ({}, {"A": 0}))  # A kept its place while out
+        line.leave("A")
+        self.assertEqual(line.places, {})
+
     def test_unmoved_base_lands_as_before(self):
         self.add_config('verify = "true"')
         self.ergon("new", "task", "Alone", "--tier", "haiku")
@@ -4894,9 +4944,7 @@ class TestHistory(DispatchProject):
             self.ergon("new", "task", f"Job {n}", "--tier", "sonnet", "--touches", f"j{n}.py")
             stamp(self.task_file(f"T-00{n + 1}"))
         self.env.update(FAKE_FOUND="|".join(f"Follow-up {i} — " + "why " * 300 for i in range(3)))
-        # six landing at once: the last may find main moved five times, a pass on its merge each (T-196)
-        cfg = self.root / ".ergon.toml"
-        cfg.write_text("remerge_rounds = 6\n" + cfg.read_text())
+        # six landing at once, with the default remerge_rounds = 3: they take their passes in line (T-209)
         out = self.ergon("dispatch", "--jobs", "6").stdout
         self.assertIn("6/6 done", out)
         for n in range(1, 7):

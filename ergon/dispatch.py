@@ -2561,6 +2561,76 @@ def kept_note(wt, branch, pubs):
 # verify fix round (fix_loop, sharing verify_rounds); review reruns only after a fix round, since
 # the merge adds no code of the worker's. Under the lock, a base that moved again since sends the
 # task back out for another pass, up to remerge_rounds; then it blocks, the base kept moving.
+# Tasks of one run that land on a common branch take those passes in line (LandingLine, T-209),
+# one at a time, those that made more passes first, so waiting for the others costs no pass.
+
+
+class LandingLine:
+    """The order a dispatch run's finished tasks land in (T-209). Side by side, six tasks green at
+    once each ran a pass on their merge, each landing sent the rest out for another, and the sixth
+    needed five passes, past remerge_rounds. In line, of the tasks landing on a common branch (the
+    base, a companion's trunk), one at a time merges its moved base in, runs the gates on the merge
+    and lands; the rest wait their turn, which uses up no pass. Next up: the one that made the most
+    passes (info["remerges"]), then the one in line first. A task steps out while a worker of its
+    runs (a conflict or fix round), keeping its place, so the line never waits on a worker. Within
+    one run only: another dispatch, or `accept`, can still move the base, and remerge_rounds bounds
+    that."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.members = {}  # task id -> {"targets", "info", "going"}: in line now; going: its turn
+        self.places = {}  # task id -> when it first joined, kept while it steps out
+        self.joined = 0
+
+    def rank(self, tid):
+        return (-(self.members[tid]["info"].get("remerges") or 0), self.places[tid])
+
+    def blocker(self, tid):
+        """Holding cond: the task tid waits for, or None. One sharing a branch with it whose turn it
+        is, else the first of those ranked ahead of it."""
+        me = self.members[tid]
+        others = [o for o, m in self.members.items() if o != tid and m["targets"] & me["targets"]]
+        going = [o for o in others if self.members[o]["going"]]
+        ahead = sorted((o for o in others if self.rank(o) < self.rank(tid)), key=self.rank)
+        return (going or ahead or [None])[0]
+
+    def wait(self, tid, targets, info, say=None):
+        """Join the line (or rejoin it, in the same place) and return when it's tid's turn: at once
+        if it already is. say(other) is called once, if it waits."""
+        with self.cond:
+            if self.members.get(tid, {}).get("going"):
+                return
+            if tid not in self.places:
+                self.places[tid], self.joined = self.joined, self.joined + 1
+            self.members[tid] = {"targets": frozenset(targets), "info": info, "going": False}
+            told = False
+            while True:
+                other = self.blocker(tid)
+                if other is None:
+                    self.members[tid]["going"] = True
+                    return
+                if say and not told:
+                    say(other)
+                    told = True
+                self.cond.wait()
+
+    def step_out(self, tid):
+        """tid leaves the line for now (a worker of its runs), keeping its place."""
+        with self.cond:
+            if self.members.pop(tid, None) is not None:
+                self.cond.notify_all()
+
+    def leave(self, tid):
+        """tid is through: landed, blocked, parked or held for review."""
+        with self.cond:
+            self.members.pop(tid, None)
+            self.places.pop(tid, None)
+            self.cond.notify_all()
+
+
+def landing_targets(base, pubs):
+    """The branches a task lands on: its base, and each companion's trunk it touches."""
+    return {(None, base)} | {(c["name"], c["trunk"]) for c, _ in pubs}
 
 def moved_bases(base, wt, branch, pubs):
     """Where the base's tip isn't an ancestor of the task branch, companions first (land()'s order),
@@ -3518,6 +3588,7 @@ def dispatch(args):
         return info
 
     live, live_lock = {}, threading.Lock()  # running task id -> what its calls have cost so far
+    line = LandingLine()  # the order finished tasks merge a moved base in and land (T-209)
 
     def learn_due():
         """`learn = true` and an uncited incident that neither an earlier learn run nor this
@@ -3813,6 +3884,7 @@ def dispatch(args):
             if stop:
                 return "blocked", (f"{conflict_note('; '.join(s['reason'] for s in found), info.get('conflicts'), stop)}"
                                    f". {kept}: merge by hand")
+            line.step_out(t["id"])  # a worker runs: the line goes on without it
             v, w = conflict_round(t, tier, base, wt, branch, pubs, info, found, n)
             if v != "done":
                 return v, w
@@ -3850,18 +3922,32 @@ def dispatch(args):
         print(f"  merged   {t['id']}  red on the merge with {where}: {failed}", flush=True)
         if not fixable:
             return "blocked", f"{failed} (on dispatch's merge of {where} into {branch}). {kept}"
+        line.step_out(t["id"])  # a fix worker runs: the line goes on without it
         return fix_loop(t, tier, base, wt, branch, pubs, info, first=(failed, fixable),
                         merged=(merged_text(t, moved, branch), where))
+
+    def take_turn(t, tier, base, pubs, info):
+        """Wait until it's t's turn in line to merge a moved base in and land (LandingLine). Not
+        for a task held for a human's accept: it lands nothing now, so it neither waits nor holds
+        anyone up."""
+        if _tasks.needs_accept(t, tier):
+            return
+
+        def say(other):
+            print(f"  waiting  {t['id']}  in line behind {other} to land on {base}", flush=True)
+        line.wait(t["id"], landing_targets(base, pubs), info, say)
 
     def catch_up(t, tier, base, wt, branch, pubs, info):
         """Before the state lock, on a branch whose gate passed: conflicts first (resolve, with
         conflict_rounds above 0), then, if a base moved and merges cleanly, a pass on its merge
         (remerge). A conflict with no conflict rounds is left to land(), which blocks on it as
-        before. A branch whose bases haven't moved comes back as it went. Returns (verdict, reason)."""
+        before. A branch whose bases haven't moved comes back as it went. The pass waits its turn in
+        line (take_turn), so another task's landing can't move the base under it. Returns (verdict, reason)."""
         if _config.CONFLICT_ROUNDS:
             v, w = resolve(t, tier, base, wt, branch, pubs, info)
             if v != "done":
                 return v, w
+        take_turn(t, tier, base, pubs, info)
         try:
             moved = moved_bases(base, wt, branch, pubs)
         except _gitops.GitError as err:
@@ -4101,10 +4187,13 @@ def dispatch(args):
                 if skip_gate and verdict == "done":  # no conflict left to resolve: nothing has gated the branch yet
                     skip_gate = False
                     if not info.get("conflicts"):
+                        line.step_out(t["id"])  # the gates and maybe fix workers: the line goes on without it
                         verdict, why = fix_loop(t, tier, base, wt, branch, pubs, info)
                         continue
             if verdict == "limited" and "resets_at" not in info:  # may probe: not under the lock
                 info["resets_at"] = _limits.resets_at(info.get("limited") or {})
+            if verdict == "done":  # back from a fix round, say: its turn again before it lands
+                take_turn(t, tier, base, pubs, info)
             with _gitops.state_lock():  # also serializes every merge into a companion's trunk
                 # `t` is the task as it was at launch, so nothing the worker did to its file since
                 # (dropping `accept:`, retiering) lets the branch skip a human's acceptance.
@@ -4207,6 +4296,7 @@ def dispatch(args):
                     hid, title = file_human(t, why + info.get("base_green", ""), epics)
                     print(f"  proposed {hid}  (human, {t['id']} now depends on it)  {title}")
             break
+        line.leave(t["id"])
         if epic_conflict:
             finish_resolved(epic_conflict, t, info)
         if claims:  # publish where it stopped (and what it filed) now, not at the next scan
@@ -4214,6 +4304,13 @@ def dispatch(args):
             if failed:
                 say_sync(f"{t['id']} {verdict} not pushed yet ({failed}); the next sync pushes it")
         return t, verdict, why, info
+
+    def in_line(t, *rest):
+        """one(), out of the landing line however it ends."""
+        try:
+            return one(t, *rest)
+        finally:
+            line.leave(t["id"])
 
     def shared(a, b):
         """Paths both tasks name, or one inside the other (split on `/`). A task with no
@@ -4507,7 +4604,7 @@ def dispatch(args):
                                       + f"  {t['title']}"
                                       + ("" if follow or lim or t["id"] in first_ready else "  (approved during this run)"))
                                 row = (limited_row(t) or {"step": lim[1]}) if lim else None
-                                running[pool.submit(one, t, base, wt, branch, pubs, answered, row)] = t["id"]
+                                running[pool.submit(in_line, t, base, wt, branch, pubs, answered, row)] = t["id"]
                                 active[t["id"]] = t
                                 if follow:
                                     fu_launched += 1
