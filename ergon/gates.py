@@ -786,56 +786,98 @@ def accept(args):
         raise SystemExit("aborted")
     who, failed = f"{approver()} {_tasks.today()}", 0
     for tid in [t["id"] for t in todo]:
-        with _gitops.state_lock():  # land() and finish_epic() expect it; also keeps dispatch off the trunk
-            t, epics = _tasks.load(_config.ITEMS)[tid], _tasks.load(_config.EPICS)
-            if t["status"] != "review":
-                print(f"skip {tid}: now {t['status']}")
-                continue
+        passes, recorded = 0, False
+        while True:  # a base that moved since the task was held: a pass on its merge, outside the lock
+            moved = None
+            with _gitops.state_lock():  # land() and finish_epic() expect it; also keeps dispatch off the trunk
+                t, epics = _tasks.load(_config.ITEMS)[tid], _tasks.load(_config.EPICS)
+                if t["status"] != "review":
+                    print(f"skip {tid}: now {t['status']}")
+                    break
+                try:
+                    base, wt, branch, pubs = held_branch(t, epics)
+                    stray = [f"{tree}: {p}" for tree in [wt] + [pub for _, pub in pubs]
+                             if tree.exists() for p in _gitops.dirty_paths(tree)]
+                except _gitops.GitError as err:
+                    print(f"{tid} not landed, still in review: {err}")
+                    failed += 1
+                    break
+                if stray:
+                    print(f"{tid} not landed, still in review: uncommitted changes would miss the merge; "
+                          "commit or discard them, then accept again:\n  " + "\n  ".join(stray))
+                    failed += 1
+                    break
+                if not recorded:
+                    _history.record("accepted", t, by=approver())
+                    recorded = True
+                if _config.CONFLICT_ROUNDS:
+                    try:
+                        found = _dispatch.find_conflicts(base, wt, branch, pubs)
+                    except _gitops.GitError:
+                        found = None  # land() reports it, and blocks as before
+                    if found:  # the base moved while it waited: a conflict round, then a new accept
+                        for s in found:
+                            _history.record("conflict", t, files=s["files"], base=s["base"], after="accept",
+                                            companion=s["c"]["name"] if s["c"] else None)
+                        where = "; ".join(f"{s['base']} in {', '.join(s['files'])}" if s["files"] else s["base"] for s in found)
+                        _dispatch.put_status(tid, "ready", f"accepted by {who}, but it conflicts with {where}; "
+                                             f"{_dispatch.ACCEPT_CONFLICT_MARK}", who="accept")
+                        print(f"  ready    {tid}  conflicts with {where}: the next dispatch resolves it")
+                        break
+                try:
+                    moved = _dispatch.moved_bases(base, wt, branch, pubs)
+                except _gitops.GitError:
+                    moved = None  # land() reports it
+                if moved and all(s["clean"] for s in moved):
+                    if passes >= _config.REMERGE_ROUNDS:  # it kept moving: the next dispatch takes it on
+                        note = _dispatch.moving_note(moved, passes)
+                        _dispatch.put_status(tid, "ready", f"accepted by {who}, but {note}; "
+                                             f"{_dispatch.ACCEPT_REMERGE_MARK}", who="accept")
+                        print(f"  ready    {tid}  {note}: the next dispatch runs the gates on its merge again")
+                        break
+                else:  # nothing moved since it was held (or a conflict, which land() blocks on)
+                    moved = None
+                    verdict, why = _dispatch.land(t, base, wt, branch, pubs, accepted=who)
+                    if verdict != "done":
+                        _dispatch.put_status(tid, "blocked", f"couldn't land it for {who}: {why}", who="accept")
+                        _history.record("blocked", t, reason=f"couldn't land it for {who}: {why}", log=None, session=None, asked=False)
+                        print(f"  blocked  {tid}  {why}")
+                        failed += 1
+                        break
+                    _dispatch.put_status(tid, "done", f"accepted by {who}: {why}", who="accept")
+                    if sign:  # landed already, so a failure to sign only warns
+                        _gitops.sign_state("accept", [f"{_gitops.ACCEPT_TRAILER}: {tid}"], undo=False)
+                    print(f"  done     {tid}  {why}")
+                    e = epics.get(t.get("epic"))
+                    if e and e["status"] == "open" and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
+                        try:
+                            _gitops.finish_epic(e["id"])
+                        except _gitops.GitError as err:
+                            print(f"  {e['id']} is complete but not merged: {err}")
+                    break
+            # outside the lock: merge what moved into the branch and run the gates on the merge (T-196)
+            passes += 1
+            where = _dispatch.bases_text(moved)
+            print(f"  merging  {tid}  {where} moved since it was held: merging it into {branch} and running "
+                  f"the gates on the merge (pass {passes}/{_config.REMERGE_ROUNDS})", flush=True)
             try:
-                base, wt, branch, pubs = held_branch(t, epics)
-                stray = [f"{tree}: {p}" for tree in [wt] + [pub for _, pub in pubs]
-                         if tree.exists() for p in _gitops.dirty_paths(tree)]
+                for s in moved:
+                    _dispatch.merge_base_in(t, s, branch, passes, "accept")
+                red, _fixable = _dispatch.merged_gates(t, base, wt, branch, pubs)
             except _gitops.GitError as err:
                 print(f"{tid} not landed, still in review: {err}")
                 failed += 1
-                continue
-            if stray:
-                print(f"{tid} not landed, still in review: uncommitted changes would miss the merge; "
-                      "commit or discard them, then accept again:\n  " + "\n  ".join(stray))
-                failed += 1
-                continue
-            _history.record("accepted", t, by=approver())
-            if _config.CONFLICT_ROUNDS:
-                try:
-                    found = _dispatch.find_conflicts(base, wt, branch, pubs)
-                except _gitops.GitError:
-                    found = None  # land() reports it, and blocks as before
-                if found:  # the base moved while it waited: a conflict round, then a new accept
-                    for s in found:
-                        _history.record("conflict", t, files=s["files"], base=s["base"], after="accept",
-                                        companion=s["c"]["name"] if s["c"] else None)
-                    where = "; ".join(f"{s['base']} in {', '.join(s['files'])}" if s["files"] else s["base"] for s in found)
-                    _dispatch.put_status(tid, "ready", f"accepted by {who}, but it conflicts with {where}; "
-                                         f"{_dispatch.ACCEPT_CONFLICT_MARK}", who="accept")
-                    print(f"  ready    {tid}  conflicts with {where}: the next dispatch resolves it")
-                    continue
-            verdict, why = _dispatch.land(t, base, wt, branch, pubs, accepted=who)
-            if verdict != "done":
-                _dispatch.put_status(tid, "blocked", f"couldn't land it for {who}: {why}", who="accept")
-                _history.record("blocked", t, reason=f"couldn't land it for {who}: {why}", log=None, session=None, asked=False)
-                print(f"  blocked  {tid}  {why}")
-                failed += 1
-                continue
-            _dispatch.put_status(tid, "done", f"accepted by {who}: {why}", who="accept")
-            if sign:  # landed already, so a failure to sign only warns
-                _gitops.sign_state("accept", [f"{_gitops.ACCEPT_TRAILER}: {tid}"], undo=False)
-            print(f"  done     {tid}  {why}")
-            e = epics.get(t.get("epic"))
-            if e and e["status"] == "open" and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
-                try:
-                    _gitops.finish_epic(e["id"])
-                except _gitops.GitError as err:
-                    print(f"  {e['id']} is complete but not merged: {err}")
+                break
+            if red:  # back to ready: the next dispatch runs the fix round and holds it at review again
+                with _gitops.state_lock():
+                    if _tasks.load(_config.ITEMS)[tid]["status"] == "review":
+                        _dispatch.put_status(tid, "ready", f"accepted by {who}, but merged with {where}, which "
+                                             f"moved while it waited, its gates went red: {red}; "
+                                             f"{_dispatch.ACCEPT_REMERGE_MARK}", who="accept")
+                print(f"  ready    {tid}  red on its merge with {where}: the next dispatch runs a fix round, "
+                      "then it waits for your accept again")
+                break
+            print(f"  merging  {tid}  green on the merge", flush=True)
     if _config.SHARED:
         sync_for_count(args.ids, after=True, what="acceptance")
     if failed or away:

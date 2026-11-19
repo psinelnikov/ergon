@@ -54,6 +54,8 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                otherwise it drops its proposed tasks
   ergon accept ID [ID ...]     HUMAN ONLY, real terminal. Land a task dispatch held at `review`
                                (merge its branch like dispatch would, close the epic if last).
+                               A base that moved since it was held is merged into the branch and
+                               the gates run on the merge first; red sends it back to ready
                                An epic ID accepts its tasks in review
   ergon answer ID ["text"]     HUMAN ONLY, real terminal. Answer the QUESTION: lines a worker
                                parked its task on (`RESULT: asking`); no text offers the options.
@@ -91,6 +93,18 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                or Ctrl-C (stop launching, let workers finish; a second kills them)
                                A reviewer's fail (`review` in .ergon.toml) goes back to the worker
                                and is reviewed again, up to review_rounds times, then blocks.
+                               A finished branch whose base moved but merges cleanly gets the base
+                               merged in by dispatch (no worker) and its gates run again on the
+                               merge before it lands; red goes back to the worker as a verify fix
+                               round. A base that moved again by then takes another pass, up to
+                               remerge_rounds (default 3); then it blocks, and accept does the same.
+                               A run's finished tasks on a common branch land one at a time, those
+                               with more passes first; waiting uses up no pass.
+
+                               `overlap` in .ergon.toml (default 1): how many running tasks may
+                               share a touches: path. Above 1, tasks sharing one run side by side,
+                               relying on those merge gates; no touches:, a shared gate file or
+                               reproduction, or different bases are held whatever it is
                                --until-done N (default 0): a worker that stops short (timeout,
                                error, output that isn't JSON, no RESULT line) runs again on the
                                same branch, up to N more rounds (session resumed, or a fresh
@@ -513,6 +527,9 @@ def main():
     once.add_argument("--join", action="store_true", help="make <state>/ a worktree of the remote's state branch")
     d = sub.add_parser("dispatch", description=(
         "Run ready tasks headless, one worktree and task/<ID> branch each, and land each finished branch. "
+        "A finished branch whose base moved but merges cleanly gets the base merged in and its gates rerun "
+        "(up to remerge_rounds passes). A run's finished tasks that land on a common branch merge and land "
+        "one at a time, those with more passes first, and waiting for another uses up no pass (within one run). "
         "A worker or reviewer the plan's usage limit stops (5-hour or weekly) parks its task blocked with a "
         "`limited: <reset> <step>` mark: no human task, no --escalate retry, no fix/verify/conflict/until-done "
         "round used up, worktree and branch kept. The run launches nothing more before the reset (--watch "
