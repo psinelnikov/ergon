@@ -3116,6 +3116,37 @@ def print_limit(results, window):
         print(f"  {t['id']}  {verdict:<8}{'$%.2f' % cost:>8}  ≈ {_limits.pct(cost, per):>6} of the 5-hour limit  {t['title']}")
 
 
+def obsidian_write_back(dry=False):
+    """T-156's write-back step (not intake) when [obsidian] sets write_back = true: tick the vault lines of
+    done/dropped imported tasks. One `Obsidian:` line per change, one per line it couldn't find. Never in an
+    agent shell. A failure only warns: it changes no task's status and not the run's exit code."""
+    import contextlib
+    import io
+    from . import obsidian as _obsidian
+    try:
+        cfg = _obsidian.settings()
+        if cfg is None or not cfg["write_back"] or _gates.in_agent_shell():
+            return
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _obsidian.tick(cfg, not dry)
+    except (Exception, SystemExit) as e:
+        print(f"warning: Obsidian write-back failed: {e}", flush=True)
+        return
+    for line in buf.getvalue().splitlines():
+        m = re.match(r"^(T-\d+): (ticked|would change) in (.+)$", line)
+        g = re.match(r"^(T-\d+): line gone from (.+)$", line)
+        if m:
+            print(f"Obsidian: {'would tick' if dry else 'ticked'} {m.group(1)} in {m.group(3)}")
+        elif g:
+            print(f"Obsidian: couldn't find {g.group(1)}'s line in {g.group(2)}")
+        elif line.startswith("  "):
+            if dry:
+                print("  " + line)
+        else:
+            print(f"Obsidian: {line}")
+
+
 def dispatch(args):
     if args.watch and not args.budget_total:
         raise SystemExit("--watch needs --budget-total (a cap on spend, so an unattended watch can't run away)")
@@ -3925,6 +3956,7 @@ def dispatch(args):
                   "one `claude -p` with no tools, only proposing")
         if not plan and not bplan:
             print("nothing to dispatch")
+        obsidian_write_back(dry=True)
         if _config.FOLLOW_UPS and _config.FOLLOW_UP_DEPTH and not _config.SHARED:
             print(f"  follow-ups  auto-approved follow-ups (bugfix, refactor, chore) a worker files may run in this "
                   f"same run, up to {_config.FOLLOW_UPS} (follow_ups), depth {_config.FOLLOW_UP_DEPTH} "
@@ -4160,6 +4192,8 @@ def dispatch(args):
                                       f"{_limits.clock(paused)}" + ("; --watch waits for it" if args.watch else
                                                                     "; running workers finish"), flush=True)
                         scan = True
+                        if args.watch and res[1] == "done":
+                            obsidian_write_back()
                     if (args.watch or running) and time.monotonic() >= next_scan:
                         scan = True
         finally:
@@ -4194,6 +4228,7 @@ def dispatch(args):
                             [fid for fid, s in filed if s == "proposed" and now.get(fid, {}).get("status") == "proposed"])):
             if ids:
                 print(f"{len(ids)} {label}: {', '.join(ids)}")
+    obsidian_write_back()
     if breaks:
         filed = [i for b in breaks for i, _ in b["filed"]]
         refused = sum(len(b["refused"]) for b in breaks)

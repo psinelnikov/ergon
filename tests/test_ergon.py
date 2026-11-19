@@ -1064,6 +1064,158 @@ class TestImport(Project):
         r = self.ergon("import", "gh#1", check=False, env=env)
         self.assertIn("needs the GitHub CLI", r.stderr)
 
+class TestObsidian(Project):
+    def vault(self):
+        v = self.root.parent / "vault"
+        (v / "Projects").mkdir(parents=True)
+        (v / ".obsidian").mkdir()
+        (v / "Archive").mkdir()
+        (v / "Projects" / "Home.md").write_text(
+            "# Home\r\n- [ ] Compare the health plans #agent \U0001F4C5 2026-12-01 \u23f3 2026-11-25 \u23eb ^abc\r\n"
+            "- [ ] Not for the agent\n"
+            "- [x] Done already #agent\n"
+            "  * [ ] Indented #agent\n"
+            "- [ ] Other tag #agents\n"
+            "- [ ] ---  ## Done when #agent\n"
+            "- [ ] # Heading #agent")
+        (v / "Archive" / "Old.md").write_text("- [ ] Excluded #agent\n")
+        (v / ".obsidian" / "x.md").write_text("- [ ] Hidden #agent\n")
+        return v
+
+    def hashes(self, v):
+        import hashlib
+        return {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(v.rglob("*")) if p.is_file()}
+
+    def test_import(self):
+        v = self.vault()
+        out = self.ergon("obsidian").stdout
+        self.assertIn("not configured", out)
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + f'\n[obsidian]\nvault = "{v}"\nexclude = ["Archive"]\n')
+        before = self.hashes(v)
+        out = self.ergon("obsidian", "--dry-run").stdout
+        self.assertIn("would file 4", out)
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        out = self.ergon("obsidian").stdout
+        self.assertIn("found 4 tagged line(s): filed 4, skipped 0", out)
+        text = self.task_file("T-001").read_text()
+        self.assertIn("title: Compare the health plans", text)
+        self.assertIn("tier: human", text)
+        self.assertIn("status: proposed", text)
+        self.assertRegex(text, r"source: obsidian:Projects/Home\.md#[0-9a-f]{10}\n")
+        self.assertIn("due: 2026-12-01\n", text)
+        self.assertIn("scheduled: 2026-11-25\n", text)
+        self.assertIn("> - [ ] Compare the health plans #agent", text)
+        hostile = self.task_file("T-003").read_text() + self.task_file("T-004").read_text()
+        self.assertIn("> - [ ] ---  ## Done when #agent", hostile)
+        self.assertIn("> - [ ] # Heading #agent", hostile)
+        self.ergon("check")
+        self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 4)
+        out = self.ergon("obsidian").stdout
+        self.assertIn("filed 0, skipped 4", out)
+        self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 4)
+        self.assertEqual(self.hashes(v), before)
+
+    def set_status(self, tid, status):
+        f = self.task_file(tid)
+        f.write_text(f.read_text().replace("status: proposed", f"status: {status}", 1))
+
+    def wb_vault(self, write_back="true"):
+        v = self.root.parent / "vault"
+        (v / "Health").mkdir(parents=True)
+        (v / "Health" / "Insurance.md").write_bytes(
+            b"# Ins\r\n- [ ] Compare plans #agent \xf0\x9f\x93\x85 2026-12-01\r\n- [ ] Call them #agent ^mine\r\n"
+            b"- [ ] Cancel old #agent\r\nplain\r\nlast")
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + f'\n[obsidian]\nvault = "{v}"\nwrite_back = {write_back}\n')
+        return v, v / "Health" / "Insurance.md"
+
+    def test_write_back(self):
+        v, note = self.wb_vault()
+        out = self.ergon("obsidian").stdout
+        self.assertIn("filed 3", out)
+        text = note.read_bytes().decode()
+        self.assertRegex(text, r"Compare plans #agent \U0001F4C5 2026-12-01 \^ergon-[0-9a-f]{10}\r\n")
+        self.assertIn("Call them #agent ^mine\r\n", text)
+        self.assertIn("source: obsidian:Health/Insurance.md#^mine\n", self.task_file("T-002").read_text())
+        self.assertRegex(self.task_file("T-001").read_text(), r"source: obsidian:Health/Insurance\.md#\^ergon-[0-9a-f]{10}\n")
+        self.assertIn("skipped 3", self.ergon("obsidian").stdout)
+        self.assertEqual(note.read_bytes().decode(), text)
+        self.set_status("T-001", "done")
+        self.set_status("T-002", "dropped")
+        before = self.hashes(v)
+        env = clean_env(**{"CLAUDE" + "CODE": "1"})
+        out = self.ergon("obsidian", env=env).stdout
+        self.assertIn("writing the vault is a human's", out)
+        self.assertIn("would change", out)
+        self.assertEqual(self.hashes(v), before)
+        out = self.ergon("obsidian").stdout
+        self.assertIn("2 line(s) ticked", out)
+        new = note.read_bytes().decode()
+        today = __import__("datetime").date.today().isoformat()
+        self.assertRegex(new, rf"- \[x\] Compare plans #agent \U0001F4C5 2026-12-01 \u2705 {today} \(ergon T-001\) \^ergon-[0-9a-f]{{10}}\r\n")
+        self.assertIn("- [ ] Call them #agent (ergon T-002 dropped) ^mine\r\n", new)
+        self.assertEqual(len(new.split("\r\n")), len(text.split("\r\n")))
+        self.assertTrue(new.endswith("\r\nplain\r\nlast"))
+        after = self.hashes(v)
+        out = self.ergon("obsidian").stdout
+        self.assertNotIn("ticked", out)
+        self.assertEqual(self.hashes(v), after)
+
+    def test_write_back_off_and_hash_keys(self):
+        v, note = self.wb_vault("false")
+        self.ergon("obsidian")
+        self.assertRegex(self.task_file("T-001").read_text(), r"source: obsidian:Health/Insurance\.md#[0-9a-f]{10}\n")
+        self.set_status("T-001", "done")
+        self.set_status("T-003", "dropped")
+        before = self.hashes(v)
+        out = self.ergon("obsidian").stdout
+        self.assertNotIn("would change", out)  # write_back off: nothing is looked at
+        self.assertEqual(self.hashes(v), before)
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text().replace("write_back = false", "write_back = true"))
+        self.ergon("obsidian")
+        new = note.read_bytes().decode()
+        self.assertIn("- [x] Compare plans #agent", new)
+        self.assertIn("Cancel old #agent (ergon T-003 dropped)\r\n", new)
+        self.assertNotIn("^ergon-", new)  # earlier hash keys stay, no block ids added to them
+        after = self.hashes(v)
+        out = self.ergon("obsidian").stdout
+        self.assertNotIn("gone", out)
+        self.assertEqual(self.hashes(v), after)
+
+    def test_write_back_missing(self):
+        v, note = self.wb_vault()
+        self.ergon("obsidian")
+        self.set_status("T-001", "done")
+        text = note.read_bytes().decode()
+        note.write_bytes(text.replace("Compare plans", "Compare other").replace(" ^ergon-", " ^x-").encode())
+        r = self.ergon("obsidian")
+        self.assertIn("T-001: line gone from Health/Insurance.md", r.stdout)
+        note.unlink()
+        r = self.ergon("obsidian")
+        self.assertIn("T-001: line gone from Health/Insurance.md", r.stdout)
+
+    def test_rewrite_skips_changed_note(self):
+        from ergon import obsidian as ob
+        v, note = self.wb_vault()
+        old = note.read_bytes()
+        note.write_bytes(old + b"more")
+        self.assertFalse(ob.rewrite(note, old, b"x"))
+        self.assertEqual(note.read_bytes(), old + b"more")
+        self.assertTrue(ob.rewrite(note, old + b"more", b"x"))
+        self.assertEqual(note.read_bytes(), b"x")
+        self.assertEqual([p.name for p in note.parent.iterdir()], ["Insurance.md"])
+
+    def test_missing_vault(self):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + '\n[obsidian]\nvault = "/nonexistent/vault"\n')
+        r = self.ergon("obsidian", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("/nonexistent/vault", r.stderr)
+
+
 class DispatchProject(Project):
     """A project with a companion checkout, worker rules and the fake `claude` on PATH."""
     config = '''
@@ -1111,6 +1263,46 @@ class TestDispatch(DispatchProject):
         self.assertEqual(sh("git", "worktree", "list", cwd=self.root / "pub" / "src").stdout.count("\n"), 1)
         runs = list((self.root / "tasks" / "runs").glob("*.json"))
         self.assertEqual(len(runs), 2)
+
+    def obsidian_dispatch(self, write_back):
+        v = self.root.parent / "vault"
+        (v / "Health").mkdir(parents=True)
+        note = v / "Health" / "Insurance.md"
+        note.write_text("- [ ] Call them #agent ^mine\n")
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + f'\n[obsidian]\nvault = "{v}"\nwrite_back = {write_back}\n')
+        sh("git", "commit", "-qam", "cfg", cwd=self.root)
+        self.ergon("new", "task", "Call them", "--tier", "haiku")
+        f = self.task_file("T-001")
+        f.write_text(re.sub(r"^source:.*$", "source: obsidian:Health/Insurance.md#^mine", f.read_text(), flags=re.M))
+        stamp(f)
+        return note
+
+    def test_dispatch_obsidian_write_back(self):
+        note = self.obsidian_dispatch("true")
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertNotIn("Obsidian:", dry)  # nothing done yet
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("Obsidian: ticked T-001 in Health/Insurance.md", out)
+        self.assertIn("- [x] Call them #agent", note.read_text())
+
+    def test_dispatch_obsidian_off(self):
+        note = self.obsidian_dispatch("false")
+        before = note.read_text()
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertNotIn("Obsidian", out)
+        self.assertEqual(note.read_text(), before)
+
+    def test_dispatch_obsidian_failure_warns(self):
+        note = self.obsidian_dispatch("true")
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text().replace(str(note.parent.parent), "/nonexistent/vault"))
+        r = self.ergon("dispatch", check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.status("T-001"), "done", r.stdout)
+        self.assertIn("warning: Obsidian write-back failed", r.stdout)
 
     def test_budget_total_stops_launches(self):
         for n in "ABC":
