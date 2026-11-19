@@ -101,6 +101,7 @@ conflict_rounds = 1                # a branch that conflicts with its base goes 
                                    #   parent, no <<<<<<< / >>>>>>> lines are left, the worktree is clean and the merge is now clean; then
                                    #   the done checks, verify and review run again. Above 0, an epic whose last task lands into a
                                    #   conflicting trunk gets one resolver too (as `ergon finish E-NNN --resolve`)
+                                   #   On a conflict round the worker (and the epic resolver, and the review after) is also shown the title, What and Done when of each task that landed on the base since the fork, trimmed and capped, so the other side's intent survives the merge
 review_resume_secs = 3300          # a fix round resumes the worker's session only if its last request is younger than this
 review_resume_tokens = 80000       # and its context smaller than this; otherwise a fresh worker on the same branch
 limit_probe = true                 # read the plan's 5-hour window around each dispatch to show each task's share of it
