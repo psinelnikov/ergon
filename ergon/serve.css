@@ -153,3 +153,6 @@ svg.depmap a:hover rect { fill: var(--code); }
 ul.tasks .score { font-weight: 600; font-variant-numeric: tabular-nums; }
 table.prio td.why b { font-weight: 500; }
 table.prio .pin { font-size: 0.85em; color: var(--warn); }
+.options { list-style: decimal inside; padding: 0; margin: 6px 0; display: flex; flex-direction: column; gap: 6px; }
+.options li, p.option { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); overflow-wrap: anywhere; }
+.options li.chosen, p.option.chosen { border-color: var(--ok); color: var(--ok); }
