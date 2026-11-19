@@ -78,7 +78,10 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                nouns. Judgment: the task-audit skill
   ergon check                  lint; non-zero exit on any violation
   ergon tidy                   move every task and epic file to where it belongs: an epic's tasks
-                               in epics/<epic>/, the rest in items/ (idempotent)
+                               in epics/<epic>/, the rest in items/ (idempotent). Also
+                               removes clean <worktrees>/E-NNN checkouts whose epic is no longer
+                               open (detached or branch gone); keeps and explains any with
+                               changes, or the one you're in
   ergon dispatch [--tier T] [--epic E] [--ids T-1,T-2] [--max N] [--jobs J]
                       [--budget-total USD [--budget-pct P]] [--watch [--interval SEC]]
                       [--until-done N] [--dry-run]

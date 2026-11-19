@@ -7,7 +7,7 @@ description: The ergon task-tracker workflow (humans approve, agents execute). U
 
 One markdown file per task and per epic. Each epic is a folder, `<state>/epics/E-NNN-slug/`, holding its brief (`EPIC.md`) and all of its tasks (`T-NNN-slug.md`), done and dropped ones included. Tasks with no epic live in `<state>/items/`. `<state>` is `state` in the project's `.ergon.toml` (default `tasks`). Frontmatter is the state; the body is the brief. The `ergon` CLI reads and writes it: run `ergon -h`.
 
-The `epic:` field decides the folder. `ergon set T-NNN epic=E-NNN` moves the file (`epic=` moves it back to `items/`). After a hand edit, `check` fails until `ergon tidy` re-files it. Other files in an epic's folder, such as design notes, are ignored by the tracker.
+The `epic:` field decides the folder. `ergon set T-NNN epic=E-NNN` moves the file (`epic=` moves it back to `items/`). After a hand edit, `check` fails until `ergon tidy` re-files it. `ergon tidy` also removes a leftover `<worktrees>/E-NNN` checkout (detached, or its branch gone) once its epic is no longer open, but only if `git status --porcelain` there is empty and you aren't inside it; otherwise it lists it with the reason. Task worktrees and open epics' worktrees are never touched. Other files in an epic's folder, such as design notes, are ignored by the tracker.
 
 **Task state is local.** `items/`, `epics/` and `runs/` are gitignored (`ergon init` adds the lines). Git keeps the record of what was done: every commit for a task cites its ID (`… (T-128)`), and an epic's merge commit lists its goal, each task, and the commits that cite it. Anything that should outlive your machine goes in a commit message, not in a task file.
 

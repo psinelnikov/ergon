@@ -103,6 +103,17 @@ def worktrees(repo=None):
     return out
 
 
+def worktree_list(repo=None):
+    """[(path, branch or None)] for every worktree; None is a detached HEAD."""
+    out = []
+    for l in git("worktree", "list", "--porcelain", cwd=repo).splitlines():
+        if l.startswith("worktree "):
+            out.append([l[len("worktree "):], None])
+        elif l.startswith("branch refs/heads/") and out:
+            out[-1][1] = l[len("branch refs/heads/"):]
+    return [(p, b) for p, b in out]
+
+
 def merge_tree(base, branch, repo=None):
     """(the tree merging branch into base would give, or None on a conflict; the conflicted files)."""
     tree = subprocess.run(["git", "-C", str(repo or _config.REPO), "merge-tree", "--write-tree", base, branch],
