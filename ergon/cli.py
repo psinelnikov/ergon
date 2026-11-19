@@ -505,6 +505,9 @@ def main():
     once.add_argument("--join", action="store_true", help="make <state>/ a worktree of the remote's state branch")
     d = sub.add_parser("dispatch", description=(
         "Run ready tasks headless, one worktree and task/<ID> branch each, and land each finished branch. "
+        "A finished branch whose base moved but merges cleanly gets the base merged in and its gates rerun "
+        "(up to remerge_rounds passes). A run's finished tasks that land on a common branch merge and land "
+        "one at a time, those with more passes first, and waiting for another uses up no pass (within one run). "
         "A worker or reviewer the plan's usage limit stops (5-hour or weekly) parks its task blocked with a "
         "`limited: <reset> <step>` mark: no human task, no --escalate retry, no fix/verify/conflict/until-done "
         "round used up, worktree and branch kept. The run launches nothing more before the reset (--watch "
