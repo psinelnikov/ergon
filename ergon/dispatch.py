@@ -642,7 +642,8 @@ def base_branch(t, epics):
     b = _gitops.epic_branch(e)
     if not _gitops.branch_exists(b):
         _gitops.git("branch", b, _config.MAIN)
-        print(f"started {e['id']} on branch {b} (cut from {_config.MAIN}, not checked out)")
+        print(f"started {e['id']} on branch {b} (cut from {_config.MAIN}, not checked out; "
+              f"ergon start {e['id']} opens a worktree)")
     return b
 
 

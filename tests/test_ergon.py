@@ -1373,6 +1373,20 @@ class TestDispatch(DispatchProject):
         runs = list((self.root / "tasks" / "runs").glob("*.json"))
         self.assertEqual(len(runs), 2)
 
+    def test_dispatch_names_ergon_start_when_it_cuts_an_epic_branch(self):
+        # An open epic with no branch yet (no approval stamp, local mode, as in
+        # test_epics_from_before_approval_count_as_approved): dispatch cuts the ref and says how
+        # to get a checkout, but never checks it out, so no worktree for the epic appears.
+        home = self.root / "tasks" / "epics" / "E-001-old"
+        home.mkdir(parents=True)
+        (home / "EPIC.md").write_text("---\nid: E-001\ntitle: Old\nstatus: open\ncreated: 2026-01-01\n---\n\n## Goal\nG\n")
+        self.ergon("new", "task", "Part", "--tier", "haiku", "--epic", "E-001")
+        stamp(self.task_file("T-001"))
+        out = self.ergon("dispatch").stdout
+        self.assertIn("started E-001 on branch epic/", out)
+        self.assertIn("(cut from main, not checked out; ergon start E-001 opens a worktree)", out)
+        self.assertFalse((self.root / ".claude" / "worktrees" / "E-001").exists())
+
     def obsidian_dispatch(self, write_back):
         v = self.root.parent / "vault"
         (v / "Health").mkdir(parents=True)
