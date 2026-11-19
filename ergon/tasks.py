@@ -432,7 +432,8 @@ def two_person(t):
 #   4. its depth, the length of its source: chain of auto-approved tasks back to a human-approved
 #      root, is at most follow_up_depth (a follow-up of a human-approved task is depth 1; 0: off);
 #   5. local mode: in shared mode an approval is a signed commit, and a parent's signature can't
-#      vouch for a task that didn't exist when it was signed.
+#      vouch for a task that didn't exist when it was signed;
+#   6. its Done when section isn't empty: nothing to work or review against otherwise.
 # The guard refuses an agent's edit to category: or touches: of an auto-approved task, so a
 # follow-up can't be relabelled or widened after it was approved.
 
@@ -446,7 +447,7 @@ def is_auto(t):
 
 
 def auto_problem(t):
-    """Why t, as filed, can't be approved by inheritance (conditions 1, 2, 3 and 5), or None."""
+    """Why t, as filed, can't be approved by inheritance (conditions 1, 2, 3, 5 and 6), or None."""
     if _config.SHARED:
         return "shared mode: approvals must be signed by an approver"
     cat = str(t.get("category") or "").strip()
@@ -461,13 +462,15 @@ def auto_problem(t):
         hit = next(((x, p) for x in touches for p in pr["touches"] if _config.protect_hit(x, p)), None)
         if hit:
             return f"touches {hit[0]} (protect {hit[1]})"
+    if not sections(t.get("_body") or "", "done when").strip():
+        return "no Done when: a human writes or approves one"
     return None
 
 
 def approval_of(t, tasks, _seen=()):
     """How t's approval stands: (root ID, depth, None) when it holds, depth 0 for a human stamp
     and n for an `auto` stamp n follow-ups from its human-approved root; else (None, None, why).
-    An auto stamp holds only if the task as filed meets conditions 1-5, it names the task's
+    An auto stamp holds only if the task as filed meets conditions 1-6, it names the task's
     source: as its parent and category: as its category, and that parent's approval holds too."""
     stamp = str(t.get("approved") or "").strip()
     if not stamp:

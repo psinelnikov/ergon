@@ -40,12 +40,19 @@ from . import tasks as _tasks
 # checkout, on a task/<ID> branch there too, which lands on the companion's local trunk first.
 # No code is ever pushed. In shared mode the state branch is, to claim tasks (see "claims").
 
+FOUND_CLAUSE = (
+    "`FOUND: <title> — <why>` followed right after by `DONE WHEN: …` (required: at least one line per FOUND, "
+    "what makes the follow-up finished; several lines are fine) and these optional lines: `TOUCHES: a, b`, "
+    "`TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour "
+    "a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same "
+    "behaviour, better code; chore: docs, help text, tests, config, tooling)")
+
 WORKER_PROMPT = """You are dispatched on {id}.
 
 Working tree: {wt} (a git worktree of this repo), on branch {branch}, cut from {base}.
 {retry}{nested}{companions}{rules}{gates}
 Work you find but don't do: end your final message with one line per item, before the RESULT line,
-`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)). The dispatcher files each as a task: a feature as proposed, for a human to approve. A bugfix, refactor or chore with TOUCHES may go straight to ready, approved by inheritance from this task, so label each one honestly: new behaviour is a feature, and the reviewer fails a branch that dresses one up.
+"""+FOUND_CLAUSE+""". The dispatcher files each as a task: a feature as proposed, for a human to approve. A bugfix, refactor or chore with TOUCHES may go straight to ready, approved by inheritance from this task, so label each one honestly: new behaviour is a feature, and the reviewer fails a branch that dresses one up.
 To prove the work runs, end a line `EVIDENCE: <path in this worktree> — <what it shows>` for each
 runtime artifact (test output, a screenshot, a recording), before the RESULT line. Dispatch copies
 those files (regular files inside the worktree, no symlinks, at most {evmax} MB each) for the
@@ -384,7 +391,7 @@ ANSWER_PROMPT = """A human answered the question(s) you asked on {id}:
 
 {note}
 Carry on with the task on {branch} in {wt}, and commit there citing {id}. End as before: a
-`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)) line for each piece of work you find but don't do, then `RESULT: done`,
+"""+FOUND_CLAUSE+""" line for each piece of work you find but don't do, then `RESULT: done`,
 `RESULT: blocked — <why>`, or new `QUESTION:` lines and `RESULT: asking`.
 """
 
@@ -865,6 +872,9 @@ def evidence_text(tid, kept, refused=()):
     return out
 
 
+NO_DONE_WHEN_NOTE = "no Done when: the worker gave none; `ergon fill {id}` writes one"
+
+
 FOUND_TIERS = ("haiku", "sonnet", "opus", "human")
 
 
@@ -876,8 +886,16 @@ def parse_found(text):
     and TIER and CATEGORY (once each) lines directly after a FOUND line fill `extra`: touches, done,
     tier, tier_why, category. A line md_trim would empty is ignored, and so is a tier or category
     that isn't one."""
-    out, cur = [], None
+    out, cur, bullets = [], None, False
     for line in text.splitlines():
+        if bullets and cur is not None:  # `DONE WHEN:` with nothing after it: its `- item` lines are the items
+            b = re.match(r"^\s*[-*•]\s+(.*?)\s*$", line)
+            if b:
+                if md_trim(b[1]):
+                    cur.setdefault("done", []).append(md_trim(b[1]))
+                continue
+        if line.strip():
+            bullets = False
         m = re.match(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", line)
         if m:
             cur = None
@@ -891,6 +909,8 @@ def parse_found(text):
                 cur = None
             continue
         val = md_trim(m[2])
+        if cur is not None and not val and m[1] == "DONE WHEN":
+            bullets = True
         if cur is None or not val:
             continue
         if m[1] == "DONE WHEN":
@@ -985,6 +1005,8 @@ def file_found(t, found, epics, vouch=True):
         body = _tasks.TASK_BODY.replace("## What\n", f"## What\n{what}\n", 1)
         if extra.get("done"):
             body = body.replace("## Done when\n", "## Done when\n" + "".join(f"- {d}\n" for d in extra["done"]), 1)
+        else:
+            body = body.rstrip("\n") + "\n" + NO_DONE_WHEN_NOTE.format(id=tid) + "\n"
         sized = extra.get("tier")
         meta = {"id": tid, "title": title, "tier": sized or t["tier"],
                 "category": extra.get("category") or "", "status": "proposed",
@@ -2067,8 +2089,7 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, ev
 FIX_PROMPT = """The reviewer vetoed your work on {id} (fix round {n} of {rounds}): {veto}
 {log}
 Fix what it raised on {branch} in {wt}, and commit there citing {id}. The done checks, verify and
-the review run again when you finish. End as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`,
-`TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)) line for each
+the review run again when you finish. End as before: a """+FOUND_CLAUSE+""" line for each
 piece of work you find but don't do, then `RESULT: done`, `RESULT: blocked — <why>`, or
 `QUESTION:` lines and `RESULT: asking`.
 """
@@ -2084,7 +2105,7 @@ The full output is in {log}.
 Fix it on {branch} in {wt}, and commit there citing {id}. The done checks and verify run again
 when you finish. If the failure isn't caused by this branch (a flaky test, a broken trunk, a
 missing tool), change nothing and end `RESULT: blocked — outside: <why>`: verify runs once more
-as it is, and this doesn't use up a round. Otherwise end as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling))
+as it is, and this doesn't use up a round. Otherwise end as before: a """+FOUND_CLAUSE+"""
 line for each piece of work you find but don't do, then `RESULT: done` or
 `RESULT: blocked — <why>`.
 """
@@ -2333,7 +2354,7 @@ since the resolution is new code. If you can't reconcile the two sides, don't gu
 CONFLICT_PROMPT = """Your work on {id} conflicts with its base, which moved since you started (conflict round {n} of {rounds}):
 
 {body}
-End as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)) line for each piece of work you find but don't do, then
+End as before: a """+FOUND_CLAUSE+""" line for each piece of work you find but don't do, then
 `RESULT: done`, `RESULT: blocked — <why>`, or `QUESTION:` lines and `RESULT: asking`.
 """
 
