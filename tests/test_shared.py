@@ -775,6 +775,27 @@ class TestDispatchClaims(Shared):
         self.ergon(self.a, "close", "T-001", "--as", "done", "--reason", "x", inp="y\n", env=self.env_a)
         self.assertEqual(self.remote_status("T-001"), "done")
 
+    def test_reject_of_a_review_task_held_elsewhere_is_refused(self):
+        self.held_in_review()
+        self.ergon(self.a, "new", "task", "Two", "--tier", "haiku")
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync", env=self.env_b)
+        self.assertEqual(self.status(self.b, "T-001"), "review")
+        r = self.ergon(self.b, "reject", "T-001", "--reason", "x", check=False, inp="y\n", env=self.env_b)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(f"refused: T-001 is held on ann@{self.host}: reject it there", r.stderr + r.stdout)
+        self.assertEqual(self.status(self.b, "T-001"), "review")
+        self.assertEqual(self.remote_status("T-001"), "review")
+        # mixed: the proposed task is dropped, the held one refused
+        r = self.ergon(self.b, "reject", "T-001", "T-002", "--reason", "x", check=False, inp="y\n", env=self.env_b)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("reject it there", r.stdout + r.stderr)
+        self.assertEqual(self.status(self.b, "T-002"), "dropped")
+        self.assertEqual(self.status(self.b, "T-001"), "review")
+        # the holding clone can
+        self.ergon(self.a, "reject", "T-001", "--reason", "x", inp="y\n", env=self.env_a)
+        self.assertEqual(self.remote_status("T-001"), "ready")
+
     def test_reject_skips_a_task_another_clone_already_closed(self):
         self.start()
         self.ergon(self.a, "new", "task", "Two", "--tier", "haiku")
