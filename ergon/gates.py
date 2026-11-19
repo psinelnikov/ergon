@@ -212,6 +212,9 @@ def stamp_approved(todo):
     back to) proposed, and its approved: is emptied. What verifies decides, never who this clone
     thinks it is, so a second key of the same person still counts once. Returns the IDs of the
     two-person tasks still waiting for an approval."""
+    no_choice = [why for t in todo if (why := _tasks.choice_problem(t))]
+    if no_choice:  # E-006: a task with options is approved only once a human chose one
+        raise SystemExit("refused: " + "; ".join(no_choice))
     shared = _config.SHARED is not None
     two = {t["id"] for t in todo if _tasks.two_person(t)}
     with _gitops.state_lock():
@@ -325,6 +328,12 @@ def approve(args):
                 if why:
                     again[t["id"]] = "; ".join(why)
     todo += [t for t in named if t["id"] in again]
+    no_choice = [why for t in todo if (why := _tasks.choice_problem(t))]
+    todo = [t for t in todo if not _tasks.choice_problem(t)]
+    for why in no_choice:
+        print(f"left out: {why}")
+    if no_choice and not todo and not briefs:
+        raise SystemExit("refused: " + "; ".join(no_choice))
     todo = briefs + todo
     if not todo:
         raise SystemExit("nothing in `proposed` among those ids" + (
@@ -353,6 +362,8 @@ def approve(args):
             print(f"      verify: {str(t['verify']).strip()}  (replaces the runtime gate)")
         if _tasks.prove_off(t):
             print("      prove: no  (skips the red-on-base proof)")
+        if _tasks.choice_text(t):  # the choice is part of what the approval approves
+            print(f"      chosen {_tasks.choice_text(t)}")
     n_epics = sum(map(_tasks.is_epic, todo))
     what = " and ".join(x for x in (f"{n_epics} epic brief(s)" if n_epics else "",
                                     f"{len(todo) - n_epics} task(s)" if len(todo) > n_epics else "") if x)
@@ -490,7 +501,8 @@ def review_interactive(args):
     `brief_due`, comes before its tasks, offering `a`: approve the brief alone, as approving the
     epic's ID does), then tasks waiting on an answer to their worker's question (offering `a`:
     answer it, as `ergon answer` does), then tasks whose review vetoed them (offering `p`: save
-    the finding as a policy). Every answer lands immediately."""
+    the finding as a policy). A proposed task with options offers `c`: choose one, as `ergon choose`
+    does; approving it is refused until it has a choice. Every answer lands immediately."""
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     held = _shared.unpublished([t["id"] for t in tasks.values() if t["status"] == "proposed"]
                                + [t["epic"] for t in tasks.values() if t["status"] == "proposed" and t.get("epic")]
@@ -575,8 +587,27 @@ def review_interactive(args):
                 print(f"\n(waits on {', '.join(waits)})")
             if apr and _tasks.two_person(t):
                 print(f"\n(two-person: {apr.tally(t)})")
-            choice = ask(f"\n{t['id']} [{t['tier']}]  [a]pprove  [r]eject  [t]ier  [e]dit  [s]kip  [q]uit > ").lower()
+            has_opts = _tasks.has_options(t)
+            if has_opts:
+                print("\n" + (f"(chosen {_tasks.choice_text(t)})" if _tasks.choice_text(t) else
+                              "(options and no choice yet: [c]hoose one before approving)"))
+            choice = ask(f"\n{t['id']} [{t['tier']}]  [a]pprove  " + ("[c]hoose  " if has_opts else "")
+                         + "[r]eject  [t]ier  [e]dit  [s]kip  [q]uit > ").lower()
+            if choice == "c" and has_opts:
+                try:
+                    choose_task(t)
+                    tally["chosen"] = tally.get("chosen", 0) + 1
+                except SystemExit as err:  # nothing picked, not confirmed, or moved on: nothing written
+                    if str(err).startswith("refused"):  # ask()'s agent-shell / no-tty refusal ends the review
+                        raise
+                    print(err)
+                t = _tasks.parse(t["_path"])
+                continue
             if choice == "a":
+                why = _tasks.choice_problem(t)
+                if why:
+                    print(f"refused: {why}")
+                    continue
                 try:  # shared mode: refuses, approving nothing, unless the approval would verify
                     approve_ready()
                     waiting = stamp_approved([t])
@@ -864,6 +895,74 @@ def answer_task(t, text=""):
     print(f"{tid} is ready: the next `ergon dispatch` resumes its worker with your answer")
 
 
+CHOICE_STEERS = ("A choice steers only: it never changes tier, touches:, accept: or approved:. If the chosen "
+                 "option needs a different tier or touches:, edit those before approving.")
+
+
+def choose(args):
+    """HUMAN ONLY: pick one of a proposed task's options (`ergon choose ID N`), or say how it is
+    built in your own words (`--own "<text>"`). With neither, offers the options to pick from."""
+    if in_agent_shell():
+        raise SystemExit("refused: running inside an agent shell. A human chooses from their own terminal.")
+    t = _tasks.load(_config.ITEMS).get(args.id)
+    if not t:
+        raise SystemExit(f"no such task: {args.id}")
+    if args.n is not None and args.own is not None:
+        raise SystemExit("give an option's number or --own \"<text>\", not both")
+    choose_task(t, args.n, args.own)
+
+
+def choose_task(t, n=None, own=None):
+    """HUMAN ONLY, the one path for `ergon choose` and `c` in the interactive review: check that t
+    is proposed and has a well-formed `## Options` section, take the choice (a number, or the
+    human's own text; with neither, ask), print it and confirm; then write or replace the
+    section's `Chosen:` line and record a `chosen` row. Never touches tier, touches:, accept: or
+    approved:. Raises SystemExit, writing nothing, if any of that fails or isn't confirmed."""
+    tid = t["id"]
+    if t["status"] != "proposed":
+        raise SystemExit(f"{tid} is {t['status']}: a choice is made on a proposed task only, before it is "
+                         f"approved (after that it's a re-plan: edit the task by hand and approve it again)")
+    if not _tasks.has_options(t):
+        raise SystemExit(f"{tid} has no ## Options section to choose from")
+    opts, chosen = _tasks.options(t)
+    if len(opts) < 2:
+        raise SystemExit(f"{tid}: {_tasks.options_problems(t)[0]}; fix the section first")
+    print(f"{tid}  {t['title']}\n\nOPTIONS")
+    _tasks.print_options(t)
+    if chosen:
+        print(f"\n(replaces the current choice: {chosen['line']})")
+    if n is None and own is None:
+        got = ask(f"\nchoice (1-{len(opts)}, or your own words): ").strip()
+        if not got:
+            raise SystemExit("no choice given; nothing written")
+        if got.isdigit():
+            n = got
+        else:
+            own = got
+    if own is not None:
+        text = _dispatch.note_line(_dispatch.md_trim(own))
+        if not text:
+            raise SystemExit("--own needs the text of your choice")
+        option, what = "own", f"your own: {text}"
+    else:
+        if not str(n).isdigit() or not 1 <= int(n) <= len(opts):
+            raise SystemExit(f"{tid}: pick an option from 1 to {len(opts)}, or --own \"<text>\"")
+        option, text = int(n), opts[int(n) - 1]
+        what = f"{option}. {text}"
+    print(f"\nchoice: {what}\n\n{CHOICE_STEERS}")
+    if not human_gate(f"Choose this for {tid} as {approver()}?"):
+        raise SystemExit("aborted")
+    with _gitops.state_lock():  # shared mode: the write is a state commit, like a `set`
+        t = _tasks.load(_config.ITEMS).get(tid)
+        if not t or t["status"] != "proposed" or not _tasks.has_options(t):
+            raise SystemExit(f"{tid} is now {t['status'] if t else 'gone'}; nothing written")
+        t["_body"] = _tasks.set_chosen(t["_body"], _tasks.chosen_line(option, approver(), _tasks.today(),
+                                                                      text))
+        _tasks.dump(t, _tasks.TASK_KEYS)
+        _history.record("chosen", t, by=approver(), option=option, text=text)
+    print(f"{tid}: chose {what}. Approve it from your own terminal: ergon approve {tid}")
+
+
 def pin(args):
     """HUMAN ONLY: `ergon pin ID first|last|clear` writes or removes `pin:`, which overrides the
     priority score in the order. Reorders only, so it asks for no confirmation."""
@@ -947,8 +1046,8 @@ SHELL_WRITE = re.compile(r"\bsed\s+(-\w+\s+)*-i|\bperl\s+-\w*i|(?<![0-9&>])>(?!\
 TAR_WRITE = re.compile(r"\btar\s+[xcru]|\btar\s[^;&|]*(\s-\w*[xcru]|--(extract|create|append|update|get))")
 # The human-only commands as plain text. human_cmd falls back to it for text it can't split into
 # words and for strings handed to a program that runs them as code (bash -c, python -c, ssh, ...).
-HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept|answer|sync|pin)\b|\breview\s+(-i|--interactive)\b")
-HUMAN_VERBS = {"approve", "reject", "close", "accept", "answer", "sync", "pin"}
+HUMAN_CMD = re.compile(r"\bergon(?:\.py)?[\"']?\s+(approve|reject|close|accept|answer|sync|pin|choose)\b|\breview\s+(-i|--interactive)\b")
+HUMAN_VERBS = {"approve", "reject", "close", "accept", "answer", "sync", "pin", "choose"}
 # Programs that run a string argument or their stdin as code: what's quoted for them is a command.
 CODE_RUNNER = re.compile(r"(?:ba|da|z|k|mk|c|tc|fi|a)?sh|busybox|eval|env|ssh|su|watch|script|tmux|screen|"
                          r"parallel|flock|expect|osascript|python[0-9.]*|pypy[0-9.]*|perl|ruby|node|nodejs|"
@@ -1185,7 +1284,7 @@ def git_commands(words):
 
 def human_cmd(cmd):
     """Whether a shell command runs a human-only ergon command: approve, reject, close, accept,
-    answer, sync, or the interactive review. Only a real call counts: `ergon` (ergon.py, the package's
+    answer, sync, pin, choose, or the interactive review. Only a real call counts: `ergon` (ergon.py, the package's
     folder or __main__.py) as a word of a simple command followed by the verb, wherever that
     command sits (after &&, inside $(...), behind sudo or xargs, in a heredoc fed to a shell). The
     verbs inside a quoted grep pattern or commit message are data and pass. Strings given to a
@@ -1650,8 +1749,8 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
         if why:
             return why
         if human_cmd(cmd):
-            return ("approve / reject / close / accept / answer / sync / pin / review -i are human-only; ask the user to run "
-                    "them in their own terminal")
+            return ("approve / reject / close / accept / answer / sync / pin / choose / review -i are human-only; ask the "
+                    "user to run them in their own terminal")
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
                      r"\b(CLAUDECODE|AI_AGENT)=", cmd):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
@@ -1728,6 +1827,11 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
         return "change status with `ergon set ID status=…` (it enforces the allowed moves), not by editing the file"
     if fb.get("pin", "") != fa.get("pin", ""):
         return "`pin:` is written by a human's `ergon pin` only"
+    # E-006: the human's pick among a task's options. Adding, changing or removing it (the whole
+    # section going counts) is a human's `ergon choose`, so an agent can't choose for them.
+    if _tasks.chosen_lines(before) != _tasks.chosen_lines(after):
+        return ("a `Chosen:` line under `## Options` is the human's choice: it is written by a human's "
+                "`ergon choose` only (ask the user to run it in their own terminal)")
     for key in ("asking", "answered"):
         if fb.get(key, "") != fa.get(key, ""):
             return f"`{key}:` is written by dispatch and a human's `ergon answer` only"

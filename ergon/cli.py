@@ -12,12 +12,17 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon guide                  print the workflow guide (also the plugin's `ergon` skill)
   ergon rules                  print this project's worker rules (worker_rules in .ergon.toml)
   ergon next [--tier T]        approved, unblocked tasks an agent of tier T may take
-  ergon review [-i]            everything waiting on human approval (-i: HUMAN ONLY, walk it
-                               item by item: tasks to approve / reject / retier / edit / skip;
+  ergon review [-i]            everything waiting on human approval, and tasks AWAITING A CHOICE
+                               of their options (-i: HUMAN ONLY, walk it item by item: tasks to
+                               approve / choose (c) / reject / retier / edit / skip;
                                epic briefs (Goal, Out of scope, Constraints) to approve, which
                                opens the epic and leaves its tasks proposed / edit / skip)
   ergon show ID
   ergon new task "Title" --tier sonnet [--epic E-001] [--touches a,b] [--source LOG.md:42]
+                      [--category C] [--option "<approach>" --option "<approach>" ...]
+                               --option (2 to 4, the recommended one first) writes an ## Options
+                               section a human picks from with `ergon choose`. In an agent shell a
+                               feature (category feature or empty) is refused without 2 of them
   ergon new epic "Title"
   ergon import gh#123 [--tier T] [--epic E] [--touches a,b]
                                a GitHub issue (or gh:OWNER/REPO#123) as a proposed task, via the
@@ -54,6 +59,12 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                parked its task on (`RESULT: asking`); no text offers the options.
                                The task goes back to ready, and the next dispatch resumes the
                                worker's session with the answer (a fresh one if its cache is gone).
+                               Never changes approved:, tier, touches: or accept:
+  ergon choose ID N | --own "<text>"
+                               HUMAN ONLY, real terminal. Pick one of a proposed task's ## Options
+                               (no N offers them): writes `Chosen: N by <name> <date>` as the
+                               section's first line and a `chosen` history row. `approve` refuses a
+                               task with options and no choice; `check` fails one past proposed.
                                Never changes approved:, tier, touches: or accept:
   ergon close ID [ID ...] --as done|dropped --reason R
                                HUMAN ONLY. An approved task whose work landed elsewhere, or that
@@ -399,6 +410,10 @@ def main():
     nw.add_argument("--epic")
     nw.add_argument("--touches")
     nw.add_argument("--source")
+    nw.add_argument("--option", action="append", metavar="TEXT",
+                    help="task: one approach to choose from; give it 2 to 4 times, the recommended one first. Writes an "
+                         "## Options section a human picks from with `ergon choose`. In an agent shell a feature "
+                         "(category feature or empty) needs at least 2")
     im = sub.add_parser("import", help="a GitHub issue as a proposed task: gh#123 or gh:OWNER/REPO#123")
     im.add_argument("ref", metavar="gh#N")
     im.add_argument("--tier", help="default: human, until someone sizes it")
@@ -428,6 +443,10 @@ def main():
     an = sub.add_parser("answer", help="HUMAN ONLY: answer a worker's question and requeue its task")
     an.add_argument("id")
     an.add_argument("text", nargs="*", help="the answer; leave it out to pick from the options")
+    ch = sub.add_parser("choose", help="HUMAN ONLY: pick one of a proposed task's options (approve waits on it)")
+    ch.add_argument("id")
+    ch.add_argument("n", nargs="?", metavar="N", help="the option's number; leave it and --own out to pick")
+    ch.add_argument("--own", metavar="TEXT", help="your own approach instead of a listed one")
     r = sub.add_parser("reject")
     r.add_argument("ids", nargs="+")
     r.add_argument("--reason")
@@ -571,7 +590,7 @@ def run(args):
              "tidy": _tasks.tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours); grade around its
         # (and tag) around their writes only, not the minutes claude takes to answer
-        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
+        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "choose": _gates.choose, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "breakdown": _dispatch.breakdown, "rules": rules,
          "import": _tasks.import_issue, "obsidian": _obsidian.obsidian, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "learn": _learn.learn, "journal": journal, "sync": _shared.sync}[args.cmd](args)
 
