@@ -3961,6 +3961,18 @@ def dispatch(args):
                 return calls + args.until_done
             # The n costliest count, so the estimate stays an upper bound whichever tasks launch.
             calls = sorted((max_calls(t) for t in plan), reverse=True)[:n]
+            # An epic whose open tasks all sit in the plan may complete, so its resolver (one call, once)
+            # may run when the last one lands (T-096).
+            resolvers = 0
+            if cr:
+                planned = {t["id"] for t in plan}
+                for eid in {t.get("epic") for t in plan if t.get("epic")}:
+                    open_ = [k["id"] for k in tasks.values()
+                             if k.get("epic") == eid and k["status"] not in ("done", "dropped")]
+                    if open_ and all(i in planned for i in open_):
+                        resolvers += 1
+                if resolvers:
+                    counted.add("resolver")
             what = [x for k, x in (
                 ("escalate", "a second worker if --escalate retries it a tier up"),
                 ("review", f"the review and {rounds}" + (" (a fix and a review each)" if rr else "")
@@ -3968,11 +3980,13 @@ def dispatch(args):
                 ("verify", f"up to {vr} verify fix round{'s' if vr != 1 else ''} (a fix each) "
                            "(with or without a verify: a weakening veto or failed harden proof takes one too)"),
                 ("conflict", f"{crounds} (a worker each) if the branch conflicts"),
-                ("until-done", f"up to {args.until_done} until-done rounds (a worker each) if it stops short"))
+                ("until-done", f"up to {args.until_done} until-done rounds (a worker each) if it stops short"),
+                ("resolver", f"{resolvers} epic resolver call{'s' if resolvers != 1 else ''} "
+                             "(one per epic whose last task lands, if its branch conflicts)"))
                 if k in counted]
             print(f"  cap        ${cap:.2f} total ({args.budget_pct:g}% of ${args.budget_total:.2f}): "
                   "no new task launches once finished workers' cost reaches it"
-                  + (f"; estimated at most ${(sum(calls) + len(bplan)) * args.budget:.2f} for {n} task(s)"
+                  + (f"; estimated at most ${(sum(calls) + len(bplan) + resolvers) * args.budget:.2f} for {n} task(s)"
                      + (f" and {len(bplan)} breakdown(s)" if bplan else "") + " at --budget "
                      f"${args.budget:g} per call" + (", counting a task as its worker plus " + ", plus ".join(what)
                                                      if what else "") + ", not counting auto-approved follow-ups, which spend from the same cap"

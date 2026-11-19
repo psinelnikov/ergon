@@ -704,6 +704,22 @@ class TestMapAndAudit(Project):
 
 
 class TestEpicBranch(Project):
+    def test_dry_run_estimate_counts_the_epic_resolver(self):
+        self.ergon("new", "epic", "Big thing")
+        approve_epic(self)
+        self.ergon("new", "task", "Part one", "--tier", "haiku", "--epic", "E-001")
+        stamp(self.task_file("T-001"))
+        args = ("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1")
+        with_resolver = self.ergon(*args).stdout
+        m = re.search(r"estimated at most \$(\d+\.\d\d) for 1 task", with_resolver)
+        self.assertIn("1 epic resolver call", with_resolver)
+        (self.root / ".ergon.toml").write_text("conflict_rounds = 0\n" + (self.root / ".ergon.toml").read_text())
+        without = self.ergon(*args).stdout
+        m0 = re.search(r"estimated at most \$(\d+\.\d\d) for 1 task", without)
+        self.assertNotIn("resolver", without)
+        # conflict_rounds = 1 adds its worker round, and the resolver one more call
+        self.assertEqual(float(m.group(1)) - float(m0.group(1)), 2.0)
+
     def test_epic_lifecycle(self):
         self.ergon("new", "epic", "Big thing")
         approve_epic(self)  # a human approves the brief, which opens it (T-098)
