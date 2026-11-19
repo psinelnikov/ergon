@@ -39,6 +39,26 @@ ignores the map.
 
 Without a `concepts` key none of this runs: `tag` and `related` say so, `check` and the task
 page are as they were, and `hold_by = "component"` is an error.
+
+Function-level touches (T-145). A `touches:` entry may name one function of a file as
+`<path>/::<fn>`, e.g. `ergon/gates.py/::guard_reason`; a task touching three functions lists
+three entries. The `/` before `::` is on purpose: every file-level rule matches a touches: entry
+by its `/`-separated leading parts (config.protect_hit for [[protect]], [[accept]], [[evidence]],
+[[two_person]] and approval by inheritance; the audit's citations; companion and nested-repo
+checks), so `ergon/gates.py/::guard_reason` still falls under a rule naming `ergon/gates.py`.
+Plain `ergon/gates.py::guard_reason` (no `/`) would not, so it isn't read as a function: `check`
+fails it, `set` refuses it and dispatch won't launch the task, each saying how to write it.
+
+Overlap (dispatch's `shared`, through `touch_parts`) compares entries part by part as before,
+with the function as one last part `::<fn>`. So two tasks touching different functions of a file
+don't overlap; the same function does; a file-level touch of the file (or of a directory above
+it) overlaps every function in it. A function counts only when the map lists it: some
+component's `fns` has it and one of that component's `files` patterns matches the path
+(`known_fn`). One the map doesn't list (a typo, or a function the task will create) counts as a
+touch of the whole file, and `check` warns about it; without a `concepts` key every function-level
+touch counts as its whole file. Missing knowledge holds, as with `hold_by = "component"`.
+`names_file` (the gate-file and suppression exemptions) keeps matching the entry exactly: a
+function-level touch never exempts its file.
 """
 import re
 import secrets
@@ -390,6 +410,97 @@ def apart(a, b, cmap):
     return (sorted(set(ta) & set(tb)) if ta and tb else []), unknown
 
 
+# ---------- function-level touches (T-145) ----------
+
+FN_SEP = "/::"
+FN = re.compile(r"[A-Za-z_][\w.]*")  # a function, or Class.method
+
+
+def parse_touch(entry):
+    """(path, fn, problem) for one touches: entry. fn is None for a file-level entry; problem is
+    '' when the entry is well formed, else what's wrong and how to write it."""
+    e = str(entry).strip()
+    if FN_SEP in e:
+        path, fn = e.split(FN_SEP, 1)
+        path = path.strip().strip("/")
+        if not path:
+            return path, fn, f"{e}: names a function but no file; write <path>{FN_SEP}<function>"
+        if not FN.fullmatch(fn):
+            return path, fn, f"{e}: {fn!r} isn't a function name; write {path}{FN_SEP}<function>"
+        return path, fn, ""
+    if "::" in e:
+        path, _, fn = e.partition("::")
+        return (path.strip().strip("/"), None,
+                f"{e}: write a function as {path.strip().strip('/')}{FN_SEP}{fn.strip()} (the `/` "
+                f"keeps [[protect]] and the other path rules matching the file)")
+    return e.strip("/"), None, ""
+
+
+def touch_problems(t):
+    """What's malformed in t's touches: entries (parse_touch), one line each."""
+    return [why for x in t.get("touches") or [] for why in [parse_touch(x)[2]] if why]
+
+
+def known_fn(path, fn, cmap):
+    """The component ids that list fn in `fns` and whose `files` patterns match path; [] when the
+    map doesn't know it there (or there is no map)."""
+    if not cmap:
+        return []
+    return [c["id"] for c in cmap["components"].values()
+            if fn in c["fns"] and any(_config.protect_hit(path, p) for p in c["files"])]
+
+
+def fn_reason(path, fn, cmap):
+    """'' when the map lists fn for path, else why it doesn't, starting `<path>/::<fn>: `."""
+    if known_fn(path, fn, cmap):
+        return ""
+    if not cmap:
+        return f"{path}{FN_SEP}{fn}: no concept map to check the function against"
+    elsewhere = [c["id"] for c in cmap["components"].values() if fn in c["fns"]]
+    return f"{path}{FN_SEP}{fn}: " + (f"the map lists {fn} under {', '.join(elsewhere)}, whose files "
+                                      f"don't match {path}" if elsewhere else f"no component's fns lists {fn}")
+
+
+def fn_problem(path, fn, cmap):
+    """'' when the map lists fn for path, else a message saying why it counts as the whole file."""
+    why = fn_reason(path, fn, cmap)
+    if not why or not cmap:
+        return why and f"{why}, so it counts as all of {path}"
+    where = getattr(_config, "CONCEPTS", None)
+    return (f"{why}, so it counts as all of {path} (add it to a component's fns in "
+            f"{where.name if where else 'the map'} if it's real)")
+
+
+def fn_map():
+    """The map function-level touches are checked against: the configured one, as much of it as
+    holds, or None without a `concepts` key."""
+    return read_map()[0] if _config.CONCEPTS else None
+
+
+def touch_parts(entry, cmap):
+    """A touches: entry as dispatch compares it for overlap: the path's `/`-separated parts, plus
+    `::<fn>` when it names a function the map lists for that path. Any other entry with a
+    function part (malformed, or a function the map doesn't list there) is its whole file."""
+    if "::" not in str(entry):
+        return str(entry).strip("/").split("/")  # exactly as dispatch always split a path
+    path, fn, why = parse_touch(entry)
+    parts = path.split("/")
+    return parts + ["::" + fn] if fn and not why and known_fn(path, fn, cmap) else parts
+
+
+def fn_notes(t, cmap, short=False):
+    """The function-level entries of t that count as their whole file, one line each: fn_problem's
+    message, or fn_reason's with short."""
+    out = []
+    for x in t.get("touches") or []:
+        path, fn, why = parse_touch(x)
+        if fn and not why:
+            note = (fn_reason if short else fn_problem)(path, fn, cmap)
+            if note:
+                out.append(note)
+    return out
+
+
 # ---------- links ----------
 
 def closure(tid, tasks):
@@ -503,17 +614,25 @@ def related(args):
 
 
 def lint(tasks):
-    """(errors, warnings) for `ergon check`: the map's problems and introduced_by IDs that name no
-    task are errors; missing depends, tags the map lacks and a dropped introducer are warnings.
-    Without a `concepts` key, only a `hold_by` that doesn't hold."""
+    """(errors, warnings) for `ergon check`: the map's problems, introduced_by IDs that name no
+    task and an open task's malformed function-level touches are errors; missing depends, tags the
+    map lacks, a dropped introducer and a function the map doesn't list are warnings. Without a
+    `concepts` key, only a `hold_by` that doesn't hold, malformed touches and the function-level
+    touches that count as their whole file for want of a map."""
     hold = hold_by_problem()
+    bad = [f"{i}: touches: {why}" for i, t in sorted(tasks.items()) if t.get("status") in OPEN
+           for why in touch_problems(t)]
     if not _config.CONCEPTS:
-        return [hold] if hold else [], []
+        fns = [f"{i}: touches: {n}" for i, t in sorted(tasks.items()) if t.get("status") in OPEN
+               for n in fn_notes(t, None)]
+        return ([hold] if hold else []) + bad, fns
     cmap, errs = read_map()
     if hold:
         errs.append(hold)
+    errs += bad
     name = _config.CONCEPTS.name
-    warns = []
+    warns = [f"{i}: touches: {n}" for i, t in sorted(tasks.items()) if t.get("status") in OPEN
+             for n in fn_notes(t, cmap)]
     for c in cmap["components"].values():
         intro = c["introduced_by"]
         if intro and intro not in tasks:

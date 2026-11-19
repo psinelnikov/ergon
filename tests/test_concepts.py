@@ -487,5 +487,160 @@ class TestHoldByComponent(DispatchProject):
                 self.assertIn(want, r.stderr)
 
 
+FN_MAP = MAP.replace('fns = ["guard_reason"]', 'fns = ["guard_reason", "hook"]', 1).replace(
+    'files = ["ergon/serve.py"]', 'files = ["ergon/serve.py"]\nfns = ["task_page"]', 1).replace(
+    'introduced_by = "T-005"\n', '', 1)
+
+
+class TestFunctionTouches(unittest.TestCase):
+    """Function-level touches (T-145): `path/::fn`, checked against the map's fns."""
+
+    def setUp(self):
+        self.cmap, errs = C.check_map(_config.mini_toml(FN_MAP))
+        self.assertEqual(errs, [])
+
+    def test_parse(self):
+        self.assertEqual(C.parse_touch("ergon/gates.py"), ("ergon/gates.py", None, ""))
+        self.assertEqual(C.parse_touch("ergon/"), ("ergon", None, ""))
+        self.assertEqual(C.parse_touch("ergon/gates.py/::guard_reason"), ("ergon/gates.py", "guard_reason", ""))
+        self.assertEqual(C.parse_touch("a.py/::Board.render")[1:], ("Board.render", ""))
+        why = C.parse_touch("ergon/gates.py::guard_reason")[2]
+        self.assertIn("write a function as ergon/gates.py/::guard_reason", why)
+        self.assertIn("[[protect]]", why)
+        self.assertIn("names a function but no file", C.parse_touch("/::guard_reason")[2])
+        self.assertIn("'1x' isn't a function name", C.parse_touch("a.py/::1x")[2])
+        self.assertIn("'' isn't a function name", C.parse_touch("a.py/::")[2])
+        self.assertEqual(C.touch_problems({"touches": ["a.py", "b.py/::f", "c.py::g"]}),
+                         [C.parse_touch("c.py::g")[2]])
+
+    def test_known_against_the_map(self):
+        self.assertEqual(C.known_fn("ergon/gates.py", "guard_reason", self.cmap), ["approval.guard"])
+        self.assertEqual(C.known_fn("ergon/serve.py", "guard_reason", self.cmap), [])
+        self.assertEqual(C.known_fn("ergon/gates.py", "guard_reason", None), [])
+        self.assertEqual(C.fn_problem("ergon/gates.py", "hook", self.cmap), "")
+        self.assertIn("ergon/gates.py/::nope: no component's fns lists nope, so it counts as all of ergon/gates.py",
+                      C.fn_problem("ergon/gates.py", "nope", self.cmap))
+        self.assertIn("the map lists guard_reason under approval.guard, whose files don't match ergon/serve.py",
+                      C.fn_problem("ergon/serve.py", "guard_reason", self.cmap))
+        self.assertIn("no concept map to check the function against", C.fn_problem("a.py", "f", None))
+
+    def test_parts_compare_functions_only_when_known(self):
+        parts = lambda x, m=self.cmap: C.touch_parts(x, m)  # noqa: E731
+        self.assertEqual(parts("ergon/gates.py"), ["ergon", "gates.py"])
+        self.assertEqual(parts("ergon/"), ["ergon"])
+        self.assertEqual(parts("ergon/gates.py/::hook"), ["ergon", "gates.py", "::hook"])
+        self.assertEqual(parts("ergon/gates.py/::nope"), ["ergon", "gates.py"])  # unknown: the whole file
+        self.assertEqual(parts("ergon/gates.py::hook"), ["ergon", "gates.py"])  # malformed: the whole file
+        self.assertEqual(parts("ergon/gates.py/::hook", None), ["ergon", "gates.py"])  # no map: the whole file
+
+
+class FnDispatch(DispatchProject):
+    config = DispatchProject.config.replace('trunk = "main"\n', 'trunk = "main"\n'
+                                           '        concepts = "concepts.toml"\n', 1)
+
+    def two(self, one, two, map_text=FN_MAP):
+        """T-001 touching `one`, T-002 touching `two`, both approved, with map_text as the map."""
+        if map_text is not None:
+            (self.root / "concepts.toml").write_text(map_text)
+            sh("git", "add", "-A", cwd=self.root)
+            sh("git", "commit", "-qm", "map", cwd=self.root)
+        for i, touches in enumerate((one, two), 1):
+            self.ergon("new", "task", f"Job {i}", "--tier", "sonnet", "--touches", touches)
+            stamp(self.task_file(f"T-{i:03d}"))
+        return self.ergon("dispatch", "--dry-run").stdout
+
+
+class TestFunctionTouchDispatch(FnDispatch):
+    def test_different_functions_of_a_file_run_side_by_side(self):
+        dry = self.two("ergon/gates.py/::guard_reason", "ergon/gates.py/::hook")
+        self.assertNotIn("held       T-002", dry)
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        for tid in ("T-001", "T-002"):
+            self.assertEqual(self.status(tid), "done", out)
+        order = [l.split()[0] + l.split()[1] for l in out.splitlines() if l.split()[:1] in (["doing"], ["done"])]
+        self.assertEqual(order[:2], ["doingT-001", "doingT-002"], out)
+        self.assertEqual([r for r in history(self.root) if r["event"] == "held"], [])
+
+    def test_the_same_function_or_its_file_holds(self):
+        cases = [  # (T-001's touches, T-002's touches, what the held line names)
+            ("ergon/gates.py/::guard_reason", "ergon/gates.py/::guard_reason", "ergon/gates.py/::guard_reason"),
+            ("ergon/gates.py", "ergon/gates.py/::guard_reason", "ergon/gates.py/::guard_reason"),
+            ("ergon/gates.py/::hook", "ergon", "ergon/gates.py/::hook"),
+            ("ergon/gates.py/::hook,x.py", "y.py,ergon/gates.py/", "ergon/gates.py/::hook"),
+        ]
+        for one, two, names in cases:
+            with self.subTest(one=one, two=two):
+                self.setUp()
+                dry = self.two(one, two)
+                self.assertIn(f"held       T-002 behind T-001: both touch {names}\n", dry)
+        # landing for real: held once, then run after T-001 lands
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        order = [l.split()[0] + l.split()[1] for l in out.splitlines() if l.split()[:1] in (["doing"], ["done"])]
+        self.assertEqual(order, ["doingT-001", "doneT-001", "doingT-002", "doneT-002"], out)
+        held = [r for r in history(self.root) if r["event"] == "held"]
+        self.assertEqual([(r["task"], r["touches"]) for r in held], [("T-002", ["ergon/gates.py/::hook"])])
+
+    def test_a_function_the_map_does_not_list_counts_as_its_file(self):
+        dry = self.two("ergon/gates.py/::brand_new", "ergon/gates.py/::hook")
+        self.assertIn("held       T-002 behind T-001: both touch ergon/gates.py/::hook (counted as the whole file: "
+                      "ergon/gates.py/::brand_new: no component's fns lists brand_new)", dry)
+        self.setUp()
+        dry = self.two("ergon/serve.py/::guard_reason", "ergon/serve.py/::task_page")
+        self.assertIn("held       T-002 behind T-001: both touch ergon/serve.py/::task_page (counted as the whole "
+                      "file: ergon/serve.py/::guard_reason: the map lists guard_reason under approval.guard, whose files "
+                      "don't match ergon/serve.py)", dry)
+
+    def test_without_a_map_every_function_is_its_file(self):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text().replace('concepts = "concepts.toml"\n', ""))
+        dry = self.two("ergon/gates.py/::guard_reason", "ergon/gates.py/::hook", map_text=None)
+        self.assertIn("held       T-002 behind T-001: both touch ergon/gates.py (counted as the whole file: "
+                      "ergon/gates.py/::hook: no concept map to check the function against; "
+                      "ergon/gates.py/::guard_reason: no concept map to check the function against)", dry)
+
+    def test_path_colon_colon_fn_is_refused_not_misread(self):
+        # ergon/gates.py::hook would slip past a [[protect]] rule on ergon/gates.py, so dispatch won't launch it
+        dry = self.two("ergon/gates.py", "ergon/gates.py::hook")
+        self.assertIn("skipped  T-002  touches: ergon/gates.py::hook: write a function as ergon/gates.py/::hook", dry)
+        self.assertNotIn("held       T-002", dry)
+        self.assertNotIn("  T-002  ", dry.split("skipped")[0])
+
+    def test_a_protect_rule_still_sees_the_file(self):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + '\n[[protect]]\ntouches = ["ergon/gates.py"]\nmin_tier = "opus"\n')
+        _config.configure(self.root)
+        self.assertEqual(T.protect_problems({"tier": "sonnet", "touches": ["ergon/gates.py/::hook"]}),
+                         ["touches ergon/gates.py/::hook (protect ergon/gates.py) needs tier opus+, is sonnet"])
+
+
+class TestFunctionTouchCheckAndSet(FnDispatch):
+    def test_check_fails_malformed_and_warns_unknown(self):
+        self.two("ergon/gates.py/::hook,ergon/gates.py/::nope", "ergon/serve.py::task_page")
+        r = self.ergon("check", check=False)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("T-002: touches: ergon/serve.py::task_page: write a function as ergon/serve.py/::task_page", r.stdout)
+        self.assertIn("warning: T-001: touches: ergon/gates.py/::nope: no component's fns lists nope, so it counts "
+                      "as all of ergon/gates.py (add it to a component's fns in concepts.toml if it's real)", r.stdout)
+        self.assertNotIn("::hook", r.stdout)
+        set_field(self.task_file("T-002"), "touches", "[ergon/serve.py/::task_page]")
+        set_field(self.task_file("T-001"), "touches", "[ergon/gates.py/::hook]")
+        r = self.ergon("check")
+        self.assertNotIn("touches:", r.stdout)
+
+    def test_set_refuses_malformed_and_warns_unknown(self):
+        self.two("a.py", "b.py")
+        for tid in ("T-001", "T-002"):  # back to proposed, where touches: may change
+            f = self.task_file(tid)
+            f.write_text(re.sub(r"^status: .*$", "status: proposed", f.read_text(), count=1, flags=re.M))
+        r = self.ergon("set", "T-001", "touches=ergon/gates.py::hook", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("T-001: touches: ergon/gates.py::hook: write a function as ergon/gates.py/::hook", r.stderr)
+        self.assertNotIn("::hook", self.task_file("T-001").read_text())
+        r = self.ergon("set", "T-001", "touches=ergon/gates.py/::hook,ergon/gates.py/::nope")
+        self.assertIn("T-001: touches: ergon/gates.py/::nope: no component's fns lists nope", r.stderr)
+        self.assertNotIn("::hook:", r.stderr)
+        self.assertIn("touches: [ergon/gates.py/::hook, ergon/gates.py/::nope]", self.task_file("T-001").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

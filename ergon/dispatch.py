@@ -3541,6 +3541,7 @@ def dispatch(args):
     # hold_by = "component" (T-144): overlapping touches hold two tasks apart only when they share a
     # component too (hold()). Read once a run; a setting or map that doesn't hold refuses the run.
     cmap = _concepts.hold_map("ergon dispatch")
+    fmap = _concepts.fn_map()  # function-level touches (T-145) count only when this map lists them
     links, epics = gitlinks(), _tasks.load(_config.EPICS)
     ids = set(args.ids.split(",")) if args.ids else None
     agents, settings = worker_agents(), worker_settings()
@@ -3586,6 +3587,10 @@ def dispatch(args):
             why = _tasks.approval_of(t, tasks)[2] if _tasks.is_auto(t) else None
             if why:
                 skipped[t["id"]] = f"its auto approval doesn't hold: {why}"
+                continue
+            bad = _concepts.touch_problems(t)
+            if bad:  # e.g. path::fn, which [[protect]] and the other path rules wouldn't match
+                skipped[t["id"]] = f"touches: {bad[0]}"
                 continue
             nested = nested_touch(t, links)
             if nested:
@@ -4381,17 +4386,21 @@ def dispatch(args):
     def shared(a, b):
         """Paths both tasks name, or one inside the other (split on `/`). A task with no
         `touches:` overlaps every other task. A companion itself isn't shared: each task gets
-        its own worktree of it, so only paths inside it that both name count."""
+        its own worktree of it, so only paths inside it that both name count. A function the
+        map lists (`path/::fn`, T-145) is one more part, so different functions of a file don't
+        overlap, the same one does, and a touch of the file overlaps all of them; any other
+        function-level entry is its whole file (concepts.touch_parts)."""
         ta, tb = a.get("touches") or [], b.get("touches") or []
         if not ta or not tb:
             return [NO_TOUCHES]
         out = set()
         for x in ta:
             for y in tb:
-                px, py = x.strip("/").split("/"), y.strip("/").split("/")
+                px, py = _concepts.touch_parts(x, fmap), _concepts.touch_parts(y, fmap)
                 n = min(len(px), len(py))
                 if px[:n] == py[:n]:
-                    out.add(x if len(px) >= len(py) else y)
+                    z, pz = (x, px) if len(px) >= len(py) else (y, py)
+                    out.add(z if "::" not in z else "/".join(pz))
         return sorted(out - every_touch)
 
     def hold(a, b):
@@ -4417,6 +4426,10 @@ def dispatch(args):
             who = [t["id"] for t in (a, b) if not t.get("touches")]
             return " and ".join(who) + (" has" if len(who) == 1 else " have") + " no touches: declared"
         why = "both touch " + ", ".join(got)
+        whole = [n for t in (a, b) for n in _concepts.fn_notes(t, fmap, short=True)
+                 if any(g.split(_concepts.FN_SEP)[0] == n.split(_concepts.FN_SEP)[0] for g in got)]
+        if whole:  # a function-level touch the map doesn't list: say why it counts as its file
+            why += " (counted as the whole file: " + "; ".join(dict.fromkeys(whole)) + ")"
         if cmap is None:
             return why
         comps, unknown = _concepts.apart(a, b, cmap)

@@ -17,6 +17,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import concepts as _concepts
 from . import config as _config
 from . import dispatch as _dispatch
 from . import gitops as _gitops
@@ -106,6 +107,12 @@ def setf(args):
                 raise SystemExit(f"{args.id} can't start: {why}")
         if key in ("depends", "touches"):
             val = [v for v in val.split(",") if v]
+        if is_task and key == "touches":  # function-level entries, `path/::fn` (T-145)
+            bad = _concepts.touch_problems({"touches": val})
+            if bad:
+                raise SystemExit(f"{args.id}: touches: " + "; ".join(bad))
+            for note in _concepts.fn_notes({"touches": val}, _concepts.fn_map()):
+                print(f"{args.id}: touches: {note}", file=sys.stderr)
         item[key] = val
     if epic and new_status:
         try:
