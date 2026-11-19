@@ -706,6 +706,107 @@ class TestBasics(Project):
         self.assertIsNone(git_config_command("user.email", "ergon approve"))
         self.assertEqual(git_config_command("ALIAS.st", "status"), "git status")
 
+    def test_guard_refuses_git_config_defined_outside_its_arguments(self):
+        """T-060: an alias or command-valued key defined where the command text doesn't hold its
+        value (--config-env, GIT_CONFIG_* set by another command, a $ expansion, a section rename),
+        through GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_<n>, or written into a file git reads config
+        from (by Edit/Write, or by a shell write naming .git/config, ~/.gitconfig, ... or an included
+        file) is refused. The same ways of setting user.name / user.email pass."""
+        from ergon.gates import (GIT_COMMAND_SECTIONS, config_edit_reason, git_config_entries,
+                                 git_config_reason, human_cmd)
+        runs = "ergon {v} T-1"
+        bash = ["CMD='!{c}' git --config-env=alias.x=CMD x", "CMD='!{c}' git --config-env alias.x=CMD x",
+                "E='{c}' git --config-env=core.editor=E commit",
+                "GIT_CONFIG_PARAMETERS=\"'alias.x=!{c}'\" git x", "GIT_CONFIG_PARAMETERS=\"'alias.x'='!{c}'\" git x",
+                "export GIT_CONFIG_PARAMETERS=\"'user.name=n' 'alias.x'='!{c}'\"; git x",
+                "env GIT_CONFIG_PARAMETERS=\"'core.pager={c}'\" git log",
+                "P=\"'alias.x=!{c}'\"; GIT_CONFIG_PARAMETERS=\"$P\" git x",
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='!{c}' git x",
+                "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x; export GIT_CONFIG_VALUE_0='!{c}'; git x",
+                "export GIT_CONFIG_VALUE_3='!{c}'",  # its key set by an earlier command
+                "export GIT_CONFIG_VALUE_3='{c}'",  # ... maybe core.editor
+                "V='!{c}'; GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=\"$V\" git x",
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x git x",  # its value set by an earlier command
+                "bash -c \"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='!{c}' git x\"",
+                "V='!{c}'; git -c alias.x=\"$V\" x", "V='{c}'; git config alias.x \"!$V\"",
+                "git config user.name '!{c}' && git config --rename-section user alias && git name",
+                "git config user.name '!{c}' && git config rename-section --file .git/config user alias",
+                # A name the text doesn't spell out: an expansion in it, a nameref, ${NAME:=value}.
+                "i=0; export GIT_CONFIG_COUNT=1 \"GIT_CONFIG_KEY_$i=alias.x\" \"GIT_CONFIG_VALUE_$i=!{c}\"; git x",
+                "declare -n k=GIT_CONFIG_KEY_0 v=GIT_CONFIG_VALUE_0; k=alias.x; v='!{c}'; export k v; git x",
+                "set -a; : ${{GIT_CONFIG_KEY_0:=alias.x}} ${{GIT_CONFIG_VALUE_0:='!{c}'}}; git x"]
+        for verb in ["approve", "reject", "close", "accept", "answer", "sync", "pin", "choose", "review -i"]:
+            for form in bash:
+                cmd = form.format(c=runs.format(v=verb))
+                self.assertTrue(git_config_reason(cmd) or human_cmd(cmd), cmd)
+        for cmd in ["git --config-env=user.name=N commit", "git --config-env user.email=E commit",
+                    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.email GIT_CONFIG_VALUE_0=t@example.com git commit",
+                    "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.email GIT_CONFIG_VALUE_0=\"$EMAIL\"",
+                    "GIT_CONFIG_PARAMETERS=\"'user.email=t@example.com'\" git commit",
+                    "GIT_CONFIG_PARAMETERS=\"'alias.st'='status'\" git st", "export GIT_CONFIG_VALUE_0=t@example.com",
+                    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.st GIT_CONFIG_VALUE_0=status git st",
+                    "git -c alias.st=status st", "git config --rename-section work home", "unset GIT_CONFIG_PARAMETERS",
+                    "env -u GIT_CONFIG_PARAMETERS git log", "echo $GIT_CONFIG_PARAMETERS", "git -c user.name=\"$N\" commit",
+                    "printenv GIT_CONFIG_PARAMETERS", "env | grep GIT_CONFIG_KEY_", "echo \"${GIT_CONFIG_PARAMETERS:-}\"",
+                    "env --unset=GIT_CONFIG_PARAMETERS git log", "git commit -m 'Read GIT_CONFIG_KEY_<n> too'"]:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+        # A value the text holds is read like git -c's: a human-only verb gets the human-only refusal.
+        self.assertIn("human-only", self.guard("Bash", {"command": bash[8].format(c="ergon approve T-1")}))
+        self.assertIn("--config-env", self.guard("Bash", {"command": bash[0].format(c="ergon approve T-1")}))
+        self.assertIsNone(self.guard("Bash", {"command": "git --config-env=user.name=N commit"}))
+        self.assertTrue(all(k.partition(".")[0] in GIT_COMMAND_SECTIONS for k in
+                            ["alias", "core", "pager", "diff", "difftool", "mergetool", "merge", "filter", "credential",
+                             "gpg", "remote", "submodule", "sendemail", "imap", "hook"]))
+
+        # Writing a git config file. An include.path target can have any name; this one is ../extra.inc
+        # from .git/, the repository's root.
+        sh("git", "config", "include.path", "../extra.inc", cwd=self.root)
+        (self.root / "extra.inc").write_text("[user]\n\tname = Tester\n")
+        alias = "[alias]\n\tx = !ergon approve T-1\n"
+        printf = r"printf '[alias]\n\tx = !ergon approve T-1\n'"
+        for f in [".git/config", ".git/config.worktree", "~/.gitconfig", "$HOME/.gitconfig", "/etc/gitconfig",
+                  "~/.config/git/config", "\"$XDG_CONFIG_HOME/git/config\"", "\"$(git rev-parse --git-dir)/config\"",
+                  "extra.inc", str(self.root / "extra.inc")]:
+            for cmd in [f"{printf} >> {f}", f"{printf} | tee -a {f}", f"sed -i '/^\\[user\\]/i [alias]\\n\\tx = !ergon approve T-1' {f}",
+                        f"cat >> {f} <<'EOF'\n{alias}EOF", f"cp /tmp/evil {f}"]:
+                self.assertFalse(human_cmd(cmd), cmd)
+                self.assertIn("git reads config from", self.guard("Bash", {"command": cmd}), cmd)
+        self.assertIn("git reads config from", self.guard("Bash", {"command": f"cd .git && {printf} >> config"}))
+        for cmd in [f"{printf} >> notes.txt", "cat > tests/t.py <<'EOF'\nopen('.git/config')\nEOF",
+                    "git config user.email t@example.com", "echo x > config.yml", "git config -l > /dev/null"]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+        home = self.root / "home"
+        (home / ".config" / "git").mkdir(parents=True)
+        for p in [self.root / ".git" / "config", self.root / ".git" / "config.worktree", home / ".gitconfig",
+                  home / ".config" / "git" / "config", self.root / "extra.inc"]:
+            if not p.exists():
+                p.write_text("[user]\n\tname = Tester\n")
+            text = p.read_text()
+            for tool, inp in [("Edit", {"old_string": "[user]", "new_string": alias + "[user]"}),
+                              ("Edit", {"old_string": "[user]", "new_string": "[user] ; a comment\n[alias] x = !ergon approve T-1\n[user]"}),
+                              ("MultiEdit", {"edits": [{"old_string": "[user]", "new_string": "[alias \"x\"]\n\ty=!ergon close T-1\n[user]"}]}),
+                              ("Write", {"content": text + "[core]\n\teditor = ergon accept T-1\n"}),
+                              ("Write", {"content": text + "[credential]\n\thelper = \"!ergon \\\n answer T-1\"\n"})]:
+                why = self.guard(tool, {"file_path": str(p), **inp})
+                self.assertIn("reads as a git config file", why or "", (p, inp))
+            # Changing only [user] passes, as does leaving an alias that was already there in place.
+            self.assertIsNone(self.guard("Edit", {"file_path": str(p), "old_string": "[user]",
+                                                  "new_string": "[user]\n\temail = t@example.com"}), p)
+        p = self.root / ".git" / "config"
+        self.assertIsNone(self.guard("Edit", {"file_path": str(p), "old_string": "[user]", "new_string": "[User]"}))
+        p.write_text(p.read_text() + "[alias]\n\tst = status\n")
+        self.assertIsNone(self.guard("Edit", {"file_path": str(p), "old_string": "[user]",
+                                              "new_string": "[user]\n\temail = me@example.com"}))
+        self.assertIn("alias.st", config_edit_reason(str(p), "Edit", {"old_string": "st = status",
+                                                                       "new_string": "st = !ergon approve T-1"}))
+        # Text git won't read as config isn't config: a Python file, Markdown showing an alias.
+        for name, content in [("t.py", f"ALIAS = {alias!r}\n"), ("README.md", f"# Aliases\n\n```\n{alias}```\n")]:
+            self.assertIsNone(self.guard("Write", {"file_path": str(self.root / name), "content": content}))
+        self.assertEqual(git_config_entries('[alias] x = "a ; b" ; c\n[Diff "My Tool"]\ntextconv = f\\\n g\nflag\n'),
+                         [("alias.x", "a ; b"), ("diff.My Tool.textconv", "f g"), ("diff.My Tool.flag", None)])
+        for bad in ["x = 1\n[", "[alias]\nx = \"open\n", "[alias x]\n", "[alias]\nx y\n", "[alias]\nx = \\q\n"]:
+            self.assertIsNone(git_config_entries(bad), bad)
+
     def test_guard_human_cmd_git_ext_urls_and_instaweb(self):
         """T-215: an ext:: URL is a command git runs (git-remote-ext(1): argv split at spaces, `% `
         a literal space), wherever git takes a URL: clone, fetch, push, ls-remote, remote add, a
