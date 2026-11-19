@@ -706,6 +706,43 @@ class TestBasics(Project):
         self.assertIsNone(git_config_command("user.email", "ergon approve"))
         self.assertEqual(git_config_command("ALIAS.st", "status"), "git status")
 
+    def test_guard_human_cmd_git_ext_urls_and_instaweb(self):
+        """T-215: an ext:: URL is a command git runs (git-remote-ext(1): argv split at spaces, `% `
+        a literal space), wherever git takes a URL: clone, fetch, push, ls-remote, remote add, a
+        remote's or submodule's url config, an insteadOf base. instaweb runs its --httpd/-d value.
+        A human-only verb there is refused; a harmless command in the same place passes."""
+        from ergon.gates import ext_command, git_config_command, human_cmd
+        # what git itself runs, checked against git 2.54 with a script printing its argv
+        self.assertEqual(ext_command("ext::show.sh a% b c%%d %s %S x%sy"),
+                         "show.sh 'a b' c%d upload-pack git-upload-pack xupload-packy")
+        self.assertEqual(ext_command("ext::show.sh %Gfoo bar %Vhost"), "show.sh bar")
+        self.assertEqual(ext_command("ext::show.sh  two"), "show.sh '' two")
+        self.assertEqual(ext_command("EXT::x y"), "x y")
+        self.assertIsNone(ext_command("https://ext::x"))
+        forms = ["git -c protocol.ext.allow=always clone '{u}' d", "git clone -q '{u}' d", "git clone -- '{u}'",
+                 "git fetch '{u}' main", "git pull '{u}'", "git push '{u}' HEAD", "git ls-remote '{u}'",
+                 "git remote add x '{u}'", "git remote add -f x '{u}'", "git remote set-url x '{u}'",
+                 "git submodule add '{u}' sub", "git archive --remote='{u}' HEAD",
+                 "git config remote.x.url '{u}'", "git -c remote.origin.pushurl='{u}' push origin",
+                 "git -c Remote.X.URL='{u}' fetch x", "git config submodule.s.url '{u}'",
+                 "git clone -c remote.origin.url='{u}' u d", "git -c url.'{u}'.insteadOf=x fetch x",
+                 "git config url.'{u}'.pushInsteadOf x"]
+        urls = ["ext::{c}", "ext::sh -c {c%}", "EXT::{c}"]
+        forms += ["git instaweb --httpd='{c}'", "git instaweb --httpd '{c}'", "git instaweb -d '{c}'",
+                  "git instaweb --start -d'{c}'", "git instaweb -p 1234 --http='{c}'", "git-instaweb -d '{c}'"]
+        for verb in ["approve", "reject", "close", "accept", "answer", "sync", "pin", "choose", "review -i"]:
+            for c in [f"ergon {verb} T-1", "git status"]:
+                for form in forms:
+                    for u in urls if "{u}" in form else [""]:
+                        u = u.replace("{c%}", c.replace(" ", "% ")).replace("{c}", c)
+                        cmd = form.replace("{u}", u).replace("{c}", c)
+                        self.assertEqual(human_cmd(cmd), c != "git status", cmd)
+        for cmd in ["git clone 'ext::git% status' d", "git instaweb -d lighttpd", "git instaweb -b 'ergon approve'",
+                    "git clone https://example.com/ergon-approve.git", "git -c remote.x.url=ergon/approve fetch x",
+                    "git fetch 'file::ergon approve'"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+        self.assertIsNone(git_config_command("url.https://x/.insteadOf", "ext::ergon approve"))
+
     def test_stop_hook_blocks_on_lint_failure(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")
