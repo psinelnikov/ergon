@@ -15,6 +15,8 @@ from pathlib import Path
 
 ERGON = Path(__file__).resolve().parent.parent / "ergon"
 sys.path.insert(0, str(ERGON.parent))
+# The fixtures below import test_shared by its bare name, which only resolves with tests/ on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ergon  # noqa: E402
 
 FAKE_CLAUDE = r'''#!/usr/bin/env python3
