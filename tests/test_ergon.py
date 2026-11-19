@@ -1236,6 +1236,46 @@ class TestDispatch(DispatchProject):
         runs = list((self.root / "tasks" / "runs").glob("*.json"))
         self.assertEqual(len(runs), 2)
 
+    def obsidian_dispatch(self, write_back):
+        v = self.root.parent / "vault"
+        (v / "Health").mkdir(parents=True)
+        note = v / "Health" / "Insurance.md"
+        note.write_text("- [ ] Call them #agent ^mine\n")
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + f'\n[obsidian]\nvault = "{v}"\nwrite_back = {write_back}\n')
+        sh("git", "commit", "-qam", "cfg", cwd=self.root)
+        self.ergon("new", "task", "Call them", "--tier", "haiku")
+        f = self.task_file("T-001")
+        f.write_text(re.sub(r"^source:.*$", "source: obsidian:Health/Insurance.md#^mine", f.read_text(), flags=re.M))
+        stamp(f)
+        return note
+
+    def test_dispatch_obsidian_write_back(self):
+        note = self.obsidian_dispatch("true")
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertNotIn("Obsidian:", dry)  # nothing done yet
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("Obsidian: ticked T-001 in Health/Insurance.md", out)
+        self.assertIn("- [x] Call them #agent", note.read_text())
+
+    def test_dispatch_obsidian_off(self):
+        note = self.obsidian_dispatch("false")
+        before = note.read_text()
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertNotIn("Obsidian", out)
+        self.assertEqual(note.read_text(), before)
+
+    def test_dispatch_obsidian_failure_warns(self):
+        note = self.obsidian_dispatch("true")
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text().replace(str(note.parent.parent), "/nonexistent/vault"))
+        r = self.ergon("dispatch", check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.status("T-001"), "done", r.stdout)
+        self.assertIn("warning: Obsidian write-back failed", r.stdout)
+
     def test_budget_total_stops_launches(self):
         for n in "ABC":
             self.ergon("new", "task", f"Job {n}", "--tier", "sonnet")
