@@ -1122,7 +1122,7 @@ def dep_layers(nodes, deps):
     return col
 
 
-def dep_map(proposed, tasks, flagged):
+def dep_map(proposed, tasks, flagged, label="the proposed tasks"):
     """Proposed tasks and their depends: as inline SVG. A proposed task's box links to its card
     below; a dependency that isn't proposed links to its task page (a missing one, nowhere)."""
     ids = [t["id"] for t in proposed]
@@ -1137,7 +1137,7 @@ def dep_map(proposed, tasks, flagged):
     width = MAP_PAD * 2 + (max(rows) + 1) * (MAP_W + MAP_GX) - MAP_GX
     height = MAP_PAD * 2 + max(len(ns) for ns in rows.values()) * (MAP_H + MAP_GY) - MAP_GY
     o = [f'<svg class=depmap viewBox="0 0 {width} {height}" width="{width}" height="{height}" role=img '
-         'aria-label="dependency map of the proposed tasks">']
+         f'aria-label="dependency map of {esc(label)}">']
     for i in ids:
         x2, y2 = pos[i]
         for d in deps[i]:
@@ -1151,7 +1151,8 @@ def dep_map(proposed, tasks, flagged):
         t = tasks.get(n)
         status = t["status"] if t else "missing"
         cls = ["box", f"st-{status}"] + (["flag"] if n in flagged else [])
-        title = f"{n} · {status}" + (f" · {t.get('title') or ''}" if t else "") \
+        title = f"{n} · {status}" + (f" · {t.get('epic')}" if t and t.get("epic") else "") \
+            + (f" · {t.get('title') or ''}" if t else "") \
             + (f" · {len(flagged[n])} finding(s)" if n in flagged else "")
         label = f"{t.get('tier') or '?'} · {status}" if t else "no such task"
         g = (f'<g class="{" ".join(cls)}"><title>{esc(title)}</title>'
@@ -1167,6 +1168,31 @@ def dep_map(proposed, tasks, flagged):
         o.append(g)
     o.append("</svg>")
     return "".join(o)
+
+
+def epic_maps(proposed, tasks, epics, flagged):
+    """One dependency map per epic of the proposed tasks, in epic order, then the tasks with no epic.
+    A dependency outside the epic still shows as a box in that epic's map."""
+    groups = {}
+    for t in proposed:
+        groups.setdefault(str(t["epic"]) if t.get("epic") else None, []).append(t)
+    keys = sorted(k for k in groups if k) + ([None] if None in groups else [])
+    if keys == [None]:
+        return f"<div class=mapwrap>{dep_map(proposed, tasks, flagged)}</div>"
+    h = []
+    for k in keys:
+        ts, n = groups[k], len(groups[k])
+        count = f' <span class=muted>({n} task{"s" if n != 1 else ""})</span>'
+        if k is None:
+            h.append(f"<h3 class=mhead id=map-none>No epic{count}</h3>")
+            label = "the proposed tasks with no epic"
+        else:
+            title = (epics.get(k) or {}).get("title")
+            h.append(f'<h3 class=mhead id="map-{esc(k)}"><a href="/e/{esc(k)}">{esc(k)}</a>'
+                     + (f" {esc(title)}" if title else "") + f"{count}</h3>")
+            label = f"the proposed tasks of {k}"
+        h.append(f"<div class=mapwrap>{dep_map(ts, tasks, flagged, label)}</div>")
+    return "".join(h)
 
 
 def review_card(t, tasks, found):
@@ -1323,8 +1349,8 @@ def epic_cards(briefs):
 
 
 def review_page(nonce):
-    tasks = _tasks.load(_config.ITEMS)
-    briefs = epic_briefs(_tasks.load(_config.EPICS))
+    tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
+    briefs = epic_briefs(epics)
     proposed = sorted((t for t in tasks.values() if t["status"] == "proposed"), key=tier_key)
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)} · review · read-only</span></div>',
          f"<h1>Proposed tasks ({len(proposed)})</h1>"]
@@ -1354,9 +1380,10 @@ def review_page(nonce):
                  'approved: score = (cod + 60 × tasks it unblocks) ÷ tier size.</p>'
                  + priority_table(ranked, tasks, anchor=True) + grade_line())
 
-    b.append(f'<h2>Dependency map</h2><div class=mapwrap>{dep_map(proposed, tasks, flagged)}</div>'
-             '<p class=legend>A box links to its card; <b>!</b> marks findings; an arrow points from a '
-             'dependency to the task that waits on it.</p>')
+    b.append(f'<h2>Dependency map</h2>{epic_maps(proposed, tasks, epics, flagged)}'
+             '<p class=legend>One map per epic. A box links to its card; <b>!</b> marks findings; an arrow '
+             'points from a dependency to the task that waits on it; a dependency in another epic is drawn '
+             'in this one too.</p>')
 
     b.append("<h2>Tasks</h2>")
     groups, alone = review_groups(proposed, tasks)

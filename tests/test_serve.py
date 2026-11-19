@@ -537,6 +537,26 @@ class TestReview(ServeFixture):
         self.assertIn(f"<code class=cmd>{APPROVE} T-004 T-005</code>", page)
         self.assertNotIn("<form", page)
 
+    def test_dep_map_per_epic(self):
+        # one map per epic, then the tasks with no epic; a dependency in another epic is drawn in both
+        self.ergon("new", "epic", "Second " + HOSTILE)
+        self.ergon("new", "task", "Other epic", "--tier", "haiku", "--epic", "E-002")
+        self.ergon("new", "task", "Loose", "--tier", "haiku")
+        f = self.task_file("T-006")
+        f.write_text(re.sub(r"^depends:.*$", "depends: [T-005]", f.read_text(), flags=re.M))
+        page = self.req("GET", "/review")[2]
+        sec = page.split("<h2>Dependency map</h2>")[1].split("<h2")[0]
+        self.assertEqual(re.findall(r'<h3 class=mhead id="?(map-[\w-]+)', sec), ["map-E-001", "map-E-002", "map-none"])
+        self.assertNotIn(HOSTILE, sec)
+        svgs = re.findall(r"<svg class=depmap.*?</svg>", sec, re.S)
+        self.assertEqual(len(svgs), 3)
+        boxes = [re.findall(r'<text class=bid [^>]*>(T-\d+)</text>', s) for s in svgs]
+        self.assertEqual(sorted(boxes[0]), ["T-001", "T-004", "T-005", "T-099"])
+        self.assertEqual(sorted(boxes[1]), ["T-005", "T-006"])  # T-005 is E-001's, drawn here too
+        self.assertEqual(boxes[2], ["T-007"])
+        self.assertIn('<a href="#T-005"><g class="box st-proposed flag">', svgs[1])
+        self.assertEqual(page.count("<h3 class=ghead"), page.split("<h2>Tasks</h2>")[1].count("<h3 class=ghead"))
+
     def test_findings(self):
         page = self.req("GET", "/review")[2]
         f4 = re.search(r'<div class=finding id="find-T-004">.*?</div>', page, re.S)[0]
