@@ -1208,6 +1208,25 @@ class TestObsidian(Project):
         self.assertEqual(note.read_bytes(), b"x")
         self.assertEqual([p.name for p in note.parent.iterdir()], ["Insurance.md"])
 
+    def test_tick_returns_results(self):
+        from unittest import mock
+        from ergon import obsidian as ob
+        v, note = self.wb_vault()
+        self.ergon("obsidian")
+        src = "obsidian:Health/Insurance.md#"
+        text = self.task_file("T-001").read_text()
+        ref = re.search(r"^source: obsidian:Health/Insurance\.md#(\S+)$", text, re.M).group(1)
+        items = {"T-001": {"source": src + ref, "status": "done"}}
+        with mock.patch.object(ob._tasks, "load", return_value=items), \
+                mock.patch.object(ob._config, "ITEMS", None, create=True):
+            res = ob.tick({"vault": v}, False)
+            self.assertEqual([(r["id"], r["note"], r["outcome"]) for r in res],
+                             [("T-001", "Health/Insurance.md", "changed")])
+            self.assertIn("[ ]", res[0]["old"])
+            self.assertIn("[x]", res[0]["new"])
+            note.unlink()
+            self.assertEqual([r["outcome"] for r in ob.tick({"vault": v}, False)], ["gone"])
+
     def test_missing_vault(self):
         cfg = self.root / ".ergon.toml"
         cfg.write_text(cfg.read_text() + '\n[obsidian]\nvault = "/nonexistent/vault"\n')

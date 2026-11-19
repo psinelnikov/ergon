@@ -3120,31 +3120,24 @@ def obsidian_write_back(dry=False):
     """T-156's write-back step (not intake) when [obsidian] sets write_back = true: tick the vault lines of
     done/dropped imported tasks. One `Obsidian:` line per change, one per line it couldn't find. Never in an
     agent shell. A failure only warns: it changes no task's status and not the run's exit code."""
-    import contextlib
-    import io
     from . import obsidian as _obsidian
     try:
         cfg = _obsidian.settings()
         if cfg is None or not cfg["write_back"] or _gates.in_agent_shell():
             return
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            _obsidian.tick(cfg, not dry)
+        results = _obsidian.tick(cfg, not dry)
     except (Exception, SystemExit) as e:
         print(f"warning: Obsidian write-back failed: {e}", flush=True)
         return
-    for line in buf.getvalue().splitlines():
-        m = re.match(r"^(T-\d+): (ticked|would change) in (.+)$", line)
-        g = re.match(r"^(T-\d+): line gone from (.+)$", line)
-        if m:
-            print(f"Obsidian: {'would tick' if dry else 'ticked'} {m.group(1)} in {m.group(3)}")
-        elif g:
-            print(f"Obsidian: couldn't find {g.group(1)}'s line in {g.group(2)}")
-        elif line.startswith("  "):
+    for r in results:
+        if r["outcome"] == "changed":
+            print(f"Obsidian: {'would tick' if dry else 'ticked'} {r['id']} in {r['note']}")
             if dry:
-                print("  " + line)
+                print(f"    - {r['old']}\n    + {r['new']}")
+        elif r["outcome"] == "gone":
+            print(f"Obsidian: couldn't find {r['id']}'s line in {r['note']}")
         else:
-            print(f"Obsidian: {line}")
+            print(f"Obsidian: {r['id']}: {r['note']} changed since it was read; skipped, run again")
 
 
 def dispatch(args):

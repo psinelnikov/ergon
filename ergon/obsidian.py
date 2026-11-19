@@ -227,20 +227,22 @@ def ticked(line, tid, status):
 
 
 def tick(cfg, write):
-    """Mark the line of each done/dropped imported task. Returns the number of lines changed (or to change)."""
+    """Mark the line of each done/dropped imported task. Returns [{id, note, outcome, old, new}], outcome
+    `changed` (written, or would be when not `write`), `gone` (line not found) or `skipped` (note changed
+    since it was read). old/new are the line before and after, empty unless `changed`."""
     vault, by_note = cfg["vault"], {}
     for tid, t in sorted(_tasks.load(_config.ITEMS).items()):
         sr = split_ref(str(t.get("source", "")))
         if sr and t.get("status") in ("done", "dropped"):
             by_note.setdefault(sr[0], []).append((tid, t["status"], sr[1]))
-    count = 0
+    results = []
     for note, todo in sorted(by_note.items()):
         raw, lines = read_note(vault, note)
         changes = []
         for tid, status, ref in todo:
             n = None if lines is None else locate(lines, note, ref)
             if n is None:
-                print(f"{tid}: line gone from {note}")
+                results.append({"id": tid, "note": note, "outcome": "gone", "old": "", "new": ""})
                 continue
             body = lines[n].rstrip("\r")
             new = ticked(body, tid, status)
@@ -249,13 +251,12 @@ def tick(cfg, write):
         for tid, n, body, new in changes:
             lines[n] = new + lines[n][len(body):]
         if write and changes and not put_lines(raw, lines, True, vault, note):
-            for tid, *_ in changes:
-                print(f"{tid}: {note} changed since it was read; skipped, run again")
+            results += [{"id": tid, "note": note, "outcome": "skipped", "old": "", "new": ""}
+                        for tid, *_ in changes]
             continue
-        for tid, n, body, new in changes:
-            print(f"{tid}: {'ticked' if write else 'would change'} in {note}\n  - {body.strip()}\n  + {new.strip()}")
-            count += 1
-    return count
+        results += [{"id": tid, "note": note, "outcome": "changed", "old": body.strip(), "new": new.strip()}
+                    for tid, n, body, new in changes]
+    return results
 
 
 def obsidian(args):
@@ -320,6 +321,15 @@ def obsidian(args):
     if wb:
         if shell and not args.dry_run:
             print("ergon obsidian: running in an agent shell; writing the vault is a human's, so nothing was written")
-        n = tick(cfg, write)
+        results = tick(cfg, write)
+        for r in results:
+            if r["outcome"] == "gone":
+                print(f"{r['id']}: line gone from {r['note']}")
+            elif r["outcome"] == "skipped":
+                print(f"{r['id']}: {r['note']} changed since it was read; skipped, run again")
+            else:
+                print(f"{r['id']}: {'ticked' if write else 'would change'} in {r['note']}\n"
+                      f"  - {r['old']}\n  + {r['new']}")
+        n = sum(r["outcome"] == "changed" for r in results)
         if n:
             print(f"{n} line(s) {'ticked' if write else 'to tick (not written)'}")
