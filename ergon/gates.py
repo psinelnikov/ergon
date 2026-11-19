@@ -1983,7 +1983,7 @@ def commit_msg_reason(msg, tasks, epics=None):
         return None
     return ("ergon: commit refused. It cites tasks no human has approved:\n  " + "\n  ".join(bad) +
             "\nOnly a human approves a task (`ergon approve`, in their own terminal). Work only `ready` "
-            "tasks (`ergon next`); file new work with `ergon new task` and ask the user to approve it.")
+            "tasks (`ergon next`); file new work with `ergon new task` (a feature needs 2 to 4 `--option`s, the recommended one first) and ask the user to approve it.")
 
 
 def commit_msg_hook(args):
