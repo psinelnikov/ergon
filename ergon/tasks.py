@@ -686,6 +686,23 @@ def status_text(t, tasks):
     return f"done, {n} follow-up{'s' if n != 1 else ''} open" if n else t["status"]
 
 
+def _epic_checkout(e):
+    """For an open epic whose branch exists: 'on <branch> at <path>' when a worktree holds it, else
+    'on <branch> (branch only: ergon start <id> for a worktree)'. '' otherwise. Read-only."""
+    if e["status"] != "open":
+        return ""
+    branch = _gitops.epic_branch(e)
+    if not _gitops.branch_exists(branch):
+        return ""
+    try:
+        path = _gitops.worktrees().get(branch)
+    except Exception:
+        path = None
+    if path:
+        return f"on {branch} at {path}"
+    return f"on {branch} (branch only: ergon start {e['id']} for a worktree)"
+
+
 def board(args):
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     shown = [t for t in tasks.values()
@@ -710,7 +727,8 @@ def board(args):
             note = f", {pending} awaiting approval" if pending else ""
             note += "  <- needs breakdown" if not kids and e["status"] == "open" else ""
             note += "  <- brief awaiting approval" if e["status"] == "proposed" else ""
-            note += f"  on {_gitops.epic_branch(e)}" if e["status"] == "open" and _gitops.branch_exists(_gitops.epic_branch(e)) else ""
+            where = _epic_checkout(e)
+            note += f"  {where}" if where else ""
             print(f"  {e['id']}  {e['status']:<8} {done}/{len(kids)} done{note}  {e['title']}")
     counts = {tier: sum(t["tier"] == tier and t["status"] not in ("done", "dropped")
                         for t in tasks.values()) for tier in TIERS}
@@ -853,6 +871,9 @@ def show(args):
                 print(f"  {c['id']}  {c['status']:<8}  {category(c):<8}  {c['title']}")
         _print_run_usage(args.id)
     if args.id in epics:
+        where = _epic_checkout(epics[args.id])
+        if where:
+            print(where.replace("on ", "BRANCH  ", 1))
         print("TASKS")
         for t in sorted((t for t in tasks.values() if t.get("epic") == args.id), key=lambda t: t["id"]):
             print(f"  {t['status']:<8}" + line(t, tasks)[1:])
@@ -1082,6 +1103,43 @@ def tracked_files():
     return index
 
 
+class BranchFile:
+    """A file at a branch's tip, read through git; stands in for a Path in the audit."""
+    def __init__(self, branch, rel):
+        self.branch, self.rel = branch, rel
+
+    def _show(self):
+        try:
+            return _gitops.git("show", f"{self.branch}:{self.rel}", raw=True)
+        except _gitops.GitError:
+            return None
+
+    def is_file(self):
+        return self._show() is not None
+
+    def read_text(self, errors="strict"):
+        return self._show() or ""
+
+
+class BranchRoot:
+    def __init__(self, branch):
+        self.branch = branch
+
+    def __truediv__(self, rel):
+        return BranchFile(self.branch, str(rel))
+
+
+def epic_index(index, epic):
+    """`index` with "here" read from the epic's branch tip, or `index` when the epic has no branch."""
+    if not epic:
+        return index
+    branch = _gitops.epic_branch(epic)
+    if not _gitops.branch_exists(branch):
+        return index
+    names = set(_gitops.git("ls-tree", "-r", "--name-only", branch, raw=True).splitlines())
+    return {**index, "here": (BranchRoot(branch), names)}
+
+
 def resolve(path, index):
     """Where a cited path lives: (where, Path) or (None, None). A path that isn't repo-rooted
     (`server/src/main.rs`) matches when exactly one file ends with it."""
@@ -1099,7 +1157,8 @@ def resolve(path, index):
 
 def audit(args):
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
-    index = tracked_files()
+    base_index = tracked_files()
+    epic_indexes = {}
     open_ = {i: t for i, t in tasks.items() if t["status"] not in ("done", "dropped")
              and (not args.epic or t.get("epic") == args.epic)}
     cited = {}
@@ -1131,6 +1190,10 @@ def audit(args):
             found["cited"].append(f"{i} [{t['status']}] cited by {len(cited[i])} commit(s), e.g. "
                                   f"{cited[i][0][:90]}")
 
+        eid = t.get("epic")
+        if eid not in epic_indexes:
+            epic_indexes[eid] = epic_index(base_index, epics.get(eid))
+        index = epic_indexes[eid]
         uses = set()  # companions whose files the task cites
         touches = [p.strip("/") for p in t.get("touches") or []]
         for p in touches:

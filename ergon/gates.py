@@ -681,6 +681,15 @@ def reject(args):
     back = [t for t in named if t["status"] == "review"]
     if not briefs and not todo and not back:
         raise SystemExit("nothing in `proposed` or `review` among those ids")
+    # shared mode: the branch is only in the clone dispatch held it on, so only that clone can reject it
+    away = {t["id"]: who for t in back
+            if (who := _tasks.held_elsewhere(t)) and not _gitops.branch_exists(_config.TASK_BRANCH + t["id"])}
+    if away:
+        back = [t for t in back if t["id"] not in away]
+        said = "\n".join(f"refused: {tid} is held on {who}: reject it there" for tid, who in away.items())
+        if not briefs and not todo and not back:
+            raise SystemExit(said)
+        print(said)
     if back and not args.reason:
         raise SystemExit("rejecting work in `review` needs --reason: it's what the next worker is told to fix")
     sign = signing()
@@ -777,56 +786,98 @@ def accept(args):
         raise SystemExit("aborted")
     who, failed = f"{approver()} {_tasks.today()}", 0
     for tid in [t["id"] for t in todo]:
-        with _gitops.state_lock():  # land() and finish_epic() expect it; also keeps dispatch off the trunk
-            t, epics = _tasks.load(_config.ITEMS)[tid], _tasks.load(_config.EPICS)
-            if t["status"] != "review":
-                print(f"skip {tid}: now {t['status']}")
-                continue
+        passes, recorded = 0, False
+        while True:  # a base that moved since the task was held: a pass on its merge, outside the lock
+            moved = None
+            with _gitops.state_lock():  # land() and finish_epic() expect it; also keeps dispatch off the trunk
+                t, epics = _tasks.load(_config.ITEMS)[tid], _tasks.load(_config.EPICS)
+                if t["status"] != "review":
+                    print(f"skip {tid}: now {t['status']}")
+                    break
+                try:
+                    base, wt, branch, pubs = held_branch(t, epics)
+                    stray = [f"{tree}: {p}" for tree in [wt] + [pub for _, pub in pubs]
+                             if tree.exists() for p in _gitops.dirty_paths(tree)]
+                except _gitops.GitError as err:
+                    print(f"{tid} not landed, still in review: {err}")
+                    failed += 1
+                    break
+                if stray:
+                    print(f"{tid} not landed, still in review: uncommitted changes would miss the merge; "
+                          "commit or discard them, then accept again:\n  " + "\n  ".join(stray))
+                    failed += 1
+                    break
+                if not recorded:
+                    _history.record("accepted", t, by=approver())
+                    recorded = True
+                if _config.CONFLICT_ROUNDS:
+                    try:
+                        found = _dispatch.find_conflicts(base, wt, branch, pubs)
+                    except _gitops.GitError:
+                        found = None  # land() reports it, and blocks as before
+                    if found:  # the base moved while it waited: a conflict round, then a new accept
+                        for s in found:
+                            _history.record("conflict", t, files=s["files"], base=s["base"], after="accept",
+                                            companion=s["c"]["name"] if s["c"] else None)
+                        where = "; ".join(f"{s['base']} in {', '.join(s['files'])}" if s["files"] else s["base"] for s in found)
+                        _dispatch.put_status(tid, "ready", f"accepted by {who}, but it conflicts with {where}; "
+                                             f"{_dispatch.ACCEPT_CONFLICT_MARK}", who="accept")
+                        print(f"  ready    {tid}  conflicts with {where}: the next dispatch resolves it")
+                        break
+                try:
+                    moved = _dispatch.moved_bases(base, wt, branch, pubs)
+                except _gitops.GitError:
+                    moved = None  # land() reports it
+                if moved and all(s["clean"] for s in moved):
+                    if passes >= _config.REMERGE_ROUNDS:  # it kept moving: the next dispatch takes it on
+                        note = _dispatch.moving_note(moved, passes)
+                        _dispatch.put_status(tid, "ready", f"accepted by {who}, but {note}; "
+                                             f"{_dispatch.ACCEPT_REMERGE_MARK}", who="accept")
+                        print(f"  ready    {tid}  {note}: the next dispatch runs the gates on its merge again")
+                        break
+                else:  # nothing moved since it was held (or a conflict, which land() blocks on)
+                    moved = None
+                    verdict, why = _dispatch.land(t, base, wt, branch, pubs, accepted=who)
+                    if verdict != "done":
+                        _dispatch.put_status(tid, "blocked", f"couldn't land it for {who}: {why}", who="accept")
+                        _history.record("blocked", t, reason=f"couldn't land it for {who}: {why}", log=None, session=None, asked=False)
+                        print(f"  blocked  {tid}  {why}")
+                        failed += 1
+                        break
+                    _dispatch.put_status(tid, "done", f"accepted by {who}: {why}", who="accept")
+                    if sign:  # landed already, so a failure to sign only warns
+                        _gitops.sign_state("accept", [f"{_gitops.ACCEPT_TRAILER}: {tid}"], undo=False)
+                    print(f"  done     {tid}  {why}")
+                    e = epics.get(t.get("epic"))
+                    if e and e["status"] == "open" and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
+                        try:
+                            _gitops.finish_epic(e["id"])
+                        except _gitops.GitError as err:
+                            print(f"  {e['id']} is complete but not merged: {err}")
+                    break
+            # outside the lock: merge what moved into the branch and run the gates on the merge (T-196)
+            passes += 1
+            where = _dispatch.bases_text(moved)
+            print(f"  merging  {tid}  {where} moved since it was held: merging it into {branch} and running "
+                  f"the gates on the merge (pass {passes}/{_config.REMERGE_ROUNDS})", flush=True)
             try:
-                base, wt, branch, pubs = held_branch(t, epics)
-                stray = [f"{tree}: {p}" for tree in [wt] + [pub for _, pub in pubs]
-                         if tree.exists() for p in _gitops.dirty_paths(tree)]
+                for s in moved:
+                    _dispatch.merge_base_in(t, s, branch, passes, "accept")
+                red, _fixable = _dispatch.merged_gates(t, base, wt, branch, pubs)
             except _gitops.GitError as err:
                 print(f"{tid} not landed, still in review: {err}")
                 failed += 1
-                continue
-            if stray:
-                print(f"{tid} not landed, still in review: uncommitted changes would miss the merge; "
-                      "commit or discard them, then accept again:\n  " + "\n  ".join(stray))
-                failed += 1
-                continue
-            _history.record("accepted", t, by=approver())
-            if _config.CONFLICT_ROUNDS:
-                try:
-                    found = _dispatch.find_conflicts(base, wt, branch, pubs)
-                except _gitops.GitError:
-                    found = None  # land() reports it, and blocks as before
-                if found:  # the base moved while it waited: a conflict round, then a new accept
-                    for s in found:
-                        _history.record("conflict", t, files=s["files"], base=s["base"], after="accept",
-                                        companion=s["c"]["name"] if s["c"] else None)
-                    where = "; ".join(f"{s['base']} in {', '.join(s['files'])}" if s["files"] else s["base"] for s in found)
-                    _dispatch.put_status(tid, "ready", f"accepted by {who}, but it conflicts with {where}; "
-                                         f"{_dispatch.ACCEPT_CONFLICT_MARK}", who="accept")
-                    print(f"  ready    {tid}  conflicts with {where}: the next dispatch resolves it")
-                    continue
-            verdict, why = _dispatch.land(t, base, wt, branch, pubs, accepted=who)
-            if verdict != "done":
-                _dispatch.put_status(tid, "blocked", f"couldn't land it for {who}: {why}", who="accept")
-                _history.record("blocked", t, reason=f"couldn't land it for {who}: {why}", log=None, session=None, asked=False)
-                print(f"  blocked  {tid}  {why}")
-                failed += 1
-                continue
-            _dispatch.put_status(tid, "done", f"accepted by {who}: {why}", who="accept")
-            if sign:  # landed already, so a failure to sign only warns
-                _gitops.sign_state("accept", [f"{_gitops.ACCEPT_TRAILER}: {tid}"], undo=False)
-            print(f"  done     {tid}  {why}")
-            e = epics.get(t.get("epic"))
-            if e and e["status"] == "open" and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
-                try:
-                    _gitops.finish_epic(e["id"])
-                except _gitops.GitError as err:
-                    print(f"  {e['id']} is complete but not merged: {err}")
+                break
+            if red:  # back to ready: the next dispatch runs the fix round and holds it at review again
+                with _gitops.state_lock():
+                    if _tasks.load(_config.ITEMS)[tid]["status"] == "review":
+                        _dispatch.put_status(tid, "ready", f"accepted by {who}, but merged with {where}, which "
+                                             f"moved while it waited, its gates went red: {red}; "
+                                             f"{_dispatch.ACCEPT_REMERGE_MARK}", who="accept")
+                print(f"  ready    {tid}  red on its merge with {where}: the next dispatch runs a fix round, "
+                      "then it waits for your accept again")
+                break
+            print(f"  merging  {tid}  green on the merge", flush=True)
     if _config.SHARED:
         sync_for_count(args.ids, after=True, what="acceptance")
     if failed or away:
@@ -1265,15 +1316,51 @@ GIT_CMD_OPTS = {
     "grep": ({"--o|pen-files-in-pager": "cmd="}, {"O": "cmd="}, "efABCm"),
     "send-email": ({"--to-c|md": "cmd", "--cc-c|md": "cmd", "--header-c|md": "cmd", "--sendmail-c|md": "cmd",
                     "--smtp-server|": "cmd"}, {}, ""),
+    "instaweb": ({"--h|ttpd": "cmd"}, {"d": "cmd"}, "bpm"),  # run as `$httpd conf`, word-split
 }
+# Config keys whose value is a remote's URL, and the url.<base>.insteadOf keys whose <base> is one:
+# an ext:: URL there is a command git runs (ext_command) on the next fetch or push.
+GIT_URL_KEYS = re.compile(r"remote\..+\.(url|pushurl)|submodule\..+\.url")
+GIT_INSTEADOF_KEY = re.compile(r"url\.(.+)\.(push)?insteadof", re.I | re.S)
+
+
+def ext_command(url):
+    """The command line git runs for an ext:: URL (git-remote-ext(1)), or None if url isn't one.
+    Its argv is the text after `ext::` split at each unescaped space, with `% ` a literal space,
+    `%%` a percent, `%s`/`%S` the service name, and an argument starting `%G` or `%V` dropped.
+    The transport name is matched case-blind; an escape git would reject is read leniently."""
+    m = re.match(r"(?is)ext::(.*)", url)
+    if not m:
+        return None
+    args, cur, keep, text, i = [], "", True, m.group(1), 0
+    while i <= len(text):
+        c = text[i] if i < len(text) else " "
+        if i == len(text) or c == " ":
+            if keep:
+                args.append(cur)
+            cur, keep = "", True
+        elif c == "%" and i + 1 < len(text):
+            i, e = i + 1, text[i + 1]
+            if e in "GV" and cur == "":
+                keep = False
+            cur += {"s": "upload-pack", "S": "git-upload-pack"}.get(e, e)
+        else:
+            cur += c
+        i += 1
+    return shlex.join(args)
 
 
 def git_config_command(key, val):
     """The command line git runs from config key = val, or None if it runs none: a `!` alias as shell
     text and any other as the git call it expands to, a credential helper as `git credential-<val>`
-    unless it's `!` text or an absolute path, a submodule's update only if it's `!` text, and the
-    value itself for the other GIT_COMMAND_KEYS."""
+    unless it's `!` text or an absolute path, a submodule's update only if it's `!` text, an ext::
+    URL as a remote's or submodule's URL or as the <base> an insteadOf rewrites to (ext_command),
+    and the value itself for the other GIT_COMMAND_KEYS."""
     k = key.lower()
+    if GIT_URL_KEYS.fullmatch(k):
+        return ext_command(val)
+    if m := GIT_INSTEADOF_KEY.fullmatch(key):
+        return ext_command(m.group(1))
     if not GIT_COMMAND_KEYS.fullmatch(k):
         return None
     if k.startswith("alias."):
@@ -1361,12 +1448,18 @@ def git_config_sets(words):
 def git_commands(words):
     """The command lines a git call among words runs from its own arguments, which the lexer saw
     as data: the value of each GIT_CMD_OPTS option (rebase --exec, filter-branch's filters, difftool
-    --extcmd, ...), `submodule foreach`'s command, and each GIT_COMMAND_KEYS value it sets
-    (git_config_sets) as git_config_command reads it. A later `git x` names no verb, so an alias is
-    checked where it is defined; one whose value the text doesn't hold is git_config_reason's."""
+    --extcmd, instaweb --httpd, ...), `submodule foreach`'s command, the command of each ext:: URL
+    among its arguments (clone, fetch, push, ls-remote, remote add, archive --remote=...; any
+    subcommand, as a word or an --option= value), and each GIT_COMMAND_KEYS or URL value it sets
+    (git_config_sets) as git_config_command reads it. A later `git x` or `git fetch x` names no
+    verb, so an alias or a remote is checked where it is defined; one whose value the text doesn't
+    hold is git_config_reason's."""
     out = [c for key, val in git_config_sets(words)
            if val is not None and (c := git_config_command(key, val)) is not None]
     for _, sub, rest in _git_calls(words):
+        for a in rest:  # an ext:: URL is a command wherever git takes a URL
+            if (c := ext_command(re.sub(r"^--[^=]+=", "", a))) is not None:
+                out.append(c)
         if sub in ("submodule", "submodule--helper"):
             j = next((m for m, a in enumerate(rest) if not a.startswith("-") or a == "--"), len(rest))
             if rest[j:j + 1] == ["foreach"]:  # one word is shell text, more are a command and its args
