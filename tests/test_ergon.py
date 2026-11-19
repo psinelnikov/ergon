@@ -1522,6 +1522,14 @@ class TestDispatch(DispatchProject):
         self.assertIn("tier: opus\n", text)
         self.assertIn("tier_why: tier of the task that found it (T-001); size it before approving", text)
 
+    def test_parse_found_reads_done_when_bullets(self):
+        text = "FOUND: A — a\nDONE WHEN:\n- one\n- two\nTOUCHES: x.py\nFOUND: B — b\nDONE WHEN:\n\nplain prose\n- not mine"
+        from ergon.dispatch import parse_found
+        (a, _, ea), (b, _, eb) = parse_found(text)
+        self.assertEqual(ea["done"], ["one", "two"])
+        self.assertEqual(ea["touches"], ["x.py"])
+        self.assertNotIn("done", eb)
+
     def test_found_category_line(self):
         self.ergon("new", "task", "Source", "--tier", "sonnet")
         stamp(self.task_file("T-001"))
@@ -1594,7 +1602,7 @@ class TestDispatch(DispatchProject):
             self.assertEqual(self.status(tid), "proposed")
 
     def test_found_bugfix_options_are_ignored(self):
-        self.found_run("Fix X \u2014 y breaks\nTOUCHES: a.py\nCATEGORY: bugfix\nOPTIONS: a | b", "--ids", "T-001")
+        self.found_run("Fix X \u2014 y breaks\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix\nOPTIONS: a | b", "--ids", "T-001")
         text = self.task_file("T-002").read_text()
         self.assertEqual(self.status("T-002"), "ready")
         self.assertNotIn("## Options", text)
@@ -5106,7 +5114,7 @@ class TestAutoApprove(DispatchProject):
         self.assertNotIn("approved", events(self.root, tid))
 
     def test_bugfix_with_touches_from_a_human_approved_task_is_ready(self):
-        out = self.found("Fix X — y breaks\nTOUCHES: a.py, b.py\nCATEGORY: bugfix")
+        out = self.found("Fix X — y breaks\nTOUCHES: a.py, b.py\nDONE WHEN: ok\nCATEGORY: bugfix")
         self.assertEqual(self.status("T-001"), "done", out)
         text = self.task_file("T-002").read_text()
         self.assertEqual(self.status("T-002"), "ready", text)
@@ -5124,13 +5132,13 @@ class TestAutoApprove(DispatchProject):
         self.assertIn("would run  T-002", self.ergon("dispatch", "--dry-run").stdout)
 
     def test_follow_up_runs_in_the_same_run_and_shows_the_tree(self):
-        out = self.found("Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix")  # --ids T-001 only, no --max
+        out = self.found("Fix X — y breaks\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix")  # --ids T-001 only, no --max
         self.assertEqual(self.status("T-001"), "done", out)
         self.assertEqual(self.status("T-002"), "ready")  # --ids doesn't name it: not launched
         self.setUp()
         self.ergon("new", "task", "Source", "--tier", "sonnet")
         stamp(self.task_file("T-001"))
-        self.env.update(FAKE_FOUND="Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix")
+        self.env.update(FAKE_FOUND="Fix X — y breaks\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix")
         out = self.ergon("dispatch", "--max", "1").stdout
         self.assertEqual([self.status("T-001"), self.status("T-002")], ["done", "done"], out)
         self.assertIn("doing    T-002", out)
@@ -5143,7 +5151,7 @@ class TestAutoApprove(DispatchProject):
         approve_epic(self)
         self.ergon("new", "task", "Last", "--tier", "sonnet", "--epic", "E-001", "--touches", "p.py")
         stamp(self.task_file("T-001"))
-        self.env.update(FAKE_FOUND="Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix")
+        self.env.update(FAKE_FOUND="Fix X — y breaks\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix")
         out = self.ergon("dispatch", "--ids", "T-001").stdout
         self.assertEqual([self.status("T-001"), self.status("T-002")], ["done", "ready"], out)
         self.assertIn("epic: E-001\n", self.task_file("T-002").read_text())
@@ -5162,7 +5170,7 @@ class TestAutoApprove(DispatchProject):
         self.write_follow_ups(1)
         self.ergon("new", "task", "Source", "--tier", "sonnet")
         stamp(self.task_file("T-001"))
-        self.env.update(FAKE_FOUND="A — a\nTOUCHES: a.py\nCATEGORY: bugfix|B — b\nTOUCHES: b.py\nCATEGORY: bugfix")
+        self.env.update(FAKE_FOUND="A — a\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix|B — b\nTOUCHES: b.py\nDONE WHEN: ok\nCATEGORY: bugfix")
         out = self.ergon("dispatch", "--max", "1").stdout
         done = [t for t in ("T-002", "T-003") if self.status(t) == "done"]
         left = [t for t in ("T-002", "T-003") if self.status(t) == "ready"]
@@ -5170,10 +5178,22 @@ class TestAutoApprove(DispatchProject):
         self.assertIn(f"auto-approved, worked this run: {done[0]} (done)", out)
         self.assertIn(f"auto-approved, left ready: {left[0]}", out)
 
+    def test_follow_up_without_done_when_is_proposed_with_a_fill_note(self):
+        out = self.found("Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix")
+        self.assert_proposed()
+        self.assertIn("no Done when: the worker gave none; `ergon fill T-002` writes one", self.task_file("T-002").read_text())
+
+    def test_follow_up_with_done_when_is_still_ready(self):
+        self.found("Fix X — y breaks\nTOUCHES: a.py\nDONE WHEN:\n- x holds\nCATEGORY: bugfix")
+        text = self.task_file("T-002").read_text()
+        self.assertEqual(self.status("T-002"), "ready", text)
+        self.assertIn("## Done when\n- x holds\n", text)
+        self.assertNotIn("no Done when", text)
+
     def test_follow_up_stops_at_the_budget_cap(self):
         self.ergon("new", "task", "Source", "--tier", "sonnet")
         stamp(self.task_file("T-001"))
-        self.env.update(FAKE_FOUND="A — a\nTOUCHES: a.py\nCATEGORY: bugfix")
+        self.env.update(FAKE_FOUND="A — a\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix")
         out = self.ergon("dispatch", "--max", "1", "--budget-total", "0.01", "--budget-pct", "100").stdout
         self.assertEqual([self.status("T-001"), self.status("T-002")], ["done", "ready"], out)
         self.assertIn("budget cap", out)
@@ -5196,10 +5216,10 @@ class TestAutoApprove(DispatchProject):
         cfg.write_text(f"follow_ups = {n}\n" + cfg.read_text())
 
     def test_refactor_and_chore_too_but_not_from_a_blocked_run(self):
-        self.found("A — a\nTOUCHES: a.py\nCATEGORY: refactor|B — b\nTOUCHES: b.py\nCATEGORY: chore")
+        self.found("A — a\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: refactor|B — b\nTOUCHES: b.py\nDONE WHEN: ok\nCATEGORY: chore")
         self.assertEqual([self.status(t) for t in ("T-002", "T-003")], ["ready", "ready"])
         self.setUp()
-        out = self.found("Fix X — y\nTOUCHES: a.py\nCATEGORY: bugfix", result="RESULT: blocked — nope")
+        out = self.found("Fix X — y\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix", result="RESULT: blocked — nope")
         self.assertEqual(self.status("T-001"), "blocked", out)
         self.assert_proposed()  # nothing passed the run, so nothing vouches for what it found
 
@@ -5216,23 +5236,23 @@ class TestAutoApprove(DispatchProject):
         self.assert_proposed()
 
     def test_human_tier_is_proposed(self):
-        self.found("Fix X — y\nTOUCHES: a.py\nCATEGORY: bugfix\nTIER: human — a policy call")
+        self.found("Fix X — y\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix\nTIER: human — a policy call")
         self.assert_proposed()
 
     def test_empty_touches_is_proposed(self):
-        self.found("Fix X — y\nCATEGORY: bugfix")
+        self.found("Fix X — y\nDONE WHEN: ok\nCATEGORY: bugfix")
         self.assert_proposed()
 
     def test_protected_touch_is_proposed_whatever_min_tier(self):
         # min_tier haiku: the sonnet follow-up passes `check`, but a protected path still needs a human
-        self.found("Fix X — y\nTOUCHES: a.py, secrets/keys.py\nCATEGORY: bugfix")
+        self.found("Fix X — y\nTOUCHES: a.py, secrets/keys.py\nDONE WHEN: ok\nCATEGORY: bugfix")
         self.assert_proposed()
         self.ergon("check")
 
     def test_depth_past_follow_up_depth_is_proposed(self):
         cfg = self.root / ".ergon.toml"
         cfg.write_text("follow_up_depth = 2\n" + cfg.read_text())
-        self.found("Fix X — y\nTOUCHES: a.py\nCATEGORY: bugfix")
+        self.found("Fix X — y\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix")
         self.assertEqual(self.status("T-002"), "ready")
         self.ergon("dispatch", "--ids", "T-002")
         text = self.task_file("T-003").read_text()
@@ -5247,7 +5267,7 @@ class TestAutoApprove(DispatchProject):
     def test_follow_up_depth_0_is_proposed(self):
         cfg = self.root / ".ergon.toml"
         cfg.write_text("follow_up_depth = 0\n" + cfg.read_text())
-        self.found("Fix X — y\nTOUCHES: a.py\nCATEGORY: bugfix")
+        self.found("Fix X — y\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix")
         self.assert_proposed()
 
     # ---- check ----
@@ -5257,7 +5277,7 @@ class TestAutoApprove(DispatchProject):
         self.ergon("new", "task", "Fix", "--tier", "sonnet", "--category", category, "--touches", touches,
                    "--source", "T-001")
         f = self.task_file("T-002")
-        text = f.read_text().replace("status: proposed", "status: ready")
+        text = f.read_text().replace("status: proposed", "status: ready").replace("## Done when\n", "## Done when\n- ok\n", 1)
         f.write_text(re.sub(r"(?m)^approved:.*$", "approved: " + (stamp_text or self.STAMP), text))
         return f
 
@@ -5265,6 +5285,13 @@ class TestAutoApprove(DispatchProject):
         r = self.ergon("check", check=False)
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("T-002: its `approved: auto …` stamp doesn't hold: " + why, r.stdout)
+
+    def test_check_fails_an_auto_stamp_with_no_done_when(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        f = self.auto_task()
+        f.write_text(f.read_text().replace("- ok\n", "", 1))
+        self.check_fails("no Done when")
 
     def test_check_passes_a_stamp_that_holds(self):
         self.ergon("new", "task", "Source", "--tier", "sonnet")
@@ -5349,7 +5376,7 @@ class TestAutoApproveReview(DispatchProject):
     def test_review_prompt_lists_found_lines_and_categories(self):
         self.ergon("new", "task", "Reviewed", "--tier", "haiku")
         stamp(self.task_file("T-001"))
-        self.env["FAKE_FOUND"] = "Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix|New Y — z"
+        self.env["FAKE_FOUND"] = "Fix X — y breaks\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix|New Y — z"
         self.ergon("dispatch", "--ids", "T-001")
         prompt = [c for c in self.calls() if c["agent"] == "REVIEW"][0]["prompt"]
         self.assertIn("The worker's FOUND lines", prompt)
