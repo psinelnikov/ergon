@@ -3830,20 +3830,6 @@ def dispatch(args):
                                 print(f"  policy   P-{n} is now enforced by {t['id']}")
                         except OSError as err:
                             print(f"  couldn't mark policies enforced by {t['id']}: {err}")
-                    e = epics.get(t.get("epic"))
-                    if verdict == "done" and e and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
-                        try:
-                            _gitops.finish_epic(e["id"])
-                        except _gitops.ConflictError as err:
-                            # the epic's branch conflicts with the trunk: its resolver runs once, outside the lock (T-096)
-                            stop = (round_stop(info, info.get("round_cost", info.get("cost", 0)), 2, kind="conflict")
-                                    if _config.CONFLICT_ROUNDS else "")
-                            if _config.CONFLICT_ROUNDS and not stop:
-                                epic_conflict = e
-                            else:
-                                print(f"  {e['id']} is complete but not merged{stop}: {err}")
-                        except _gitops.GitError as err:
-                            print(f"  {e['id']} is complete but not merged: {err}")
                 else:
                     put_status(t["id"], "blocked", f"{why}{info.get('rounds', '')} (log {info['log']}"
                                + (f", `claude --resume {info['session']}` in {wt}" if info.get("session") else "") + ")")
@@ -3865,6 +3851,22 @@ def dispatch(args):
                     else:
                         print(f"  proposed {fid}  (found by {t['id']})  {title}")
                     info.setdefault("filed", []).append((fid, st))
+                # only now, with this task's follow-ups filed into its epic, is the epic complete or not:
+                # a follow-up of its last task keeps it open until that follow-up is closed too
+                e = epics.get(t.get("epic"))
+                if verdict == "done" and e and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
+                    try:
+                        _gitops.finish_epic(e["id"])
+                    except _gitops.ConflictError as err:
+                        # the epic's branch conflicts with the trunk: its resolver runs once, outside the lock (T-096)
+                        stop = (round_stop(info, info.get("round_cost", info.get("cost", 0)), 2, kind="conflict")
+                                if _config.CONFLICT_ROUNDS else "")
+                        if _config.CONFLICT_ROUNDS and not stop:
+                            epic_conflict = e
+                        else:
+                            print(f"  {e['id']} is complete but not merged{stop}: {err}")
+                    except _gitops.GitError as err:
+                        print(f"  {e['id']} is complete but not merged: {err}")
                 if verdict == "blocked" and info.get("base_red"):
                     layer, bbase, blog = info["base_red"]
                     hid, title, new = file_gate_fix(t, layer, bbase, why, blog, epics)

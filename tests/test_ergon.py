@@ -5021,6 +5021,27 @@ class TestAutoApprove(DispatchProject):
         self.assertIn("auto-approved, worked this run: T-002 (done)", out)
         self.assertNotIn("left ready", out)
 
+    def test_follow_up_of_an_epics_last_task_keeps_the_epic_open(self):
+        # E-005 merged with T-189 still ready: the epic finished before its last task's FOUND lines were filed
+        self.ergon("new", "epic", "Small epic")
+        approve_epic(self)
+        self.ergon("new", "task", "Last", "--tier", "sonnet", "--epic", "E-001", "--touches", "p.py")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix")
+        out = self.ergon("dispatch", "--ids", "T-001").stdout
+        self.assertEqual([self.status("T-001"), self.status("T-002")], ["done", "ready"], out)
+        self.assertIn("epic: E-001\n", self.task_file("T-002").read_text())
+        epic = lambda: re.search(r"^status: (\w+)", next((self.root / "tasks/epics").glob("E-001-*/EPIC.md"))
+                                 .read_text(), re.M).group(1)
+        self.assertEqual(epic(), "open", out)
+        self.assertNotIn("epic_finished", [r["event"] for r in history(self.root)])
+        self.env.pop("FAKE_FOUND")
+        out = self.ergon("dispatch", "--ids", "T-002").stdout
+        self.assertEqual([self.status("T-002"), epic()], ["done", "done"], out)
+        fin = next(r for r in history(self.root) if r["event"] == "epic_finished")
+        log = sh("git", "log", "-1", "--format=%B", fin["commit"], cwd=self.root).stdout
+        self.assertIn("T-002 Fix X", log)
+
     def test_follow_ups_cap_leaves_the_rest_ready(self):
         self.write_follow_ups(1)
         self.ergon("new", "task", "Source", "--tier", "sonnet")
