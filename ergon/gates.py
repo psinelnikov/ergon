@@ -1206,11 +1206,15 @@ def human_cmd(cmd):
 
 
 def frontmatter(text):
+    """The fields of a task file's frontmatter, read by tasks.parse_fields: quotes and list
+    style don't change a value."""
     m = re.match(r"---\n(.*?)\n---", text, re.S)
-    out = {}
-    for line in (m.group(1).splitlines() if m else []):
+    if not m:
+        return {}
+    out, bad = _tasks.parse_fields(m.group(1))
+    for _, line in bad:  # a line ergon can't read still counts for the guard: ` key: v` is key `key`
         key, _, val = line.partition(":")
-        out[key.strip()] = re.sub(r"\s+#.*$", "", val).strip()
+        out.setdefault(key.strip(), _tasks._scalar(val))
     return out
 
 
@@ -1727,8 +1731,10 @@ def fm_value(fm, key):
     else stripped."""
     val = fm.get(key, "")
     if key not in ("touches", "suppress_ok"):
-        return val.strip()
-    return frozenset(x for x in (_dispatch.touch_key(v) for v in val.strip().strip("[]").split(",")) if x)
+        return ", ".join(val) if isinstance(val, list) else val.strip()
+    if not isinstance(val, list):
+        val = val.strip().strip("[]").split(",")
+    return frozenset(x for x in (_dispatch.touch_key(v) for v in val) if x)
 
 
 def replan_reason(key, status):

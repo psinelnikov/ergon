@@ -438,6 +438,49 @@ class TestBasics(Project):
         self.assertIn("warning: T-001: pin: last", r.stdout)
         self.assertEqual(r.returncode, 0)
 
+    def test_block_lists_and_quotes(self):
+        self.ergon("new", "task", "Fix it", "--tier", "haiku")
+        f = self.task_file("T-001")
+        flow = ergon.tasks.parse(f)
+        text = f.read_text()
+        text = re.sub(r"^status: .*$", 'status: "proposed"  # c', text, flags=re.M)
+        text = re.sub(r"^depends: .*$", "depends:\n  - T-010\n  - 'T-011'", text, flags=re.M)
+        text = re.sub(r"^touches: .*$", "touches:\n- a.py\n    - b.py", text, flags=re.M)
+        f.write_text(text.replace("\ntier:", "\nconcepts:\n  - x.y\nnote: \"a # b\"\ntier:", 1))
+        got = ergon.tasks.parse(f)
+        self.assertEqual(got["status"], flow["status"])
+        self.assertEqual(got["depends"], ["T-010", "T-011"])
+        self.assertEqual(got["touches"], ["a.py", "b.py"])
+        self.assertEqual(got["concepts"], ["x.y"])
+        self.assertEqual(got["note"], "a # b")
+        self.assertEqual(got["_bad"], [])
+        self.ergon("set", "T-001", "tier=sonnet")
+        out = f.read_text()
+        self.assertIn("depends: [T-010, T-011]", out)
+        self.assertIn("touches: [a.py, b.py]", out)
+        self.assertIn("status: proposed", out)
+
+    def test_guard_requote_status(self):
+        self.ergon("new", "task", "Fix it", "--tier", "haiku")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("status: proposed", "status: ready").replace("approved:", "approved: A 2026-01-01", 1))
+        p = str(f)
+        fm = ergon.gates.frontmatter
+        self.assertEqual(fm('---\nstatus: "ready"\n---\n'), fm("---\nstatus: ready\n---\n"))
+        self.assertIsNone(self.guard("Edit", {"file_path": p, "old_string": "status: ready", "new_string": 'status: "ready"'}))
+        self.assertIn("status", self.guard("Edit", {"file_path": p, "old_string": "status: ready", "new_string": 'status: "done"'}))
+
+    def test_check_fails_on_unreadable_frontmatter(self):
+        self.ergon("new", "task", "Fix it", "--tier", "haiku")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("\ntier:", "\n  - stray\ntier:", 1))
+        r = self.ergon("check", check=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f"{f.name}:", r.stdout)
+        self.assertIn("stray", r.stdout)
+        f.write_text(f.read_text().replace("  - stray", "no colon here"))
+        self.assertIn("no colon here", self.ergon("check", check=False).stdout)
+
     def test_check_fails_on_unstamped_ready(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")

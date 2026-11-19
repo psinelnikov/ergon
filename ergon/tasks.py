@@ -57,21 +57,60 @@ EPIC_KEYS = ["id", "title", "status", "created", "approved"]
 
 # ---------- file format ----------
 
+def _scalar(val):
+    """A frontmatter scalar or flow list: a quoted value loses its quotes (a ` #` inside is text),
+    a bare one loses a trailing ` # comment`."""
+    val = val.strip()
+    m = re.match(r"""(["'])(.*?)\1(?:\s+#.*)?$""", val)
+    if m:
+        return m.group(2)
+    val = re.sub(r"\s+#.*$", "", val).strip()
+    if val.startswith("[") and val.endswith("]"):
+        return [_scalar(v) for v in val[1:-1].split(",") if v.strip()]
+    return val
+
+
+def parse_fields(block):
+    """(fields, bad) of a frontmatter block: `key: value`, flow lists, block lists (`key:` then
+    `- item` lines at any indent), quoted scalars. `bad` is [(line number, text)] for lines it
+    can't read; those are skipped."""
+    meta, bad, listkey = {}, [], None
+    for n, line in enumerate(block.splitlines(), 2):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        item = re.match(r"\s*-(?:\s+(.*))?$", line)
+        if item:
+            if listkey is None:
+                bad.append((n, line))
+                continue
+            if not isinstance(meta[listkey], list):
+                meta[listkey] = []
+            meta[listkey].append(_scalar(item.group(1) or ""))
+            continue
+        if line[0] in " \t" or ":" not in line:
+            bad.append((n, line))
+            continue
+        key, _, val = line.partition(":")
+        key, val = key.strip(), val.strip()
+        listkey = None
+        if not val or val.startswith("#"):
+            meta[key] = ""
+            if not val:
+                listkey = key
+            continue
+        meta[key] = _scalar(val)
+    return meta, bad
+
+
 def parse_text(text, where="task file"):
-    """Frontmatter fields and `_body` of a task or epic file's text (no `_path`)."""
+    """Frontmatter fields and `_body` of a task or epic file's text (no `_path`). `_bad` lists
+    the frontmatter lines it couldn't read, as (line number, text)."""
     m = re.match(r"---\n(.*?)\n---\n?(.*)", text, re.S)
     if not m:
         raise SystemExit(f"{where}: missing frontmatter")
-    meta = {}
-    for line in m.group(1).splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        key, _, val = line.partition(":")
-        val = re.sub(r"\s+#.*$", "", val).strip()
-        if val.startswith("[") and val.endswith("]"):
-            val = [v.strip() for v in val[1:-1].split(",") if v.strip()]
-        meta[key.strip()] = val
+    meta, bad = parse_fields(m.group(1))
     meta["_body"] = m.group(2)
+    meta["_bad"] = bad
     return meta
 
 
@@ -1046,6 +1085,10 @@ def lint(warns=None):
             if i in seen:
                 errs.append(f"{i}: duplicate id in {name} and {seen[i]}")
             seen[i] = name
+    for kind in (tasks, epics):
+        for t in kind.values():
+            for n, line in t.get("_bad", []):
+                errs.append(f"{t['_path'].name}:{n}: frontmatter line can't be read: {line.strip()!r}")
     for t in tasks.values():
         where = t["id"]
         if t["_path"].parent != task_home(t, epics):

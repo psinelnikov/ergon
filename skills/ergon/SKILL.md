@@ -164,6 +164,8 @@ pin: first              # optional, HUMAN ONLY (`ergon pin ID first|last|clear`)
 ## Notes
 ```
 
+Frontmatter is a small YAML subset: `key: value` lines, quoted scalars (`status: "ready"` reads as `ready`), and lists in either style: flow (`depends: [T-010]`) or block (`depends:` then `- T-010` lines, as Obsidian's Properties editor writes them). Ergon reads both and always writes flow lists and bare scalars. No nested maps, no multi-line strings. `ergon check` fails a line it can't read, naming the file and line.
+
 The body sections stay short. Cite `file:line`. Don't restate the spec.
 
 ## Epic or task?
