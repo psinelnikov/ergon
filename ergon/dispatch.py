@@ -321,6 +321,8 @@ def release_breakdown(eid, mine, push=False):
 
 ASKING_MARK = "dispatch: asking:"
 ACCEPT_CONFLICT_MARK = "the next dispatch resolves it, and it returns to review for your accept"
+ACCEPT_REMERGE_MARK = ("the next dispatch runs the gates on its merge again (a fix round if red), and it returns to "
+                       "review for your accept")
 NO_SESSION = "-"
 
 
@@ -1324,15 +1326,17 @@ def weakening(t, base, branch, pubs=()):
 WEAKEN_MAX = 8  # findings quoted in the reason; the rest are counted
 
 
-def run_weakening(t, base, branch, pubs, rnd=None, tier=None):
+def run_weakening(t, base, branch, pubs, rnd=None, tier=None, merged=False):
     """The weakening check as a gate: None on a pass, else the reason, after a failed `verify`
-    row (layer `weaken`) and an incident. Git errors propagate: the caller blocks on them."""
+    row (layer `weaken`; `merged: true` on a merge with a moved base) and an incident. Git
+    errors propagate: the caller blocks on them."""
     start = time.monotonic()
     found = weakening(t, base, branch, pubs)
     if not found:
         return None
     _history.record("verify", t, ok=False, cmd="weakening check", layer="weaken",
-                    seconds=round(time.monotonic() - start, 1), log=None, findings=found, **_round(rnd))
+                    seconds=round(time.monotonic() - start, 1), log=None, findings=found, **_round(rnd),
+                    **_merged(merged))
     more = f"; and {len(found) - WEAKEN_MAX} more" if len(found) > WEAKEN_MAX else ""
     failed = (f"verify (weakening check) vetoed the branch: it weakens a gate its task doesn't allow it to: "
               f"{'; '.join(found[:WEAKEN_MAX])}{more}")
@@ -1373,7 +1377,12 @@ def save_incident(t, layer, reason, base, branch, pubs=(), log=None, tier=None):
         print(f"ergon: couldn't save an incident for {t['id']}: {err}", file=sys.stderr)
 
 
-def _run_gate(t, wt, layer, cmd, rnd):
+def _merged(merged):
+    """The history's `merged` field: set only on a gate row of a pass on a merge with a moved base."""
+    return {"merged": True} if merged else {}
+
+
+def _run_gate(t, wt, layer, cmd, rnd, merged=False):
     start = time.monotonic()
     try:
         r = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True, timeout=VERIFY_TIMEOUT)
@@ -1383,24 +1392,25 @@ def _run_gate(t, wt, layer, cmd, rnd):
         out, code = f"{text_of(e.stdout)}{text_of(e.stderr)}\ntimed out after {VERIFY_TIMEOUT // 60} min\n", None
     seconds = round(time.monotonic() - start, 1)
     if code == 0:
-        _history.record("verify", t, ok=True, cmd=cmd, layer=layer, seconds=seconds, log=None, **_round(rnd))
+        _history.record("verify", t, ok=True, cmd=cmd, layer=layer, seconds=seconds, log=None, **_round(rnd),
+                        **_merged(merged))
         return None
     _config.RUNS.mkdir(parents=True, exist_ok=True)
     log = _config.RUNS / f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}-verify.log"
     log.write_text(out)
     _history.record("verify", t, ok=False, cmd=cmd, layer=layer, seconds=seconds, log=log, exit=code,
-                    **_round(rnd))
+                    **_round(rnd), **_merged(merged))
     tail = " | ".join(l.strip() for l in out.strip().splitlines()[-5:])[-400:]
     how = "timed out" if code is None else f"failed (exit {code})"
     return f"verify ({layer} gate) `{cmd}` {how}: {tail} (full output {log.relative_to(_config.HOME)})"
 
 
-def run_verify(t, wt, rnd=None):
+def run_verify(t, wt, rnd=None, merged=False):
     """Run the gates (see gate_cmds) in the task worktree, in order, stopping at the first red.
     Returns None if all pass or none is set, else a reason naming the layer; full output goes
-    to <state>/runs/."""
+    to <state>/runs/. `merged` marks the rows of a pass on a merge with a moved base."""
     for layer, cmd in gate_cmds(t):
-        failed = _run_gate(t, wt, layer, cmd, rnd)
+        failed = _run_gate(t, wt, layer, cmd, rnd, merged)
         if failed:
             return failed
     return None
@@ -2016,6 +2026,18 @@ def veto_lines(failed):
             + "Fix what it raised on this branch; it reviews again before this lands.\n")
 
 
+def done_checks(t, base, wt, branch, pubs):
+    """A worker's done claim holds: no uncommitted changes in its worktrees, and a commit on the
+    branch cites the task. None, or why not. Raises GitError."""
+    for tree in [wt] + [pub for _, pub in pubs]:
+        if _gitops.dirty_paths(tree):
+            return f"worker said done but left uncommitted changes in {tree}"
+    msgs = _gitops.git("log", "--format=%B%x1e", f"{base}..{branch}", raw=True)
+    if not re.search(rf"\b{t['id']}\b", msgs):
+        return f"worker said done but no commit on {branch} cites {t['id']}"
+    return None
+
+
 def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, evidence=None, prove=True,
          found=(), waived=None):
     """After a worker says done, before the merge lock: its done claim holds, verify passes,
@@ -2029,12 +2051,9 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, ev
     it was at launch; the red-on-base proof (unless `prove` is False: the worker waived it) and a
     harden task's proof run after its gates pass. A reviewer the usage limit stopped returns
     {"limited": …} as `fixable` (run_review's). The caller adds kept_note."""
-    for tree in [wt] + [pub for _, pub in pubs]:
-        if _gitops.dirty_paths(tree):
-            return f"worker said done but left uncommitted changes in {tree}", 0, False
-    msgs = _gitops.git("log", "--format=%B%x1e", f"{base}..{branch}", raw=True)
-    if not re.search(rf"\b{t['id']}\b", msgs):
-        return f"worker said done but no commit on {branch} cites {t['id']}", 0, False
+    failed = done_checks(t, base, wt, branch, pubs)
+    if failed:
+        return failed, 0, False
     failed = run_weakening(t, base, branch, pubs, rnd, tier)
     if failed:
         return failed, 0, "weaken"
@@ -2224,7 +2243,7 @@ def resume_choice(session, wt):
 
 
 def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, veto, rnd, verify=None, n=None,
-              kind="verify"):
+              kind="verify", merged=""):
     """Hand a reviewer's veto back to a worker on the same branch: its own session resumed if
     resume_choice() allows, else a fresh worker with the retry prompt. Returns run_worker's
     (verdict, reason, info), with info["resumed"] and, for a fresh one, info["fresh_because"].
@@ -2232,7 +2251,8 @@ def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, 
     with kind="weaken" for a weakening veto (run_weakening's), kind="prove" for tests that pass on
     the base (run_prove's) or kind="harden" for a failed harden proof (run_harden's). `rnd` numbers
     every worker run
-    (logs, history); a review fix round's own count is `n`."""
+    (logs, history); a review fix round's own count is `n`. `merged` (merged_text's) goes in the
+    prompt after its first line: the failure is on dispatch's merge of a base that moved."""
     n, rounds = verify or (n, _config.REVIEW_ROUNDS)
     weaken = bool(verify) and kind == "weaken"
     harden = bool(verify) and kind == "harden"
@@ -2267,6 +2287,9 @@ def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, 
             log = re.search(r"\(review log (\S+?\.json)\)", veto)
             prompt = FIX_PROMPT.format(id=t["id"], n=n, rounds=rounds, veto=veto, branch=branch, wt=wt,
                                        log=f"Its full review is in {_config.HOME / log[1]}.\n" if log else "")
+        if merged:
+            head, _, rest = prompt.partition("\n")
+            prompt = f"{head}\n\n{merged.rstrip()}\n{rest}"
         verdict, why, info = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd,
                                         prompt=prompt, resume=session, after=after)
     else:
@@ -2275,7 +2298,8 @@ def fix_round(t, tier, base, wt, branch, pubs, args, agents, settings, session, 
                         round=rnd, fresh_because=fresh_because)
         print(f"  {what:<8} {t['id']}  round {n}/{rounds}: fresh session ({fresh_because})", flush=True)
         verdict, why, info = run_worker(tt, base, wt, branch, pubs, args, agents, settings, rnd=rnd,
-                                        veto=veto, lines=lines, after=after)
+                                        veto=veto, lines=(merged + lines) if merged and lines else lines,
+                                        after=after)
     info["resumed"], info["fresh_because"] = resume, fresh_because
     return verdict, why, info
 
@@ -2449,6 +2473,141 @@ def resolved_note(found):
 
 def kept_note(wt, branch, pubs):
     return f"Branch {branch} and worktree {wt} kept" + "".join(f" ({c['name']} worktree {pub})" for c, pub in pubs)
+
+
+# ---------- a base that moved ----------
+# The gates run on task/<ID> as it was cut. If the base moved since and merges cleanly, landing
+# would put a tree on the base that no gate has seen. So dispatch (and accept) merges each moved
+# base into the branch itself, in the task's worktree, with no worker, and reruns the done checks,
+# the weakening check and the gates on the merge, outside the state lock (T-196). A red goes to a
+# verify fix round (fix_loop, sharing verify_rounds); review reruns only after a fix round, since
+# the merge adds no code of the worker's. Under the lock, a base that moved again since sends the
+# task back out for another pass, up to remerge_rounds; then it blocks, the base kept moving.
+
+def moved_bases(base, wt, branch, pubs):
+    """Where the base's tip isn't an ancestor of the task branch, companions first (land()'s order),
+    each a dict: c (the companion, or None), base, repo, tree (the task's worktree there), tip (the
+    base's), fork, log (`git log --oneline fork..tip`), clean (it merges without a conflict) and
+    files (the conflicted ones). Raises GitError."""
+    spots = [(c, c["trunk"], c["path"], pub) for c, pub in pubs] + [(None, base, None, wt)]
+    out = []
+    for c, b, repo, tree in spots:
+        tip = _gitops.git("rev-parse", b, cwd=repo)
+        if _gitops.is_ancestor(tip, branch, repo):
+            continue
+        merged, files = _gitops.merge_tree(tip, branch, repo)
+        fork = _gitops.git("merge-base", tip, branch, cwd=repo)
+        out.append({"c": c, "base": b, "repo": repo, "tree": tree, "tip": tip, "fork": fork,
+                    "log": _gitops.git("log", "--oneline", f"{fork}..{tip}", cwd=repo),
+                    "clean": merged is not None, "files": files})
+    return out
+
+
+def bases_text(moved):
+    return " and ".join(f"{s['c']['name'] + ' ' if s['c'] else ''}{s['base']}" for s in moved)
+
+
+def merge_base_in(t, s, branch, n, by):
+    """Merge the moved base `s` (moved_bases') at the tip it recorded into the branch, in the
+    task's worktree there: `git merge --no-edit -m "Merge <base> into task/<ID> (<ID>)"`, with no
+    ID in a companion with forbid_tracker_ids. Sets s["commit"] and records a `merged_base` row
+    (`round` is the pass, n). Raises GitError, the merge aborted."""
+    c, tree = s["c"], str(s["tree"])
+    msg = f"Merge {s['base']}" if c and c["forbid_ids"] else f"Merge {s['base']} into {branch} ({t['id']})"
+    r = subprocess.run(["git", "-C", tree, "merge", "--no-edit", "-m", msg, s["tip"]], capture_output=True, text=True)
+    if r.returncode:
+        subprocess.run(["git", "-C", tree, "merge", "--abort"], capture_output=True)
+        raise _gitops.GitError(f"merging {bases_text([s])} into {branch} in {tree} failed: "
+                               f"{(r.stderr or r.stdout).strip()[:300]}")
+    s["commit"] = _gitops.git("rev-parse", "HEAD", cwd=tree)
+    _history.record("merged_base", t, base=s["base"], tip=s["tip"], fork=s["fork"], branch=branch,
+                    companion=c["name"] if c else None, commit=s["commit"], round=n, by=by)
+
+
+def merged_gates(t, base, wt, branch, pubs, rnd=None, tier=None):
+    """The pass on a merge with a moved base: the done checks, the weakening check and the gates
+    (run_verify), their rows marked `merged: true`. Returns (failure or None, fixable: "weaken",
+    "verify" or False). Raises GitError."""
+    failed = done_checks(t, base, wt, branch, pubs)
+    if failed:
+        return failed, False
+    failed = run_weakening(t, base, branch, pubs, rnd, tier, merged=True)
+    if failed:
+        return failed, "weaken"
+    failed = run_verify(t, wt, rnd, merged=True)
+    if failed:
+        if "(runtime gate)" in failed:
+            log = re.search(r"\(full output (\S+?)\)\s*$", failed)
+            save_incident(t, "runtime", failed, base, branch, pubs, log=log and log[1], tier=tier)
+        return failed, "verify"
+    return None, False
+
+
+MERGED_RED = """Your branch was green alone, and went red merged with its base: {bases} moved since you
+started, so dispatch merged {it} into {branch} and ran the gates on the merge. What came in:
+
+{body}
+Make your work fit those changes, on {branch} on top of the merge: don't revert or redo the merge,
+and don't undo the base's commits.
+"""
+
+
+def merged_text(t, moved, branch):
+    """The fix round's lines on a red merge: per merged base its tip, dispatch's merge commit and
+    the base's commits since the fork (`git log --oneline <fork>..<base>`)."""
+    parts = []
+    for s in moved:
+        lines = s["log"].splitlines()
+        shown = "\n".join("    " + l for l in lines[:CONFLICT_LOG_MAX]) + (
+            f"\n    ... and {len(lines) - CONFLICT_LOG_MAX} more" if len(lines) > CONFLICT_LOG_MAX else "")
+        where = f"{s['c']['name']}, in its worktree" if s["c"] else "This repo, in"
+        parts.append(f"- {where} {s['tree']}: {s['base']} (at {s['tip'][:12]}), merged in by "
+                     f"{(s.get('commit') or '?')[:12]}. {s['base']}'s commits since {branch} forked from it, "
+                     f"`git -C {s['tree']} log --oneline {s['fork'][:12]}..{s['base']}`:\n{shown or '    (none)'}")
+    return MERGED_RED.format(bases=bases_text(moved), it="them" if len(moved) > 1 else "it", branch=branch,
+                             body="\n".join(parts))
+
+
+def moving_note(moved, passes):
+    """Why a task whose base moved (again) gets no more passes."""
+    where = bases_text(moved)
+    if not _config.REMERGE_ROUNDS:
+        return (f"{where} moved since the branch was cut, and remerge_rounds = 0 lets no pass run the gates "
+                "on its merge")
+    return (f"the base kept moving: {where} moved again after {passes} pass(es) merging it in and running "
+            f"the gates (remerge_rounds = {_config.REMERGE_ROUNDS})")
+
+
+def merged_rows(t):
+    """The merges of the last pass recorded for t (its latest `merged_base` rows of one round and
+    one `by`), as dicts: base, tip, fork, companion, commit."""
+    rows = [r for r in _history.read() if r.get("task") == t["id"] and r.get("event") == "merged_base"]
+    if not rows:
+        return []
+    last = rows[-1]
+    out = []
+    for r in reversed(rows):
+        if (r.get("round"), r.get("by")) != (last.get("round"), last.get("by")):
+            break
+        out.insert(0, r)
+    return out
+
+
+def merged_refound(t, wt, pubs):
+    """moved_bases()'s dicts for the merges of t's last pass (merged_rows), rebuilt on this
+    dispatch's worktrees, with their commits; [] when none applies. Raises GitError."""
+    comps = {c["name"]: (c, pub) for c, pub in pubs}
+    out = []
+    for r in merged_rows(t):
+        name = r.get("companion")
+        if name and name not in comps:
+            continue
+        c, tree = comps[name] if name else (None, wt)
+        repo = c["path"] if c else None
+        out.append({"c": c, "base": r["base"], "repo": repo, "tree": tree, "tip": r["tip"], "fork": r["fork"],
+                    "commit": r.get("commit"), "clean": True, "files": [],
+                    "log": _gitops.git("log", "--oneline", f"{r['fork']}..{r['tip']}", cwd=repo)})
+    return out
 
 
 def land(t, base, wt, branch, pubs=(), accepted=None):
@@ -3334,7 +3493,7 @@ def dispatch(args):
                     f"past the ${cap:.2f} cap")
         return ""
 
-    def fix_loop(t, tier, base, wt, branch, pubs, info):
+    def fix_loop(t, tier, base, wt, branch, pubs, info, first=None, merged=None):
         """gate() the finished branch; on a red verify or a reviewer's `REVIEW: fail`, hand it back
         to a worker (fix_round) and gate again: up to verify_rounds and review_rounds times. A
         worker that ends `blocked — outside: <why>` on a verify round costs no round: verify reruns
@@ -3344,9 +3503,14 @@ def dispatch(args):
         Returns (verdict, reason). Folds every call's cost and FOUND lines, and the last worker's
         log and session, into info; info["rounds"] gets the earlier vetoes when a fix worker blocks.
         Worker runs are numbered on from info["rnd"] (after a conflict round, say), and what the
-        rounds fixed is added to info["fixed"]."""
+        rounds fixed is added to info["fixed"]. `first` = (failure, fixable) starts it at that
+        failure instead of a gate() run: a red on dispatch's merge with a moved base (remerge),
+        whose context `merged` (merged_text's) every fix prompt carries. Its verify fix rounds then
+        count on from info["vfixes"], the dispatch's earlier ones, so they share verify_rounds."""
         kept, vetoes, rnd = kept_note(wt, branch, pubs), [], info.get("rnd", 1)
-        vfixes, outside = 0, None
+        vfixes, outside = (info.get("vfixes", 0) if first else 0), None
+        vstart = vfixes
+        on_merge = f" (red since dispatch merged {merged[1]} into {branch}; it was green alone)" if merged else ""
         repos = [None] + [c["path"] for c, _ in pubs]
         round_cost = info.get("round_cost", info.get("cost", 0))
         info.setdefault("review_cost", 0)
@@ -3365,7 +3529,8 @@ def dispatch(args):
             except _gitops.GitError:
                 tips = None
             v, w, finfo = fix_round(t, tier, base, wt, branch, pubs, args, agents, settings,
-                                    info.get("session"), failed, rnd, verify, n, kind)
+                                    info.get("session"), failed, rnd, verify, n, kind,
+                                    merged=merged[0] if merged else "")
             round_cost = finfo.get("cost", 0)
             info["cost"] = info.get("cost", 0) + round_cost
             info["found"] = (info.get("found") or []) + (finfo.get("found") or [])
@@ -3390,14 +3555,17 @@ def dispatch(args):
             return v, w
 
         while True:
-            try:
-                ev = copy_evidence(t, wt, info.get("evidence") or [], rnd) if info.get("evidence") else None
-                failed, rcost, fixable = gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd, ev,
-                                              prove=not info.get("prove_waived"),
-                                              found=info.get("found") or [],
-                                              waived=info.get("prove_waived"))
-            except _gitops.GitError as err:
-                failed, rcost, fixable = str(err), 0, False
+            if first:  # the pass on the merge already ran the gates
+                (failed, fixable), rcost, first = first, 0, None
+            else:
+                try:
+                    ev = copy_evidence(t, wt, info.get("evidence") or [], rnd) if info.get("evidence") else None
+                    failed, rcost, fixable = gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd, ev,
+                                                  prove=not info.get("prove_waived"),
+                                                  found=info.get("found") or [],
+                                                  waived=info.get("prove_waived"))
+                except _gitops.GitError as err:
+                    failed, rcost, fixable = str(err), 0, False
             info["cost"] = info.get("cost", 0) + rcost
             info["review_cost"] += rcost
             round_cost += rcost
@@ -3408,9 +3576,10 @@ def dispatch(args):
                 info.update(limited=fixable["limited"], step="review", kind=None, fixing=None)
                 return "limited", failed
             if not failed:
-                if vetoes or vfixes or outside:
+                if vetoes or vfixes > vstart or outside:
                     info["fixed"] = "; ".join(x for x in (info.get("fixed"),
-                        f"verify passed after {vfixes} fix round(s)" if vfixes else "",
+                        f"verify passed{' on the merge' if merged else ''} after {vfixes - vstart} fix round(s)"
+                        if vfixes > vstart else "",
                         f"verify passed on rerun after the worker found the failure outside the branch: {outside}"
                         if outside else "",
                         f"review passed in round {len(vetoes) + 1}, after {len(vetoes)} fix round(s): "
@@ -3434,7 +3603,7 @@ def dispatch(args):
                 else:
                     stop = round_stop(info, round_cost, rnd + 1)
                 if stop or vfixes >= _config.VERIFY_ROUNDS:
-                    return "blocked", f"{failed}{stop}. {kept}"
+                    return "blocked", f"{failed}{on_merge}{stop}. {kept}"
                 v, w = fix(failed, (vfixes + 1, _config.VERIFY_ROUNDS), kind=fixable)
                 if v == "limited":  # uses up no round: the task parks at this one
                     return v, w
@@ -3451,8 +3620,9 @@ def dispatch(args):
                     print(f"  prove    {t['id']}  waived by the worker ({w}); checking again without it", flush=True)
                     continue
                 vfixes += 1
+                info["vfixes"] = vfixes
                 if v != "done":
-                    info["rounds"] = f" (verify fix round {vfixes}, after: {failed})"
+                    info["rounds"] = f" (verify fix round {vfixes}, after: {failed}{on_merge})"
                     return ("asking" if v == "asking" else "blocked"), w
                 continue
             stop = ""
@@ -3565,6 +3735,57 @@ def dispatch(args):
             v, w = fix_loop(t, tier, base, wt, branch, pubs, info)
             if v != "done":
                 return v, w
+
+    def remerge(t, tier, base, wt, branch, pubs, info, moved):
+        """One pass on a branch whose base (or a companion's trunk) moved and merges cleanly
+        (`moved`, moved_bases'): merge each in (merge_base_in), then the done checks, the weakening
+        check and the gates on the merge (merged_gates). A red goes to fix_loop, its verify fix
+        rounds shared with the dispatch's. No pass past remerge_rounds. Returns (verdict, reason)."""
+        kept = kept_note(wt, branch, pubs)
+        n = info.get("remerges", 0) + 1
+        if n > _config.REMERGE_ROUNDS:
+            return "blocked", f"{moving_note(moved, n - 1)}. {kept}"
+        info["remerges"] = n
+        where = bases_text(moved)
+        try:
+            for s in moved:
+                merge_base_in(t, s, branch, n, "dispatch")
+        except _gitops.GitError as err:
+            return "blocked", f"{err}. {kept}"
+        print(f"  merged   {t['id']}  {where} moved: merged it into {branch}, running the gates on the merge "
+              f"(pass {n}/{_config.REMERGE_ROUNDS})", flush=True)
+        try:
+            failed, fixable = merged_gates(t, base, wt, branch, pubs, info.get("rnd", 1), tier)
+        except _gitops.GitError as err:
+            failed, fixable = str(err), False
+        if not failed:
+            said = f"merged {where}, which had moved; the gates passed on the merge"
+            if said not in (info.get("fixed") or ""):  # once, however many passes
+                info["fixed"] = "; ".join(x for x in (info.get("fixed"), said) if x)
+            return "done", ""
+        print(f"  merged   {t['id']}  red on the merge with {where}: {failed}", flush=True)
+        if not fixable:
+            return "blocked", f"{failed} (on dispatch's merge of {where} into {branch}). {kept}"
+        return fix_loop(t, tier, base, wt, branch, pubs, info, first=(failed, fixable),
+                        merged=(merged_text(t, moved, branch), where))
+
+    def catch_up(t, tier, base, wt, branch, pubs, info):
+        """Before the state lock, on a branch whose gate passed: conflicts first (resolve, with
+        conflict_rounds above 0), then, if a base moved and merges cleanly, a pass on its merge
+        (remerge). A conflict with no conflict rounds is left to land(), which blocks on it as
+        before. A branch whose bases haven't moved comes back as it went. Returns (verdict, reason)."""
+        if _config.CONFLICT_ROUNDS:
+            v, w = resolve(t, tier, base, wt, branch, pubs, info)
+            if v != "done":
+                return v, w
+        try:
+            moved = moved_bases(base, wt, branch, pubs)
+        except _gitops.GitError as err:
+            return "blocked", f"{err}. {kept_note(wt, branch, pubs)}"
+        if not moved or not all(s["clean"] for s in moved):
+            return "done", ""
+        # one pass; a base that moved again meanwhile is found under the lock, which sends it back here
+        return remerge(t, tier, base, wt, branch, pubs, info, moved)
 
     def until_done(t, base, wt, branch, pubs, verdict, why, info, tier=None, extra=""):
         """A worker that stopped short (info["stopped"]: it timed out, errored, printed no JSON or
@@ -3709,7 +3930,19 @@ def dispatch(args):
         # a question asked in a conflict round (T-110), or a conflict round the usage limit stopped
         # (T-185): its context, for the checks on the run that carries it on
         conflict = (limited_conflict(lim) if lim is not None else asked_conflict(t) if answered else None)
-        if lim is None and not answered and _config.CONFLICT_ROUNDS and ACCEPT_CONFLICT_MARK in _report.last_note(t):
+        # only a task that waits for a human's accept anyway: this path reruns no review, so it must never land by itself
+        regate = (lim is None and not answered and ACCEPT_REMERGE_MARK in _report.last_note(t)
+                  and _tasks.needs_accept(t))
+        if regate:
+            # `accept` merged in a base that moved while it waited, and its gates went red there, or the
+            # base kept moving (T-196): no fresh attempt, the gates on the branch as accept left it, a
+            # fix round if red. The earlier acceptance is not carried over.
+            print(f"  merged   {t['id']}  accepted, but its merge with a moved base isn't green yet: "
+                  "running the gates on it", flush=True)
+            verdict, why, up = "done", "", None
+            info = {"found": [], "evidence": [], "policy": [], "session": None, "log": "(none)", "cost": 0}
+            skip_gate = False
+        elif lim is None and not answered and _config.CONFLICT_ROUNDS and ACCEPT_CONFLICT_MARK in _report.last_note(t):
             # `accept` found the branch conflicting with its base (T-097): no fresh attempt at the task,
             # straight to the conflict round on the existing branch. The earlier acceptance is not carried over.
             print(f"  conflict {t['id']}  accepted, but its branch conflicts with its base: resolving it", flush=True)
@@ -3718,7 +3951,7 @@ def dispatch(args):
             skip_gate = True
         else:
             skip_gate = False
-        if skip_gate:
+        if skip_gate or regate:
             pass
         elif lim is not None:  # the usage limit stopped it and has reset: restart that step
             verdict, why, info, up = resume_limited(t, base, wt, branch, pubs, lim)
@@ -3740,7 +3973,7 @@ def dispatch(args):
             info["resumed"], info["fresh_because"] = resume, fresh_because
         else:
             verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings)
-        if args.until_done and not skip_gate:
+        if args.until_done and not skip_gate and not regate:
             with live_lock:
                 live[t["id"]] = info.get("cost", 0)
             verdict, why = until_done(t, base, wt, branch, pubs, verdict, why, info, tier=up,
@@ -3764,11 +3997,23 @@ def dispatch(args):
         with live_lock:
             live[t["id"]] = info.get("cost", 0)
         tier = up or t["tier"]
-        if verdict == "done" and not skip_gate:
+        if regate:
+            try:
+                moved = merged_refound(t, wt, pubs)
+                failed, fixable = merged_gates(t, base, wt, branch, pubs, tier=tier)
+            except _gitops.GitError as err:
+                moved, (failed, fixable) = [], (str(err), False)
+            if failed and fixable:
+                where = bases_text(moved) or base
+                verdict, why = fix_loop(t, tier, base, wt, branch, pubs, info, first=(failed, fixable),
+                                        merged=(merged_text(t, moved, branch) if moved else "", where))
+            elif failed:
+                verdict, why = "blocked", f"{failed}. {kept_note(wt, branch, pubs)}"
+        elif verdict == "done" and not skip_gate:
             verdict, why = fix_loop(t, tier, base, wt, branch, pubs, info)
-        while True:  # a conflict found under the lock loops back here for another round
-            if verdict == "done" and _config.CONFLICT_ROUNDS:
-                verdict, why = resolve(t, tier, base, wt, branch, pubs, info)
+        while True:  # a conflict, or a base that moved, found under the lock loops back here for another pass
+            if verdict == "done":
+                verdict, why = catch_up(t, tier, base, wt, branch, pubs, info)
                 if skip_gate and verdict == "done":  # no conflict left to resolve: nothing has gated the branch yet
                     skip_gate = False
                     if not info.get("conflicts"):
@@ -3794,12 +4039,22 @@ def dispatch(args):
                             found = None  # land() reports it
                     if found and not conflict_stop(info, len(info.get("conflicts") or []) + 1):
                         continue  # the base moved again since resolve(): another round, outside the lock
+                    try:
+                        moved = None if found else moved_bases(base, wt, branch, pubs)
+                    except _gitops.GitError:
+                        moved = None  # land() reports it
+                    if moved and all(s["clean"] for s in moved) and info.get("remerges", 0) < _config.REMERGE_ROUNDS:
+                        print(f"  merged   {t['id']}  {bases_text(moved)} moved again since the gates ran: "
+                              "another pass", flush=True)
+                        continue  # the base moved since the gates ran on the merge: another pass, outside the lock
                     if found:
                         n = conflict_seen(t, info, found)
                         verdict, why = "blocked", (
                             conflict_note("; ".join(s["reason"] for s in found), info.get("conflicts"),
                                           conflict_stop(info, n)) + f". {kept_note(wt, branch, pubs)}: merge by hand")
-                    else:
+                    elif moved and all(s["clean"] for s in moved):
+                        verdict, why = "blocked", f"{moving_note(moved, info.get('remerges', 0))}. {kept_note(wt, branch, pubs)}"
+                    else:  # nothing moved; or a conflict with no conflict rounds, which land() blocks on
                         verdict, why = land(t, base, wt, branch, pubs)
                 if verdict == "asking":
                     park(t, info, wt, branch, pubs)
@@ -3932,6 +4187,8 @@ def dispatch(args):
                      if harden_ids(t) else "")
                   + (f", red-on-base proof if it changes {', '.join(_config.TESTS)}" if not prove_skip(t) else "")
                   + (f", {crounds} if its branch conflicts" if cr else "")
+                  + (", gates rerun on its merge if its base moves" if _config.REMERGE_ROUNDS
+                     else ", blocks if its base moves (remerge_rounds = 0)")
                   + (f", escalates to {_config.WORKER_TIERS[_config.WORKER_TIERS.index(t['tier']) + 1]} if blocked"
                      if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1] else "")
                   + (", held for your accept" if _tasks.needs_accept(t) else "")

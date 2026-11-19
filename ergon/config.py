@@ -55,6 +55,9 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 #                               # again, up to this many times; then block (0: block on the first fail)
 # conflict_rounds = 1           # a branch that conflicts with its base goes back to its worker to merge the
 #                               # base in, this many times; then block for a hand merge (0: block at once)
+# remerge_rounds = 3            # a finished branch whose base moved (cleanly) gets the base merged in by
+#                               # dispatch, and its gates run again on the merge, this many passes before
+#                               # it blocks saying the base kept moving (0: block when the base moved)
 # review_resume_secs = 3300     # resume the worker's own session only if its last request is younger
 # review_resume_tokens = 80000  # and its context smaller than these; else a fresh worker on the branch
 # journal = true                # when an epic finishes, have claude write its journal entry (one `claude -p`
@@ -246,7 +249,7 @@ def configure(start=None, need_config=True):
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, CONCEPTS, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, EVIDENCE, \
-        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, LEARN, \
+        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, REMERGE_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, LEARN, \
         FOLLOW_UP_DEPTH, FOLLOW_UPS, GATE_FILES, SUPPRESS, REPROS, TESTS, PROVE_TIERS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
@@ -325,6 +328,9 @@ def configure(start=None, need_config=True):
     REVIEW_ROUNDS = count("review_rounds", 2)
     VERIFY_ROUNDS = count("verify_rounds", 2)  # a red verify goes back to the worker this many times (T-027)
     CONFLICT_ROUNDS = count("conflict_rounds", 1)  # a branch that conflicts with its base goes back to its worker (T-095)
+    # A finished branch whose base moved cleanly gets it merged in, and its gates rerun on the merge,
+    # up to this many passes (T-196); then the task blocks, saying the base kept moving.
+    REMERGE_ROUNDS = count("remerge_rounds", 3)
     RESUME_SECS = count("review_resume_secs", 3300)
     RESUME_TOKENS = count("review_resume_tokens", 80000)
     # How many FOUND follow-ups deep a non-feature follow-up is approved by inheritance (T-136);

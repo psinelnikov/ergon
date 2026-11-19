@@ -3670,6 +3670,178 @@ class TestConflictRounds(DispatchProject):
         self.assertIn("conflict_rounds is a whole number", self.ergon("board", check=False).stderr)
 
 
+class TestRemerge(DispatchProject):
+    """remerge_rounds (default 3, T-196): a finished branch whose base moved and merges cleanly gets
+    the base merged in by dispatch, and its gates run again on the merge, before it lands. T-001
+    (haiku) and T-002 (sonnet, slower) run at once on disjoint files, so T-002, landing second,
+    finds main moved."""
+
+    def setUp(self):
+        super().setUp()
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0", FAKE_SLEEP_SONNET="1.5")
+        self.env.pop("CLAUDE_CONFIG_DIR", None)  # never the developer's own config dir
+        self.wt = self.root / ".claude" / "worktrees" / "T-002"
+
+    def tasks(self, verify2=None):
+        self.ergon("new", "task", "Rename", "--tier", "haiku", "--touches", "first.txt")
+        self.ergon("new", "task", "Caller", "--tier", "sonnet", "--touches", "second.txt")
+        for t in ("T-001", "T-002"):
+            stamp(self.task_file(t))
+        if verify2:
+            f = self.task_file("T-002")
+            f.write_text(f.read_text().replace("\ntier:", f"\nverify: {verify2}\ntier:", 1))
+
+    def add_config(self, line):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(line + "\n" + cfg.read_text())
+
+    def calls(self, tid="T-002"):
+        rows = [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+        return [c for c in rows if f"on {tid}" in c["prompt"] or f"{tid}\n" in c["prompt"]]
+
+    def rows(self, event, tid="T-002"):
+        return [r for r in history(self.root) if r["task"] == tid and r["event"] == event]
+
+    def notes(self, tid="T-002"):
+        return self.task_file(tid).read_text().split("## Notes", 1)[1]
+
+    def kept(self):
+        self.assertTrue(self.wt.exists())
+        self.assertIn("task/T-002", sh("git", "branch", "--list", "task/T-002", cwd=self.root).stdout)
+
+    def test_green_alone_red_merged_gets_a_fix_round_then_blocks(self):
+        # T-001 renames old() to new(); T-002 calls old(). Each is green alone; merged, the call breaks.
+        (self.root / "check.sh").write_text(
+            'if [ -e T-001.txt ] && [ -e T-002.txt ]; then echo "T-002 calls old(), which T-001 renamed"; exit 1; fi\n')
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "check", cwd=self.root)
+        self.add_config('verify = "sh check.sh"')
+        self.tasks()
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertEqual(self.status("T-002"), "blocked", out)
+        t1 = sh("git", "log", "--format=%h %s", "--grep", r"Do the thing (T-001)", "--fixed-strings", "main",
+                cwd=self.root).stdout.strip()
+        self.assertTrue(t1)
+        calls = self.calls()
+        self.assertEqual([c["agent"] for c in calls], ["SONNET", "SONNET", "SONNET"])  # verify_rounds = 2
+        prompt = calls[1]["prompt"]
+        self.assertIn("Verify failed on your work on T-002 (verify fix round 1 of 2)", prompt)
+        self.assertIn("Your branch was green alone, and went red merged with its base", prompt)
+        self.assertIn(t1, prompt)  # the base's commits since the fork: the first task's commit
+        self.assertIn("T-002 calls old(), which T-001 renamed", prompt)
+        self.assertIn("outside: <why>", prompt)
+        self.assertIn("verify fix round 2 of 2", calls[2]["prompt"])
+        self.assertIn("red since dispatch merged main into task/T-002; it was green alone", self.notes())
+        self.assertIn("no verify fix rounds left (verify_rounds = 2)", self.notes())
+        # the trunk never holds the broken merge
+        self.assertFalse((self.root / "T-002.txt").exists())
+        self.assertNotIn("T-002", sh("git", "log", "--format=%B", "main", cwd=self.root).stdout)
+        self.assertEqual([(r["ok"], r.get("merged")) for r in self.rows("verify")],
+                         [(True, None), (False, True), (False, None), (False, None)])
+        m = self.rows("merged_base")
+        self.assertEqual([(r["base"], r["branch"], r["companion"], r["round"], r["by"]) for r in m],
+                         [("main", "task/T-002", None, 1, "dispatch")])
+        self.kept()
+
+    def test_clean_green_merge_lands_with_dispatchs_merge_commit(self):
+        self.add_config('verify = "true"')
+        self.tasks()
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertIn(", gates rerun on its merge if its base moves", dry)
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        self.assertEqual(self.status("T-002"), "done", out)
+        self.assertIn("merged   T-002  main moved: merged it into task/T-002", out)
+        log = sh("git", "log", "--format=%H %P|%s", "main", cwd=self.root).stdout.splitlines()
+        merge = [l for l in log if l.endswith("|Merge main into task/T-002 (T-002)")]
+        self.assertEqual(len(merge), 1, log)
+        sha, *parents = merge[0].split("|")[0].split()
+        self.assertEqual(len(parents), 2)
+        m = self.rows("merged_base")
+        self.assertEqual(len(m), 1)
+        self.assertEqual((m[0]["base"], m[0]["branch"], m[0]["companion"], m[0]["commit"], m[0]["round"], m[0]["by"]),
+                         ("main", "task/T-002", None, sha, 1, "dispatch"))
+        self.assertIn(m[0]["tip"], parents)  # the base's tip, as it was merged in
+        self.assertEqual([(r["ok"], r.get("merged")) for r in self.rows("verify")], [(True, None), (True, True)])
+        self.assertEqual(events(self.root, "T-002")[-3:], ["merged_base", "verify", "landed"])
+        self.assertIn("merged main, which had moved; the gates passed on the merge", self.notes())
+        self.assertEqual(len(self.calls()), 1)  # no worker for the merge
+
+    def test_companion_merge_cites_no_id(self):
+        pub = self.root / "pub" / "src"
+        self.add_config('verify = "true"')
+        self.ergon("new", "task", "Pub one", "--tier", "haiku", "--touches", "acme/public/a.txt")
+        self.ergon("new", "task", "Pub two", "--tier", "sonnet", "--touches", "acme/public/b.txt")
+        for t in ("T-001", "T-002"):
+            stamp(self.task_file(t))
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        self.assertEqual(self.status("T-002"), "done", out)
+        # both workers commit in each repo, so both moved: the companion first, as land() merges
+        self.assertEqual([(r["companion"], r["by"]) for r in self.rows("merged_base")],
+                         [("acme/public", "dispatch"), (None, "dispatch")])
+        self.assertNotRegex(sh("git", "log", "--format=%B", "main", cwd=pub).stdout, r"\bT-\d{3}")
+        self.assertIn("Merge main", sh("git", "log", "--format=%s", "main", cwd=pub).stdout.splitlines())
+        self.assertIn("Merge main into task/T-002 (T-002)",
+                      sh("git", "log", "--format=%s", "main", cwd=self.root).stdout.splitlines())
+
+    def test_base_moving_again_takes_another_pass_or_blocks(self):
+        # T-002's verify commits another change to main the first time it runs on a merge, so main
+        # has moved again by the time the lock is taken.
+        for rounds in (1, 3):
+            with self.subTest(rounds=rounds):
+                self.setUp()
+                flag, script = Path(self.tmp.name) / "moved", Path(self.tmp.name) / "move.sh"
+                script.write_text(f"if git rev-parse -q --verify HEAD^2 >/dev/null && [ ! -e {flag} ]; then\n"
+                                  f"  touch {flag}; cd {self.root} && echo later > later.txt && git add later.txt && "
+                                  "git commit -qm Later -- later.txt\nfi\n")
+                if rounds == 1:
+                    self.add_config("remerge_rounds = 1")
+                self.tasks(verify2=f"sh {script}")
+                out = self.ergon("dispatch", "--jobs", "2").stdout
+                if rounds == 1:
+                    self.assertEqual(self.status("T-002"), "blocked", out)
+                    self.assertRegex(self.notes(), r"the base kept moving: main moved again after 1 pass\(es\) merging "
+                                     r"it in and running the gates \(remerge_rounds = 1\)\. Branch task/T-002 and worktree")
+                    self.assertEqual(len(self.rows("merged_base")), 1)
+                    self.assertFalse((self.root / "T-002.txt").exists())
+                    self.kept()
+                else:
+                    self.assertEqual(self.status("T-002"), "done", out)
+                    self.assertIn("main moved again since the gates ran: another pass", out)
+                    self.assertEqual([r["round"] for r in self.rows("merged_base")], [1, 2])
+                    self.assertEqual([r.get("merged") for r in self.rows("verify")], [None, True, True])
+                    self.assertTrue((self.root / "later.txt").exists() and (self.root / "T-002.txt").exists())
+                self.assertEqual(len(self.calls()), 1)
+
+    def test_unmoved_base_lands_as_before(self):
+        self.add_config('verify = "true"')
+        self.ergon("new", "task", "Alone", "--tier", "haiku")
+        stamp(self.task_file("T-001"))
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertNotIn("merged   T-001", out)
+        self.assertEqual(events(self.root, "T-001"), ["created", "dispatched", "worker_end", "verify", "landed"])
+        self.assertNotIn("Merge main into", sh("git", "log", "--format=%s", "main", cwd=self.root).stdout)
+        self.assertNotIn("had moved", self.notes("T-001"))
+
+    def test_zero_rounds_blocks_a_moved_base(self):
+        self.add_config("remerge_rounds = 0")
+        self.tasks()
+        self.assertIn("blocks if its base moves (remerge_rounds = 0)", self.ergon("dispatch", "--dry-run").stdout)
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        self.assertEqual(self.status("T-002"), "blocked", out)
+        self.assertIn("main moved since the branch was cut, and remerge_rounds = 0 lets no pass run the gates", self.notes())
+        self.assertEqual(self.rows("merged_base"), [])
+        self.kept()
+
+    def test_bad_config(self):
+        (self.root / ".ergon.toml").write_text("remerge_rounds = -1\n")
+        self.assertIn("remerge_rounds is a whole number", self.ergon("board", check=False).stderr)
+
+
 class TestEpicConflict(DispatchProject):
     """T-096: an epic complete but conflicting with the trunk goes to a resolver agent (`ergon
     finish E-NNN --resolve`, or dispatch once with conflict_rounds above 0). E-001 started, then the
@@ -3942,8 +4114,9 @@ class TestAccept(DispatchProject):
         self.assertFalse(self.has_branch("task/T-001"))
         self.assertFalse(self.has_branch(branch))
         self.assertFalse((self.root / ".claude" / "worktrees" / "T-001").exists())
+        # T-002 landed into the epic while T-001 waited, so accept merged the epic branch in first (T-196)
         self.assertEqual(events(self.root, "T-001"),
-                         ["created", "dispatched", "worker_end", "review_hold", "accepted", "landed"])
+                         ["created", "dispatched", "worker_end", "review_hold", "accepted", "merged_base", "landed"])
         rows = history(self.root)
         self.assertRegex(rows[-2]["accepted_by"], r"^Tester \d{4}-")
         self.assertEqual((rows[-1]["event"], rows[-1]["epic"]), ("epic_finished", "E-001"))
@@ -4040,6 +4213,63 @@ class TestAccept(DispatchProject):
         self.assertRegex(sh("git", "log", "--format=%B", "main", cwd=self.root).stdout,
                          r"Merge T-001: Shared\n\nAccepted by Tester \d{4}-")
         self.assertEqual(sorted((self.root / "shared.txt").read_text().split()), ["T-001", "moved"])
+
+    def held_task_with_cleanly_moved_base(self, verify=None):
+        """T-001 (accept: yes) is held at review; then main gains other.txt, which merges cleanly."""
+        self.ergon("new", "task", "Held", "--tier", "sonnet", "--touches", "s.py")
+        f = self.task_file("T-001")
+        stamp(f)
+        f.write_text(f.read_text().replace("\ntier:", "\naccept: yes\n" + (f"verify: {verify}\n" if verify else "")
+                                           + "tier:", 1))
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "review")
+        (self.root / "other.txt").write_text("moved\n")
+        sh("git", "add", "other.txt", cwd=self.root)
+        sh("git", "commit", "-qm", "Move the base", cwd=self.root)
+
+    def test_accept_of_a_moved_base_gates_the_merge_then_lands(self):
+        self.held_task_with_cleanly_moved_base(verify="test -e T-001.txt")
+        code, out = self.human("accept", "T-001")
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("merging  T-001  main moved since it was held: merging it into task/T-001 and running the "
+                      "gates on the merge", out)
+        log = sh("git", "log", "--format=%B", "main", cwd=self.root).stdout
+        self.assertRegex(log, r"Merge T-001: Held\n\nAccepted by Tester \d{4}-")
+        self.assertIn("Merge main into task/T-001 (T-001)", log)
+        rows = history(self.root)
+        m = [r for r in rows if r["event"] == "merged_base"]
+        self.assertEqual([(r["base"], r["branch"], r["round"], r["by"]) for r in m], [("main", "task/T-001", 1, "accept")])
+        self.assertEqual([r.get("merged") for r in rows if r["event"] == "verify"], [None, True])
+        self.assertEqual(events(self.root, "T-001")[-4:], ["accepted", "merged_base", "verify", "landed"])
+        self.assertTrue((self.root / "other.txt").exists() and (self.root / "T-001.txt").exists())
+
+    def test_accept_of_a_moved_base_that_goes_red_goes_back_for_a_fix_round(self):
+        # red once other.txt is in, until T-001 commits a second line of its own
+        self.held_task_with_cleanly_moved_base(verify="test ! -e other.txt || test $(wc -l < T-001.txt) -ge 2")
+        main = sh("git", "rev-parse", "main", cwd=self.root).stdout
+        code, out = self.human("accept", "T-001")
+        self.assertEqual(self.status("T-001"), "ready", out)
+        self.assertIn("ready    T-001  red on its merge with main: the next dispatch runs a fix round", out)
+        self.assertRegex(self.task_file("T-001").read_text(),
+                         r"accept: accepted by Tester \d{4}-\S+, but merged with main, which moved while it waited, its "
+                         r"gates went red: verify \(runtime gate\)[^\n]*; the next dispatch runs the gates on its merge "
+                         r"again \(a fix round if red\), and it returns to review for your accept")
+        self.assertEqual(sh("git", "rev-parse", "main", cwd=self.root).stdout, main)  # nothing landed
+        self.assertEqual([r["by"] for r in history(self.root) if r["event"] == "merged_base"], ["accept"])
+        seen = Path(self.tmp.name) / "seen.jsonl"
+        self.env["FAKE_SEEN"] = str(seen)
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "review", out)  # the fix is new code: accept again
+        calls = [json.loads(l) for l in seen.read_text().splitlines()]
+        self.assertEqual(len(calls), 1, out)  # the fix round alone, no fresh attempt at the task
+        self.assertIn("Verify failed on the last attempt", calls[0]["prompt"])
+        self.assertIn("Your branch was green alone, and went red merged with its base", calls[0]["prompt"])
+        self.assertIn("Move the base", calls[0]["prompt"])
+        self.assertFalse(self.on("main", "T-001.txt"))
+        code, out = self.human("accept", "T-001")
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertRegex(sh("git", "log", "--format=%B", "main", cwd=self.root).stdout,
+                         r"Merge T-001: Held\n\nAccepted by Tester \d{4}-")
 
     def test_accept_landing_failure_that_isnt_a_conflict_still_blocks(self):
         self.held_task_with_moved_base(move=False)
@@ -4421,8 +4651,11 @@ class TestHistory(DispatchProject):
                          ["created", "approved", "dispatched", "worker_end", "verify", "landed"])
         self.assertEqual(events(self.root, "T-002"),
                          ["created", "approved", "dispatched", "worker_end", "blocked"])
-        self.assertEqual(events(self.root, "T-003"),
-                         ["created", "approved", "dispatched", "worker_end", "verify", "review", "landed"])
+        # T-003 lands on main before E-001 finishes into it, or after, merging main in first (T-196)
+        self.assertIn(events(self.root, "T-003"),
+                      [["created", "approved", "dispatched", "worker_end", "verify", "review", "landed"],
+                       ["created", "approved", "dispatched", "worker_end", "verify", "review", "merged_base", "verify",
+                        "landed"]])
         self.assertEqual(events(self.root, "T-004"), ["created"])  # the human task T-002 asked for
         self.assertEqual([r["event"] for r in rows if r["task"] is None], ["created", "approved", "epic_finished"])
 
@@ -4505,11 +4738,15 @@ class TestHistory(DispatchProject):
             self.ergon("new", "task", f"Job {n}", "--tier", "sonnet", "--touches", f"j{n}.py")
             stamp(self.task_file(f"T-00{n + 1}"))
         self.env.update(FAKE_FOUND="|".join(f"Follow-up {i} — " + "why " * 300 for i in range(3)))
+        # six landing at once: the last may find main moved five times, a pass on its merge each (T-196)
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text("remerge_rounds = 6\n" + cfg.read_text())
         out = self.ergon("dispatch", "--jobs", "6").stdout
         self.assertIn("6/6 done", out)
         for n in range(1, 7):
-            self.assertEqual(events(self.root, f"T-00{n}"),
-                             ["created", "dispatched", "worker_end", "verify", "landed"], out)
+            own = [r["event"] for r in history(self.root) if r["task"] == f"T-00{n}"
+                   and r["event"] != "merged_base" and not r.get("merged")]
+            self.assertEqual(own, ["created", "dispatched", "worker_end", "verify", "landed"], out)
         self.assertEqual(sum(r["event"] == "created" and r.get("by") == "found" for r in history(self.root)), 18)
 
         # Many processes at once, each row far past PIPE_BUF: every line is still whole.
