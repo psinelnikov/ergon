@@ -258,7 +258,7 @@ if os.path.isdir(pub):
     commit(pub, os.environ.get("FAKE_PUB_MSG", "Do the public thing").replace("{id}", tid), os.environ.get("FAKE_PUB_SHARED"))
 if os.environ.get("FAKE_DIRTY"):
     open(f"{tid}.txt", "a").write("more\n")
-found = "".join(f"FOUND: {x}\n" for x in os.environ.get("FAKE_FOUND", "").split("|") if x)
+found = "".join(f"FOUND: {x}\n" for x in os.environ.get("FAKE_FOUND", "").split(os.environ.get("FAKE_FOUND_SEP", "|")) if x)
 if os.environ.get("FAKE_ASK") and "answered" not in prompt:
     print(json.dumps({"result": "need a call\n" + found + os.environ["FAKE_ASK"] + "\nRESULT: asking",
                       "session_id": "s-1", "total_cost_usd": 0.01}))
@@ -761,8 +761,8 @@ class TestEpicApproval(Project):
         text = self.epic_file().read_text()
         self.assertIn("\nstatus: proposed\n", text)
         self.assertIn("\napproved:\n", text)
-        self.ergon("new", "task", "Part one", "--tier", "haiku", "--epic", "E-001", env=agent)
-        self.ergon("new", "task", "Part two", "--tier", "haiku", "--epic", "E-001", env=agent)
+        self.ergon("new", "task", "Part one", "--tier", "haiku", "--category", "chore", "--epic", "E-001", env=agent)
+        self.ergon("new", "task", "Part two", "--tier", "haiku", "--category", "chore", "--epic", "E-001", env=agent)
         stamp(self.task_file("T-001"))  # a human approved the task, but not its epic's brief
         self.ergon("check")  # a proposed epic is a fine state to be in
         self.assertIn("EPICS AWAITING APPROVAL (1)", self.ergon("review").stdout)
@@ -864,8 +864,8 @@ class TestEpicApproval(Project):
         human = clean_env(ERGON_ASK_STDIN="1")
         agent = clean_env(CLAUDECODE="1")
         self.ergon("new", "epic", "Unwanted", env=agent)
-        self.ergon("new", "task", "Part one", "--tier", "haiku", "--epic", "E-001", env=agent)
-        self.ergon("new", "task", "Part two", "--tier", "haiku", "--epic", "E-001", env=agent)
+        self.ergon("new", "task", "Part one", "--tier", "haiku", "--category", "chore", "--epic", "E-001", env=agent)
+        self.ergon("new", "task", "Part two", "--tier", "haiku", "--category", "chore", "--epic", "E-001", env=agent)
         stamp(self.task_file("T-001"))  # a human approved this task, but not its epic's brief
         r = self.ergon("reject", "E-001", check=False, env=agent, inp="y\n")
         self.assertNotEqual(r.returncode, 0)
@@ -1567,6 +1567,54 @@ class TestDispatch(DispatchProject):
         text = self.task_file("T-004").read_text()
         self.assertIn("title: Fix beta\n", text)
         self.assertIn("## What\nWrapped whole. Found by T-001", text)
+
+    def found_run(self, found, *args):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND=found, FAKE_FOUND_SEP="~")
+        return self.ergon("dispatch", *args).stdout
+
+    def test_found_feature_options_become_an_options_section(self):
+        self.found_run("Cache it \u2014 slow\nCATEGORY: feature\nOPTIONS: an LRU | `a redis cache` | | c | d | e")
+        text = self.task_file("T-002").read_text()
+        self.assertEqual(self.status("T-002"), "proposed")
+        self.assertIn("## Options\n1. an LRU (recommended)\n2. a redis cache\n3. c\n4. d\n\n## Notes", text)
+        self.assertNotIn("no options given", text)
+        self.ergon("check")
+        r = self.ergon("approve", "T-002", inp="y\n", check=False, env=dict(self.env, ERGON_ASK_STDIN="1"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.status("T-002"), "proposed")
+        self.ergon("choose", "T-002", "1", inp="y\n", env=dict(self.env, ERGON_ASK_STDIN="1"))
+        self.assertIn("Chosen:", self.task_file("T-002").read_text())
+
+    def test_found_two_options(self):
+        self.found_run("Cache it \u2014 slow\nOPTIONS: a | b")
+        self.assertEqual(self.task_file("T-002").read_text().partition("## Options\n")[2].partition("\n## ")[0],
+                         "1. a (recommended)\n2. b\n")
+
+    def test_found_feature_without_options_gets_a_note(self):
+        self.found_run("Cache it \u2014 slow\nOPTIONS: only one~Other \u2014 x")
+        for tid in ("T-002", "T-003"):
+            text = self.task_file(tid).read_text()
+            self.assertNotIn("## Options", text)
+            self.assertIn("no options given by T-001: choose an approach before approving, "
+                          "or add one with ergon choose --own", text)
+            self.assertEqual(self.status(tid), "proposed")
+
+    def test_found_bugfix_options_are_ignored(self):
+        self.found_run("Fix X \u2014 y breaks\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix\nOPTIONS: a | b", "--ids", "T-001")
+        text = self.task_file("T-002").read_text()
+        self.assertEqual(self.status("T-002"), "ready")
+        self.assertNotIn("## Options", text)
+        self.assertNotIn("no options given", text)
+
+    def test_options_after_found_do_not_go_to_the_question(self):
+        from ergon.dispatch import parse_questions, parse_found
+        text = "QUESTION: q\nFOUND: f \u2014 why\nOPTIONS: x | y\n"
+        self.assertEqual(parse_questions(text), [("q", [])])
+        self.assertEqual(parse_found(text)[0][2]["options"], ["x", "y"])
+        text = "FOUND: f \u2014 why\nTIER: haiku \u2014 s\nQUESTION: q\nOPTIONS: a | b\n"
+        self.assertEqual(parse_questions(text), [("q", ["a", "b"])])
 
     def test_md_trim(self):
         from ergon.dispatch import md_trim
@@ -4068,6 +4116,7 @@ BREAKDOWN_REPLY = """Read the code.
 TASK: Add the schema
 tier: haiku
 tier_why: the exact change is written below
+category: chore
 touches: db/schema.sql
 depends:
 ## What
@@ -4079,6 +4128,7 @@ END TASK
 **TASK: Read widgets in the API**
 tier: sonnet
 tier_why: one subsystem, has to run its tests
+category: chore
 touches: api/widgets.py
 depends: 1
 ## What
@@ -4092,17 +4142,22 @@ END TASK
 TASK: Sign widget exports
 tier: opus
 tier_why: signing
+category: feature
 touches: server/auth/sign.py, api/export.py
 depends: 1, 2
 ## What
 Sign each export.
 ## Done when
 - exports verify
+## Options
+1. Sign with the account key (recommended)
+2. Sign with a per-export key
 END TASK
 
 TASK: Rotate the signing key
 tier: sonnet
 tier_why: it looks small
+category: chore
 touches: server/auth/keys.py
 depends:
 ## What
@@ -4114,6 +4169,7 @@ END TASK
 TASK: Announce the rotation
 tier: haiku
 tier_why: a doc row
+category: chore
 touches: docs/keys.md
 depends: 4
 ## What
@@ -4227,6 +4283,11 @@ class TestBreakdown(DispatchProject):
         self.assertIn("## What\nServe the table from api/widgets.py.\n", text)
         self.assertIn("## Done when\n- GET /widgets returns the rows\n", text)
         self.assertIn("## Notes\nKeep it small.\n", text)
+        self.assertEqual(self.field("T-002", "category"), "chore")
+        self.assertNotIn("## Options", text)
+        text = self.task_file("T-003").read_text()
+        self.assertEqual(self.field("T-003", "category"), "feature")
+        self.assertIn("## Options\n1. Sign with the account key (recommended)\n2. Sign with a per-export key\n\n## Notes", text)
         # the rest are refused with a warning, never repaired
         self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 3)
         self.assertIn("warning: breakdown E-001 block 4 refused (Rotate the signing key): touches "
@@ -4267,6 +4328,42 @@ class TestBreakdown(DispatchProject):
         self.assertIn("two `## What` sections", got[3][2])
         self.assertEqual(got[0][1]["title"], "T")
 
+    def test_feature_blocks_need_two_to_four_options_and_a_known_category(self):
+        from ergon import dispatch as D
+        head = "TASK: T\ntier: haiku\ntier_why: w\n%stouches:\ndepends:\n## What\nx\n## Done when\n- y\n"
+        opts = lambda n: "## Options\n" + "".join(f"{i}. approach {i}\n" for i in range(1, n + 1))
+        replies = [head % "category: feature\n" + opts(2), head % "category: feature\n" + opts(1),
+                   head % "" + opts(5), head % "category: chore\n", head % "category: chore\n" + opts(1),
+                   head % "category: bugfix\n" + "## Options\nsome prose\n", head % "category: epic\n" + opts(2),
+                   head % "category: feature\n" + opts(2) + "Chosen: 1 by me 2026-01-01\n"]
+        got = D.parse_blocks("".join(r + "END TASK\n" for r in replies))
+        why = []
+        for n, f, w in got:
+            why.append(w or D.check_block(n, f, {}, {}, set()))
+        self.assertIsNone(why[0])
+        self.assertEqual(got[0][1]["options"], "1. approach 1\n2. approach 2")
+        self.assertIn("a feature block needs 2 to 4 options under `## Options`, has 1", why[1])
+        self.assertIn("a feature block needs 2 to 4 options", why[2])  # no category reads as feature
+        self.assertIsNone(why[3])
+        self.assertIn("a block with options needs 2 to 4", why[4])
+        self.assertIn("isn't a numbered option", why[5])
+        self.assertIn("category 'epic' not in", why[6])
+        self.assertIn("`Chosen:` line", why[7])
+
+    def test_breakdown_refuses_a_one_option_feature_and_files_the_rest(self):
+        self.new_epic()
+        approve_epic(self)
+        blk = "TASK: %s\ntier: haiku\ntier_why: w\ncategory: %s\ntouches:\ndepends:\n## What\nx\n## Done when\n- y\n%sEND TASK\n"
+        self.env["FAKE_BREAKDOWN"] = (blk % ("Two", "feature", "## Options\n1. a\n2. b\n") + blk % ("One", "feature", "## Options\n1. a\n")
+                                      + blk % ("Plain", "chore", "") + blk % ("Odd", "wish", "") + "RESULT: done\n")
+        out = self.ergon("breakdown", "E-001").stdout
+        self.assertIn("block 2 refused (One): a feature block needs 2 to 4 options under `## Options`, has 1", out)
+        self.assertIn("block 4 refused (Odd): category 'wish' not in", out)
+        self.assertIn("## Options\n1. a (recommended)\n2. b\n", self.task_file("T-001").read_text())
+        self.assertNotIn("## Options", self.task_file("T-002").read_text())
+        self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 2)
+        self.ergon("check")
+
     def new_epic_dir(self):
         return next((self.root / "tasks" / "epics").glob("E-001-*")).name
 
@@ -4301,7 +4398,7 @@ class TestBreakdown(DispatchProject):
         self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
         self.assertEqual(len(self.calls()), 1)
         # by hand it runs again, and again only adds
-        one = "TASK: First\ntier: haiku\ntier_why: w\ntouches: a.md\ndepends:\n## What\nx\n## Done when\n- y\nEND TASK\nRESULT: done\n"
+        one = "TASK: First\ntier: haiku\ntier_why: w\ncategory: chore\ntouches: a.md\ndepends:\n## What\nx\n## Done when\n- y\nEND TASK\nRESULT: done\n"
         self.env["FAKE_BREAKDOWN"] = one
         out = self.ergon("breakdown", "E-001", "--budget", "1").stdout
         self.assertIn("proposed T-001  (breakdown E-001)  First", out)
@@ -6863,6 +6960,9 @@ class TestLearn(Project):
                                                    "log": None, "base": "x", "tip": "y", "tier": "sonnet"}))
         (d / f"{iid}.patch").write_text(f"+++ b/{iid}.py\n+try:\n+    parse()\n+except:\n+    pass\n")
 
+    def human(self):
+        return dict(self.env, ERGON_ASK_STDIN="1")
+
     def reply(self, *classes):
         return dict(self.env, LEARN_REPLY=json.dumps({"classes": list(classes)}))
 
@@ -6936,6 +7036,49 @@ class TestLearn(Project):
                          ["T-001", "T-002", "T-003", "T-004"])  # nothing new filed
         self.ergon("check")
 
+    def test_class_options_become_the_options_section_and_approval_waits_on_a_choice(self):
+        opts = ["a ruff rule E722", "  an AST test   that flags bare except ", "a grep in the static gate"]
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=opts + ["x"] * 3)))
+        from ergon.tasks import options
+        t = self.fields("T-004")
+        self.assertEqual(options(t), (opts[:1] + ["an AST test that flags bare except", opts[2]] + ["x"], None))
+        self.assertNotIn("No options were offered", t["_body"])
+        r = self.ergon("approve", "T-004", inp="y\n", check=False, env=self.human())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("has options and no choice", r.stderr)
+        r = self.ergon("choose", "T-004", "2", inp="y\n", check=False, env=self.human())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.ergon("approve", "T-004", inp="y\n", check=False, env=self.human())
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_class_options_are_capped_at_four_and_a_class_with_fewer_than_two_gets_a_note(self):
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=["1", "2", "3", "4", "5", " "])))
+        self.assertEqual(len(__import__("ergon").tasks.options(self.fields("T-004"))[0]), 4)
+        for extra in ({}, {"options": []}, {"options": ["only one"]}, {"options": "nope"}):
+            with self.subTest(extra=extra):
+                for f in (self.root / "tasks").rglob("T-004-*.md"):
+                    f.unlink()
+                for r in (self.runs / "learn").glob("*.json"):
+                    r.unlink()
+                self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, **extra)))
+                t = self.fields("T-004")
+                self.assertNotIn("## Options", t["_body"])
+                self.assertIn("No options were offered", t["_body"])
+                self.ergon("approve", "T-004", inp="y\n", env=self.human())
+
+    def test_a_class_joining_an_open_task_leaves_its_options_alone(self):
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=["one", "two"])))
+        self.ergon("choose", "T-004", "1", inp="y\n", env=self.human())
+        before = self.task_file("T-004").read_text()
+        self.incident(self.D, "runtime", "test_parse fails: ValueError swallowed")
+        self.ergon("learn", env=self.reply(self.bare_except(self.D, task="T-004", options=["three", "four"])))
+        after = self.task_file("T-004").read_text()
+        self.assertEqual(after.partition("## Options\n")[2].partition("\n## ")[0],
+                         before.partition("## Options\n")[2].partition("\n## ")[0])
+        self.assertIn("Chosen: 1 by", after)
+        self.assertIn("  - three", after.partition("## Notes")[2])
+        self.assertNotIn("3. three", after)
+
     def test_malformed_reply_files_nothing_and_warns(self):
         before = {p.name: p.read_text() for p in (self.root / "tasks").rglob("T-*.md")}
         for raw in ("I think they are all the same mistake.", '{"classes": "one"}'):
@@ -7003,6 +7146,218 @@ class TestLearn(Project):
         out = self.ergon("dispatch", env=self.reply(self.bare_except(self.D, task="T-004"))).stdout
         self.assertIn("joined   T-004", out)
         self.assertEqual(len(self.prompts()), 2)
+
+
+class TestOptions(Project):
+    """E-006 / T-190: a task's ## Options, `ergon choose`, and approve waiting on a choice."""
+    TODAY = time.strftime("%Y-%m-%d")
+
+    def human(self, **extra):
+        return dict(self.env, ERGON_ASK_STDIN="1", **extra)
+
+    def agent(self):
+        return clean_env(CLAUDECODE="1")
+
+    def new_feature(self, *opts, title="Cache it"):
+        args = ["new", "task", title, "--tier", "sonnet"]
+        for o in opts:
+            args += ["--option", o]
+        return self.ergon(*args)
+
+    def choose(self, tid, *args, inp="y\n", env=None):
+        return self.ergon("choose", tid, *args, inp=inp, check=False, env=env or self.human())
+
+    def approve(self, tid, inp="y\n"):
+        return self.ergon("approve", tid, inp=inp, check=False, env=self.human())
+
+    def options_text(self, tid):
+        return self.task_file(tid).read_text().partition("## Options\n")[2].partition("\n## ")[0]
+
+    def test_new_writes_options_in_order_first_recommended(self):
+        self.new_feature("an in-memory LRU", "a redis cache", "  no   cache ")
+        self.assertEqual(self.options_text("T-001"),
+                         "1. an in-memory LRU (recommended)\n2. a redis cache\n3. no cache\n")
+        t = ergon.tasks.parse(self.task_file("T-001"))
+        self.assertEqual(ergon.tasks.options(t), (["an in-memory LRU", "a redis cache", "no cache"], None))
+        body = t["_body"]
+        self.assertLess(body.index("## Done when"), body.index("## Options"))
+        self.assertLess(body.index("## Options"), body.index("## Notes"))
+        self.ergon("check")  # a proposed task with options and no choice is fine
+        r = self.ergon("new", "task", "One", "--tier", "haiku", "--option", "only", check=False)
+        self.assertIn("at least 2", r.stderr)
+        self.assertEqual(len(list((self.root / "tasks").rglob("T-002-*.md"))), 0)
+
+    def test_choose_writes_chosen_line_and_row_then_approve(self):
+        self.new_feature("an in-memory LRU", "a redis cache")
+        f = self.task_file("T-001")
+        out = self.ergon("show", "T-001").stdout
+        self.assertIn("OPTIONS  no choice yet: `ergon choose T-001 <N>`", out)
+        self.assertIn("  1. an in-memory LRU  (recommended)", out)
+        review = self.ergon("review").stdout
+        self.assertIn("AWAITING A CHOICE (1)", review)
+        self.assertIn("         2. a redis cache", review)
+        self.assertIn("ergon choose <ID> <N>", review)
+        self.assertIn("nothing awaiting approval", review)  # it can't be approved yet
+
+        # approve is refused until a human chooses, and names the command
+        r = self.approve("T-001")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("ergon choose T-001", r.stderr)
+        self.assertEqual(self.status("T-001"), "proposed")
+
+        r = self.choose("T-001", "2")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("choice: 2. a redis cache", r.stdout)
+        self.assertIn("A choice steers only", r.stdout)
+        self.assertEqual(self.options_text("T-001").splitlines()[0], f"Chosen: 2 by Tester {self.TODAY}")
+        rows = [x for x in history(self.root) if x["event"] == "chosen"]
+        self.assertEqual([(x["task"], x["by"], x["option"], x["text"]) for x in rows],
+                         [("T-001", "Tester", 2, "a redis cache")])
+        t = ergon.tasks.parse(f)
+        self.assertEqual(ergon.tasks.options(t)[1]["option"], 2)
+        self.assertEqual(ergon.tasks.options(t)[1]["text"], "a redis cache")
+        self.assertIn("(chosen)", self.ergon("show", "T-001").stdout)
+
+        # choosing again replaces the line; --own writes the human's own text
+        before = ergon.tasks.brief_digest(t)
+        r = self.choose("T-001", "--own", "a file cache, keyed by path")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = self.options_text("T-001").splitlines()
+        self.assertEqual(lines[0], f"Chosen: own by Tester {self.TODAY} — a file cache, keyed by path")
+        self.assertEqual(sum(l.startswith("Chosen:") for l in lines), 1)
+        t = ergon.tasks.parse(f)
+        self.assertEqual(ergon.tasks.options(t)[1]["text"], "a file cache, keyed by path")
+        self.assertNotEqual(ergon.tasks.brief_digest(t), before)  # the choice is in what approval approves
+        self.assertEqual([x["option"] for x in history(self.root) if x["event"] == "chosen"], [2, "own"])
+
+        # not confirmed: nothing written
+        r = self.choose("T-001", "1", inp="n\n")
+        self.assertIn("aborted", r.stderr)
+        self.assertIn("Chosen: own", self.options_text("T-001"))
+        r = self.choose("T-001", "3")
+        self.assertIn("from 1 to 2", r.stderr)
+
+        r = self.approve("T-001")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("chosen own: a file cache", r.stdout)
+        self.assertEqual(self.status("T-001"), "ready")
+        self.ergon("check")
+
+    def test_choose_refusals(self):
+        self.new_feature("a", "b")
+        self.ergon("new", "task", "Plain", "--tier", "haiku")
+        r = self.choose("T-001", "1", env=self.agent())
+        self.assertIn("agent shell", r.stderr)
+        self.assertNotIn("Chosen:", self.task_file("T-001").read_text())
+        r = self.choose("T-002", "1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no ## Options", r.stderr)
+        self.assertEqual(self.choose("T-404", "1").returncode, 1)
+        # a task that isn't proposed
+        self.assertEqual(self.choose("T-001", "1").returncode, 0)
+        self.assertEqual(self.approve("T-001").returncode, 0)
+        r = self.choose("T-001", "2")
+        self.assertIn("is ready: a choice is made on a proposed task only", r.stderr)
+        self.assertIn("Chosen: 1 by", self.options_text("T-001"))
+        self.assertEqual([x["option"] for x in history(self.root) if x["event"] == "chosen"], [1])
+
+    def test_task_without_options_approves_as_before(self):
+        self.ergon("new", "task", "Plain", "--tier", "haiku")
+        t = ergon.tasks.parse(self.task_file("T-001"))
+        self.assertEqual(ergon.tasks.options(t), ([], None))
+        self.assertIsNone(ergon.tasks.choice_problem(t))
+        self.assertNotIn("AWAITING A CHOICE", self.ergon("review").stdout)
+        r = self.approve("T-001")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("choose", r.stdout + r.stderr)
+        self.assertEqual(self.status("T-001"), "ready")
+
+    def test_approve_several_leaves_out_the_one_without_a_choice(self):
+        self.new_feature("a", "b")
+        self.ergon("new", "task", "Plain", "--tier", "haiku")
+        r = self.ergon("approve", "T-001", "T-002", inp="y\n", env=self.human())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("left out: T-001 has options and no choice", r.stdout)
+        self.assertEqual((self.status("T-001"), self.status("T-002")), ("proposed", "ready"))
+
+    def test_check_fails_ready_task_without_choice_and_malformed_sections(self):
+        self.new_feature("a", "b")
+        f = self.task_file("T-001")
+        stamp(f)  # a hand-written ready can't skip the choice
+        r = self.ergon("check", check=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("T-001: ready, but its ## Options has no `Chosen:` line", r.stdout)
+        f.write_text(f.read_text().replace("## Options\n", "## Options\nChosen: 1 by Tester 2026-01-01\n"))
+        self.ergon("check")
+        f.write_text(f.read_text().replace("Chosen: 1 by", "Chosen: 7 by"))
+        r = self.ergon("check", check=False)
+        self.assertIn("T-001: ## Options has `Chosen: 7`, but the list has 2 option(s)", r.stdout)
+        f.write_text(f.read_text().replace("Chosen: 7 by Tester 2026-01-01", "Chosen: whichever"))
+        self.assertIn("doesn't read", self.ergon("check", check=False).stdout)
+        self.ergon("new", "task", "Thin", "--tier", "haiku")
+        g = self.task_file("T-002")
+        g.write_text(g.read_text().replace("## Notes", "## Options\n1. only one\n\n## Notes"))
+        r = self.ergon("check", check=False)
+        self.assertIn("T-002: ## Options lists 1 numbered option(s); it needs at least 2", r.stdout)
+        self.assertIn("at least 2", self.choose("T-002", "1").stderr)
+
+    def test_guard_refuses_agent_edits_of_the_chosen_line(self):
+        self.new_feature("a", "b")
+        f = self.task_file("T-001")
+        p = str(f)
+        add = {"file_path": p, "old_string": "## Options\n", "new_string": "## Options\nChosen: 1 by Me 2026-01-01\n"}
+        self.assertIn("ergon choose", self.guard("Edit", add))
+        self.assertIn("ergon choose", self.guard("Write", {"file_path": p, "content": f.read_text().replace(
+            "## Options\n", "## Options\nChosen: 2 by Me 2026-01-01\n")}))
+        self.assertIn("ergon choose", self.guard("MultiEdit", {"file_path": p, "edits": [add]}))
+        # a new task file that arrives with a choice already made
+        new = f.with_name("T-009-x.md")
+        self.assertIn("ergon choose", self.guard("Write", {"file_path": str(new), "content": f.read_text().replace(
+            "## Options\n", "## Options\nChosen: 1 by Me 2026-01-01\n").replace("T-001", "T-009")}))
+        self.assertIsNone(self.guard("Edit", {"file_path": p, "old_string": "## What\n", "new_string": "## What\nmore\n"}))
+        self.assertIsNone(self.guard("Edit", {"file_path": p, "old_string": "2. b", "new_string": "2. b, but faster"}))
+
+        self.assertEqual(self.choose("T-001", "1").returncode, 0)
+        line = f"Chosen: 1 by Tester {self.TODAY}"
+        self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": line,
+                                                          "new_string": line.replace(": 1", ": 2")}))
+        self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": line + "\n", "new_string": ""}))
+        self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": "## Options\n",
+                                                          "new_string": "## Choices\n"}))
+        # and the command itself, run by an agent through Bash
+        for cmd in ("ergon choose T-001 2", 'ergon choose T-001 --own "mine"', "cd x && ergon choose T-001 1",
+                    "bash -c 'ergon choose T-001 1'"):
+            self.assertIn("human-only", self.guard("Bash", {"command": cmd}), cmd)
+        self.assertIsNone(self.guard("Bash", {"command": 'git commit -m "ergon choose T-001 1"'}))
+
+    def test_new_task_in_agent_shell_needs_options_for_a_feature(self):
+        agent = self.agent()
+        r = self.ergon("new", "task", "Feature", "--tier", "sonnet", check=False, env=agent)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("needs 2 to 4", r.stderr)
+        self.assertIn("chooses how it is built", r.stderr)
+        r = self.ergon("new", "task", "Feature", "--tier", "sonnet", "--category", "feature", "--option", "a",
+                       check=False, env=agent)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        self.ergon("new", "task", "Feature", "--tier", "sonnet", "--option", "a", "--option", "b", env=agent)
+        self.assertEqual(self.options_text("T-001"), "1. a (recommended)\n2. b\n")
+        self.ergon("new", "task", "Fix", "--tier", "haiku", "--category", "bugfix", env=agent)
+        self.assertNotIn("## Options", self.task_file("T-002").read_text())
+        self.ergon("new", "task", "Human's feature", "--tier", "sonnet")  # outside an agent shell: optional
+        self.assertNotIn("## Options", self.task_file("T-003").read_text())
+
+    def test_review_interactive_offers_choose(self):
+        self.new_feature("a", "b")
+        # a: refused without a choice; c, pick 2, confirm; a: approved
+        r = self.ergon("review", "-i", inp="a\nc\n2\ny\na\n", env=self.human(), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("[c]hoose", r.stdout)
+        self.assertIn("refused: T-001 has options and no choice", r.stdout)
+        self.assertIn("chosen 1", r.stdout)
+        self.assertIn(f"Chosen: 2 by Tester {self.TODAY}", self.options_text("T-001"))
+        self.assertEqual(self.status("T-001"), "ready")
+        self.assertEqual([x["option"] for x in history(self.root) if x["event"] == "chosen"], [2])
 
 
 if __name__ == "__main__":

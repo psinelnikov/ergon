@@ -179,7 +179,7 @@ class TestServe(ServeFixture):
         self.assertEqual(code, 200)
         self.assertEqual(headers["Content-Type"], "application/json")
         d = json.loads(body)
-        self.assertEqual(d["counts"], {"approval": 2, "acceptance": 1, "answer": 0})
+        self.assertEqual(d["counts"], {"approval": 2, "choice": 0, "acceptance": 1, "answer": 0})
         [doing] = d["doing"]
         self.assertEqual(doing["id"], "T-002")
         self.assertEqual(doing["round"], 2)
@@ -358,6 +358,51 @@ class TestServe(ServeFixture):
         self.assertIn("<strong>bold</strong>", page)  # the markdown subset still works
         self.assertIn("<code>&lt;b&gt;code&lt;/b&gt;</code>", page)
         self.assertIn('<a href="/t/T-001">T-001</a>', page)
+
+    def add_options(self, tid, *opts):
+        f = self.task_file(tid)
+        f.write_text(f.read_text().rstrip("\n") + "\n\n## Options\n"
+                     + "".join(f"{n}. {o}" + (" (recommended)" if n == 1 else "") + "\n" for n, o in enumerate(opts, 1)))
+
+    def test_options_shown_with_choose_commands(self):
+        """T-194: /review and /t/T-NNN list a task's options, the recommended one marked, one `ergon choose`
+        command each plus --own; after a choice, the chosen mark shows and the commands are gone."""
+        self.add_options("T-004", "plain <script>alert(1)</script> approach", "second approach")
+        for path in ("/review", "/t/T-004"):
+            _, _, page = self.req("GET", path)
+            sec = page.split('<ol class=options>')[1].split("</ol>")[0]
+            self.assertIn("plain &lt;script&gt;alert(1)&lt;/script&gt; approach", sec)
+            self.assertIn("second approach", sec)
+            self.assertNotIn("<script>alert(1)", page)
+            self.assertEqual(sec.count("recommended"), 1)
+            self.assertIn("ergon choose T-004 1</code>", page)
+            self.assertIn("ergon choose T-004 2</code>", page)
+            self.assertIn("ergon choose T-004 --own", page)
+        _, _, review = self.req("GET", "/review")
+        appr = review.split("<h2>Approve</h2>")[1]
+        self.assertNotIn("ergon approve T-004", appr)
+        self.assertRegex(appr, r"Choose first.*T-004")
+        _, _, board = self.req("GET", "/")
+        self.assertIn("Awaiting choice (1)", board)
+        self.assertRegex(board, r'id="count-choice">1<')
+        self.ergon("choose", "T-004", "2", inp="y\n", env=dict(self.env, ERGON_ASK_STDIN="1"))
+        for path in ("/review", "/t/T-004"):
+            _, _, page = self.req("GET", path)
+            self.assertIn("chosen by", page)
+            self.assertNotIn("ergon choose T-004", page)
+        _, _, review = self.req("GET", "/review")
+        self.assertIn("ergon approve T-004", review.split("<h2>Approve</h2>")[1])
+        _, _, board = self.req("GET", "/")
+        self.assertNotIn("Awaiting choice", board)
+
+    def test_findings_flag_a_feature_without_options(self):
+        f = self.task_file("T-004")
+        f.write_text(re.sub(r"^category: \w+\n", "", f.read_text(), flags=re.M).replace("\ntier:", "\ncategory: feature\ntier:", 1))
+        _, _, review = self.req("GET", "/review")
+        self.assertIn("a proposed feature with no ## Options", review)
+        self.add_options("T-004", "a", "b")
+        _, _, review = self.req("GET", "/review")
+        self.assertIn("has ## Options and no choice yet", review)
 
     def test_only_get_and_head(self):
         for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "PROPFIND"):

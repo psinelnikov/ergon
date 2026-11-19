@@ -40,12 +40,14 @@ from . import tasks as _tasks
 # checkout, on a task/<ID> branch there too, which lands on the companion's local trunk first.
 # No code is ever pushed. In shared mode the state branch is, to claim tasks (see "claims").
 
+# The FOUND line and its follow-up lines, as every worker prompt tells them (agents/task-*.md say the same).
 FOUND_CLAUSE = (
     "`FOUND: <title> — <why>` followed right after by `DONE WHEN: …` (required: at least one line per FOUND, "
     "what makes the follow-up finished; several lines are fine) and these optional lines: `TOUCHES: a, b`, "
-    "`TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour "
+    "`TIER: haiku|sonnet|opus|human — <why>`, `OPTIONS: a | b | c`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour "
     "a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same "
-    "behaviour, better code; chore: docs, help text, tests, config, tooling)")
+    "behaviour, better code; chore: docs, help text, tests, config, tooling); a feature needs an `OPTIONS:` line "
+    "with 2 to 4 approaches to take, the recommended one first, which a human chooses from before approving it)")
 
 WORKER_PROMPT = """You are dispatched on {id}.
 
@@ -333,17 +335,22 @@ NO_SESSION = "-"
 
 def parse_questions(text):
     """[(question, [options])] from a worker's QUESTION: / OPTIONS: lines. An OPTIONS line belongs
-    to the QUESTION line before it."""
-    out = []
+    to the QUESTION line directly before it, never to a FOUND line's."""
+    out, last = [], None
     for l in text.splitlines():
-        m = re.match(r"^\W*(QUESTION|OPTIONS):\s*(.*?)\s*$", l)
+        m = re.match(r"^\W*(QUESTION|OPTIONS|FOUND):\s*(.*?)\s*$", l)
         if not m:
             continue
         val = m[2].strip(" *`")
-        if m[1] == "QUESTION" and val:
-            out.append((val, []))
-        elif m[1] == "OPTIONS" and out and not out[-1][1]:
-            out[-1][1].extend(o.strip(" *`") for o in val.split("|") if o.strip(" *`"))
+        if m[1] == "QUESTION":
+            last = None
+            if val:
+                out.append((val, []))
+                last = out[-1]
+        elif m[1] == "FOUND":
+            last = None
+        elif last is not None and not last[1]:
+            last[1].extend(o.strip(" *`") for o in val.split("|") if o.strip(" *`"))
     return out
 
 
@@ -883,8 +890,8 @@ FOUND_CATEGORIES = ("feature", "bugfix", "refactor", "chore")  # tasks.CATEGORIE
 
 def parse_found(text):
     """[(title, why, extra)] from a worker's FOUND: lines. TOUCHES (once), DONE WHEN (repeatable)
-    and TIER and CATEGORY (once each) lines directly after a FOUND line fill `extra`: touches, done,
-    tier, tier_why, category. A line md_trim would empty is ignored, and so is a tier or category
+    and TIER, CATEGORY and OPTIONS (`a | b | c`, at most 4) lines (once each) directly after a FOUND
+    line fill `extra`: touches, done, tier, tier_why, category, options. A line md_trim would empty is ignored, and so is a tier or category
     that isn't one."""
     out, cur, bullets = [], None, False
     for line in text.splitlines():
@@ -903,7 +910,7 @@ def parse_found(text):
                 cur = {}
                 out.append((md_trim(m[1]), md_trim(m[2]), cur))
             continue
-        m = re.match(r"^\W*(TOUCHES|DONE WHEN|TIER|CATEGORY):\s*(.*?)\s*$", line)
+        m = re.match(r"^\W*(TOUCHES|DONE WHEN|TIER|CATEGORY|OPTIONS):\s*(.*?)\s*$", line)
         if not m:
             if line.strip():
                 cur = None
@@ -918,6 +925,9 @@ def parse_found(text):
         elif m[1] == "TOUCHES":
             if "touches" not in cur:
                 cur["touches"] = [x for x in (md_trim(x) for x in val.split(",")) if x]
+        elif m[1] == "OPTIONS":
+            if "options" not in cur:
+                cur["options"] = [x for x in (md_trim(x) for x in val.split("|")) if x][:4]
         elif m[1] == "CATEGORY":
             if "category" not in cur and val.lower() in FOUND_CATEGORIES:
                 cur["category"] = val.lower()
@@ -1007,6 +1017,10 @@ def file_found(t, found, epics, vouch=True):
             body = body.replace("## Done when\n", "## Done when\n" + "".join(f"- {d}\n" for d in extra["done"]), 1)
         else:
             body = body.rstrip("\n") + "\n" + NO_DONE_WHEN_NOTE.format(id=tid) + "\n"
+        opts = extra.get("options") or []
+        feature = (extra.get("category") or "feature") == "feature"
+        if feature and len(opts) >= 2:
+            body = body.replace("\n## Notes", _tasks.options_section(opts) + "\n## Notes", 1)
         sized = extra.get("tier")
         meta = {"id": tid, "title": title, "tier": sized or t["tier"],
                 "category": extra.get("category") or "", "status": "proposed",
@@ -1020,6 +1034,10 @@ def file_found(t, found, epics, vouch=True):
             meta["status"], meta["approved"] = "ready", auto[0]
             if not sized:  # nobody approves it, so nobody sizes it then
                 meta["tier_why"] = f"tier of the task that found it ({t['id']})"
+        if feature and len(opts) < 2:
+            meta["_body"] = meta["_body"].rstrip("\n") + (
+                f"\nno options given by {t['id']}: choose an approach before approving, "
+                "or add one with ergon choose --own\n")
         _tasks.dump(meta, _tasks.TASK_KEYS)
         _history.record("created", meta, tier=meta["tier"], title=title, source=t["id"], by="found")
         if auto:
@@ -1932,7 +1950,8 @@ def found_lines(found):
         touches = ", ".join(extra.get("touches") or []) or "none declared"
         out.append(f"- {title}" + (f" — {why}" if why else "")
                    + f"\n  category: {extra.get('category') or '(none: reads as feature)'}; "
-                   + f"tier: {extra.get('tier') or FINDERS}; touches: {touches}\n")
+                   + f"tier: {extra.get('tier') or FINDERS}; touches: {touches}\n"
+                   + (f"  options: {' | '.join(extra['options'])}\n" if extra.get("options") else ""))
     return REVIEW_FOUND.format(lines="".join(out))
 
 
@@ -2738,8 +2757,9 @@ BREAKDOWN_MAX = 30  # TASK blocks filed per run; past that every block is refuse
 BREAKDOWN_SOURCE = "breakdown {eid}"
 BLOCK_START = re.compile(r"^\W*TASK:[ \t]*(.*?)[ \t*`]*$")
 BLOCK_END = re.compile(r"^\W*END TASK\W*$")
-BLOCK_FIELDS = ("tier", "tier_why", "touches", "depends")
-BLOCK_SECTIONS = ("what", "done when", "notes")
+BLOCK_FIELDS = ("tier", "tier_why", "category", "touches", "depends")  # category may be left out (a feature)
+BLOCK_SECTIONS = ("what", "done when", "options", "notes")
+BLOCK_OPTIONS = (2, 4)  # a feature block's number of options, at least and at most
 
 BREAKDOWN_PROMPT = """Break down epic {eid} into tasks.
 
@@ -2759,18 +2779,24 @@ If the brief can't be broken down as it stands, write no blocks and end with
 TASK: <title: what changes, one line>
 tier: <haiku | sonnet | opus | human>
 tier_why: <one line: why that tier>
+category: <feature | bugfix | refactor | chore; empty reads as feature>
 touches: <comma-separated paths or names it changes; may be empty>
 depends: <comma-separated numbers of earlier blocks in this reply, or existing T-NNN IDs; may be empty>
 ## What
 <the change, citing file:line>
 ## Done when
 <outcomes a reviewer can check>
+## Options
+1. <the recommended approach, one line>
+2. <an alternative approach, one line>
 END TASK
 
-Blocks are numbered 1, 2, 3, … in the order you write them, and `depends` may name only an earlier
+`## Options` lists 2 to 4 alternative approaches, the one you recommend first, one line each, and every
+option stays within the epic's Goal and Constraints. A feature block needs it; a bugfix, refactor or
+chore block may leave it out. Blocks are numbered 1, 2, 3, … in the order you write them, and `depends` may name only an earlier
 block. Each block is checked as `ergon check` would check it. A block with an unknown field, a tier
-below a `[[protect]]` minimum for a path it touches, an empty What or Done when, or a missing
-END TASK line is refused and never repaired. So is a block that depends on a refused one. At most
+below a `[[protect]]` minimum for a path it touches, an unknown category, a feature with fewer than 2 or more than 4 options, an empty What or
+Done when, or a missing END TASK line is refused and never repaired. So is a block that depends on a refused one. At most
 {max} blocks are filed.
 """
 
@@ -2918,7 +2944,7 @@ def check_block(n, f, tasks, ids, refused):
     if re.search(r"(?:^|\s)#", title) or title.startswith("["):
         return "title would not survive frontmatter (a ` #` starts a comment, a leading `[` a list)"
     for k in BLOCK_FIELDS:
-        if k not in f:
+        if k not in f and k != "category":
             return f"no `{k}:` line"
     if f["tier"] not in _tasks.TIERS:
         return f"tier {f['tier']!r} not in {_tasks.TIERS}"
@@ -2930,6 +2956,19 @@ def check_block(n, f, tasks, ids, refused):
         return "empty or missing `## What`"
     if not f.get("done when"):
         return "empty or missing `## Done when`"
+    cat = f.get("category", "").strip().lower() or "feature"
+    if cat not in _tasks.CATEGORIES:
+        return f"category {f['category']!r} not in {_tasks.CATEGORIES}"
+    f["_category"] = cat
+    opts = [m[2] for l in f.get("options", "").split("\n") if (m := _tasks.OPTION_ITEM.match(l)) and m[2]]
+    if any(l.strip().startswith("Chosen:") for l in f.get("options", "").split("\n")):
+        return "`## Options` has a `Chosen:` line (a human chooses)"
+    if f.get("options") and len(opts) != len([l for l in f["options"].split("\n") if l.strip()]):
+        return "`## Options` holds a line that isn't a numbered option (`1. …`)"
+    if (cat == "feature" or opts) and not BLOCK_OPTIONS[0] <= len(opts) <= BLOCK_OPTIONS[1]:
+        return (f"{'a feature block' if cat == 'feature' else 'a block with options'} needs "
+                f"{BLOCK_OPTIONS[0]} to {BLOCK_OPTIONS[1]} options under `## Options`, has {len(opts)}")
+    f["_options"] = [_tasks.RECOMMENDED.sub("", o) for o in opts]
     touches = split_list(f["touches"])
     if any(re.search(r"[\[\]#]", x) for x in touches):
         return f"a touches: entry holds `[`, `]` or `#`: {f['touches']}"
@@ -3071,10 +3110,11 @@ def file_blocks(e, blocks, info):
             info["refused"].append((n, title, why))
             continue
         tid = _tasks.next_id(_config.ITEMS, "T")
-        body = f"\n## What\n{f['what']}\n\n## Done when\n{f['done when']}\n\n## Notes\n" + (
-            f"{f['notes']}\n" if f.get("notes") else "")
+        body = (f"\n## What\n{f['what']}\n\n## Done when\n{f['done when']}\n"
+                + (_tasks.options_section(f["_options"]) if f["_options"] else "") + "\n## Notes\n"
+                + (f"{f['notes']}\n" if f.get("notes") else ""))
         source = BREAKDOWN_SOURCE.format(eid=e["id"])
-        meta = {"id": tid, "title": title, "tier": f["tier"], "status": "proposed", "epic": e["id"],
+        meta = {"id": tid, "title": title, "tier": f["tier"], "category": f["_category"], "status": "proposed", "epic": e["id"],
                 "depends": f["_depends"], "touches": f["_touches"], "source": source,
                 "created": _tasks.today(), "approved": "", "tier_why": f["tier_why"],
                 "_path": e["_path"].parent / f"{tid}-{_tasks.slug(title)}.md", "_body": body}

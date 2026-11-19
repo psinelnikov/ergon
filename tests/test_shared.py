@@ -800,6 +800,7 @@ class TestDispatchClaims(Shared):
 BREAKDOWN_ONE = """TASK: Add the schema
 tier: haiku
 tier_why: the exact change is written below
+category: chore
 touches: db/schema.sql
 depends:
 ## What
@@ -1062,7 +1063,7 @@ class TestSignedApprovals(Shared):
         self.start()
         agent = clean_env(CLAUDECODE="1")
         self.ergon(self.a, "new", "epic", "Big", env=agent)
-        self.ergon(self.a, "new", "task", "Part", "--tier", "haiku", "--epic", "E-001", env=agent)
+        self.ergon(self.a, "new", "task", "Part", "--tier", "haiku", "--category", "chore", "--epic", "E-001", env=agent)
         epic = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
         epic.write_text(epic.read_text().replace("## Goal\n", "## Goal\nShip the big thing.\n"))
         self.ergon(self.a, "approve", "T-002", inp="y\n")  # the task, but not its epic's brief

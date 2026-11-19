@@ -173,7 +173,8 @@ def today():
 
 # ---------- what an approval approves (shared mode) ----------
 # docs/shared-state.md, "Trusting approval stamps". An approval covers the brief: id, title, tier,
-# touches, accept and the What and Done when sections. status, depends, epic and Notes are left
+# touches, accept and the What and Done when sections (and Options, with its choice, when a task
+# has one). status, depends, epic and Notes are left
 # out: dispatch moves status and adds dependencies to blocked tasks, and Notes are scratch.
 # An epic's approval covers its id, title and the Goal, Out of scope and Constraints sections.
 
@@ -223,9 +224,11 @@ def brief_digest(t):
     `prove: no`) are in it, so writing one after approval un-approves the task. So are a harden
     task's incidents (`harden:`, as a set) and the gate its proof replays them on (`harden_layer:`,
     `static` when unset), since together they are what the task must prove it catches. So are the
-    files a task may add a suppression marker to (`suppress_ok:`, as a set, T-160). Each goes in
-    only when set (the layer only with incidents, as it does nothing without them), so a task that
-    has none of these keeps the digest it had before they counted."""
+    files a task may add a suppression marker to (`suppress_ok:`, as a set, T-160), and the
+    `## Options` section with its `Chosen:` line (E-006): a choice is made before approval, and the
+    approval covers it. Each goes in only when set (the layer only with incidents, as it does
+    nothing without them), so a task that has none of these keeps the digest it had before they
+    counted."""
     body = t.get("_body") or ""
     if is_epic(t):
         doc = {"kind": "epic", "id": str(t.get("id") or "").strip(),
@@ -255,7 +258,151 @@ def brief_digest(t):
         doc["suppress_ok"] = suppress_ok
     for name in DIGEST_SECTIONS:
         doc[name] = normalised(sections(body, name))
+    opts = normalised(sections(body, "options"))
+    if opts:  # the options and the human's choice among them (E-006)
+        doc["options"] = opts
     return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+# ---------- a task's options (E-006) ----------
+# A proposed feature may carry a `## Options` section: a numbered list of approaches, the first
+# recommended. A human picks one with `ergon choose`, which writes a first line
+# `Chosen: <N> by <name> <date>` (or `Chosen: own by <name> <date> — <text>`) above the list.
+# `approve` refuses a task whose section has no such line; the guard refuses an agent's edit of it.
+
+OPTION_ITEM = re.compile(r"^\s*(\d+)[.)]\s+(.*?)\s*$")
+CHOSEN = re.compile(r"^Chosen:\s+(\d+|own)\s+by\s+(.+?)\s+(\d{4}-\d\d-\d\d)(?:\s+—\s+(.*?))?\s*$")
+RECOMMENDED = re.compile(r"\s*\((?:recommended)\)\s*$", re.I)
+
+
+def _body_of(text):
+    """A task file's text without its frontmatter (the text itself when it has none)."""
+    return re.sub(r"\A---\n.*?\n---\n?", "", text or "", count=1, flags=re.S)
+
+
+def has_options(t):
+    """Has t's body a `## Options` heading?"""
+    return any((m := HEADING.match(l)) and m.group(1).strip().lower() == "options"
+               for l in (t.get("_body") or "").splitlines())
+
+
+def chosen_lines(text):
+    """The `Chosen:` lines under `## Options` in a task file's text (or body), stripped, in order.
+    The guard compares them before and after an agent's edit."""
+    return [l.strip() for l in sections(_body_of(text), "options").split("\n") if l.strip().startswith("Chosen:")]
+
+
+def options(t):
+    """(options, chosen) of t's `## Options` section. options: the numbered list's texts in order
+    (a trailing `(recommended)` taken off). chosen: the first `Chosen:` line as {"option": N (an
+    int) or "own", "text": the chosen option's text or the human's own, "by", "date", "line"},
+    or None when there is none. A Chosen: line that doesn't read gives {"option": None, "line"}.
+    ([], None) when t has no section."""
+    text = sections(t.get("_body") or "", "options")
+    opts, chosen = [], None
+    for l in text.split("\n"):
+        s = l.strip()
+        if s.startswith("Chosen:"):
+            if chosen is None:
+                m = CHOSEN.match(s)
+                if not m:
+                    chosen = {"option": None, "text": "", "by": "", "date": "", "line": s}
+                else:
+                    num = int(m[1]) if m[1].isdigit() else "own"
+                    chosen = {"option": num, "text": m[4] or "", "by": m[2], "date": m[3], "line": s}
+            continue
+        m = OPTION_ITEM.match(l)
+        if m and m[2]:
+            opts.append(RECOMMENDED.sub("", m[2]))
+    if chosen and isinstance(chosen["option"], int):
+        n = chosen["option"]
+        chosen["text"] = opts[n - 1] if 1 <= n <= len(opts) else ""
+    return opts, chosen
+
+
+def options_problems(t):
+    """What is wrong with t's `## Options` section, one line each, or [] (also for no section)."""
+    if not has_options(t):
+        return []
+    opts, chosen = options(t)
+    out = []
+    if len(opts) < 2:
+        out.append(f"## Options lists {len(opts)} numbered option(s); it needs at least 2 (`1. …`, `2. …`)")
+    if len(chosen_lines(t.get("_body") or "")) > 1:
+        out.append("## Options has more than one `Chosen:` line")
+    if chosen and chosen["option"] is None:
+        out.append(f"## Options has a `Chosen:` line that doesn't read: {chosen['line']!r} (expected "
+                   f"`Chosen: <N> by <name> <YYYY-MM-DD>` or `Chosen: own by <name> <YYYY-MM-DD> — <text>`)")
+    elif chosen and chosen["option"] == "own" and not chosen["text"]:
+        out.append("## Options has `Chosen: own` without its text (`… — <text>`)")
+    elif chosen and isinstance(chosen["option"], int) and not 1 <= chosen["option"] <= len(opts):
+        out.append(f"## Options has `Chosen: {chosen['option']}`, but the list has {len(opts)} option(s)")
+    return out
+
+
+def choice_problem(t):
+    """Why t can't be approved yet for want of a choice, or None: it has a `## Options` section
+    with no `Chosen:` line, or one that doesn't name a listed option (or own text). A task with no
+    section is approved as before."""
+    if is_epic(t) or not has_options(t):
+        return None
+    chosen = options(t)[1]
+    if chosen is None:
+        return (f"{t['id']} has options and no choice: a human picks one first with "
+                f"`ergon choose {t['id']} <N>` (or `--own \"<text>\"`), in their own terminal")
+    if chosen["option"] is None or not chosen["text"]:
+        return (f"{t['id']}'s `Chosen:` line doesn't name one of its options (`ergon check` says why): a human "
+                f"chooses again with `ergon choose {t['id']} <N>`, in their own terminal")
+    return None
+
+
+def chosen_line(option, by, date, text=""):
+    """The `Chosen:` line `ergon choose` writes: option is a number or "own" (with its text)."""
+    return f"Chosen: {option} by {by} {date}" + (f" — {text}" if option == "own" else "")
+
+
+def set_chosen(body, line):
+    """body with every `Chosen:` line under `## Options` taken out and `line` written as the
+    first line of its first `## Options` section."""
+    out, on, done = [], False, False
+    for l in body.split("\n"):
+        m = HEADING.match(l)
+        if m:
+            on = m.group(1).strip().lower() == "options"
+            out.append(l)
+            if on and not done:
+                out.append(line)
+                done = True
+            continue
+        if on and l.strip().startswith("Chosen:"):
+            continue
+        out.append(l)
+    return "\n".join(out)
+
+
+def options_section(opts):
+    """The `## Options` section `ergon new task --option` writes, the first option recommended."""
+    return "\n## Options\n" + "".join(f"{n}. {o}" + (" (recommended)" if n == 1 else "") + "\n"
+                                      for n, o in enumerate(opts, 1))
+
+
+def print_options(t, indent="  "):
+    """Print t's options, the recommended and the chosen one marked."""
+    opts, chosen = options(t)
+    for n, o in enumerate(opts, 1):
+        marks = [m for m, on in (("recommended", n == 1), ("chosen", bool(chosen) and chosen["option"] == n)) if on]
+        print(f"{indent}{n}. {o}" + (f"  ({', '.join(marks)})" if marks else ""))
+    if chosen and chosen["option"] == "own":
+        print(f"{indent}own. {chosen['text']}  (chosen)")
+
+
+def choice_text(t):
+    """One line saying what was chosen for t, or None when nothing is."""
+    chosen = options(t)[1]
+    if not chosen or chosen["option"] is None:
+        return None
+    what = f"own: {chosen['text']}" if chosen["option"] == "own" else f"{chosen['option']}. {chosen['text']}"
+    return f"{what}  (by {chosen['by']} {chosen['date']})"
 
 
 PROVE_NO = ("no", "false", "0")  # as dispatch.PROVE_NO reads `prove:`
@@ -599,7 +746,10 @@ def review(args):
     if args.interactive:
         return _gates.review_interactive(args)
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
-    waiting = [t for t in tasks.values() if t["status"] == "proposed"]
+    proposed = [t for t in tasks.values() if t["status"] == "proposed"]
+    # a task with options and no choice can't be approved yet: it waits on `ergon choose` first
+    choosing = sorted((t for t in proposed if choice_problem(t)), key=lambda t: t["id"])
+    waiting = [t for t in proposed if t not in choosing]
     briefs = sorted((e for e in epics.values() if e.get("status") == "proposed"), key=lambda e: e["id"])
     if briefs:
         print(f"\nEPICS AWAITING APPROVAL ({len(briefs)}): approving one approves its brief "
@@ -619,12 +769,20 @@ def review(args):
             print(line(t, tasks))
             if t.get("tier_why"):
                 print(f"         why {t['tier']}: {t['tier_why']}")
+            if choice_text(t):
+                print(f"         chosen {choice_text(t)}")
             if apr and two_person(t):
                 print(f"         two-person: {apr.tally(t)}")
     if not waiting and not briefs:
         print("nothing awaiting approval")
     else:
         print("\napprove from your own terminal:  ergon approve <ID|E-ID> ...   or drop:  ergon reject <ID|E-ID>")
+    if choosing:
+        print(f"\nAWAITING A CHOICE ({len(choosing)}): pick how each is built; approving one waits on its choice")
+        for t in choosing:
+            print(line(t, tasks))
+            print_options(t, indent="         ")
+        print('\nfrom your own terminal:  ergon choose <ID> <N>   or   ergon choose <ID> --own "<text>"')
     asking = sorted((t for t in tasks.values() if is_asking(t)), key=lambda t: t["id"])
     if asking:
         print(f"\nAWAITING ANSWER ({len(asking)}): a worker asked, its branch is kept")
@@ -682,6 +840,10 @@ def show(args):
         from . import priority as _pri
         t = tasks[args.id]
         print(f"CATEGORY  {category(t)}" + ("" if t.get("category") else " (not set: reads as feature)"))
+        if has_options(t):
+            print("OPTIONS  " + (f"chosen {choice_text(t)}" if choice_text(t) else
+                                 f"no choice yet: `ergon choose {t['id']} <N>` (a human, in their own terminal)"))
+            print_options(t)
         print(f"PRIORITY  cod={t.get('cod', '')}  cod_why={t.get('cod_why', '')}  graded={t.get('graded', '')}"
               f"  unblocks={_pri.unblocks(t, tasks)}  p={_pri.score(t, tasks):.1f}")
         fus = follow_ups(t, tasks, open_only=False)
@@ -722,6 +884,15 @@ def new(args):
             raise SystemExit(f"--tier must be one of {TIERS}")
         if args.category and args.category not in CATEGORIES:
             raise SystemExit(f"--category must be one of {CATEGORIES}")
+        opts = [o for o in (" ".join(str(x).split()) for x in getattr(args, "option", None) or []) if o]
+        if len(opts) == 1:
+            raise SystemExit("--option: give at least 2 (the recommended one first), or none: a choice of one "
+                             "isn't a choice")
+        if _gates.in_agent_shell() and category({"category": args.category}) == "feature" and len(opts) < 2:
+            raise SystemExit("refused: in an agent shell a feature (--category feature, or none) needs 2 to 4 "
+                             "--option \"<approach>\", the recommended one first, so the human chooses how it is "
+                             "built before approving it. If it isn't new behaviour a user would notice, give "
+                             "--category bugfix, refactor or chore")
         epics = load(_config.EPICS)
         if args.epic and args.epic not in epics:
             raise SystemExit(f"no such epic: {args.epic}")
@@ -730,7 +901,8 @@ def new(args):
         meta = {"id": tid, "title": args.title, "tier": args.tier, "category": args.category or "", "status": "proposed",
                 "epic": args.epic or "", "depends": [], "touches": args.touches.split(",") if args.touches else [],
                 "source": args.source or "", "created": today(), "approved": "", "tier_why": "",
-                "_path": home / f"{tid}-{slug(args.title)}.md", "_body": TASK_BODY}
+                "_path": home / f"{tid}-{slug(args.title)}.md",
+                "_body": TASK_BODY.replace("\n## Notes", options_section(opts) + "\n## Notes") if opts else TASK_BODY}
         dump(meta, TASK_KEYS)
         _history.record("created", meta, tier=args.tier, title=args.title, source=args.source or None, by="new")
     else:
@@ -1152,6 +1324,12 @@ def lint(warns=None):
         for x in _dispatch.suppress_ok_paths(t):  # T-160: a file, named on purpose
             if any(ch in x for ch in "*?["):
                 errs.append(f"{where}: suppress_ok: {x!r} is a glob; it names files one by one (a glob exempts nothing)")
+        if t.get("status") != "dropped":  # E-006: the options and the human's choice among them
+            errs += [f"{where}: {why}" for why in options_problems(t)]
+            if t.get("status") in NEEDS_APPROVAL and has_options(t) and options(t)[1] is None:
+                errs.append(f"{where}: {t['status']}, but its ## Options has no `Chosen:` line: a human chooses "
+                            f"(`ergon choose {t['id']} <N>`) before a task is approved, so edit it back to proposed "
+                            f"(status and approved:), choose, and approve it again")
         if t.get("epic") and t["epic"] not in epics:
             errs.append(f"{where}: epic {t['epic']} doesn't exist")
         for d in t.get("depends") or []:
