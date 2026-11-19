@@ -389,9 +389,13 @@ Carry on with the task on {branch} in {wt}, and commit there citing {id}. End as
 """
 
 
-ANSWER_CONFLICT = (" You asked in conflict round {n}: when you finish, the dispatcher checks your merge as that "
-                   "round said (a clean worktree, a merge commit with the base's tip as a parent, no conflict "
-                   "markers left, a branch that merges cleanly), and a miss blocks the task.")
+MERGE_CHECKED = ("when you finish, the dispatcher checks your merge as that round said (a clean worktree, a merge "
+                 "commit with the base's tip as a parent, no conflict markers left, a branch that merges cleanly), "
+                 "and a miss blocks the task.")
+
+ANSWER_CONFLICT = " You asked in conflict round {n}: " + MERGE_CHECKED
+
+LIMIT_CONFLICT = "It stopped in conflict round {n}: " + MERGE_CHECKED + "\n"
 
 
 def answer_lines(t, conflict=None):
@@ -413,6 +417,15 @@ def asked_conflict(t):
                None)
     ctx = (row or {}).get("conflict")
     return ctx if isinstance(ctx, dict) and ctx.get("found") else None
+
+
+def limited_conflict(lim):
+    """The conflict context (conflict_context()) on a `limited` row whose step is a conflict round,
+    else None: the restarted run's merge gets that round's checks (T-185)."""
+    ctx = (lim or {}).get("conflict")
+    if not str((lim or {}).get("step") or "").startswith("conflict ") or not isinstance(ctx, dict):
+        return None
+    return ctx if ctx.get("found") else None
 
 
 def park(t, info, wt, branch, pubs):
@@ -441,9 +454,10 @@ def park(t, info, wt, branch, pubs):
 # launches nothing more before the reset. A scan at or after it moves the task back to doing
 # (the mark goes) and restarts that step: `worker` (its first worker, an answered one, an
 # escalated one or an until-done round), `fix N` (review fix round), `verify N` (verify, weaken,
-# prove, harden or evidence round), `conflict N`, or `review` (the gate runs again from the top,
-# the worker doesn't). `approved:` is never touched, and only dispatch and a human's close
-# write the mark.
+# prove, harden or evidence round), `conflict N` (its row keeps the round's conflict context, so
+# the restarted run's merge gets conflict_checks() before the task goes on), or `review` (the gate
+# runs again from the top, the worker doesn't). `approved:` is never touched, and only dispatch
+# and a human's close write the mark.
 
 LIMITED = "limited"
 
@@ -498,7 +512,10 @@ def park_limited(t, info, wt, branch, pubs, tier, at, escalated=None):
     _history.record(LIMITED, t, resets_at=int(at), step=step, session=session, log=info.get("log"), tier=tier,
                     text=lim.get("text"), kind=info.get("kind"), fixing=info.get("fixing"),
                     found=[[a, b, c] for a, b, c in info.get("found") or []],
-                    evidence=[list(e) for e in info.get("evidence") or []], escalated=escalated)
+                    evidence=[list(e) for e in info.get("evidence") or []], escalated=escalated,
+                    # a conflict round's context, so the restart's merge gets that round's checks (T-185)
+                    **({"conflict": info["conflict"]} if info.get("conflict") and str(step).startswith("conflict ")
+                       else {}))
 
 
 def worker_agents():
@@ -3285,6 +3302,8 @@ def dispatch(args):
                               extra="The round it stopped in: the branch conflicts with its base, which moved "
                                     f"since the work started.\n\n{body}\n")
         if v == "limited":  # uses up no round: the task parks at this one
+            # the restarted run's merge gets this round's checks (T-185)
+            info["conflict"] = conflict_context(found, n, body, info["conflicts"])
             return v, w
         if v != "done":
             info["rounds"] = f" (conflict round {n}, after: {what})"
@@ -3392,12 +3411,14 @@ def dispatch(args):
                   flush=True)
             return "done", "", dict(carried, session=session, log=lim.get("log") or "(none)", cost=0), up
         what, text = limit_step_text(step), lim.get("text") or "the usage limit"
+        conflict = limited_conflict(lim)
         resume, fresh_because = resume_choice(session, wt)
         tt = dict(t, tier=tier, escalated=True) if up else t
         if resume:
             _history.record("resumed", t, session=session, tier=tier, after="limit", step=step)
             print(f"  limit    {t['id']}  the limit has reset: {what}, resumed {session}", flush=True)
-            prompt = LIMIT_PROMPT.format(id=t["id"], what=what, text=text, branch=branch, wt=wt, tail=UNTIL_DONE_TAIL)
+            tail = (LIMIT_CONFLICT.format(n=conflict.get("round")) if conflict else "") + UNTIL_DONE_TAIL
+            prompt = LIMIT_PROMPT.format(id=t["id"], what=what, text=text, branch=branch, wt=wt, tail=tail)
             v, w, info = run_worker(tt, base, wt, branch, pubs, args, agents, settings, prompt=prompt, resume=session,
                                     after="limit")
         else:
@@ -3411,15 +3432,17 @@ def dispatch(args):
                     session=info.get("session") or session)
         return v, w, info, up
 
-    def answered_conflict(t, wt, branch, pubs, info, conflict, verdict, why):
-        """The run a human's answer resumed, on a question a conflict round asked (`conflict`, from
-        asked_conflict()): its merge gets that round's checks before the task goes on, as
-        conflict_round() does. Returns (verdict, reason)."""
+    def answered_conflict(t, wt, branch, pubs, info, conflict, verdict, why, after="the answer"):
+        """The run that carries on a conflict round after a break: a human's answer to a question
+        the round asked (`conflict` from asked_conflict()), or the usage limit's reset after it
+        stopped the round (`conflict` from limited_conflict(), `after` "the usage limit"). Its merge
+        gets that round's checks before the task goes on, as conflict_round() does. Returns
+        (verdict, reason)."""
         n = conflict.get("round")
         what = "; ".join(s.get("reason") or "" for s in conflict["found"])
         info["conflicts"] = list(conflict.get("conflicts") or [])  # the rounds already run count
         info.update(step=f"conflict {n}", kind="conflict", fixing=conflict.get("body"))
-        if verdict == "asking":  # asked again: the next answer's run gets the checks too
+        if verdict in ("asking", "limited"):  # parked again: the next run gets the checks too (T-110, T-185)
             info["conflict"] = conflict
         if verdict != "done":
             if verdict != "limited":
@@ -3434,13 +3457,14 @@ def dispatch(args):
             info["asked"] = False
             return "blocked", f"{failed} (conflict round {n}, after: {what}). {kept_note(wt, branch, pubs)}"
         info["fixed"] = "; ".join(x for x in (info.get("fixed"), resolved_note(found)) if x)
-        print(f"  conflict {t['id']}  round {n}, after the answer: merged; checking again", flush=True)
+        print(f"  conflict {t['id']}  round {n}, after {after}: merged; checking again", flush=True)
         return "done", ""
 
     def one(t, base, wt, branch, pubs, answered=None, lim=None):
         up = first = why1 = None
-        # a question asked in a conflict round (T-110): its context, for the answered run's checks
-        conflict = asked_conflict(t) if answered and lim is None else None
+        # a question asked in a conflict round (T-110), or a conflict round the usage limit stopped
+        # (T-185): its context, for the checks on the run that carries it on
+        conflict = (limited_conflict(lim) if lim is not None else asked_conflict(t) if answered else None)
         if lim is None and not answered and _config.CONFLICT_ROUNDS and ACCEPT_CONFLICT_MARK in _report.last_note(t):
             # `accept` found the branch conflicting with its base (T-097): no fresh attempt at the task,
             # straight to the conflict round on the existing branch. The earlier acceptance is not carried over.
@@ -3491,7 +3515,8 @@ def dispatch(args):
             info2["policy"] = (info.get("policy") or []) + (info2.get("policy") or [])
             verdict, info = v2, info2
         if conflict:
-            verdict, why = answered_conflict(t, wt, branch, pubs, info, conflict, verdict, why)
+            verdict, why = answered_conflict(t, wt, branch, pubs, info, conflict, verdict, why,
+                                             after="the usage limit" if lim is not None else "the answer")
         with live_lock:
             live[t["id"]] = info.get("cost", 0)
         tier = up or t["tier"]

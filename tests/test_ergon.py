@@ -37,7 +37,8 @@ of each conflicted file, then ends $FAKE_CONFLICT_RESULT (default RESULT: done);
 = markers commits the markers, nomerge aborts the merge and commits something else, and still
 lands a conflicting commit on the main checkout's trunk after merging. With $FAKE_CONFLICT_ASK
 (QUESTION lines) a conflict round asks before merging, and the answered worker does the merge
-(main, in its own worktree, if the prompt names no base). With $FAKE_WEAKEN =
+(main, in its own worktree, if the prompt names no base), as does a session resumed after the usage
+limit stopped it in a conflict round. With $FAKE_WEAKEN =
 "<path>|<line>" its first run appends that line to that file too; with $FAKE_UNWEAKEN a fix round
 the weakening check asked for puts the file back as main has it. $FAKE_EDIT_TOUCHES rewrites its
 own task file's touches: in the main checkout to that list. $FAKE_WRITE = "<path>|<text>" has its
@@ -142,7 +143,8 @@ if os.environ.get("FAKE_STOPS"):  # nth worker call: nojson (what a timeout leav
     if kind == "noresult":
         print(json.dumps({"result": "I ran out of steam", "session_id": "s-1", "total_cost_usd": 0.01})); sys.exit()
 tid = re.search(r"(?:dispatched|work|asked) on (T-\d+)", prompt).group(1)
-if "conflicts with its base" in prompt or (os.environ.get("FAKE_CONFLICT_ASK") and "answered" in prompt):
+if ("conflicts with its base" in prompt or "It stopped in conflict round" in prompt
+        or (os.environ.get("FAKE_CONFLICT_ASK") and "answered" in prompt)):
     if os.environ.get("FAKE_CONFLICT_ASK") and "answered" not in prompt:  # ask before merging anything
         print(json.dumps({"result": "which side?\n" + os.environ["FAKE_CONFLICT_ASK"] + "\nRESULT: asking",
                           "session_id": "s-1", "total_cost_usd": 0.01}))
@@ -3307,6 +3309,52 @@ class TestConflictRounds(DispatchProject):
                     self.assertEqual(self.rows("blocked")[0]["asked"], False)
                 else:
                     self.assertEqual(self.status("T-002"), "done", out)
+                    self.assertEqual((self.root / "shared.txt").read_text(), "T-002\nT-001\n")
+                    self.assertIn("resolved a conflict with main in shared.txt", self.notes())
+
+    def test_merge_after_a_conflict_round_the_usage_limit_stopped_is_checked(self):
+        # T-185: the usage limit stops the conflict round; once it resets, the restarted run's merge
+        # gets the conflict-round checks, even though a merge that leaves markers in merges cleanly.
+        for mode, age in (("markers", "0"), ("markers", "4000"), ("resolve", "0")):
+            with self.subTest(mode=mode, age=age):
+                self.setUp()
+                self.tasks()
+                at = int(time.time() + 3600)
+                # an old transcript (age 4000) makes the restart a fresh worker
+                self.env.update(FAKE_STOPS="ok|ok|limit|ok", FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"),
+                                FAKE_LIMIT_TEXT=f"Claude AI usage limit reached|{at}", FAKE_TRANSCRIPT_AGE=age)
+                out = self.ergon("dispatch", "--jobs", "2").stdout
+                self.assertEqual(self.status("T-002"), "blocked", out)
+                self.assertRegex(self.task_file("T-002").read_text(), r"(?m)^limited: \S+ conflict 1$")
+                lim = self.rows("limited")[0]
+                self.assertEqual(lim["conflict"]["round"], 1)
+                self.assertEqual([(s["base"], s["files"], s["companion"]) for s in lim["conflict"]["found"]],
+                                 [("main", ["shared.txt"], None)])
+                f = self.task_file("T-002")  # the reset passes
+                f.write_text(re.sub(r"(?m)^limited: \S+", "limited: 2026-01-01T00:00:00Z", f.read_text()))
+                self.env["FAKE_CONFLICT"] = mode
+                time.sleep(1.1)  # run logs are named to the second
+                out = self.ergon("dispatch").stdout
+                calls = self.calls()
+                self.assertEqual(len(calls), 3)
+                if age == "0":
+                    self.assertEqual(calls[2]["resume"], "s-1")
+                    self.assertIn("The usage limit stopped your work on T-002 during conflict round 1", calls[2]["prompt"])
+                    self.assertIn("It stopped in conflict round 1: when you finish, the dispatcher checks your merge",
+                                  calls[2]["prompt"])
+                else:
+                    self.assertIsNone(calls[2]["resume"])
+                    self.assertIn("task/T-002 conflicts with main", calls[2]["prompt"])  # the round's instructions
+                if mode == "markers":
+                    self.assertEqual(self.status("T-002"), "blocked", out)
+                    self.assertIn("conflict markers left in shared.txt on task/T-002 (conflict round 1, after: "
+                                  "conflicts with main in shared.txt). Branch task/T-002 and worktree", self.notes())
+                    self.kept()
+                    self.assertEqual((self.root / "shared.txt").read_text(), "T-001\n")  # nothing landed
+                    self.assertEqual(self.rows("blocked")[0]["asked"], False)
+                else:
+                    self.assertEqual(self.status("T-002"), "done", out)
+                    self.assertIn("conflict T-002  round 1, after the usage limit: merged; checking again", out)
                     self.assertEqual((self.root / "shared.txt").read_text(), "T-002\nT-001\n")
                     self.assertIn("resolved a conflict with main in shared.txt", self.notes())
 
