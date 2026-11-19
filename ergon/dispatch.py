@@ -40,12 +40,21 @@ from . import tasks as _tasks
 # checkout, on a task/<ID> branch there too, which lands on the companion's local trunk first.
 # No code is ever pushed. In shared mode the state branch is, to claim tasks (see "claims").
 
+# The FOUND line's follow-up lines, as every worker prompt tells them (agents/task-*.md say the same).
+FOUND_SYNTAX = (
+    "(optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, "
+    "`TIER: haiku|sonnet|opus|human — <why>`, `OPTIONS: a | b | c`, "
+    "`CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: "
+    "existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: "
+    "docs, help text, tests, config, tooling); a feature needs an `OPTIONS:` line with 2 to 4 approaches "
+    "to take, the recommended one first, which a human chooses from before approving it)")
+
 WORKER_PROMPT = """You are dispatched on {id}.
 
 Working tree: {wt} (a git worktree of this repo), on branch {branch}, cut from {base}.
 {retry}{nested}{companions}{rules}{gates}
 Work you find but don't do: end your final message with one line per item, before the RESULT line,
-`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)). The dispatcher files each as a task: a feature as proposed, for a human to approve. A bugfix, refactor or chore with TOUCHES may go straight to ready, approved by inheritance from this task, so label each one honestly: new behaviour is a feature, and the reviewer fails a branch that dresses one up.
+`FOUND: <title> — <why>` """ + FOUND_SYNTAX + """. The dispatcher files each as a task: a feature as proposed, for a human to approve. A bugfix, refactor or chore with TOUCHES may go straight to ready, approved by inheritance from this task, so label each one honestly: new behaviour is a feature, and the reviewer fails a branch that dresses one up.
 To prove the work runs, end a line `EVIDENCE: <path in this worktree> — <what it shows>` for each
 runtime artifact (test output, a screenshot, a recording), before the RESULT line. Dispatch copies
 those files (regular files inside the worktree, no symlinks, at most {evmax} MB each) for the
@@ -326,17 +335,22 @@ NO_SESSION = "-"
 
 def parse_questions(text):
     """[(question, [options])] from a worker's QUESTION: / OPTIONS: lines. An OPTIONS line belongs
-    to the QUESTION line before it."""
-    out = []
+    to the QUESTION line directly before it, never to a FOUND line's."""
+    out, last = [], None
     for l in text.splitlines():
-        m = re.match(r"^\W*(QUESTION|OPTIONS):\s*(.*?)\s*$", l)
+        m = re.match(r"^\W*(QUESTION|OPTIONS|FOUND):\s*(.*?)\s*$", l)
         if not m:
             continue
         val = m[2].strip(" *`")
-        if m[1] == "QUESTION" and val:
-            out.append((val, []))
-        elif m[1] == "OPTIONS" and out and not out[-1][1]:
-            out[-1][1].extend(o.strip(" *`") for o in val.split("|") if o.strip(" *`"))
+        if m[1] == "QUESTION":
+            last = None
+            if val:
+                out.append((val, []))
+                last = out[-1]
+        elif m[1] == "FOUND":
+            last = None
+        elif last is not None and not last[1]:
+            last[1].extend(o.strip(" *`") for o in val.split("|") if o.strip(" *`"))
     return out
 
 
@@ -384,7 +398,7 @@ ANSWER_PROMPT = """A human answered the question(s) you asked on {id}:
 
 {note}
 Carry on with the task on {branch} in {wt}, and commit there citing {id}. End as before: a
-`FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)) line for each piece of work you find but don't do, then `RESULT: done`,
+`FOUND: <title> — <why>` """ + FOUND_SYNTAX + """ line for each piece of work you find but don't do, then `RESULT: done`,
 `RESULT: blocked — <why>`, or new `QUESTION:` lines and `RESULT: asking`.
 """
 
@@ -873,8 +887,8 @@ FOUND_CATEGORIES = ("feature", "bugfix", "refactor", "chore")  # tasks.CATEGORIE
 
 def parse_found(text):
     """[(title, why, extra)] from a worker's FOUND: lines. TOUCHES (once), DONE WHEN (repeatable)
-    and TIER and CATEGORY (once each) lines directly after a FOUND line fill `extra`: touches, done,
-    tier, tier_why, category. A line md_trim would empty is ignored, and so is a tier or category
+    and TIER, CATEGORY and OPTIONS (`a | b | c`, at most 4) lines (once each) directly after a FOUND
+    line fill `extra`: touches, done, tier, tier_why, category, options. A line md_trim would empty is ignored, and so is a tier or category
     that isn't one."""
     out, cur = [], None
     for line in text.splitlines():
@@ -885,7 +899,7 @@ def parse_found(text):
                 cur = {}
                 out.append((md_trim(m[1]), md_trim(m[2]), cur))
             continue
-        m = re.match(r"^\W*(TOUCHES|DONE WHEN|TIER|CATEGORY):\s*(.*?)\s*$", line)
+        m = re.match(r"^\W*(TOUCHES|DONE WHEN|TIER|CATEGORY|OPTIONS):\s*(.*?)\s*$", line)
         if not m:
             if line.strip():
                 cur = None
@@ -898,6 +912,9 @@ def parse_found(text):
         elif m[1] == "TOUCHES":
             if "touches" not in cur:
                 cur["touches"] = [x for x in (md_trim(x) for x in val.split(",")) if x]
+        elif m[1] == "OPTIONS":
+            if "options" not in cur:
+                cur["options"] = [x for x in (md_trim(x) for x in val.split("|")) if x][:4]
         elif m[1] == "CATEGORY":
             if "category" not in cur and val.lower() in FOUND_CATEGORIES:
                 cur["category"] = val.lower()
@@ -985,6 +1002,10 @@ def file_found(t, found, epics, vouch=True):
         body = _tasks.TASK_BODY.replace("## What\n", f"## What\n{what}\n", 1)
         if extra.get("done"):
             body = body.replace("## Done when\n", "## Done when\n" + "".join(f"- {d}\n" for d in extra["done"]), 1)
+        opts = extra.get("options") or []
+        feature = (extra.get("category") or "feature") == "feature"
+        if feature and len(opts) >= 2:
+            body = body.replace("\n## Notes", _tasks.options_section(opts) + "\n## Notes", 1)
         sized = extra.get("tier")
         meta = {"id": tid, "title": title, "tier": sized or t["tier"],
                 "category": extra.get("category") or "", "status": "proposed",
@@ -998,6 +1019,10 @@ def file_found(t, found, epics, vouch=True):
             meta["status"], meta["approved"] = "ready", auto[0]
             if not sized:  # nobody approves it, so nobody sizes it then
                 meta["tier_why"] = f"tier of the task that found it ({t['id']})"
+        if feature and len(opts) < 2:
+            meta["_body"] = meta["_body"].rstrip("\n") + (
+                f"\nno options given by {t['id']}: choose an approach before approving, "
+                "or add one with ergon choose --own\n")
         _tasks.dump(meta, _tasks.TASK_KEYS)
         _history.record("created", meta, tier=meta["tier"], title=title, source=t["id"], by="found")
         if auto:
@@ -1910,7 +1935,8 @@ def found_lines(found):
         touches = ", ".join(extra.get("touches") or []) or "none declared"
         out.append(f"- {title}" + (f" — {why}" if why else "")
                    + f"\n  category: {extra.get('category') or '(none: reads as feature)'}; "
-                   + f"tier: {extra.get('tier') or FINDERS}; touches: {touches}\n")
+                   + f"tier: {extra.get('tier') or FINDERS}; touches: {touches}\n"
+                   + (f"  options: {' | '.join(extra['options'])}\n" if extra.get("options") else ""))
     return REVIEW_FOUND.format(lines="".join(out))
 
 
@@ -2067,8 +2093,7 @@ def gate(t, tier, base, wt, branch, pubs, args, reviewer, settings, rnd=None, ev
 FIX_PROMPT = """The reviewer vetoed your work on {id} (fix round {n} of {rounds}): {veto}
 {log}
 Fix what it raised on {branch} in {wt}, and commit there citing {id}. The done checks, verify and
-the review run again when you finish. End as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`,
-`TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)) line for each
+the review run again when you finish. End as before: a `FOUND: <title> — <why>` """ + FOUND_SYNTAX + """ line for each
 piece of work you find but don't do, then `RESULT: done`, `RESULT: blocked — <why>`, or
 `QUESTION:` lines and `RESULT: asking`.
 """
@@ -2084,7 +2109,7 @@ The full output is in {log}.
 Fix it on {branch} in {wt}, and commit there citing {id}. The done checks and verify run again
 when you finish. If the failure isn't caused by this branch (a flaky test, a broken trunk, a
 missing tool), change nothing and end `RESULT: blocked — outside: <why>`: verify runs once more
-as it is, and this doesn't use up a round. Otherwise end as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling))
+as it is, and this doesn't use up a round. Otherwise end as before: a `FOUND: <title> — <why>` """ + FOUND_SYNTAX + """
 line for each piece of work you find but don't do, then `RESULT: done` or
 `RESULT: blocked — <why>`.
 """
@@ -2333,7 +2358,7 @@ since the resolution is new code. If you can't reconcile the two sides, don't gu
 CONFLICT_PROMPT = """Your work on {id} conflicts with its base, which moved since you started (conflict round {n} of {rounds}):
 
 {body}
-End as before: a `FOUND: <title> — <why>` (optional lines right after it: `TOUCHES: a, b`, `DONE WHEN: …`, `TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same behaviour, better code; chore: docs, help text, tests, config, tooling)) line for each piece of work you find but don't do, then
+End as before: a `FOUND: <title> — <why>` """ + FOUND_SYNTAX + """ line for each piece of work you find but don't do, then
 `RESULT: done`, `RESULT: blocked — <why>`, or `QUESTION:` lines and `RESULT: asking`.
 """
 

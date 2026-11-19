@@ -258,7 +258,7 @@ if os.path.isdir(pub):
     commit(pub, os.environ.get("FAKE_PUB_MSG", "Do the public thing").replace("{id}", tid), os.environ.get("FAKE_PUB_SHARED"))
 if os.environ.get("FAKE_DIRTY"):
     open(f"{tid}.txt", "a").write("more\n")
-found = "".join(f"FOUND: {x}\n" for x in os.environ.get("FAKE_FOUND", "").split("|") if x)
+found = "".join(f"FOUND: {x}\n" for x in os.environ.get("FAKE_FOUND", "").split(os.environ.get("FAKE_FOUND_SEP", "|")) if x)
 if os.environ.get("FAKE_ASK") and "answered" not in prompt:
     print(json.dumps({"result": "need a call\n" + found + os.environ["FAKE_ASK"] + "\nRESULT: asking",
                       "session_id": "s-1", "total_cost_usd": 0.01}))
@@ -1559,6 +1559,54 @@ class TestDispatch(DispatchProject):
         text = self.task_file("T-004").read_text()
         self.assertIn("title: Fix beta\n", text)
         self.assertIn("## What\nWrapped whole. Found by T-001", text)
+
+    def found_run(self, found, *args):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND=found, FAKE_FOUND_SEP="~")
+        return self.ergon("dispatch", *args).stdout
+
+    def test_found_feature_options_become_an_options_section(self):
+        self.found_run("Cache it \u2014 slow\nCATEGORY: feature\nOPTIONS: an LRU | `a redis cache` | | c | d | e")
+        text = self.task_file("T-002").read_text()
+        self.assertEqual(self.status("T-002"), "proposed")
+        self.assertIn("## Options\n1. an LRU (recommended)\n2. a redis cache\n3. c\n4. d\n\n## Notes", text)
+        self.assertNotIn("no options given", text)
+        self.ergon("check")
+        r = self.ergon("approve", "T-002", inp="y\n", check=False, env=dict(self.env, ERGON_ASK_STDIN="1"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.status("T-002"), "proposed")
+        self.ergon("choose", "T-002", "1", inp="y\n", env=dict(self.env, ERGON_ASK_STDIN="1"))
+        self.assertIn("Chosen:", self.task_file("T-002").read_text())
+
+    def test_found_two_options(self):
+        self.found_run("Cache it \u2014 slow\nOPTIONS: a | b")
+        self.assertEqual(self.task_file("T-002").read_text().partition("## Options\n")[2].partition("\n## ")[0],
+                         "1. a (recommended)\n2. b\n")
+
+    def test_found_feature_without_options_gets_a_note(self):
+        self.found_run("Cache it \u2014 slow\nOPTIONS: only one~Other \u2014 x")
+        for tid in ("T-002", "T-003"):
+            text = self.task_file(tid).read_text()
+            self.assertNotIn("## Options", text)
+            self.assertIn("no options given by T-001: choose an approach before approving, "
+                          "or add one with ergon choose --own", text)
+            self.assertEqual(self.status(tid), "proposed")
+
+    def test_found_bugfix_options_are_ignored(self):
+        self.found_run("Fix X \u2014 y breaks\nTOUCHES: a.py\nCATEGORY: bugfix\nOPTIONS: a | b", "--ids", "T-001")
+        text = self.task_file("T-002").read_text()
+        self.assertEqual(self.status("T-002"), "ready")
+        self.assertNotIn("## Options", text)
+        self.assertNotIn("no options given", text)
+
+    def test_options_after_found_do_not_go_to_the_question(self):
+        from ergon.dispatch import parse_questions, parse_found
+        text = "QUESTION: q\nFOUND: f \u2014 why\nOPTIONS: x | y\n"
+        self.assertEqual(parse_questions(text), [("q", [])])
+        self.assertEqual(parse_found(text)[0][2]["options"], ["x", "y"])
+        text = "FOUND: f \u2014 why\nTIER: haiku \u2014 s\nQUESTION: q\nOPTIONS: a | b\n"
+        self.assertEqual(parse_questions(text), [("q", ["a", "b"])])
 
     def test_md_trim(self):
         from ergon.dispatch import md_trim
