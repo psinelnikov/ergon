@@ -89,6 +89,7 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                remerge_rounds (default 3); then it blocks, and accept does the same.
                                A run's finished tasks on a common branch land one at a time, those
                                with more passes first; waiting uses up no pass.
+
                                `overlap` in .ergon.toml (default 1): how many running tasks may
                                share a touches: path. Above 1, tasks sharing one run side by side,
                                relying on those merge gates; no touches:, a shared gate file or
