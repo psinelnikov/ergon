@@ -70,7 +70,7 @@ where it lives.
 that passes, a grep, a line in a doc. Name the test or the file where you can.
 - touches: the repo paths (files, or a directory when the change spreads across it, relative to \
 the checkout) the change will edit, plus the name of any host or outside system it changes. No \
-globs. Include the test and doc files the change has to update.
+globs. A function the concept map lists may be named as `<path>/::<fn>` (with the `/`). Include the test and doc files the change has to update.
 - category: one of feature (new behaviour a user would notice), bugfix (existing behaviour is \
 wrong, security holes included), refactor (same behaviour, better code), chore (docs, help text, \
 tests, config, tooling). When in doubt, feature.
