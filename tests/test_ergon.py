@@ -1387,6 +1387,30 @@ class TestDispatch(DispatchProject):
         self.assertIn("(cut from main, not checked out; ergon start E-001 opens a worktree)", out)
         self.assertFalse((self.root / ".claude" / "worktrees" / "E-001").exists())
 
+    def test_board_and_show_say_where_an_open_epic_is_checked_out(self):
+        home = self.root / "tasks" / "epics" / "E-001-old"
+        home.mkdir(parents=True)
+        (home / "EPIC.md").write_text("---\nid: E-001\ntitle: Old\nstatus: open\ncreated: 2026-01-01\n---\n\n## Goal\nG\n")
+        self.ergon("new", "task", "Part", "--tier", "haiku", "--epic", "E-001")
+
+        def both():
+            b = [l for l in self.ergon("board").stdout.splitlines() if l.startswith("  E-001")][0]
+            return b, self.ergon("show", "E-001").stdout
+
+        b, s = both()  # no branch: neither
+        self.assertNotIn("epic/", b)
+        self.assertNotIn("BRANCH", s)
+        sh("git", "branch", "epic/E-001-old", cwd=self.root)
+        b, s = both()
+        for out in (b, s):
+            self.assertIn("epic/E-001-old (branch only: ergon start E-001 for a worktree)", out)
+        wt = self.root.parent / "e001-wt"
+        sh("git", "worktree", "add", str(wt), "epic/E-001-old", cwd=self.root)
+        b, s = both()
+        for out in (b, s):
+            self.assertIn(f"epic/E-001-old at {wt.resolve()}", out.replace(str(wt), str(wt.resolve())))
+            self.assertNotIn("branch only", out)
+
     def obsidian_dispatch(self, write_back):
         v = self.root.parent / "vault"
         (v / "Health").mkdir(parents=True)

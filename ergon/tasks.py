@@ -686,6 +686,23 @@ def status_text(t, tasks):
     return f"done, {n} follow-up{'s' if n != 1 else ''} open" if n else t["status"]
 
 
+def _epic_checkout(e):
+    """For an open epic whose branch exists: 'on <branch> at <path>' when a worktree holds it, else
+    'on <branch> (branch only: ergon start <id> for a worktree)'. '' otherwise. Read-only."""
+    if e["status"] != "open":
+        return ""
+    branch = _gitops.epic_branch(e)
+    if not _gitops.branch_exists(branch):
+        return ""
+    try:
+        path = _gitops.worktrees().get(branch)
+    except Exception:
+        path = None
+    if path:
+        return f"on {branch} at {path}"
+    return f"on {branch} (branch only: ergon start {e['id']} for a worktree)"
+
+
 def board(args):
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     shown = [t for t in tasks.values()
@@ -710,7 +727,8 @@ def board(args):
             note = f", {pending} awaiting approval" if pending else ""
             note += "  <- needs breakdown" if not kids and e["status"] == "open" else ""
             note += "  <- brief awaiting approval" if e["status"] == "proposed" else ""
-            note += f"  on {_gitops.epic_branch(e)}" if e["status"] == "open" and _gitops.branch_exists(_gitops.epic_branch(e)) else ""
+            where = _epic_checkout(e)
+            note += f"  {where}" if where else ""
             print(f"  {e['id']}  {e['status']:<8} {done}/{len(kids)} done{note}  {e['title']}")
     counts = {tier: sum(t["tier"] == tier and t["status"] not in ("done", "dropped")
                         for t in tasks.values()) for tier in TIERS}
@@ -853,6 +871,9 @@ def show(args):
                 print(f"  {c['id']}  {c['status']:<8}  {category(c):<8}  {c['title']}")
         _print_run_usage(args.id)
     if args.id in epics:
+        where = _epic_checkout(epics[args.id])
+        if where:
+            print(where.replace("on ", "BRANCH  ", 1))
         print("TASKS")
         for t in sorted((t for t in tasks.values() if t.get("epic") == args.id), key=lambda t: t["id"]):
             print(f"  {t['status']:<8}" + line(t, tasks)[1:])
