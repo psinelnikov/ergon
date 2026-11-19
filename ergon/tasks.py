@@ -1369,8 +1369,8 @@ def lint(warns=None):
                         f"review, or fix/verify/conflict and a round number)")
         if t.get("answered") and t.get("status") not in ("ready", "done", "dropped"):
             errs.append(f"{where}: answered: is set but status is {t.get('status')}; `ergon answer` leaves it ready")
-        if t.get("pin") and t.get("status") in ("done", "dropped"):
-            print(f"warning: {where}: pin: {t['pin']} left on a {t['status']} task; clear it with `ergon pin {t['id']} clear`")
+        if t.get("pin") and t.get("status") in ("done", "dropped") and warns is not None:
+            warns.append(f"{where}: pin: {t['pin']} left on a {t['status']} task; clear it with `ergon pin {t['id']} clear`")
         if t.get("accept") and str(t["accept"]).lower() not in YES:
             errs.append(f"{where}: accept: {t['accept']!r} isn't `yes` (leave it out for no; config "
                         f"[[accept]] rules can't be opted out of)")
