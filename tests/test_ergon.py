@@ -849,6 +849,38 @@ class TestBasics(Project):
             self.assertFalse(human_cmd(cmd), cmd)
         self.assertIsNone(git_config_command("url.https://x/.insteadOf", "ext::ergon approve"))
 
+    def test_guard_human_cmd_git_command_env_vars(self):
+        """T-216: git runs the value of GIT_PAGER, GIT_EDITOR, GIT_SSH_COMMAND, ... (GIT_COMMAND_ENV) as a
+        command. Set ahead of a git call, behind a wrapper, or by an earlier assignment or export the
+        git call inherits, a human-only verb in it is refused; a harmless value passes, and the same
+        text as another program's argument or a commit message is data."""
+        from ergon.gates import GIT_COMMAND_ENV, human_cmd
+        for var in ["GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF",
+                    "GIT_ASKPASS", "EDITOR", "PAGER", "VISUAL", "GIT_SSH", "SSH_ASKPASS", "GIT_PROXY_COMMAND"]:
+            self.assertIn(var, GIT_COMMAND_ENV)
+        forms = ["{v}='{c}' git log", "{v}=\"{c}\" git -C . commit", "X=1 {v}='{c}' git fetch", "{v}=$'{c}' git log",
+                 "sudo {v}='{c}' git log", "env -u X {v}='{c}' git log", "nice {v}='{c}' git log",
+                 "cd x && {v}='{c}' git log | cat", "echo $({v}='{c}' git log)", "{v}='{c}' /usr/bin/git log",
+                 "{v}='{c}'; git log", "export {v}='{c}'; git log", "declare -x {v}='{c}'", "{v}='{c}' {v}+=' x' git log",
+                 "bash -c \"{v}='{c}' git log\""]
+        verbs = ["approve", "reject", "close", "accept", "answer", "sync", "pin", "choose", "review -i"]
+        for var in sorted(GIT_COMMAND_ENV):
+            for form in forms:
+                for verb in verbs:
+                    cmd = form.format(v=var, c=f"ergon {verb} T-1")
+                    self.assertTrue(human_cmd(cmd), cmd)
+                cmd = form.format(v=var, c="less -R")
+                self.assertFalse(human_cmd(cmd), cmd)
+        for cmd in ["GIT_PAGER=ergon; GIT_PAGER+=' approve T-1'; git log", "LESSOPEN='|ergon approve T-1 %s' git log",
+                    "LESSOPEN='||-ergon close T-1' git log"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["GIT_PAGER=less git log", "GIT_EDITOR=true git commit --amend", "PAGER=cat git log",
+                    "GIT_SSH_COMMAND='ssh -i ~/.ssh/k' git fetch", "GIT_PAGER=ergon; GIT_PAGER=' approve'; git log",
+                    "git commit -m \"GIT_PAGER='ergon approve T-1'\"", "echo GIT_EDITOR='ergon approve T-1'",
+                    "grep 'PAGER=ergon close' x", "git log --grep 'EDITOR=ergon accept T-1'",
+                    "X='ergon approve T-1' git log", "printf '%s\\n' \"GIT_PAGER=ergon approve\""]:
+            self.assertFalse(human_cmd(cmd), cmd)
+
     def test_stop_hook_blocks_on_lint_failure(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")
