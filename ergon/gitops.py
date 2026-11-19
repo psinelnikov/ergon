@@ -34,6 +34,14 @@ class GitError(Exception):
     pass
 
 
+class ConflictError(GitError):
+    """A merge that would conflict: `files` are the conflicted paths (empty when git named none)."""
+
+    def __init__(self, msg, files=()):
+        super().__init__(msg)
+        self.files = list(files)
+
+
 @contextmanager
 def state_lock(label=None):
     """Exclusive across processes and threads (each call opens its own descriptor). Not reentrant.
@@ -112,7 +120,7 @@ def merge_check(base, branch, repo=None):
     """The tree merging branch into base would give, or GitError naming the conflicts."""
     tree, files = merge_tree(base, branch, repo)
     if tree is None:
-        raise GitError(conflict_text(base, files))
+        raise ConflictError(conflict_text(base, files), files)
     return tree
 
 
@@ -272,6 +280,10 @@ def finish_epic(eid):
                        f"`ergon finish {eid}`:\n  " + "\n  ".join(stray))
     try:
         merge_into(_config.MAIN, branch, merge_message(e, tasks, branch_commits(branch)), no_ff=True)
+    except ConflictError as err:  # `ergon finish E-NNN --resolve` hands this one to an agent (T-096)
+        raise ConflictError(f"merging {branch} into {_config.MAIN} failed and changed nothing. Resolve it by hand "
+                            f"(merge {_config.MAIN} into {branch}, say), then run `ergon finish {eid}`; or run "
+                            f"`ergon finish {eid} --resolve` to have an agent merge it.\n{err}", err.files)
     except GitError as err:
         raise GitError(f"merging {branch} into {_config.MAIN} failed and changed nothing. Resolve it by hand "
                        f"(merge {_config.MAIN} into {branch}, say), then run `ergon finish {eid}`.\n{err}")

@@ -33,9 +33,10 @@ $FAKE_FIVE_HOUR set (|-separated utilizations, the nth probe the nth, the last r
 a rate_limit_event; without it, no window, as on an API key. A worker writes its task ID over
 $FAKE_SHARED (and $FAKE_PUB_SHARED in the companion) too, so two tasks conflict, and sleeps
 $FAKE_SLEEP_<TIER> first. Handed a conflict round, it merges each base named and keeps both sides
-of each conflicted file, then ends $FAKE_CONFLICT_RESULT (default RESULT: done); $FAKE_CONFLICT
+of each conflicted file, then ends $FAKE_CONFLICT_RESULT (default RESULT: done), and so does an
+epic's resolver (its prompt names the epic where a task's names the task); $FAKE_CONFLICT
 = markers commits the markers, nomerge aborts the merge and commits something else, and still
-lands a conflicting commit on the main checkout's trunk after merging. With $FAKE_CONFLICT_ASK
+lands a conflicting commit on the main checkout's trunk after merging ($FAKE_CONFLICT_ADD: a line it adds to each file it resolves). With $FAKE_CONFLICT_ASK
 (QUESTION lines) a conflict round asks before merging, and the answered worker does the merge
 (main, in its own worktree, if the prompt names no base), as does a session resumed after the usage
 limit stopped it in a conflict round. With $FAKE_WEAKEN =
@@ -142,7 +143,7 @@ if os.environ.get("FAKE_STOPS"):  # nth worker call: nojson (what a timeout leav
                           "total_cost_usd": 0.01})); sys.exit()
     if kind == "noresult":
         print(json.dumps({"result": "I ran out of steam", "session_id": "s-1", "total_cost_usd": 0.01})); sys.exit()
-tid = re.search(r"(?:dispatched|work|asked) on (T-\d+)", prompt).group(1)
+tid = re.search(r"(?:dispatched|work|asked) on ([TE]-\d+)", prompt).group(1)  # E-: an epic's resolver
 if ("conflicts with its base" in prompt or "It stopped in conflict round" in prompt
         or (os.environ.get("FAKE_CONFLICT_ASK") and "answered" in prompt)):
     if os.environ.get("FAKE_CONFLICT_ASK") and "answered" not in prompt:  # ask before merging anything
@@ -157,6 +158,7 @@ if ("conflicts with its base" in prompt or "It stopped in conflict round" in pro
         if mode == "nomerge":
             subprocess.run(["git", "-C", tree, "merge", "--abort"], capture_output=True)
             open(os.path.join(tree, f"{tid}.txt"), "a").write("again\n")
+            subprocess.run(["git", "-C", tree, "add", f"{tid}.txt"], check=True)  # an epic's resolver has none tracked yet
             subprocess.run(["git", "-C", tree, "commit", "-qam", f"Try again ({tid})" if own else "Try again"], check=True)
             continue
         if r.returncode:
@@ -166,7 +168,7 @@ if ("conflicts with its base" in prompt or "It stopped in conflict round" in pro
                 path = os.path.join(tree, name)
                 if mode != "markers":
                     keep = [l for l in open(path) if not l.startswith(("<<<<<<< ", "=======", ">>>>>>> "))]
-                    open(path, "w").writelines(keep)
+                    open(path, "w").writelines(keep + [os.environ.get("FAKE_CONFLICT_ADD", "")])
             subprocess.run(["git", "-C", tree, "add", "-A"], check=True)
             subprocess.run(["git", "-C", tree, "commit", "-qm", msg], check=True)
     if mode == "still":  # another task lands a conflicting change meanwhile
@@ -3439,6 +3441,184 @@ class TestConflictRounds(DispatchProject):
     def test_bad_config(self):
         (self.root / ".ergon.toml").write_text("conflict_rounds = -1\n")
         self.assertIn("conflict_rounds is a whole number", self.ergon("board", check=False).stderr)
+
+
+class TestEpicConflict(DispatchProject):
+    """T-096: an epic complete but conflicting with the trunk goes to a resolver agent (`ergon
+    finish E-NNN --resolve`, or dispatch once with conflict_rounds above 0). E-001 started, then the
+    trunk rewrote shared.txt's one line, which the epic's T-001 rewrites too."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "shared.txt").write_text("base\n")
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "shared file", cwd=self.root)
+        self.seen = Path(self.tmp.name) / "seen.jsonl"
+        self.env.update(FAKE_SEEN=str(self.seen))
+        self.ergon("new", "epic", "Big thing")
+        epic = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        text = epic.read_text().replace("## Goal\n", "## Goal\nShip the big thing.\n")
+        epic.write_text(text.replace("## Constraints\n", "## Constraints\nKeep the old line format.\n"))
+        approve_epic(self)
+        self.ergon("new", "task", "Part one", "--tier", "sonnet", "--epic", "E-001", "--touches", "part1.txt")
+        stamp(self.task_file("T-001"))
+        self.ergon("start", "E-001")
+        self.ewt = self.root / ".claude" / "worktrees" / "E-001"
+        self.branch = sh("git", "branch", "--show-current", cwd=self.ewt).stdout.strip()
+        self.trunk_commit("shared.txt", "trunk\n", "Trunk change")
+
+    def trunk_commit(self, path, text, msg):
+        (self.root / path).write_text(text)
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", msg, cwd=self.root)
+
+    def add_config(self, line):
+        cfg = self.root / ".ergon.toml"
+        self.trunk_commit(".ergon.toml", line + "\n" + cfg.read_text(), "config")
+
+    def work_by_hand(self):
+        """T-001 done on the epic branch: finishing the epic conflicts, so nothing merges."""
+        self.ergon("set", "T-001", "status=doing", cwd=self.ewt)
+        (self.ewt / "shared.txt").write_text("epic\n")
+        sh("git", "commit", "-qam", "Change the shared line (T-001)", cwd=self.ewt)
+        return self.ergon("set", "T-001", "status=done", cwd=self.ewt).stdout
+
+    def epic_status(self):
+        epic = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        return re.search(r"^status: (\w+)", epic.read_text(), re.M).group(1)
+
+    def tip(self, ref):
+        return sh("git", "rev-parse", ref, cwd=self.root).stdout.strip()
+
+    def calls(self):
+        rows = [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
+        return [c for c in rows if "work on E-001" in c["prompt"]]
+
+    def epic_rows(self):
+        """The epic's own rows since it was approved (no task's)."""
+        return [r for r in history(self.root) if r["epic"] == "E-001" and r["task"] is None
+                and r["event"] not in ("created", "approved", "status")]
+
+    def test_finish_resolve_merges_the_trunk_in_and_closes_the_epic(self):
+        out = self.work_by_hand()
+        self.assertIn("E-001 is complete but not merged", out)
+        self.assertIn("`ergon finish E-001 --resolve`", out)  # today's message, with the hint
+        self.assertEqual(self.epic_status(), "open")
+        # the trunk's verify runs in the epic's worktree: only the resolved tree has both lines
+        self.add_config('verify = "grep -q epic shared.txt && grep -q trunk shared.txt"')
+        out = self.ergon("finish", "E-001", "--resolve").stdout
+        self.assertEqual(self.epic_status(), "done", out)
+        self.assertEqual(sh("git", "branch", "--list", "epic/*", cwd=self.root).stdout.strip(), "")
+        self.assertFalse(self.ewt.exists())
+        self.assertEqual((self.root / "shared.txt").read_text(), "epic\ntrunk\n")  # both sides survive
+        log = sh("git", "log", "--format=%s", "main", cwd=self.root).stdout.splitlines()
+        self.assertEqual(log[0], "Merge E-001: Big thing")
+        self.assertIn("Merge main (E-001)", log)  # the resolution commit, citing the epic
+        merge = sh("git", "log", "-1", "--format=%P", "main^{/Merge main .E-001.}", cwd=self.root).stdout.split()
+        self.assertEqual(len(merge), 2)
+        calls = self.calls()
+        self.assertEqual([c["agent"] for c in calls], ["OPUS"])
+        prompt = calls[0]["prompt"]
+        self.assertIn("the work on E-001 conflicts with its base, the trunk main", prompt)
+        self.assertIn(f"{self.branch} conflicts with main", prompt)
+        self.assertIn("in shared.txt. Merge it with `git -C", prompt)
+        self.assertIn("Trunk change", prompt)  # the trunk's commits since the fork
+        self.assertIn("with a message citing E-001", prompt)
+        self.assertIn("Ship the big thing.", prompt)
+        self.assertIn("Keep the old line format.", prompt)
+        self.assertIn("- T-001 Part one", prompt)
+        self.assertIn("Never touch prod.", prompt)  # the worker rules
+        rows = self.epic_rows()
+        self.assertEqual([r["event"] for r in rows if r["event"] != "verify"],
+                         ["conflict", "worker_end", "epic_finished"])
+        c = next(r for r in rows if r["event"] == "conflict")
+        self.assertEqual((c["files"], c["base"], c["companion"]), (["shared.txt"], "main", None))
+        w = next(r for r in rows if r["event"] == "worker_end")
+        self.assertEqual((w["tier"], w["verdict"], w["after"]), ("opus", "done", "conflict"))
+        self.assertTrue(w["log"].startswith("tasks/runs/resolve/E-001-"), w["log"])
+        v = [r for r in rows if r["event"] == "verify"]
+        self.assertEqual([r["ok"] for r in v], [True])
+
+    def test_a_bad_resolution_or_a_red_verify_changes_nothing(self):
+        cases = [("markers", "", "conflict markers left in shared.txt on "),
+                 ("nomerge", "", "isn't a merge commit, so main isn't merged in"),
+                 ("resolve", 'verify = "exit 3"', "verify (runtime gate) `exit 3` failed (exit 3)")]
+        self.work_by_hand()
+        for mode, config, why in cases:
+            with self.subTest(mode=mode, config=config):
+                if config:
+                    self.add_config(config)
+                main, epic = self.tip("main"), self.tip(self.branch)
+                r = self.ergon("finish", "E-001", "--resolve", check=False,
+                               env=dict(self.env, FAKE_CONFLICT=mode))
+                self.assertNotEqual(r.returncode, 0, r.stdout)
+                self.assertIn("E-001 not merged: ", r.stderr)
+                self.assertIn(why, r.stderr)
+                self.assertIn(f"{self.branch} is back at {epic[:12]}", r.stderr)
+                self.assertEqual(self.tip("main"), main)
+                self.assertEqual(self.tip(self.branch), epic)
+                self.assertEqual(self.epic_status(), "open")
+                self.assertEqual((self.root / "shared.txt").read_text(), "trunk\n")
+                self.assertEqual(sh("git", "status", "--porcelain", "--untracked-files=no", cwd=self.ewt).stdout, "")
+                self.assertNotEqual(sh("git", "rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=self.ewt,
+                                       check=False).returncode, 0)  # no merge left under way
+        self.assertEqual([r["event"] for r in self.epic_rows() if r["event"] in ("conflict", "worker_end", "epic_finished")],
+                         ["conflict", "worker_end"] * 3)
+
+    def test_the_merge_may_not_weaken_a_gate(self):
+        # Only what the resolver's merge adds beyond both sides counts: a gate file both sides
+        # changed, or a suppression marker in neither parent. The tasks' changes were checked as they landed.
+        cfg = self.root / ".ergon.toml"
+        self.trunk_commit(".ergon.toml", cfg.read_text() + '\n[gates]\nsuppress = ["noqa"]\n', "config")
+        self.work_by_hand()
+        main, epic = self.tip("main"), self.tip(self.branch)
+        r = self.ergon("finish", "E-001", "--resolve", check=False, env=dict(self.env, FAKE_CONFLICT_ADD="x  # noqa\n"))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("the weakening check vetoed the merge: shared.txt gets a suppression marker in the merge "
+                      "(suppress `noqa`): `x  # noqa`", r.stderr)
+        self.assertEqual((self.tip("main"), self.tip(self.branch)), (main, epic))
+        w = [x for x in self.epic_rows() if x["event"] == "verify"]
+        self.assertEqual([(x["ok"], x["layer"]) for x in w], [(False, "weaken")])
+        # a conflict in a gate file is a human's to merge
+        (self.ewt / ".ergon.toml").write_text("# the epic's\n" + (self.ewt / ".ergon.toml").read_text())
+        sh("git", "commit", "-qam", "Note the config (T-001)", cwd=self.ewt)
+        self.trunk_commit(".ergon.toml", "# the trunk's\n" + cfg.read_text(), "Note the config")
+        r = self.ergon("finish", "E-001", "--resolve", check=False)
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn(".ergon.toml changed in the merge (a gate file: protect `.ergon.toml`)", r.stderr)
+        self.assertEqual(self.epic_status(), "open")
+
+    def test_finish_without_resolve_is_unchanged(self):
+        self.work_by_hand()
+        r = self.ergon("finish", "E-001", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("conflicts with main in shared.txt", r.stderr)
+        self.assertIn("`ergon finish E-001 --resolve`", r.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.epic_status(), "open")
+
+    def test_dispatch_resolves_the_epic_its_last_task_completes(self):
+        self.env.update(FAKE_SHARED="shared.txt")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn("conflict E-001", out)
+        self.assertEqual(self.epic_status(), "done", out)
+        self.assertEqual((self.root / "shared.txt").read_text(), "T-001\ntrunk\n")
+        self.assertEqual(sh("git", "branch", "--list", "epic/*", cwd=self.root).stdout.strip(), "")
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual([r["event"] for r in self.epic_rows() if r["event"] != "verify"],
+                         ["conflict", "worker_end", "epic_finished"])
+
+    def test_dispatch_with_no_conflict_rounds_keeps_todays_message(self):
+        self.add_config("conflict_rounds = 0")
+        self.env.update(FAKE_SHARED="shared.txt")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIn(f"E-001 is complete but not merged: merging {self.branch} into main failed and changed nothing", out)
+        self.assertIn("`ergon finish E-001 --resolve`", out)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.epic_status(), "open")
+        self.assertEqual([r["event"] for r in self.epic_rows() if r["event"] == "conflict"], [])
 
 
 class TestAccept(DispatchProject):

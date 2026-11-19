@@ -908,7 +908,7 @@ def parse_found(text):
     return out
 
 
-def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
+def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None, logs=None):
     # A resumed session gets the same agent, permission mode and guard hook as a fresh one.
     cmd = ["claude", "-p", "--agents", json.dumps(agents), "--agent", f"task-{t['tier']}",
            "--permission-mode", args.permission_mode, "--settings", settings,
@@ -920,11 +920,13 @@ def _run_worker(t, wt, args, agents, settings, prompt, resume=None, rnd=None):
     # A fix round's log is <ID>-<time>-fix<N>.json: `stats` counts its cost, not another run.
     suffix = f"-fix{rnd}" if rnd and rnd > 1 else ("-" + t["tier"] if t.get("escalated") else "")
     stem = f"{t['id']}-{datetime.datetime.now():%Y%m%d-%H%M%S}{suffix}"
-    log = _config.RUNS / f"{stem}.json"
+    logs = logs or _config.RUNS  # an epic's resolver logs apart (resolve_dir()), as breakdowns do
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"{stem}.json"
     out, err = run_proc(cmd + [prompt], wt, args.timeout * 60)
     log.write_text(out)
     if err.strip():
-        (_config.RUNS / f"{stem}.err").write_text(err)
+        (logs / f"{stem}.err").write_text(err)
     info = {"log": log.relative_to(_config.HOME)}
     if err.startswith(KILLED):
         return "blocked", "killed by a second Ctrl-C", info
@@ -2360,9 +2362,9 @@ def find_conflicts(base, wt, branch, pubs):
     return out
 
 
-def conflict_body(t, found, branch):
+def conflict_body(t, found, branch, rules=CONFLICT_RULES):
     """The conflict round's instructions: per conflicted repo, the base, its tip, the conflicted
-    files, how to merge and commit, and the base's commits since the fork."""
+    files, how to merge and commit, and the base's commits since the fork; then `rules`."""
     parts = []
     for s in found:
         c, b, tree = s["c"], s["base"], s["tree"]
@@ -2376,7 +2378,7 @@ def conflict_body(t, found, branch):
                      f"{b} (now at {s['tip'][:12]}) in {', '.join(s['files']) or 'files git did not name'}. Merge "
                      f"it with `git -C {tree} merge {b}`, and commit the merge {cite}. {b}'s commits since "
                      f"{branch} forked from it, `git -C {tree} log --oneline {s['fork'][:12]}..{b}`:\n{shown or '    (none)'}")
-    return "\n".join(parts) + "\n" + CONFLICT_RULES
+    return "\n".join(parts) + "\n" + rules
 
 
 def conflict_checks(found, branch):
@@ -2496,6 +2498,201 @@ def land(t, base, wt, branch, pubs=(), accepted=None):
         left += drop_worktree(pub, branch, c["path"])
     left += drop_worktree(wt, branch) if not left else f"; left {wt} too"
     return "done", f"merged into {base}" + "".join(f" and {c['name']} {c['trunk']}" for c, _ in pubs) + left
+
+
+# ---------- an epic's conflict with the trunk ----------
+# When an epic's last task lands but its branch conflicts with the trunk (finish_epic raises
+# ConflictError), a resolver merges the trunk in, in the epic's worktree: one `claude -p --agent
+# task-opus`, outside the state lock, with the conflict round's contract and checks
+# (conflict_checks), plus a merge commit that cites the epic. Then the trunk's gates run in that
+# worktree. A miss puts the epic branch back where it was, so nothing changes; a pass leaves
+# finish_epic to merge it as usual, under the lock. `ergon finish E-NNN --resolve` runs it, and
+# so does dispatch, once, when conflict_rounds is above 0. No one resumes a resolver: there's no
+# task to park, so a question or a block only says why nothing merged.
+
+EPIC_AGENT_TIER = "opus"
+
+EPIC_CONFLICT_RULES = """
+Resolve only the conflicted hunks, so that both sides' intent survives: the commits above say what
+the trunk side meant, and the epic's brief and tasks below say what the epic's side meant. Don't
+rebase, reset or force-move the branch, and change nothing else. When you finish, ergon checks: the
+worktree is clean, the tip of {branch} is a merge commit with {main}'s tip as a parent and a message
+citing {id}, no conflict marker lines (`<<<<<<< ` or `>>>>>>> ` at the start of a line) are left in
+the files the branch changes, {branch} now merges cleanly into {main}, and the merge changes no gate
+file that differs from both sides and adds no suppression marker. Then the trunk's gates run in
+this worktree. A miss puts {branch} back where it was, and nothing merges.
+"""
+
+EPIC_CONFLICT_PROMPT = """You are resolving a merge conflict for epic {id}, {title}. Every task of the epic is done, but
+the work on {id} conflicts with its base, the trunk {main}, which moved since the epic started, so
+{branch} can't merge into {main}. You work in the epic's worktree, {wt}, on {branch}.
+
+{body}
+What the epic's side meant, from its brief:
+
+## Goal
+{goal}
+
+## Constraints
+{constraints}
+
+Its done tasks, whose commits are on {branch}:
+{tasks}
+{rules}
+No one answers questions in this run. If you can't reconcile the two sides, don't guess: end with
+`RESULT: blocked — <why>`, and a human merges it by hand. Otherwise end with `RESULT: done` once the
+merge is committed.
+"""
+
+
+def resolve_dir():
+    return _config.RUNS / "resolve"
+
+
+def epic_resolver_prompt(e, tasks, found, wt, branch):
+    kids = sorted((t for t in tasks.values() if t.get("epic") == e["id"] and t["status"] == "done"),
+                  key=lambda t: t["id"])
+    rules = worker_rules()
+    pol = policies_text()
+    fmt = dict(id=e["id"], branch=branch, main=_config.MAIN)
+    return EPIC_CONFLICT_PROMPT.format(
+        **fmt, title=e["title"], wt=wt,
+        body=conflict_body(e, found, branch, rules=EPIC_CONFLICT_RULES.format(**fmt)),
+        goal=_gitops.epic_section(e, "Goal") or "(none)",
+        constraints=_gitops.epic_section(e, "Constraints") or "(none)",
+        tasks="\n".join(f"- {t['id']} {t['title']}" for t in kids) or "(none)",
+        rules=(f"\nThis project's worker rules:\n\n{rules}\n" if rules else "")
+        + (WORKER_POLICIES.format(policies=pol) if pol else ""))
+
+
+def put_back(wt, branch, old):
+    """Return the epic branch to `old` (its tip before the resolver ran), dropping whatever the
+    resolver left in the worktree: it was clean when the resolver started. Returns what happened."""
+    new = _gitops.tip(branch)
+    if _gitops.merging(wt):
+        subprocess.run(["git", "-C", str(wt), "merge", "--abort"], capture_output=True)
+    try:
+        if _gitops.git("branch", "--show-current", cwd=wt) == branch:
+            _gitops.git("reset", "-q", "--hard", old, cwd=wt)
+        else:
+            _gitops.git("update-ref", f"refs/heads/{branch}", old)
+    except _gitops.GitError as err:
+        return f"couldn't put {branch} back at {old[:12]}: {err}"
+    if new and new != old:
+        return (f"{branch} is back at {old[:12]}; the resolver's attempt was {new[:12]} "
+                f"(`git -C {wt} reset --hard {new[:12]}` brings it back)")
+    return f"{branch} is unchanged"
+
+
+def resolution_weakening(old, trunk, branch):
+    """The weakening check on a resolver's merge alone: [] or one finding per file. Only what the
+    merge adds beyond both sides counts (a file that differs from both parents, `old`, the epic's
+    tip before, and `trunk`, the trunk's tip it merged): any gate file so (a conflicted gate file is
+    a human's to merge), and an added line in neither parent matching a suppression marker. The
+    tasks' own changes were checked when each landed."""
+    def changed(a):
+        return set(p for p in _gitops.git("diff", "--name-only", "-z", "--no-renames", a, branch, raw=True).split("\0") if p)
+    found = []
+    for path in sorted(changed(old) & changed(trunk)):
+        pattern = gate_file_hit(path)
+        if pattern:
+            found.append(f"{path} changed in the merge (a gate file: protect `{pattern}`)")
+            continue
+        new = set(added_lines(f"{old}..{branch}", path)) & set(added_lines(f"{trunk}..{branch}", path))
+        hit = next(((rx, l) for l in sorted(new) for rx in _config.SUPPRESS if rx.search(l)), None)
+        if hit:
+            found.append(f"{path} gets a suppression marker in the merge (suppress `{hit[0].pattern}`): "
+                         f"`{hit[1].strip()[:120]}`")
+    return found
+
+
+def resolve_epic(e, args, info=None):
+    """If epic e's branch conflicts with the trunk, run the resolver in its worktree and check its
+    merge, then the trunk's gates. Outside the state lock. Returns (ok, what happened); on a miss
+    the branch is put back (put_back). `info`, when given, gets the call's cost added. Never
+    raises GitError."""
+    eid, branch, info = e["id"], _gitops.epic_branch(e), info if info is not None else {}
+    try:
+        if not _gitops.branch_exists(branch) or _gitops.merge_tree(_config.MAIN, branch)[0] is not None:
+            return True, f"{branch} merges cleanly into {_config.MAIN}: nothing to resolve"
+        wt = _gitops.open_epic(e)
+        if _gitops.merging(wt) or _gitops.dirty_paths(wt):
+            return False, f"uncommitted changes in {wt}: commit or clear them, then run `ergon finish {eid} --resolve`"
+        if _gitops.git("branch", "--show-current", cwd=wt) != branch:
+            return False, f"{wt} isn't on {branch}"
+        old = _gitops.git("rev-parse", branch)
+        found = find_conflicts(_config.MAIN, wt, branch, [])
+    except _gitops.GitError as err:
+        return False, str(err)
+    if not found:  # the trunk moved meanwhile and no longer conflicts
+        return True, f"{branch} merges cleanly into {_config.MAIN}: nothing to resolve"
+    what = "; ".join(s["reason"] for s in found)
+    for s in found:
+        _history.record("conflict", e, files=s["files"], base=s["base"], round=1, companion=None)
+    prompt = epic_resolver_prompt(e, _tasks.load(_config.ITEMS), found, wt, branch)
+    print(f"  conflict {eid}  {branch} {what}: a resolver ({EPIC_AGENT_TIER}) merges {_config.MAIN} in {wt}",
+          flush=True)
+    start = time.monotonic()
+    tt = dict(e, tier=EPIC_AGENT_TIER)
+    try:
+        verdict, why, finfo = _run_worker(tt, wt, args, worker_agents(), worker_settings(), prompt, logs=resolve_dir())
+    except KeyboardInterrupt:  # `finish --resolve` in a terminal (dispatch's own SIGINT handler never raises this)
+        kill_workers()  # the resolver runs in its own session, so the Ctrl-C didn't reach it
+        raise SystemExit(f"{eid} not merged: interrupted. {put_back(wt, branch, old)}")
+    seconds = round(time.monotonic() - start, 1)
+    _history.record("worker_end", e, tier=EPIC_AGENT_TIER, verdict=verdict, reason=why, session=finfo.get("session"),
+                    cost=finfo.get("cost", 0), seconds=seconds, log=finfo.get("log"), after="conflict")
+    info["cost"] = info.get("cost", 0) + finfo.get("cost", 0)
+    failed = None
+    if verdict == "asking":
+        failed = "the resolver asked instead of merging: " + "; ".join(q for q, _ in finfo.get("questions") or [])
+    elif verdict != "done":
+        failed = f"the resolver ended {verdict}: {why}"
+    else:
+        try:
+            failed = conflict_checks(found, branch)
+            if not failed and not re.search(rf"\b{re.escape(eid)}\b", _gitops.git("log", "-1", "--format=%B", branch)):
+                failed = f"the merge commit at the tip of {branch} doesn't cite {eid}"
+            if not failed:  # the merge's trunk parent: the tip it was given, or a later one (conflict_checks)
+                parents = _gitops.git("rev-list", "--parents", "-n", "1", branch).split()[1:]
+                trunk = next((x for x in parents if x != old and _gitops.is_ancestor(x, _config.MAIN)), found[0]["tip"])
+            weak = [] if failed else resolution_weakening(old, trunk, branch)
+            if weak:
+                failed = "the weakening check vetoed the merge: " + "; ".join(weak[:WEAKEN_MAX]) + (
+                    f"; and {len(weak) - WEAKEN_MAX} more" if len(weak) > WEAKEN_MAX else "")
+                _history.record("verify", e, ok=False, cmd="weakening check", layer="weaken", seconds=0,
+                                log=None, findings=weak)
+        except _gitops.GitError as err:
+            failed = str(err)
+        for layer, cmd in ([] if failed else gate_cmds({})):  # the trunk's gates: an epic has no verify: of its own
+            failed = _run_gate(e, wt, layer, cmd, None)
+            if failed:
+                break
+    if failed:
+        return False, f"{failed} (log {finfo.get('log')}). {put_back(wt, branch, old)}"
+    return True, f"the resolver merged {_config.MAIN} into {branch} ({what}) and the gates passed"
+
+
+def finish_resolve(args):
+    """`ergon finish E-NNN --resolve`: the resolver, outside the state lock, then finish_epic
+    under it."""
+    e = _tasks.load(_config.EPICS).get(args.id)
+    if not e:
+        raise SystemExit(f"no such epic: {args.id}")
+    if not _gitops.epic_complete(args.id, _tasks.load(_config.ITEMS)):
+        raise SystemExit(f"{args.id} still has open tasks")
+    if not shutil.which("claude"):
+        raise SystemExit("no `claude` on PATH")
+    args.permission_mode = getattr(args, "permission_mode", None) or "auto"
+    ok, why = resolve_epic(e, args)
+    if not ok:
+        raise SystemExit(f"{args.id} not merged: {why}")
+    print(f"  {why}", flush=True)
+    with _gitops.state_lock():
+        try:
+            _gitops.finish_epic(args.id)
+        except _gitops.GitError as err:
+            raise SystemExit(str(err))
 
 
 # ---------- breakdown ----------
@@ -3460,8 +3657,31 @@ def dispatch(args):
         print(f"  conflict {t['id']}  round {n}, after {after}: merged; checking again", flush=True)
         return "done", ""
 
+    def finish_resolved(e, t, info):
+        """The epic e is complete but its branch conflicts with the trunk: its resolver
+        (resolve_epic), outside the state lock, its cost counted in the task's `info` (so in
+        --budget-total), then finish_epic under the lock."""
+        eid = e["id"]
+        try:
+            ok, why = resolve_epic(e, args, info)
+        except Exception as err:  # noqa: BLE001 - the task has landed: an epic that won't finish never takes it down
+            ok, why = False, f"the resolver crashed: {err}"
+        finally:
+            with live_lock:
+                live[t["id"]] = info.get("cost", 0)
+        if not ok:
+            print(f"  {eid} is complete but not merged: {why}. Merge it by hand, or run `ergon finish {eid} --resolve`")
+            return
+        print(f"  conflict {eid}  {why}", flush=True)
+        with _gitops.state_lock():
+            try:
+                _gitops.finish_epic(eid)
+            except _gitops.GitError as err:
+                print(f"  {eid} is complete but not merged: {err}")
+
     def one(t, base, wt, branch, pubs, answered=None, lim=None):
         up = first = why1 = None
+        epic_conflict = None  # an epic this task completed whose branch conflicts with the trunk
         # a question asked in a conflict round (T-110), or a conflict round the usage limit stopped
         # (T-185): its context, for the checks on the run that carries it on
         conflict = (limited_conflict(lim) if lim is not None else asked_conflict(t) if answered else None)
@@ -3583,6 +3803,14 @@ def dispatch(args):
                     if verdict == "done" and e and _gitops.epic_complete(e["id"], _tasks.load(_config.ITEMS)):
                         try:
                             _gitops.finish_epic(e["id"])
+                        except _gitops.ConflictError as err:
+                            # the epic's branch conflicts with the trunk: its resolver runs once, outside the lock (T-096)
+                            stop = (round_stop(info, info.get("round_cost", info.get("cost", 0)), 2, kind="conflict")
+                                    if _config.CONFLICT_ROUNDS else "")
+                            if _config.CONFLICT_ROUNDS and not stop:
+                                epic_conflict = e
+                            else:
+                                print(f"  {e['id']} is complete but not merged{stop}: {err}")
                         except _gitops.GitError as err:
                             print(f"  {e['id']} is complete but not merged: {err}")
                 else:
@@ -3614,6 +3842,8 @@ def dispatch(args):
                     hid, title = file_human(t, why + info.get("base_green", ""), epics)
                     print(f"  proposed {hid}  (human, {t['id']} now depends on it)  {title}")
             break
+        if epic_conflict:
+            finish_resolved(epic_conflict, t, info)
         if claims:  # publish where it stopped (and what it filed) now, not at the next scan
             failed = sync_state()
             if failed:

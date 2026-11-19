@@ -27,8 +27,12 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon set ID status=doing    agents: ready -> doing -> done | blocked (never approval)
   ergon start E-ID             branch epic/<folder> off the trunk and check it out in its own
                                worktree, <worktrees>/E-ID (also happens on an epic's first `doing`)
-  ergon finish E-ID            close the epic and merge its branch into the trunk (also happens
-                               when its last task goes done); no checkout needs switching
+  ergon finish E-ID [--resolve] [--budget USD] [--timeout MIN]
+                               close the epic and merge its branch into the trunk (also happens
+                               when its last task goes done); no checkout needs switching.
+                               --resolve: if the branch conflicts with the trunk, a resolver
+                               agent merges the trunk in, in the epic's worktree; its merge is
+                               checked and the trunk's gates run there before anything merges
   ergon approve ID [ID ...]    HUMAN ONLY, real terminal. An epic ID approves its brief when it's
                                proposed, or in shared mode open with no signed approval that
                                verifies (an old epic with no approved: stamp counts as approved
@@ -398,8 +402,15 @@ def main():
     st = sub.add_parser("set")
     st.add_argument("id")
     st.add_argument("pairs", nargs="+", metavar="key=value")
-    for name in ("start", "finish"):
-        sub.add_parser(name).add_argument("id")
+    sub.add_parser("start").add_argument("id")
+    fi = sub.add_parser("finish", help="merge a complete epic's branch into the trunk and close it")
+    fi.add_argument("id")
+    fi.add_argument("--resolve", action="store_true",
+                    help="if the branch conflicts with the trunk, a resolver agent (claude -p, task-opus) merges the "
+                         "trunk in, in the epic's worktree; its merge is checked and the trunk's gates run there "
+                         "before anything merges")
+    fi.add_argument("--budget", type=float, help="--resolve: max USD for the resolver's call (--max-budget-usd)")
+    fi.add_argument("--timeout", type=int, default=60, help="--resolve: minutes for the resolver's call (default 60)")
     a = sub.add_parser("approve")
     a.add_argument("ids", nargs="+")
     sub.add_parser("accept").add_argument("ids", nargs="+")
@@ -544,6 +555,8 @@ def run(args):
             args.tier = args.epic = None
             args.all = False
         _tasks.board(args)
+    elif args.cmd == "finish" and args.resolve:  # the resolver runs for minutes: it takes the lock only to merge
+        _dispatch.finish_resolve(args)
     elif args.cmd in ("new", "set", "start", "finish", "tidy"):  # read, then write state: one at a time
         with _gitops.state_lock():
             {"new": _tasks.new, "set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish,
