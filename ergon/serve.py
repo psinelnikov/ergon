@@ -340,10 +340,47 @@ def asks(tasks):
                   key=lambda t: t["id"])
 
 
+def needs_choice(t):
+    """A proposed task whose `## Options` has no usable choice yet: approve waits on a human's pick."""
+    return t["status"] == "proposed" and _tasks.choice_problem(t) is not None
+
+
+def choices(tasks):
+    return sorted((t for t in tasks.values() if needs_choice(t)), key=lambda t: t["id"])
+
+
 def counts(tasks):
     return {"approval": sum(t["status"] == "proposed" for t in tasks.values()),
+            "choice": len(choices(tasks)),
             "acceptance": sum(t["status"] == "review" for t in tasks.values()),
             "answer": len(asks(tasks))}
+
+
+def options_html(t):
+    """A task's `## Options` as a numbered list: the first marked recommended, a chosen one marked
+    with who and when, and `ergon choose` commands to copy while nothing is chosen. '' without
+    options. Read-only: the page takes no input."""
+    if not _tasks.has_options(t):
+        return ""
+    opts, chosen = _tasks.options(t)
+    tid = str(t["id"])
+    o = ["<h3>Options</h3><ol class=options>"]
+    for n, text in enumerate(opts, 1):
+        is_chosen = bool(chosen) and chosen["option"] == n
+        o.append(f'<li class="option{" chosen" if is_chosen else ""}">{esc(text)}'
+                 + (' <span class=tier>recommended</span>' if n == 1 else "")
+                 + (f' <span class="tier chosen-mark">chosen by {esc(chosen["by"])} {esc(chosen["date"])}</span>'
+                    if is_chosen else "") + "</li>")
+    o.append("</ol>")
+    if chosen and chosen["option"] == "own":
+        o.append(f'<p class="option chosen">own: {esc(chosen["text"])} '
+                 f'<span class="tier chosen-mark">chosen by {esc(chosen["by"])} {esc(chosen["date"])}</span></p>')
+    if chosen is None and t["status"] == "proposed" and TASK_ID.fullmatch(tid):
+        o.append("<p class=muted>This page chooses nothing. From your own terminal:</p>")
+        for n in range(1, len(opts) + 1):
+            o.append(f"<code class=cmd>{esc('ergon choose ' + tid + ' ' + str(n))}</code>")
+        o.append(f"<code class=cmd>{esc('ergon choose ' + tid + ' --own \"<your words>\"')}</code>")
+    return "".join(o)
 
 
 def by_task(rows):
@@ -543,6 +580,7 @@ def board_page(nonce):
     b = [f'<div class=top><h1>{esc(_config.HOME.name)}</h1><span class=crumb>ergon board · read-only · <a href="/metrics">metrics</a></span></div>']
     b.append("<div class=counts>")
     for key, label, anchor in (("approval", "awaiting approval", "#proposed"),
+                               ("choice", "awaiting choice", "#choice"),
                                ("acceptance", "awaiting acceptance", "#review"),
                                ("answer", "awaiting answer", "#answer")):
         b.append(f'<a class="count{" hot" if c[key] else ""}" href="{anchor}"><b id="count-{key}">{c[key]}</b>{label}</a>')
@@ -575,6 +613,11 @@ def board_page(nonce):
     if parents:
         b.append(f'<h2 id=followups>Done, follow-ups open ({len(parents)})</h2><ul class=tasks>')
         b.extend(task_li(t, tasks, f' <span class=flags>{esc(_tasks.status_text(t, tasks))}</span>') for t, _ in parents)
+        b.append("</ul>")
+    chose = choices(tasks)
+    if chose:
+        b.append(f'<h2 id=choice>Awaiting choice ({len(chose)})</h2><ul class=tasks>')
+        b.extend(task_li(t, tasks, ' <span class=flags>options, no choice yet</span>') for t in chose)
         b.append("</ul>")
     asked = asks(tasks)
     if asked:
@@ -839,6 +882,7 @@ def task_page(tid, nonce):
 
     # the brief
     b.append(f'<h2>Brief</h2><div class=brief>{markdown(t["_body"], tasks)}</div>')
+    b.append(options_html(t))
 
     # totals
     cost = 0.0
@@ -985,6 +1029,11 @@ def findings(t, tasks):
             out.append(f"touches {p}: not in the main checkout (a new file, or a typo?)")
     if t.get("status") == "proposed" and t.get("cod") in (None, ""):
         out.append("not graded: no cod:, so it ranks at the neutral 50")
+    if t.get("status") == "proposed" and _tasks.category(t) == "feature":
+        if not _tasks.has_options(t):
+            out.append("a proposed feature with no ## Options: nothing offers the human a choice")
+        elif _tasks.choice_problem(t):
+            out.append("has ## Options and no choice yet: a human runs ergon choose first")
     if blank(section(body, "Done when")):
         out.append("Done when is empty: nothing says when the task is finished")
     if blank(t.get("tier_why")):
@@ -1149,7 +1198,7 @@ def review_card(t, tasks, found):
             f'<tr><th>touches</th><td class=why>{touches}</td></tr>'
             + (f'<tr><th>epic</th><td><a href="/e/{esc(t["epic"])}">{esc(t["epic"])}</a></td></tr>' if t.get("epic") else "")
             + (f'<tr><th>source</th><td class=why>{link_ids(esc(t["source"]), tasks)}</td></tr>' if t.get("source") else "")
-            + f'</tbody></table></div><div class=brief>{brief}</div></section>')
+            + f'</tbody></table></div><div class=brief>{brief}</div>{options_html(t)}</section>')
 
 
 def quiz_html(tasks):
@@ -1237,9 +1286,12 @@ def group_header(ts, tasks):
         notes.append(f"{len(ts)} linked tasks, no epic")
     if notes:
         h.append(f'<p class=muted>{"; ".join(notes)}</p>')
-    cmd = " ".join(i for i in sorted(ids) if TASK_ID.fullmatch(i))
+    cmd = " ".join(i for i in sorted(ids) if TASK_ID.fullmatch(i) and not needs_choice(tasks[i]))
     if cmd:
         h.append(f'<p class=muted>For this group:</p><code class=cmd>{esc("ergon approve " + cmd)}</code>')
+    first = [i for i in sorted(ids) if needs_choice(tasks[i])]
+    if first:
+        h.append(f'<p class=muted>Choose first: {link_ids(esc(", ".join(first)), tasks)}</p>')
     return "".join(h)
 
 
@@ -1328,10 +1380,15 @@ def review_page(nonce):
 
     b.append("<h2>Quiz</h2>" + quiz_html(tasks))
 
-    ids = [t["id"] for t in proposed if TASK_ID.fullmatch(t["id"])]  # only IDs go in a command to copy
+    all_ids = [t["id"] for t in proposed if TASK_ID.fullmatch(t["id"])]  # only IDs go in a command to copy
+    first = [i for i in all_ids if needs_choice(tasks[i])]
+    ids = [i for i in all_ids if i not in first]  # options with no choice yet wait on `ergon choose`
     clean = [i for i in ids if i not in flagged]
     b.append("<h2>Approve</h2><p class=muted>This page approves nothing. From your own terminal:</p>"
-             f"<code class=cmd>{esc('ergon approve ' + ' '.join(ids))}</code>")
+             + (f"<code class=cmd>{esc('ergon approve ' + ' '.join(ids))}</code>" if ids
+                else "<p class=muted>nothing to approve yet</p>"))
+    if first:
+        b.append("<p class=muted>Choose first, then approve: " + link_ids(esc(", ".join(first)), tasks) + "</p>")
     if flagged and clean:
         b.append(f"<p class=muted>Only those without findings:</p><code class=cmd>{esc('ergon approve ' + ' '.join(clean))}</code>")
     return page("ergon · review", "".join(b), nonce, script=True)
