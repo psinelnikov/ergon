@@ -137,6 +137,15 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # remote = "origin"             # a remote name or URL
 # branch = "ergon-state"
 
+# Local mode only: an approval counts only if the human approve command signed it (ssh-keygen -Y
+# sign with git's user.signingkey) and the signature verifies against an allowed_signers file read
+# from the committed trunk, never the working tree. A hand-written stamp, an approved brief edited
+# since, or a key the file doesn't list counts for nothing. Use a key that needs a touch or a
+# confirmation (a hardware key, `ssh-add -c`), so an agent in your shell can't sign. Shared mode
+# always signs.
+# [signing]
+# approvers = ".ergon/approvers"   # lines like: you@example.com namespaces="ergon" ssh-ed25519 AAAA...
+
 # Shared mode only: a task matching a rule needs signed approvals of its current brief from two
 # different principals in the approvers file before it leaves `proposed`. Matched like [[accept]]:
 # its tier is in tiers (when given) and a touches: entry matches (when given).
@@ -153,6 +162,7 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 
 
 SHARED = None  # [shared]: {remote, branch}, or None for local-only state
+SIGNING = None  # [signing], local mode: {approvers}, or None for unsigned local approvals
 GATE_FILES = [CONFIG_FILE]  # [gates] protect, plus the config itself
 SUPPRESS = []  # [gates] suppress, compiled
 REPROS = "tests/harden"  # [gates] repros: a harden task's reproductions, <incident id>.patch
@@ -164,6 +174,31 @@ EVIDENCE = []  # [[evidence]] rules: {tiers, touches}; a matching task's done ne
 TWO_PERSON = []  # [[two_person]] rules: {tiers, touches}; shared mode only
 FOLLOW_UP_DEPTH = 3  # follow_up_depth: see tasks.auto_approval
 FOLLOW_UPS = 10  # follow_ups: auto-approved follow-ups one dispatch run works
+
+
+def signed():
+    """Do approvals count only when signed? Shared mode, or [signing] in local mode."""
+    return SHARED is not None or SIGNING is not None
+
+
+def committed_signing():
+    """The [signing] table of the config as committed on the trunk (refs/heads/<trunk> in the main
+    checkout), or None if it has none or can't be read. configure() sets HOME and MAIN first."""
+    r = subprocess.run(["git", "-C", str(HOME), "show", f"refs/heads/{MAIN}:{CONFIG_FILE}"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        return None
+    try:
+        import tomllib
+        cfg = tomllib.loads(r.stdout)
+    except ModuleNotFoundError:
+        try:
+            cfg = mini_toml(r.stdout)
+        except NotConfigured:
+            return None
+    except ValueError:  # TOMLDecodeError
+        return None
+    return cfg.get("signing") if isinstance(cfg, dict) else None
 
 
 def protect_hit(touch, pattern):
@@ -254,7 +289,7 @@ def configure(start=None, need_config=True):
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, CONCEPTS, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, EVIDENCE, \
-        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, REMERGE_ROUNDS, OVERLAP, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, LEARN, \
+        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, REMERGE_ROUNDS, OVERLAP, RESUME_SECS, RESUME_TOKENS, SHARED, SIGNING, TWO_PERSON, JOURNAL, LEARN, \
         FOLLOW_UP_DEPTH, FOLLOW_UPS, GATE_FILES, SUPPRESS, REPROS, TESTS, PROVE_TIERS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
@@ -377,6 +412,29 @@ def configure(start=None, need_config=True):
             raise NotConfigured(f"{CONFIG_FILE}: [shared] branch must be a plain branch name of its own, "
                                 f"not the trunk, task/… or epic/…")
         SHARED = {"remote": sh["remote"].strip(), "branch": branch}
+    # Opt-in signed approvals in local mode (T-210): approving writes a detached SSH signature over
+    # `<ID> sha256:<digest>` lines into <state>/approvals/, and an approval counts only if one from a
+    # key in the approvers file, as committed on the trunk, covers the brief as it is now. The
+    # approvers file becomes a gate file, so a dispatched branch can't change it unless its approved
+    # touches: names it. Once the trunk's committed config has [signing], that table is the one
+    # that counts: deleting or repointing it in the working tree changes nothing, so turning it off
+    # takes a commit to the trunk, as changing the approvers file does.
+    SIGNING = None
+    sg = None if SHARED is not None else committed_signing()
+    sg = CFG.get("signing") if sg is None else sg
+    if sg is not None:
+        if not isinstance(sg, dict) or any(k != "approvers" for k in sg):
+            raise NotConfigured(f"{CONFIG_FILE}: [signing] takes approvers, a path in the repo")
+        if SHARED is not None:
+            raise NotConfigured(f"{CONFIG_FILE}: [signing] is for local mode; with [shared] approvals are "
+                                f"always signed, against [shared] approvers")
+        path = sg.get("approvers", ".ergon/approvers")
+        path = path.strip().strip("/") if isinstance(path, str) else ""
+        if not path or path.startswith(".git/") or any(x in ("", ".", "..") for x in path.split("/")):
+            raise NotConfigured(f"{CONFIG_FILE}: [signing] approvers must be a path inside the repo, "
+                                f"like .ergon/approvers")
+        SIGNING = {"approvers": path}
+        GATE_FILES = list(dict.fromkeys(GATE_FILES + [path]))
     PROTECT.clear()
     for n, pr in enumerate(CFG.get("protect") or [], 1):
         if pr.get("min_tier") not in _tasks.TIERS or not pr.get("touches"):

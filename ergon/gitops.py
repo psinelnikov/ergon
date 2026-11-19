@@ -497,7 +497,10 @@ APPROVE_VALUE = re.compile(r"^([TE]-\d{3,})\s+sha256:([0-9a-f]{64})$")  # a task
 
 
 def approvers_path():
-    """Where the approvers file sits in the trunk ([shared] approvers, default .ergon/approvers)."""
+    """Where the approvers file sits in the trunk ([shared] approvers, or [signing] approvers in
+    local mode; default .ergon/approvers)."""
+    if _config.SIGNING:
+        return _config.SIGNING["approvers"]  # checked by config.configure
     p = str(((_config.CFG.get("shared") or {}).get("approvers")) or ".ergon/approvers").strip().strip("/")
     if not p or p.startswith(".git/") or ".." in p.split("/"):
         raise SystemExit(f"{_config.CONFIG_FILE}: [shared] approvers must be a path inside the repo, like .ergon/approvers")
@@ -505,13 +508,16 @@ def approvers_path():
 
 
 def where():
-    """The remote and branch the approvers file is read from, for messages."""
-    return f"{_config.SHARED['remote']} {_config.MAIN}"
+    """The remote and branch the approvers file is read from, for messages: in local mode the
+    trunk as committed in this repo."""
+    return f"{_config.SHARED['remote']} {_config.MAIN}" if _config.SHARED else _config.MAIN
 
 
 def approvers_text():
-    """The approvers file as last fetched from the trunk on the [shared] remote, or None."""
-    r = subprocess.run(["git", "-C", str(_config.HOME), "show", f"{TRUNK_REF}:{approvers_path()}"],
+    """The approvers file as last fetched from the trunk on the [shared] remote, or in local mode
+    ([signing]) as committed on the trunk here; None if there is none. Never the working tree."""
+    ref = TRUNK_REF if _config.SHARED else f"refs/heads/{_config.MAIN}"
+    r = subprocess.run(["git", "-C", str(_config.HOME), "show", f"{ref}:{approvers_path()}"],
                        capture_output=True, text=True)
     return r.stdout if r.returncode == 0 and r.stdout.strip() else None
 
@@ -521,6 +527,14 @@ def ssh_keygen():
 
 
 def signing_howto():
+    if not _config.SHARED:
+        return (f"To sign approvals ([signing] in {_config.CONFIG_FILE}), name your SSH key in this repo:\n"
+                f"  git config user.signingkey ~/.ssh/id_ed25519.pub   # your public key, or key::ssh-ed25519 AAAA...\n"
+                f"Then add your key to {approvers_path()} as an allowed_signers line\n"
+                f"  you@example.com namespaces=\"{SIGN_NAMESPACE}\" ssh-ed25519 AAAA...\n"
+                f"and commit it to {_config.MAIN} yourself. Ergon reads it from the committed {_config.MAIN}, "
+                f"never from the working tree. Use a key that needs a touch or a confirmation (a hardware "
+                f"key, `ssh-add -c`), so an agent in your shell can't sign for you.")
     return (f"To sign in shared mode, set up SSH commit signing (git 2.34+) in this clone:\n"
             f"  git config gpg.format ssh\n"
             f"  git config user.signingkey ~/.ssh/id_ed25519.pub   # your public key, or key::ssh-ed25519 AAAA...\n"
@@ -540,6 +554,9 @@ def signing_problem():
     """Why this clone can't make an SSH-signed state commit, with how to set it up; None if it can."""
     if not ssh_keygen():
         return "no ssh-keygen on PATH, so nothing can be signed or verified.\n" + signing_howto()
+    if not _config.SHARED:  # [signing]: ergon runs ssh-keygen itself, so gpg.format doesn't matter
+        return None if config_value("user.signingkey") else (
+            "no signing key: user.signingkey isn't set.\n" + signing_howto())
     if config_value("gpg.format") != "ssh":
         return "SSH commit signing isn't set up here (gpg.format isn't ssh).\n" + signing_howto()
     if not (config_value("user.signingkey") or config_value("gpg.ssh.defaultKeyCommand")):
@@ -572,8 +589,9 @@ def listed(blob, text):
 
 
 def approve_problem():
-    """Why approving from this clone can't make an approval that verifies, or None. Shared mode."""
-    if not _shared.joined():
+    """Why approving from this clone can't make an approval that verifies, or None. Shared mode,
+    or [signing] in local mode."""
+    if _config.SHARED and not _shared.joined():
         return (f"{_config.STATE} isn't a worktree of {_shared.branch()}, so an approval can't be signed: "
                 f"run `ergon sync --join` (or `ergon sync --init`) first")
     why = signing_problem()
@@ -581,8 +599,9 @@ def approve_problem():
         return why
     text = approvers_text()
     if text is None:
-        return (f"there is no approvers file {approvers_path()} on {where()} (as of the last fetch), so no "
-                f"approval would count.\n" + signing_howto())
+        return (f"there is no approvers file {approvers_path()} on {where()}"
+                + (" (as of the last fetch)" if _config.SHARED else " (as committed)")
+                + ", so no approval would count.\n" + signing_howto())
     blob = own_key()
     if blob and not listed(blob, text):
         return (f"your signing key ({config_value('user.signingkey')}) isn't in {approvers_path()} on "
@@ -601,6 +620,9 @@ class Approvals:
         self.good = good or {}
         self.seen = seen or set()  # task IDs some Ergon-Approve trailer names, signed or not
 
+    def load(self, tid):
+        """Make good and seen complete for tid. Shared mode reads every approval up front."""
+
     def needed(self, t):
         """How many different principals must approve t's current brief: 2 under [[two_person]]."""
         return 2 if _tasks.two_person(t) else 1
@@ -608,6 +630,7 @@ class Approvals:
     def signers(self, t):
         """[(principal, name, date)] of the different principals whose approval of t's current
         brief verifies, each at its first approval, oldest first."""
+        self.load(t["id"])
         out = {}
         for who in reversed((self.good.get(t["id"]) or {}).get(_tasks.brief_digest(t)) or []):
             out.setdefault(who[0], who)
@@ -629,6 +652,7 @@ class Approvals:
         if self.error:
             return self.error
         tid, d = t["id"], _tasks.brief_digest(t)
+        self.load(tid)
         who, need = self.signers(t), self.needed(t)
         if len(who) >= need:
             return None
@@ -657,9 +681,10 @@ class Approvals:
 
 
 def approvals():
-    """Approvals verified now; None outside shared mode. Never raises: a failure is its error."""
+    """Approvals verified now; None in local mode without [signing]. Never raises: a failure is
+    its error."""
     if not _config.SHARED:
-        return None
+        return local_approvals() if _config.SIGNING else None
     if not _shared.joined():
         return Approvals(error=f"{_config.STATE} isn't a worktree of {_shared.branch()}, so no approval "
                                f"can be verified: run `ergon sync --join`")
@@ -701,6 +726,160 @@ def approvals():
             if status == "G" and principal:
                 good.setdefault(m.group(1), {}).setdefault(m.group(2), []).append((principal, name, date))
     return Approvals(good=good, seen=seen)
+
+
+# ---------- signed approvals (local mode, [signing]) ----------
+# T-210: shared mode's rule without a state branch. Approving signs one message, a line
+# `<ID> sha256:<digest>` per task or epic brief it approves, with `ssh-keygen -Y sign` and git's
+# user.signingkey (one signature per approval, so one touch of a hardware key however many it
+# approves), and writes it to <state>/approvals/<time>-<pid>.txt beside its .txt.sig. A task or
+# epic counts as approved only if a signature that verifies against the approvers file, as
+# committed on the trunk (refs/heads/<trunk>, never the working tree), covers its brief digest as
+# it is now. Anyone can write in <state>/, but only a listed key makes a signature that verifies:
+# a file written by hand counts for nothing, and one deleted only un-approves. Every failure fails
+# closed: no ssh-keygen, no approvers file, a bad signature all mean nothing verifies.
+
+SIGN_NAMESPACE = "ergon"  # ssh-keygen -Y's namespace, so an approval's signature is no commit's
+APPROVAL_FILE = re.compile(r"^[\w.-]+\.txt$")
+
+
+def approvals_dir():
+    return _config.STATE / "approvals"
+
+
+def approval_message(pairs):
+    """What an approval signs: one `<ID> sha256:<digest>` line per (ID, digest)."""
+    return "".join(f"{tid} sha256:{digest}\n" for tid, digest in pairs)
+
+
+def verify_signature(keygen, allowed, message, sig):
+    """The principal of the allowed_signers file `allowed` whose key made `sig` (a path) over
+    `message` (bytes) in the ergon namespace, or None if none did."""
+    try:
+        r = subprocess.run([keygen, "-Y", "find-principals", "-s", str(sig), "-f", str(allowed)],
+                           capture_output=True, text=True)
+        if r.returncode:
+            return None
+        for principal in (l.strip() for l in r.stdout.splitlines()):
+            if principal and subprocess.run([keygen, "-Y", "verify", "-f", str(allowed), "-I", principal,
+                                             "-n", SIGN_NAMESPACE, "-s", str(sig)],
+                                            input=message, capture_output=True).returncode == 0:
+                return principal
+    except (OSError, UnicodeError):  # fails closed: approvals() never raises
+        return None
+    return None
+
+
+class LocalApprovals(Approvals):
+    """[signing]: what the signed approvals in <state>/approvals/ approve, verified against the
+    approvers file on the committed trunk. A file is verified the first time a task or epic it
+    names is asked about, so `check` and `next` verify only what they look at."""
+
+    def __init__(self, keygen, text):
+        super().__init__()
+        self.keygen, self.text = keygen, text
+        self.loaded, self.verdicts = set(), {}
+        self.files = {}  # ID: [(file name, message, digest)], newest first
+        try:
+            names = sorted((p.name for p in approvals_dir().iterdir() if APPROVAL_FILE.match(p.name)), reverse=True)
+        except OSError:
+            names = []
+        for name in names:
+            try:
+                msg = (approvals_dir() / name).read_bytes()
+            except OSError:
+                continue
+            for line in msg.decode("utf-8", "replace").splitlines():
+                m = APPROVE_VALUE.match(line.strip())
+                if m:
+                    self.seen.add(m[1])
+                    self.files.setdefault(m[1], []).append((name, msg, m[2]))
+
+    def load(self, tid):
+        if tid in self.loaded:
+            return
+        self.loaded.add(tid)
+        for name, msg, digest in self.files.get(tid, []):
+            who = self.verdict(name, msg)
+            if who:
+                self.good.setdefault(tid, {}).setdefault(digest, []).append(who)
+
+    def verdict(self, name, msg):
+        """(principal, principal, date) if the file's signature verifies, else None."""
+        if name not in self.verdicts:
+            who, sig = None, approvals_dir() / (name + ".sig")
+            if sig.is_file():
+                with tempfile.TemporaryDirectory(prefix="ergon-approvers-") as d:
+                    allowed = Path(d) / "allowed_signers"
+                    allowed.write_text(self.text)
+                    principal = verify_signature(self.keygen, allowed, msg, sig)
+                if principal:
+                    who = (principal, principal, name[:10])
+            self.verdicts[name] = who
+        return self.verdicts[name]
+
+
+def local_approvals():
+    """[signing]: approvals verified against the approvers file on the committed trunk."""
+    keygen = ssh_keygen()
+    if not keygen:
+        return Approvals(error="no ssh-keygen on PATH, so no approval signature can be verified")
+    text = approvers_text()
+    if text is None:
+        return Approvals(error=f"no approvers file {approvers_path()} committed on {where()}, so no "
+                               f"approval can be verified")
+    return LocalApprovals(keygen, text)
+
+
+def sign_approvals(pairs):
+    """[signing]: sign one approval of `pairs`, [(ID, digest)], with user.signingkey, check that it
+    verifies against the approvers file on the committed trunk, and write it to <state>/approvals/.
+    Raises SystemExit, having written nothing, if it can't sign or the signature doesn't verify.
+    stdin stays the terminal's, for a passphrase."""
+    why = approve_problem()
+    if why:
+        raise SystemExit(f"refused: {why}")
+    keygen, key, text = ssh_keygen(), config_value("user.signingkey"), approvers_text()
+    message = approval_message(pairs)
+    with tempfile.TemporaryDirectory(prefix="ergon-sign-") as d:
+        msg = Path(d) / "approval.txt"
+        msg.write_text(message)
+        cmd = [keygen, "-Y", "sign", "-n", SIGN_NAMESPACE]
+        if key.startswith("key::"):  # a literal public key: its private half is in the ssh-agent
+            pub = Path(d) / "key.pub"
+            pub.write_text(key[5:].strip() + "\n")
+            cmd += ["-U", "-f", str(pub)]
+        else:
+            cmd += ["-f", os.path.expanduser(key)]
+        try:
+            r = subprocess.run(cmd + [str(msg)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except OSError as err:
+            r = subprocess.CompletedProcess(cmd, 1, "", str(err))
+        sig = msg.with_name(msg.name + ".sig")
+        if r.returncode or not sig.is_file():
+            raise SystemExit(f"refused: signing the approval failed, so nothing was approved: "
+                             f"{(r.stderr or r.stdout).strip()[:300]}\n" + signing_howto())
+        allowed = Path(d) / "allowed_signers"
+        allowed.write_text(text)
+        if not verify_signature(keygen, allowed, message.encode(), sig):
+            raise SystemExit(f"refused: your signature doesn't verify against {approvers_path()} on {where()}, "
+                             f"so nothing was approved: is your key listed there, with "
+                             f"namespaces=\"{SIGN_NAMESPACE}\" or none?\n" + signing_howto())
+        folder = approvals_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        if not (folder / ".gitignore").exists():  # <state>/ isn't gitignored as a whole, only items/, epics/, runs/
+            (folder / ".gitignore").write_text("*\n")
+        stem = f"{datetime.datetime.now():%Y-%m-%d-%H%M%S}-{os.getpid()}"
+        n = 0
+        while (folder / f"{stem}-{n}.txt").exists():
+            n += 1
+        out = folder / f"{stem}-{n}.txt"
+        # the signature first: a reader keys on the .txt, so it never sees one without its .sig
+        (folder / (out.name + ".sig")).write_bytes(sig.read_bytes())
+        tmp = folder / f".{out.name}.tmp"
+        tmp.write_text(message)
+        tmp.replace(out)
+    return out
 
 
 def sign_state(label, trailers, paths=(), undo=True):

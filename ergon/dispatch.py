@@ -3565,7 +3565,7 @@ def dispatch(args):
 
     def eligible(tasks):
         epics.update(_tasks.load(_config.EPICS))  # another run or session may have closed one
-        apr = _gitops.approvals()  # shared mode: verified now, after the scan's sync; None otherwise
+        apr = _gitops.approvals()  # shared mode (verified now, after the scan's sync) or [signing]; None otherwise
         now = time.time()
         for t in sorted(tasks.values(), key=lambda t: _priority.sort_key(t, tasks)):
             lim = _tasks.limited(t)  # blocked by the usage limit: back in once it has reset
@@ -4528,7 +4528,7 @@ def dispatch(args):
         if not plan and not bplan:
             print("nothing to dispatch")
         obsidian_write_back(dry=True)
-        if _config.FOLLOW_UPS and _config.FOLLOW_UP_DEPTH and not _config.SHARED:
+        if _config.FOLLOW_UPS and _config.FOLLOW_UP_DEPTH and not _config.signed():
             print(f"  follow-ups  auto-approved follow-ups (bugfix, refactor, chore) a worker files may run in this "
                   f"same run, up to {_config.FOLLOW_UPS} (follow_ups), depth {_config.FOLLOW_UP_DEPTH} "
                   f"(follow_up_depth); they don't count toward --max")

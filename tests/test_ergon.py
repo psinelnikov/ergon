@@ -5858,6 +5858,216 @@ class TestHardenInDigestSigned(unittest.TestCase):
             self.counts(self.a, "T-001")
 
 
+class TestSignedLocal(DispatchProject):
+    """[signing] in local mode (T-210): approve signs `<ID> sha256:<digest>` with ssh-keygen into
+    <state>/approvals/, and a task or epic counts as approved only if a signature from a key in the
+    approvers file, as committed on the trunk, covers its brief as it is now. Each failing case is
+    left out by `next`, reported by `check` and skipped by dispatch."""
+    config = DispatchProject.config + '''
+        [signing]
+        approvers = ".ergon/approvers"
+    '''
+
+    def setUp(self):
+        super().setUp()
+        self.env["ERGON_ASK_STDIN"] = "1"
+        self.keys = Path(self.tmp.name) / "keys"
+        self.keys.mkdir()
+        for name in ("a", "x"):  # a is listed, x isn't
+            sh("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"{name}@example.com",
+               "-f", str(self.keys / name), cwd=self.keys)
+        (self.root / ".ergon").mkdir()
+        self.approvers = self.root / ".ergon" / "approvers"
+        self.approvers.write_text(self.line("a"))
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "approvers", cwd=self.root)
+        sh("git", "config", "user.signingkey", str(self.keys / "a.pub"), cwd=self.root)
+        self.ergon("new", "task", "One", "--tier", "haiku")
+
+    def line(self, key):
+        return f'{key}@example.com namespaces="ergon" {(self.keys / (key + ".pub")).read_text().strip()}\n'
+
+    def approve(self, *ids, check=True):
+        return self.ergon("approve", *ids, inp="y\n", check=check)
+
+    def digest(self, tid):
+        from ergon import tasks as T
+        return T.brief_digest(T.parse(self.task_file(tid)))
+
+    def counts(self, tid, run=False):
+        """next lists tid, check passes, and dispatch would run it (or, with run, runs it)."""
+        self.assertIn(f"  {tid}  ", self.ergon("next").stdout)
+        r = self.ergon("check", check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"would run  {tid}", self.ergon("dispatch", "--dry-run").stdout)
+        if run:
+            out = self.ergon("dispatch", "--ids", tid).stdout
+            self.assertEqual(self.status(tid), "done", out)
+
+    def doesnt_count(self, tid, why, what="ready"):
+        """next leaves tid out, check reports it with `why`, dispatch neither plans nor launches it."""
+        r = self.ergon("next")
+        self.assertNotIn(f"  {tid}  ", r.stdout)
+        self.assertIn(f"left out because their approval doesn't verify: {tid}", r.stdout)
+        r = self.ergon("check", check=False)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(f"{tid}: {what}, but its approval doesn't verify: {why}", r.stdout)
+        r = self.ergon("dispatch", "--dry-run")
+        self.assertNotIn(f"would run  {tid}", r.stdout)
+        self.assertIn(f"skipped  {tid}  approval doesn't verify: {why}", r.stdout)
+        r = self.ergon("dispatch", "--ids", tid)
+        self.assertEqual(self.status(tid), what, r.stdout)
+        self.assertFalse((self.root / tid / "").exists() or (self.root / f"{tid}.txt").exists(), r.stdout)
+
+    def sign_by_hand(self, tid, key):
+        """A stamp plus an approval file signed with `key` over tid's current brief: what approve
+        would write, made without it."""
+        stamp(self.task_file(tid))
+        folder = self.root / "tasks" / "approvals"
+        folder.mkdir(exist_ok=True)
+        msg = folder / "2099-01-01-000000-1-0.txt"
+        msg.write_text(f"{tid} sha256:{self.digest(tid)}\n")
+        sh("ssh-keygen", "-Y", "sign", "-n", "ergon", "-f", str(self.keys / key), str(msg), cwd=folder)
+
+    def test_an_approval_signed_with_a_listed_key_is_offered_and_launched(self):
+        r = self.approve("T-001")
+        self.assertIn("approved 1", r.stdout)
+        d = self.digest("T-001")
+        self.assertRegex(self.task_file("T-001").read_text(), rf"\napproved: Tester \d{{4}}-\d\d-\d\d sha256:{d[:8]}\n")
+        msgs = list((self.root / "tasks" / "approvals").glob("*.txt"))
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0].read_text(), f"T-001 sha256:{d}\n")
+        self.assertTrue(msgs[0].with_name(msgs[0].name + ".sig").is_file())
+        row = [r for r in history(self.root) if r["task"] == "T-001" and r["event"] == "approved"]
+        self.assertEqual([r.get("signature") for r in row], [msgs[0].name])  # the audit row names it
+        self.assertNotIn("tasks/approvals", sh("git", "status", "--porcelain", cwd=self.root).stdout)  # it ignores itself
+        self.counts("T-001", run=True)
+
+    def test_one_signature_covers_every_task_one_approve_names(self):
+        self.ergon("new", "task", "Two", "--tier", "haiku")
+        self.approve("T-001", "T-002")
+        msgs = list((self.root / "tasks" / "approvals").glob("*.txt"))
+        self.assertEqual(len(msgs), 1)  # one touch of a hardware key, however many it approves
+        self.assertEqual(msgs[0].read_text(), f"T-001 sha256:{self.digest('T-001')}\nT-002 sha256:{self.digest('T-002')}\n")
+        self.counts("T-001")
+        self.counts("T-002")
+
+    def test_a_stamp_written_by_hand_doesnt_count(self):
+        stamp(self.task_file("T-001"))
+        self.doesnt_count("T-001", "no signed approval")
+        r = self.approve("T-001")  # a human approves it again, and then it counts
+        self.assertIn("(approve again: no signed approval", r.stdout)
+        self.counts("T-001")
+
+    def test_an_approval_of_a_brief_edited_afterwards_doesnt_count(self):
+        self.approve("T-001")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("## What\n", "## What\nAlso drop the production database.\n"))
+        self.doesnt_count("T-001", "brief changed after approval")
+        self.ergon("set", "T-001", "tier=opus")  # a proposed-only check passes it, the digest doesn't
+        self.doesnt_count("T-001", "brief changed after approval")
+        r = self.approve("T-001")
+        self.assertIn("(approve again: brief changed after approval", r.stdout)
+        self.counts("T-001")
+
+    def test_an_approval_signed_by_an_unlisted_key_doesnt_count(self):
+        sh("git", "config", "user.signingkey", str(self.keys / "x.pub"), cwd=self.root)
+        r = self.approve("T-001", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("isn't in .ergon/approvers on main", r.stderr)
+        self.assertIn("status: proposed", self.task_file("T-001").read_text())
+        self.assertFalse(list((self.root / "tasks").glob("approvals/*.txt")))
+        self.sign_by_hand("T-001", "x")  # what approve refused to make
+        self.doesnt_count("T-001", "approval not signed by an approver")
+        # listing x in the working tree doesn't count: the approvers file is read from the committed trunk
+        self.approvers.write_text(self.line("a") + self.line("x"))
+        self.doesnt_count("T-001", "approval not signed by an approver")
+        sh("git", "commit", "-qam", "list x", cwd=self.root)  # a human commits it to main
+        self.counts("T-001")
+
+    def test_removing_signing_from_the_working_tree_config_turns_nothing_off(self):
+        stamp(self.task_file("T-001"))
+        self.doesnt_count("T-001", "no signed approval")
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text().replace("[signing]", "[nosigning]").replace("approvers =", "# approvers ="))
+        self.doesnt_count("T-001", "no signed approval")  # the trunk's committed config still has it
+        cfg.write_text(cfg.read_text().replace("[nosigning]", '[signing]\napprovers = "elsewhere"'))
+        self.doesnt_count("T-001", "no signed approval")  # nor does repointing it there do anything
+        sh("git", "checkout", "-q", ".ergon.toml", cwd=self.root)
+        cfg.write_text(cfg.read_text().replace("[signing]", "").replace('approvers = ".ergon/approvers"', ""))
+        sh("git", "commit", "-qam", "signing off", cwd=self.root)  # a human turns it off on the trunk
+        self.assertIn("  T-001  ", self.ergon("next").stdout)  # and the old stamp counts again
+        self.ergon("check")
+
+    def test_a_garbled_signature_or_no_approvers_file_fails_closed(self):
+        self.approve("T-001")
+        self.counts("T-001")
+        sig = next((self.root / "tasks" / "approvals").glob("*.txt.sig"))
+        good = sig.read_text()
+        sig.write_text(good.replace(good.splitlines()[2], good.splitlines()[2][::-1]))
+        self.doesnt_count("T-001", "approval not signed by an approver")
+        sig.write_text(good)
+        self.counts("T-001")
+        sh("git", "rm", "-q", ".ergon/approvers", cwd=self.root)
+        sh("git", "commit", "-qm", "no approvers", cwd=self.root)
+        self.doesnt_count("T-001", "no approvers file .ergon/approvers committed on main")
+        r = self.approve("T-001", check=False)
+        self.assertIn("there is no approvers file .ergon/approvers on main", r.stderr)
+
+    def test_an_epic_brief_needs_a_signed_approval_too(self):
+        agent = clean_env(CLAUDECODE="1")
+        self.ergon("new", "epic", "Big", env=agent)
+        self.ergon("new", "task", "Part", "--tier", "haiku", "--category", "chore", "--epic", "E-001", env=agent)
+        epic = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        self.approve("T-002")
+        self.assertIn("left out because epic E-001 is proposed", self.ergon("next").stdout)
+        self.approve("E-001")
+        self.assertRegex(epic.read_text(), r"\nstatus: open\n(.*\n)*approved: Tester \d{4}-\d\d-\d\d sha256:")
+        self.counts("T-002")
+        # an epic opened by hand, stamp and all, isn't approved
+        epic.write_text(re.sub(r"^approved:.*$", "approved: Tester 2026-01-01", epic.read_text(), flags=re.M)
+                        .replace("## Goal\n", "## Goal\nSomething else.\n"))
+        r = self.ergon("next")
+        self.assertIn("left out because epic E-001's approval doesn't verify: brief changed after approval", r.stdout)
+        self.assertIn("E-001: open, but its approval doesn't verify", self.ergon("check", check=False).stdout)
+
+    def test_a_bugfix_follow_up_stays_proposed(self):
+        self.approve("T-001")
+        self.env.update(FAKE_FOUND="Fix X — y breaks\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix")
+        out = self.ergon("dispatch", "--ids", "T-001").stdout
+        self.assertEqual(self.status("T-001"), "done", out)
+        text = self.task_file("T-002").read_text()
+        self.assertEqual(self.status("T-002"), "proposed", text)
+        self.assertRegex(text, r"(?m)^approved:\s*$")
+        self.assertIn("proposed T-002  (found by T-001)", out)
+        # a hand-written auto stamp has nothing signed behind it
+        text = text.replace("status: proposed", "status: ready")
+        self.task_file("T-002").write_text(re.sub(
+            r"(?m)^approved:.*$", "approved: auto bugfix follow-up of T-001 (root T-001, Tester 2026-01-01)", text))
+        self.assertIn("T-002: ready, but its approval doesn't verify: no signed approval",
+                      self.ergon("check", check=False).stdout)
+
+    def test_the_commit_hook_refuses_a_hand_stamped_task(self):
+        self.ergon("init", "--hooks")
+        stamp(self.task_file("T-001"))
+        r = sh("git", "commit", "--allow-empty", "-m", "Sneak (T-001)", cwd=self.root, check=False, env=self.env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("T-001: approval doesn't verify: no signed approval", r.stderr)
+        self.approve("T-001")
+        r = sh("git", "commit", "--allow-empty", "-m", "Work (T-001)", cwd=self.root, check=False, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_the_approvers_file_is_a_gate_file_and_shared_mode_refuses_signing(self):
+        r = sh(sys.executable, "-c", "import sys; from ergon import config as C; C.configure(sys.argv[1]); "
+               "print(C.GATE_FILES)", str(self.root), cwd=ERGON.parent)
+        self.assertIn("'.ergon/approvers'", r.stdout)
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + '\n[shared]\nremote = "origin"\n')
+        r = self.ergon("next", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("[signing] is for local mode", r.stdout + r.stderr)
+
+
 class TestAutoApprove(DispatchProject):
     """A FOUND follow-up that is a bugfix, refactor or chore is approved by inheritance (T-136)."""
     config = DispatchProject.config + '''

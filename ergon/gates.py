@@ -196,9 +196,15 @@ def signing():
 
 
 def approve_ready():
-    """Shared mode: refuse (SystemExit) unless an approval made here would verify: the state is
-    a worktree, signing is set up, and the approvers file on the remote's trunk lists this key."""
+    """Shared mode, or [signing] in local mode: refuse (SystemExit) unless an approval made here
+    would verify: (shared) the state is a worktree, signing is set up, and the approvers file on
+    the remote's trunk, or (local) on the committed trunk, lists this key."""
+    if not _config.signed():
+        return
     if not _config.SHARED:
+        why = _gitops.approve_problem()
+        if why:
+            raise SystemExit(f"refused: {why}")
         return
     if _shared.joined():
         _shared.fetch_trunk()  # see the approvers file as the remote has it now
@@ -211,7 +217,9 @@ def stamp_approved(todo):
     """Approve `todo`: proposed tasks move to ready, and each gets `approved: <name> <date>`. In
     shared mode the stamp also names its brief digest, and the stamps go in one SSH-signed state
     commit with an `Ergon-Approve: <ID> sha256:<digest>` trailer per task, which is what makes
-    them count. If signing fails, nothing is approved (SystemExit). Takes the state lock.
+    them count. If signing fails, nothing is approved (SystemExit). Takes the state lock. With
+    [signing] in local mode the stamp names its digest too, and one detached signature over every
+    `<ID> sha256:<digest>` goes to <state>/approvals/ before any stamp is written (T-210).
 
     A task under a [[two_person]] rule only gets its trailer in the signed commit. Then the
     approvals that verify are counted: with two different principals it moves to ready and its
@@ -223,10 +231,14 @@ def stamp_approved(todo):
     if no_choice:  # E-006: a task with options is approved only once a human chose one
         raise SystemExit("refused: " + "; ".join(no_choice))
     shared = _config.SHARED is not None
+    signed = _config.signed()
     two = {t["id"] for t in todo if _tasks.two_person(t)}
     with _gitops.state_lock():
         if shared:
             _shared.commit_pending()  # hand edits go in a commit of their own, not the signed one
+        sig = {}
+        if signed and not shared:  # local [signing]: sign first, so a failure leaves every file as it was
+            sig = {"signature": _gitops.sign_approvals([(t["id"], _tasks.brief_digest(t)) for t in todo]).name}
         trailers, stamp = [], f"{approver()} {_tasks.today()}"
         for t in todo:
             digest = _tasks.brief_digest(t)
@@ -236,14 +248,15 @@ def stamp_approved(todo):
             epic = _tasks.is_epic(t)  # an epic's brief: proposed -> open
             if t["status"] == "proposed":
                 t["status"] = "open" if epic else "ready"
-            t["approved"] = f"{stamp} sha256:{digest[:8]}" if shared else stamp
+            t["approved"] = f"{stamp} sha256:{digest[:8]}" if signed else stamp
             _tasks.dump(t, _tasks.EPIC_KEYS if epic else _tasks.TASK_KEYS)
         if shared:
             _gitops.sign_state("approve", trailers, [t["_path"] for t in todo if t["id"] not in two])
-        apr = _gitops.approvals() if shared else None
+        apr = _gitops.approvals() if signed else None
         for t in todo:
             if t["id"] not in two:
-                _history.record("approved", t, by=approver(), tier=t.get("tier") or None, **approved_touches_field(t))
+                _history.record("approved", t, by=approver(), tier=t.get("tier") or None, **approved_touches_field(t),
+                                **sig)  # [signing]: the <state>/approvals/ file that signs it
                 continue
             # the files change after the signed commit, from what it verifies as: committed
             # unsigned as the lock is released, like sync's restamp, since they grant nothing
@@ -266,7 +279,7 @@ def stamp_approved(todo):
             if old == "ready" and t["status"] == "proposed":
                 _history.record("status", t, by=approver(), **{"from": old, "to": t["status"]})
     waiting = []
-    if shared:  # e.g. a key user.signingkey didn't name, so approve_ready couldn't check it
+    if signed:  # e.g. a key user.signingkey didn't name, so approve_ready couldn't check it
         for t in todo:
             why = apr.problem(t)
             if t["id"] in two and why:
@@ -2478,7 +2491,7 @@ def commit_msg_reason(msg, tasks, epics=None):
     bad = []
     apr = None
     for tid in cited_tasks(msg):
-        if apr is None and _config.SHARED:
+        if apr is None and _config.signed():
             apr = _gitops.approvals()
         t = tasks.get(tid)
         if not t:

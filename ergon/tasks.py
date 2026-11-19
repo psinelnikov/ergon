@@ -415,18 +415,19 @@ def prove_off(t):
 
 # ---------- is an epic approved? ----------
 # An epic is filed `proposed`; a human's `approve E-NNN` stamps `approved:` and opens it.
-# In shared mode an open epic counts as approved only if a signed approval of its brief verifies,
-# as a task's does, stamp or no stamp: an open epic with no stamp (from before epics were
-# approved, or pushed by a clone without the guard) is refused until a human runs `approve
-# E-NNN` on it (T-124). A done epic is checked only if stamped: nothing is broken down or opened
-# from one. In local mode a stamp can't be verified, so an epic past proposed counts as approved
+# In shared mode, and in local mode with [signing] (T-210), an open epic counts as approved only
+# if a signed approval of its brief verifies, as a task's does, stamp or no stamp: an open epic
+# with no stamp (from before epics were approved, or pushed by a clone without the guard) is
+# refused until a human runs `approve E-NNN` on it (T-124). A done epic is checked only if
+# stamped: nothing is broken down or opened from one. In local mode without [signing] a stamp
+# can't be verified, so an epic past proposed counts as approved
 # with or without one, which keeps old unstamped epics working; there the guard is what stops an
 # agent opening one (`new epic` writes proposed, `set` won't move an epic out of proposed, and the
 # guard refuses an agent's status edit or a new EPIC.md that isn't proposed).
 
 def epic_problem(e, apr=None):
     """Why tasks of epic e mustn't be offered or started (its brief isn't approved), or None.
-    apr: gitops.approvals() in shared mode. None for no epic (a task without one)."""
+    apr: gitops.approvals() in shared mode or with [signing]. None for no epic (a task without one)."""
     if not e:
         return None
     eid, status = e["id"], e.get("status")
@@ -435,7 +436,7 @@ def epic_problem(e, apr=None):
     if status == "dropped":
         return f"epic {eid} is dropped"
     if not apr:
-        return None  # local mode: nothing to verify a stamp against
+        return None  # local mode without [signing]: nothing to verify a stamp against
     if status != "open" and not e.get("approved"):
         return None  # a done epic from before epics were approved
     why = apr.problem(e)
@@ -578,8 +579,9 @@ def two_person(t):
 #   3. its touches: is non-empty and no entry falls under a [[protect]] rule, whatever min_tier;
 #   4. its depth, the length of its source: chain of auto-approved tasks back to a human-approved
 #      root, is at most follow_up_depth (a follow-up of a human-approved task is depth 1; 0: off);
-#   5. local mode: in shared mode an approval is a signed commit, and a parent's signature can't
-#      vouch for a task that didn't exist when it was signed;
+#   5. approvals aren't signed (neither shared mode nor [signing]): a signed approval covers one
+#      task's digest, and a parent's signature can't vouch for a task that didn't exist when it
+#      was signed;
 #   6. its Done when section isn't empty: nothing to work or review against otherwise.
 # The guard refuses an agent's edit to category: or touches: of an auto-approved task, so a
 # follow-up can't be relabelled or widened after it was approved.
@@ -597,6 +599,8 @@ def auto_problem(t):
     """Why t, as filed, can't be approved by inheritance (conditions 1, 2, 3, 5 and 6), or None."""
     if _config.SHARED:
         return "shared mode: approvals must be signed by an approver"
+    if _config.SIGNING:
+        return "[signing]: approvals must be signed by an approver"
     cat = str(t.get("category") or "").strip()
     if cat not in AUTO_CATEGORIES:
         return f"category {cat or '(empty)'} is a feature: a human approves it"
@@ -739,7 +743,7 @@ def nxt(args):
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
     ok = [t for t in tasks.values() if t["status"] == "ready" and deps_done(t, tasks)
           and (not args.tier or t["tier"] == args.tier)]
-    apr = _gitops.approvals()  # shared mode: only tasks whose signed approval verifies
+    apr = _gitops.approvals()  # shared mode or [signing]: only tasks whose signed approval verifies
     hidden = [t for t in ok if apr and apr.problem(t)]
     ok = [t for t in ok if t not in hidden]
     waiting = [t for t in ok if epic_problem(epic_of(t, epics), apr)]  # its epic's brief isn't approved
@@ -1342,7 +1346,7 @@ def lint(warns=None):
     """(errors, summary). Warnings that don't fail the check go into `warns`, a list, when given
     (the stop hook passes none: its stdout is JSON)."""
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
-    apr = _gitops.approvals()  # None outside shared mode
+    apr = _gitops.approvals()  # None in local mode without [signing]
     errs = []
     for p in _config.EPICS.glob("*.md"):
         errs.append(f"{p.name}: an epic belongs in its own folder; run `ergon tidy`")
@@ -1374,7 +1378,7 @@ def lint(warns=None):
             errs.append(f"{where}: category {t.get('category')!r} not in {CATEGORIES}")
         if t.get("status") not in TASK_STATUSES:
             errs.append(f"{where}: status {t.get('status')!r} not in {TASK_STATUSES}")
-        # shared mode: an open task's approval must verify (a signed commit from an approver
+        # shared mode or [signing]: an open task's approval must verify (a signed commit from an approver
         # approving its current brief); the approved: stamp is only a copy
         why = apr.problem(t) if apr and t.get("status") in _gitops.GATED else None
         if why:
@@ -1436,7 +1440,7 @@ def lint(warns=None):
     for e in epics.values():
         if e.get("status") not in EPIC_STATUSES:
             errs.append(f"{e['id']}: status {e.get('status')!r} not in {EPIC_STATUSES}")
-        # shared mode: an open epic needs a signed approval of its current brief, stamp or no
+        # shared mode or [signing]: an open epic needs a signed approval of its current brief, stamp or no
         # stamp (epic_problem). Local mode has nothing to verify, so an unstamped one passes.
         why = apr.problem(e) if apr and e.get("status") == "open" else None
         if why:

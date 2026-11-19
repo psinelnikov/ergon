@@ -148,9 +148,28 @@ How it works:
 
 **Old epics (the exemption, local mode only).** An epic from before epics were approved has no `approved:` stamp. In shared mode an open epic counts as approved only if a signed approval of its current brief verifies, stamp or no stamp (T-124). So an open epic with no stamp is refused, whether it is from before epics were approved or was pushed by a clone without the guard: `next` offers none of its tasks, dispatch neither starts them nor breaks it down, the commit-msg hook refuses commits citing them, and `check` reports `E-NNN: open, but its approval doesn't verify: no signed approval …`. A human runs `ergon approve E-NNN` on it. That approves its brief again, as for a stamp that doesn't verify, and writes a signed stamp; naming the epic once more approves its proposed tasks. Before upgrading a shared project, approve its old open epics that way, or their tasks wait until someone does. A done epic is checked only if it has a stamp, since nothing is opened or broken down from one. `restamp` (run by `sync`) leaves epic stamps alone: what verifies decides, so a stamp is only the copy `approve` wrote.
 
-In local mode nothing can verify a stamp, so the exemption stays there: an open or done epic with no stamp counts as approved, `check` doesn't report it, and `ergon approve E-NNN` on it approves its proposed tasks. What protects local mode is that nothing new becomes unstamped and open: `new epic` writes `proposed`, `set` won't move an epic out of `proposed`, and the guard refuses an agent's new or open epic brief.
+In local mode without `[signing]` (below) nothing can verify a stamp, so the exemption stays there: an open or done epic with no stamp counts as approved, `check` doesn't report it, and `ergon approve E-NNN` on it approves its proposed tasks. What protects local mode is that nothing new becomes unstamped and open: `new epic` writes `proposed`, `set` won't move an epic out of `proposed`, and the guard refuses an agent's new or open epic brief.
 
-In local mode, nothing changes. Recording the digest in local stamps too, to catch edits to approved briefs, would be cheap and useful. It is listed as an open question, not part of this design.
+In local mode, nothing changes unless the project opts in to `[signing]`.
+
+### Signed approvals in local mode (`[signing]`, T-210)
+
+Local mode had the same gap with less around it: an approval is `status: ready` plus a stamp in a gitignored file, and the only things between an agent and a forged one are the CLI's agent-shell check and the guard, which runs in Claude Code only. Codex, Cursor or a guard bypass could write one, and nothing downstream could tell.
+
+```toml
+[signing]
+approvers = ".ergon/approvers"   # the default
+```
+
+Options considered: a local-only state branch (shared mode with no remote), which would reuse `sign_state` and the commit-based `Approvals` unchanged but turn `<state>/` into a worktree; recording the digest in local stamps unsigned, which catches an edited brief but not a forged stamp; and **detached signatures, chosen**:
+
+1. **Signing.** `approve` (and `a` in `review -i`) signs one message with `ssh-keygen -Y sign -n ergon` and the key `user.signingkey` names: a line `<ID> sha256:<digest>` per task or epic brief it approves, the same value as shared mode's `Ergon-Approve` trailer. One approval is one signature, so a key that needs a touch needs one touch however many tasks it approves. The message and its `.sig` go to `<state>/approvals/<time>-<pid>.txt`, which ignores itself (`<state>/approvals/.gitignore`). Before writing anything, `approve` checks that the signature verifies; if it can't sign, or the key isn't listed, it refuses and nothing changes. The stamp names the digest, as in shared mode.
+2. **Approvers.** The same `allowed_signers` format, read from the trunk as committed in this repo (`refs/heads/<trunk>`), never from the working tree. Lines may say `namespaces="ergon"` or nothing; a `namespaces="git"` line (shared mode's) doesn't verify an approval. With `[signing]` the file is a gate file, so dispatch refuses a branch that changes it unless the task's approved `touches:` names it; projects should also `[[protect]]` it with `min_tier = "human"`.
+3. **Verification.** `gitops.LocalApprovals` has the interface shared mode's `Approvals` has, so `next`, `check`, dispatch, the commit-msg hook, `epic_problem` and `approve`'s "approve again" all apply the same rules: a task in `ready`, `doing`, `review` or `blocked`, and an open epic, count as approved only if a file's signature verifies (`ssh-keygen -Y find-principals`, then `-Y verify` in the `ergon` namespace) against the approvers file and the file approves the brief's current digest. The messages are shared mode's: `no signed approval`, `brief changed after approval`, `approval not signed by an approver`. A file is verified the first time a task it names is asked about, once per command.
+4. **What stays as in shared mode.** No approval by inheritance: a bugfix, refactor or chore follow-up stays `proposed`. Open epics without a verifying approval are refused, stamp or no stamp. The two-person rule still needs `[shared]`, and `[signing]` with `[shared]` is an error, since shared mode always signs.
+5. **Fails closed.** No `ssh-keygen`, no approvers file on the trunk, a garbled or unlisted signature: nothing verifies.
+6. **What it doesn't stop.** As in shared mode, an agent that can use the key. The docs say to use one that needs a touch or a confirmation. And locally the trunk is only as safe as what can commit to it: an agent that commits its own key to the trunk in an interactive session, or points `trunk` in the working tree's config at a branch it made, gets that read. Both leave commits behind; a dispatched branch is stopped by the gate-file check, an uncommitted edit by reading the trunk. Deleting files in `<state>/approvals/` only un-approves. The `approved` history row names the file that signs each approval (`signature`).
+7. **Turning it on and off.** Existing stamps have no signature behind them, so `check` reports every open task and epic until a human approves them again. Once the trunk's committed `.ergon.toml` has `[signing]`, that table is the one read: deleting it or repointing `approvers` in the working tree changes nothing, so turning it off takes a commit to the trunk, like changing the approvers file. Then the old stamps count as before.
 
 ### Two-person rule (optional)
 
@@ -189,7 +208,8 @@ tiers = ["opus"]                 # and/or touches = [...]; both given means both
 
 ## Open questions
 
-- Should local mode also record and check the brief digest? It would catch edits to approved briefs today, at the cost of stamps changing format.
+- ~~Should local mode also record and check the brief digest?~~ Answered by `[signing]` (T-210): opt-in, signed, verified like shared mode's approvals. Without it local stamps are as before.
+- Should `accept`, `reject`, `close`, `answer` and `pin` be signed in local mode too? `[signing]` signs approvals only (choosing is covered, since the `Chosen:` line is in the digest).
 - Should accepting a two-person task require someone other than the dispatching person?
 - Should `sync` run automatically after every mutating human command, or stay explicit? This design keeps it explicit, plus the human-only commands and dispatch, which sync themselves.
 - Task branches held for `review` stay local. Letting others accept would mean pushing code.
