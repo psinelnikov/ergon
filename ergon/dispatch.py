@@ -315,7 +315,9 @@ def release_breakdown(eid, mine, push=False):
 # worktree and branch kept. Only a human's `ergon answer` moves it on: it writes the answer to
 # Notes, swaps `asking:` for `answered: <session>` and sets the task ready. The next dispatch
 # clears `answered:` at launch and resumes that session with the answer (a fresh worker with the
-# questions and answer in its prompt when resume_choice() says the cache is gone).
+# questions and answer in its prompt when resume_choice() says the cache is gone). A question
+# asked in a conflict round keeps that round's context on its `question` row (conflict_context()),
+# so the answered run's merge gets the round's checks (conflict_checks()) before the task goes on.
 
 ASKING_MARK = "dispatch: asking:"
 ACCEPT_CONFLICT_MARK = "the next dispatch resolves it, and it returns to review for your accept"
@@ -387,10 +389,30 @@ Carry on with the task on {branch} in {wt}, and commit there citing {id}. End as
 """
 
 
-def answer_lines(t):
-    """Retry-prompt lines for a fresh worker on a task whose question a human answered."""
+ANSWER_CONFLICT = (" You asked in conflict round {n}: when you finish, the dispatcher checks your merge as that "
+                   "round said (a clean worktree, a merge commit with the base's tip as a parent, no conflict "
+                   "markers left, a branch that merges cleanly), and a miss blocks the task.")
+
+
+def answer_lines(t, conflict=None):
+    """Retry-prompt lines for a fresh worker on a task whose question a human answered; with the
+    question's conflict context (asked_conflict()), the conflict round's instructions too."""
     return (f"An earlier attempt on this branch stopped to ask a human, who answered:\n\n{qa_text(t)}\n\n"
-            f"{ANSWER_NOTE}\n")
+            f"{ANSWER_NOTE}\n" + (conflict_round_lines(conflict) if conflict else ""))
+
+
+def conflict_round_lines(conflict):
+    return ("The round it stopped in: the branch conflicts with its base, which moved since the work "
+            f"started.\n\n{conflict.get('body') or ''}\n")
+
+
+def asked_conflict(t):
+    """The conflict context (conflict_context()) of t's last question, if a conflict round asked
+    it, else None."""
+    row = next((r for r in reversed(_history.read()) if r.get("event") == "question" and r.get("task") == t["id"]),
+               None)
+    ctx = (row or {}).get("conflict")
+    return ctx if isinstance(ctx, dict) and ctx.get("found") else None
 
 
 def park(t, info, wt, branch, pubs):
@@ -407,7 +429,8 @@ def park(t, info, wt, branch, pubs):
         add_note(cur, question_note(q, opts), who="question")
     _tasks.dump(cur, _tasks.TASK_KEYS)
     _history.record("question", t, questions=[{"text": q, "options": o} for q, o in qs],
-                    session=info.get("session"), log=info.get("log"), tier=t["tier"])
+                    session=info.get("session"), log=info.get("log"), tier=t["tier"],
+                    **({"conflict": info["conflict"]} if info.get("conflict") else {}))
 
 
 # ---------- the usage limit ----------
@@ -2366,6 +2389,31 @@ def conflict_checks(found, branch):
     return None
 
 
+def conflict_context(found, n, body, conflicts):
+    """What a question asked in conflict round n keeps for the answered run (the `question` row's
+    `conflict`): the round, its instructions, the rounds so far, and per conflicted repo what
+    conflict_checks() needs."""
+    return {"round": n, "body": body, "conflicts": list(conflicts or []),
+            "found": [{"companion": s["c"]["name"] if s["c"] else None, "base": s["base"], "tip": s["tip"],
+                       "files": s["files"], "reason": s["reason"]} for s in found]}
+
+
+def conflict_refound(ctx, wt, pubs):
+    """conflict_checks()'s `found`, rebuilt from a conflict context on this dispatch's worktrees.
+    Raises GitError when a companion it names has no worktree here."""
+    comps = {c["name"]: (c, pub) for c, pub in pubs}
+    out = []
+    for s in ctx.get("found") or []:
+        name = s.get("companion")
+        if name and name not in comps:
+            raise _gitops.GitError(f"conflict round {ctx.get('round')} was merging into {name}, "
+                                   "which this dispatch has no worktree of")
+        c, tree = comps[name] if name else (None, wt)
+        out.append({"c": c, "base": s["base"], "repo": c["path"] if c else None, "tree": tree,
+                    "files": s.get("files") or [], "tip": s["tip"], "reason": s.get("reason") or ""})
+    return out
+
+
 def conflict_note(last, earlier, stop=""):
     """A block reason after conflict rounds: the last conflict, why no round followed it, then
     each earlier round's conflict (as rounds_note does for fix rounds)."""
@@ -3240,6 +3288,8 @@ def dispatch(args):
             return v, w
         if v != "done":
             info["rounds"] = f" (conflict round {n}, after: {what})"
+            if v == "asking":  # the answered run's merge gets this round's checks (T-110)
+                info["conflict"] = conflict_context(found, n, body, info["conflicts"])
             return v, w
         try:
             failed = conflict_checks(found, branch)
@@ -3361,8 +3411,36 @@ def dispatch(args):
                     session=info.get("session") or session)
         return v, w, info, up
 
+    def answered_conflict(t, wt, branch, pubs, info, conflict, verdict, why):
+        """The run a human's answer resumed, on a question a conflict round asked (`conflict`, from
+        asked_conflict()): its merge gets that round's checks before the task goes on, as
+        conflict_round() does. Returns (verdict, reason)."""
+        n = conflict.get("round")
+        what = "; ".join(s.get("reason") or "" for s in conflict["found"])
+        info["conflicts"] = list(conflict.get("conflicts") or [])  # the rounds already run count
+        info.update(step=f"conflict {n}", kind="conflict", fixing=conflict.get("body"))
+        if verdict == "asking":  # asked again: the next answer's run gets the checks too
+            info["conflict"] = conflict
+        if verdict != "done":
+            if verdict != "limited":
+                info["rounds"] = f" (conflict round {n}, after: {what})"
+            return verdict, why
+        try:
+            found = conflict_refound(conflict, wt, pubs)
+            failed = conflict_checks(found, branch)
+        except _gitops.GitError as err:
+            failed = str(err)
+        if failed:
+            info["asked"] = False
+            return "blocked", f"{failed} (conflict round {n}, after: {what}). {kept_note(wt, branch, pubs)}"
+        info["fixed"] = "; ".join(x for x in (info.get("fixed"), resolved_note(found)) if x)
+        print(f"  conflict {t['id']}  round {n}, after the answer: merged; checking again", flush=True)
+        return "done", ""
+
     def one(t, base, wt, branch, pubs, answered=None, lim=None):
         up = first = why1 = None
+        # a question asked in a conflict round (T-110): its context, for the answered run's checks
+        conflict = asked_conflict(t) if answered and lim is None else None
         if lim is None and not answered and _config.CONFLICT_ROUNDS and ACCEPT_CONFLICT_MARK in _report.last_note(t):
             # `accept` found the branch conflicting with its base (T-097): no fresh attempt at the task,
             # straight to the conflict round on the existing branch. The earlier acceptance is not carried over.
@@ -3383,20 +3461,22 @@ def dispatch(args):
             if resume:
                 _history.record("resumed", t, session=answered, tier=t["tier"], after="answer")
                 print(f"  answer   {t['id']}  resumed {answered}", flush=True)
-                prompt = ANSWER_PROMPT.format(id=t["id"], qa=qa_text(t), note=ANSWER_NOTE, branch=branch, wt=wt)
+                note = ANSWER_NOTE + (ANSWER_CONFLICT.format(n=conflict.get("round")) if conflict else "")
+                prompt = ANSWER_PROMPT.format(id=t["id"], qa=qa_text(t), note=note, branch=branch, wt=wt)
                 verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings,
                                                 prompt=prompt, resume=answered)
             else:
                 print(f"  answer   {t['id']}  fresh session ({fresh_because})", flush=True)
                 verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings,
-                                                lines=answer_lines(t))
+                                                lines=answer_lines(t, conflict))
             info["resumed"], info["fresh_because"] = resume, fresh_because
         else:
             verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings)
         if args.until_done and not skip_gate:
             with live_lock:
                 live[t["id"]] = info.get("cost", 0)
-            verdict, why = until_done(t, base, wt, branch, pubs, verdict, why, info, tier=up)
+            verdict, why = until_done(t, base, wt, branch, pubs, verdict, why, info, tier=up,
+                                      extra=conflict_round_lines(conflict) if conflict else "")
         if (args.escalate and not up and verdict == "blocked" and info.get("asked")
                 and t["tier"] in _config.WORKER_TIERS[:-1]):
             # the worker itself reported blocked: retry once a tier up on the same branch
@@ -3410,6 +3490,8 @@ def dispatch(args):
             info2["found"] = (info.get("found") or []) + (info2.get("found") or [])
             info2["policy"] = (info.get("policy") or []) + (info2.get("policy") or [])
             verdict, info = v2, info2
+        if conflict:
+            verdict, why = answered_conflict(t, wt, branch, pubs, info, conflict, verdict, why)
         with live_lock:
             live[t["id"]] = info.get("cost", 0)
         tier = up or t["tier"]

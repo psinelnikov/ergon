@@ -33,7 +33,9 @@ $FAKE_SHARED (and $FAKE_PUB_SHARED in the companion) too, so two tasks conflict,
 $FAKE_SLEEP_<TIER> first. Handed a conflict round, it merges each base named and keeps both sides
 of each conflicted file, then ends $FAKE_CONFLICT_RESULT (default RESULT: done); $FAKE_CONFLICT
 = markers commits the markers, nomerge aborts the merge and commits something else, and still
-lands a conflicting commit on the main checkout's trunk after merging. With $FAKE_WEAKEN =
+lands a conflicting commit on the main checkout's trunk after merging. With $FAKE_CONFLICT_ASK
+(QUESTION lines) a conflict round asks before merging, and the answered worker does the merge
+(main, in its own worktree, if the prompt names no base). With $FAKE_WEAKEN =
 "<path>|<line>" its first run appends that line to that file too; with $FAKE_UNWEAKEN a fix round
 the weakening check asked for puts the file back as main has it. $FAKE_EDIT_TOUCHES rewrites its
 own task file's touches: in the main checkout to that list. $FAKE_WRITE = "<path>|<text>" has its
@@ -138,9 +140,13 @@ if os.environ.get("FAKE_STOPS"):  # nth worker call: nojson (what a timeout leav
     if kind == "noresult":
         print(json.dumps({"result": "I ran out of steam", "session_id": "s-1", "total_cost_usd": 0.01})); sys.exit()
 tid = re.search(r"(?:dispatched|work|asked) on (T-\d+)", prompt).group(1)
-if "conflicts with its base" in prompt:
+if "conflicts with its base" in prompt or (os.environ.get("FAKE_CONFLICT_ASK") and "answered" in prompt):
+    if os.environ.get("FAKE_CONFLICT_ASK") and "answered" not in prompt:  # ask before merging anything
+        print(json.dumps({"result": "which side?\n" + os.environ["FAKE_CONFLICT_ASK"] + "\nRESULT: asking",
+                          "session_id": "s-1", "total_cost_usd": 0.01}))
+        sys.exit()
     mode = os.environ.get("FAKE_CONFLICT", "resolve")
-    for tree, base in re.findall(r"`git -C (\S+) log --oneline \S+?\.\.(\S+)`", prompt):
+    for tree, base in (re.findall(r"`git -C (\S+) log --oneline \S+?\.\.(\S+)`", prompt) or [(".", "main")]):
         own = os.path.realpath(tree) == os.path.realpath(os.getcwd())
         msg = f"Merge {base} ({tid})" if own else f"Merge {base}"
         r = subprocess.run(["git", "-C", tree, "merge", "--no-edit", base], capture_output=True, text=True)
@@ -3258,6 +3264,50 @@ class TestConflictRounds(DispatchProject):
                     self.assertIn("the two sides contradict (conflict round 1, after: conflicts with main", text)
                     self.assertIn("depends: [T-003]", text)  # the worker's own block files a human task
 
+    def test_merge_after_an_answered_conflict_question_is_checked(self):
+        # T-110: the conflict round asks; once answered, the worker's merge gets the conflict-round
+        # checks, even though a merge that leaves markers in merges cleanly.
+        for mode, age in (("markers", "0"), ("markers", "4000"), ("resolve", "0")):
+            with self.subTest(mode=mode, age=age):
+                self.setUp()
+                self.tasks()
+                # an old transcript (age 4000) makes the answered run a fresh worker
+                self.env.update(FAKE_CONFLICT_ASK="QUESTION: keep whose wording?", FAKE_TRANSCRIPT_AGE=age)
+                out = self.ergon("dispatch", "--jobs", "2").stdout
+                self.assertEqual(self.status("T-002"), "blocked", out)
+                self.assertRegex(self.task_file("T-002").read_text(), r"(?m)^asking: s-1$")
+                q = self.rows("question")[0]
+                self.assertEqual(q["conflict"]["round"], 1)
+                self.assertEqual([(s["base"], s["files"], s["companion"]) for s in q["conflict"]["found"]],
+                                 [("main", ["shared.txt"], None)])
+                r = self.ergon("answer", "T-002", "keep both", inp="y\n", check=False,
+                               env=dict(self.env, ERGON_ASK_STDIN="1"))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.env["FAKE_CONFLICT"] = mode
+                time.sleep(1.1)  # run logs are named to the second
+                out = self.ergon("dispatch").stdout
+                calls = self.calls()
+                self.assertEqual(len(calls), 3)
+                if age == "0":
+                    self.assertEqual(calls[2]["resume"], "s-1")
+                    self.assertIn("A human answered the question(s) you asked on T-002", calls[2]["prompt"])
+                    self.assertIn("conflict round 1", calls[2]["prompt"])
+                else:
+                    self.assertIsNone(calls[2]["resume"])
+                    self.assertIn("stopped to ask a human, who answered", calls[2]["prompt"])
+                    self.assertIn("task/T-002 conflicts with main", calls[2]["prompt"])  # the round's instructions
+                if mode == "markers":
+                    self.assertEqual(self.status("T-002"), "blocked", out)
+                    self.assertIn("conflict markers left in shared.txt on task/T-002 (conflict round 1, after: "
+                                  "conflicts with main in shared.txt). Branch task/T-002 and worktree", self.notes())
+                    self.kept()
+                    self.assertEqual((self.root / "shared.txt").read_text(), "T-001\n")  # nothing landed
+                    self.assertEqual(self.rows("blocked")[0]["asked"], False)
+                else:
+                    self.assertEqual(self.status("T-002"), "done", out)
+                    self.assertEqual((self.root / "shared.txt").read_text(), "T-002\nT-001\n")
+                    self.assertIn("resolved a conflict with main in shared.txt", self.notes())
+
     def test_zero_rounds_blocks_as_before(self):
         self.add_config("conflict_rounds = 0")
         self.tasks()
@@ -5448,6 +5498,7 @@ class TestAsking(DispatchProject):
         self.assertEqual(q["questions"], [{"text": "Which store should it use?", "options": ["sqlite", "json"]},
                                           {"text": "Keep the old flag?", "options": []}])
         self.assertEqual(q["session"], "s-1")
+        self.assertNotIn("conflict", q)  # not asked in a conflict round: no conflict context (T-110)
         self.assertIn("worker_end", events(self.root, "T-001"))
         self.assertNotIn("blocked", events(self.root, "T-001"))
         review = self.ergon("review").stdout
@@ -5494,6 +5545,7 @@ class TestAsking(DispatchProject):
         self.assertIn("Q1: Which store should it use? (options: sqlite | json)\nQ2: Keep the old flag?\n"
                       "Answer: Q1: sqlite. Q2: keep it for now.", resumed)
         self.assertIn("re-plan", resumed)
+        self.assertNotIn("conflict", resumed)  # resumed as before: no conflict-round checks (T-110)
         self.assertNotIn("The task file", resumed)  # the resumed session has it already
         self.assertEqual((self.root / "T-001.txt").read_text(), "work\nwork\n")  # both runs' commits landed
         self.assertNotIn("answered:", self.text())
@@ -5564,6 +5616,7 @@ class TestAsking(DispatchProject):
         self.assertIn("stopped to ask a human, who answered:\n\nQ1: Which store should it use? (options: sqlite | json)", fresh)
         self.assertIn("Answer: use json", fresh)
         self.assertIn("An earlier attempt left commits", fresh)
+        self.assertNotIn("conflicts with its base", fresh)  # no conflict round's instructions (T-110)
         self.assertNotIn("resumed", events(self.root, "T-001"))
 
     def test_declined_or_empty_answer_writes_nothing(self):
