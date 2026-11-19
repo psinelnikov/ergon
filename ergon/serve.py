@@ -56,6 +56,7 @@ from pathlib import Path
 
 from . import concepts as _concepts
 from . import config as _config
+from . import dispatch as _dispatch
 from . import gitops as _gitops
 from . import history as _history
 from . import limits as _limits
@@ -334,10 +335,8 @@ def newest_session(wt, since_ts):
 # ---------- the data ----------
 
 def asks(tasks):
-    """Open human tasks a worker filed when it blocked: what workers wait on a human to answer."""
-    return sorted((t for t in tasks.values() if t.get("tier") == "human"
-                   and t["status"] not in ("done", "dropped") and TASK_ID.fullmatch(str(t.get("source") or ""))),
-                  key=lambda t: t["id"])
+    """Tasks parked on a worker's question, waiting for a human's reply: what the CLI review lists."""
+    return sorted((t for t in tasks.values() if _tasks.is_asking(t)), key=lambda t: t["id"])
 
 
 def counts(tasks):
@@ -579,8 +578,10 @@ def board_page(nonce):
     asked = asks(tasks)
     if asked:
         b.append(f'<h2 id=answer>Awaiting answer ({len(asked)})</h2><ul class=tasks>')
-        b.extend(task_li(t, tasks, f' <span class=flags>asked by {link_ids(esc(t["source"]), tasks)}</span>')
-                 for t in asked)
+        for t in asked:
+            qs = "".join(f"<br>Q{n} {esc(q)}" + (f' <span class=muted>[{esc(" | ".join(o))}]</span>' if o else "")
+                         for n, (q, o) in enumerate(_dispatch.asked(t)[0], 1))
+            b.append(task_li(t, tasks, f"<span class=flags>{qs}</span>" if qs else ""))
         b.append("</ul>")
     if epics:
         b.append('<h2>Epics</h2><div class=table><table><thead><tr><th>epic</th><th>status</th><th>progress</th>'

@@ -131,12 +131,13 @@ class TestServe(ServeFixture):
         code, headers, page = self.req("GET", "/")
         self.assertEqual(code, 200)
         self.assertTrue(headers["Content-Type"].startswith("text/html"))
-        for section in ("PROPOSED (2)", "DOING (1)", "REVIEW (1)", "Awaiting answer (1)"):
+        for section in ("PROPOSED (2)", "DOING (1)", "REVIEW (1)"):
             self.assertIn(section, page)
+        self.assertNotIn("Awaiting answer", page)  # T-005 is a human task, not a worker's question
         self.assertNotIn("DONE (", page)  # open work only, as `ergon` prints it
         self.assertIn('<b id="count-approval">2</b>', page)
         self.assertIn('<b id="count-acceptance">1</b>', page)
-        self.assertIn('<b id="count-answer">1</b>', page)
+        self.assertIn('<b id="count-answer">0</b>', page)
         self.assertIn("1/5", page)  # E-001's progress
         self.assertIn('href="/t/T-002"', page)
         # PROPOSED lists haiku before human, as `ergon` sorts by tier
@@ -159,12 +160,26 @@ class TestServe(ServeFixture):
         self.assertIn("<span class=park>asking</span>", self.req("GET", "/t/T-003")[2])
         self.assertNotIn("class=park", self.req("GET", "/t/T-001")[2])
 
+    def test_awaiting_answer_lists_asking_tasks_only(self):
+        f = self.task_file("T-003")
+        f.write_text(re.sub(r"^status: \w+$", "status: blocked\nasking: sess-1", f.read_text(), flags=re.M).rstrip()
+                     + "\n- 2026-11-08 dispatch: asking: 1 question(s) below\n"
+                     "- 2026-11-08 question: Which <b>store</b>? [options: sqlite | json]\n")
+        page = self.req("GET", "/")[2]
+        self.assertIn("Awaiting answer (1)", page)
+        self.assertIn('<b id="count-answer">1</b>', page)
+        sec = page[page.index("Awaiting answer"):]
+        self.assertIn('href="/t/T-003"', sec)
+        self.assertNotIn("T-005", sec)  # the ready human task stays under READY only
+        self.assertIn("Which &lt;b&gt;store&lt;/b&gt;?", sec)
+        self.assertEqual(json.loads(self.req("GET", "/live.json")[2])["counts"]["answer"], 1)
+
     def test_live_json(self):
         code, headers, body = self.req("GET", "/live.json")
         self.assertEqual(code, 200)
         self.assertEqual(headers["Content-Type"], "application/json")
         d = json.loads(body)
-        self.assertEqual(d["counts"], {"approval": 2, "acceptance": 1, "answer": 1})
+        self.assertEqual(d["counts"], {"approval": 2, "acceptance": 1, "answer": 0})
         [doing] = d["doing"]
         self.assertEqual(doing["id"], "T-002")
         self.assertEqual(doing["round"], 2)
