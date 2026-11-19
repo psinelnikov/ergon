@@ -105,6 +105,8 @@ A task's `concepts:` lists component ids. `ergon tag [ID|E-ID ...] [--all] [--mo
 
 `/t/T-NNN` in `ergon serve` shows the same lists. `ergon check` fails a map that doesn't hold (a missing file, an unknown concern, a duplicate id, an `introduced_by` naming a missing task) and only warns on a missing depend, on tags the map lacks and on a dropped `introduced_by`. A missing depend is a lead, not a rule: add the depend if the task really needs that work first. By default scheduling ignores the map and dispatch holds tasks apart by shared `touches:` only; `hold_by = "component"` makes it want a shared component too (Dispatch, "Overlap").
 
+Function-level touches: an entry may name one function as `<path>/::<fn>` (e.g. `ergon/gates.py/::guard_reason`; one entry per function). The `/` before `::` is on purpose: every file-level rule (`[[protect]]`, `[[accept]]`, `[[evidence]]`, `[[two_person]]`, approval by inheritance) matches a touches entry by its `/`-separated leading parts, so the entry still falls under a rule naming `ergon/gates.py`; plain `ergon/gates.py::guard_reason` would not, so `check` fails it and `set` and dispatch refuse it. A function counts only when the concept map lists it (some component's `fns` has it and one of that component's `files` patterns matches the path); otherwise the entry is refused. Two tasks touching different functions of a file don't overlap; the same function, or a file-level touch of the file, does.
+
 Without a `concepts` key, `tag` and `related` say so and nothing else changes.
 
 ## Lifecycle

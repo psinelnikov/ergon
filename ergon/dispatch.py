@@ -3091,7 +3091,7 @@ TASK: <title: what changes, one line>
 tier: <haiku | sonnet | opus | human>
 tier_why: <one line: why that tier>
 category: <feature | bugfix | refactor | chore; empty reads as feature>
-touches: <comma-separated paths or names it changes; may be empty>
+touches: <comma-separated paths or names it changes; may be empty; a function the concept map lists can be named as <path>/::<fn>>
 depends: <comma-separated numbers of earlier blocks in this reply, or existing T-NNN IDs; may be empty>
 ## What
 <the change, citing file:line>
