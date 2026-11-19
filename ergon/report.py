@@ -29,14 +29,14 @@ from . import tasks as _tasks
 RUN_LOG = re.compile(r"^(?P<id>[A-Z]+-\d+)-(?P<date>\d{4})(?P<m>\d{2})(?P<d>\d{2})-\d{6}(?:-\w+)?\.json$")
 
 
-BREAKDOWN_LOG = re.compile(r"^(?P<id>E-\d+)-(?P<date>\d{4})(?P<m>\d{2})(?P<d>\d{2})-\d{6}\.json$")
+BREAKDOWN_LOG = re.compile(r"^(?P<id>E-\d+)-(?P<date>\d{4})(?P<m>\d{2})(?P<d>\d{2})-\d{6}(?:-\w+)?\.json$")
 
 
-def _breakdown_totals(runs_dir, since, until, epic):
-    """{runs, cost} of the breakdown logs in <runs_dir>/breakdown/ (E-NNN-<time>.json), in range;
-    with epic, only that epic's. Never raises on a bad log."""
+def _breakdown_totals(runs_dir, since, until, epic, sub="breakdown"):
+    """{runs, cost} of the epic logs in <runs_dir>/<sub>/ (E-NNN-<time>.json; sub is "breakdown" or
+    "resolve", an epic resolver's), in range; with epic, only that epic's. Never raises on a bad log."""
     out = {"runs": 0, "cost": 0.0}
-    for log in sorted((Path(runs_dir) / "breakdown").glob("*.json")):
+    for log in sorted((Path(runs_dir) / sub).glob("*.json")):
         m = BREAKDOWN_LOG.match(log.name)
         if not m or (epic and m["id"] != epic):
             continue
@@ -113,6 +113,7 @@ def aggregate_stats(runs_dir, tasks, since=None, epic=None, until=None):
         if verdict == "blocked":
             per_task[t["id"]] = per_task.get(t["id"], 0) + 1
     return {"tiers": tiers, "skipped": skipped, "breakdown": _breakdown_totals(runs_dir, since, until, epic),
+            "resolve": _breakdown_totals(runs_dir, since, until, epic, "resolve"),
             "repeat": {k: v for k, v in sorted(per_task.items()) if v > 1}}
 
 
@@ -130,11 +131,15 @@ def stats(args):
         print(f"{tier:<8}{row['runs']:>5}{row['done']:>6}{row['blocked']:>8}{100 * row['blocked'] / n:>7.0f}%"
               f"{'$%.2f' % row['cost']:>10}{'$%.2f' % (row['cost'] / n):>9}{row['timeouts']:>9}"
               + (f"{_limits.pct(row['cost'], per):>8}{_limits.pct(row['cost'] / n, per):>9}" if per is not None else ""))
-    if not r["tiers"] and not r["breakdown"]["runs"]:
+    if not r["tiers"] and not r["breakdown"]["runs"] and not r["resolve"]["runs"]:
         print("(no runs)")
     if r["breakdown"]["runs"]:
         b = r["breakdown"]
         print(f"\nepic breakdowns: {b['runs']} run{'s' if b['runs'] != 1 else ''}, ${b['cost']:.2f}"
+              + " (not in the tier rows above)")
+    if r["resolve"]["runs"]:
+        b = r["resolve"]
+        print(f"\nepic resolvers: {b['runs']} run{'s' if b['runs'] != 1 else ''}, ${b['cost']:.2f}"
               + " (not in the tier rows above)")
     if per is not None and r["tiers"]:
         print(f"\n5h%: share of the 5-hour limit at {per:.1f}% per $, measured by dispatch over its last "
