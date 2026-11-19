@@ -96,6 +96,8 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                or Ctrl-C (stop launching, let workers finish; a second kills them)
                                A reviewer's fail (`review` in .ergon.toml) goes back to the worker
                                and is reviewed again, up to review_rounds times, then blocks.
+                               A branch that conflicts with its base goes back to its worker to merge
+                               the base in, up to conflict_rounds times, then blocks for a hand merge.
                                A finished branch whose base moved but merges cleanly gets the base
                                merged in by dispatch (no worker) and its gates run again on the
                                merge before it lands; red goes back to the worker as a verify fix
@@ -530,6 +532,8 @@ def main():
     once.add_argument("--join", action="store_true", help="make <state>/ a worktree of the remote's state branch")
     d = sub.add_parser("dispatch", description=(
         "Run ready tasks headless, one worktree and task/<ID> branch each, and land each finished branch. "
+        "A branch that conflicts with its base goes back to its worker to merge the base in, up to "
+        "conflict_rounds times, then blocks for a hand merge. "
         "A finished branch whose base moved but merges cleanly gets the base merged in and its gates rerun "
         "(up to remerge_rounds passes). A run's finished tasks that land on a common branch merge and land "
         "one at a time, those with more passes first, and waiting for another uses up no pass (within one run). "

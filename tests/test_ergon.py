@@ -356,6 +356,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(mini, tomllib.loads(text))
 
 
+class TestDispatchHelp(Project):
+    def test_help_mentions_conflict_rounds(self):
+        self.assertIn("conflict_rounds", self.ergon("dispatch", "--help").stdout)
+
+
 class TestProtect(Project):
     config = """
         [[protect]]
