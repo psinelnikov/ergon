@@ -1302,6 +1302,15 @@ GIT_COMMAND_KEYS = re.compile(
     r"|tar\..+\.command|trailer\..+\.(command|cmd)|hook\..+\.command"
     r"|sendemail\.(.+\.)?(smtpserver|sendmailcmd|tocmd|cccmd|headercmd)|imap\.tunnel"
     r"|(browser|man)\..+\.cmd|guitool\..+\.cmd|instaweb\.httpd")
+# The environment variables whose value git runs as a command (git(1), git-var(1)): its editor and
+# pager, falling back to VISUAL/EDITOR and PAGER; ssh, askpass and proxy programs; an external diff.
+# The askpass and ssh programs are run as a path, not shell text, but are read as commands anyway.
+# less, git's default pager, runs LESSOPEN / LESSCLOSE (a leading `|`, `||` or `-` is a mode flag).
+GIT_COMMAND_ENV = {"GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "VISUAL", "EDITOR", "GIT_PAGER", "PAGER",
+                   "GIT_SSH_COMMAND", "GIT_SSH", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_PROXY_COMMAND",
+                   "GIT_EXTERNAL_DIFF", "LESSOPEN", "LESSCLOSE"}
+# Programs whose NAME=value arguments set a variable a later command inherits.
+SHELL_DECLARE = {"export", "declare", "typeset", "local", "readonly"}
 # Per git subcommand, the options whose value git runs as a command ("cmd"; "cmd=" when the value
 # must be attached, as for an optional one) or sets as config ("config", key=value): long options as
 # "<shortest abbreviation>|<rest>", then short letters, then the other short letters that take a value
@@ -1482,6 +1491,28 @@ def git_commands(words):
     return out
 
 
+def env_commands(cmds):
+    """The command lines git runs from the GIT_COMMAND_ENV variables a list of shell commands sets,
+    in order: `GIT_PAGER=x git log`, `sudo GIT_EDITOR=x git commit` (an assignment ahead of a git
+    call), a lone `PAGER=x` or `export PAGER=x` a later git call inherits. `NAME+=x` appends to the
+    value set earlier in the text. An assignment-shaped word after git, or as another program's
+    argument (echo, a commit message), is data."""
+    vals, out = {}, []
+    for words, _ in cmds:
+        git_at = next((k for k, w in enumerate(words) if _program(w) == "git" or _program(w).startswith("git-")),
+                      -1)
+        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        declares = head < len(words) and _program(words[head]) in SHELL_DECLARE
+        for k, w in enumerate(words):
+            m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)", w, re.S)
+            if not m or m.group(1) not in GIT_COMMAND_ENV or not (k < head or declares or k < git_at):
+                continue
+            name, append, val = m.groups()
+            vals[name] = (vals.get(name, "") if append else "") + val
+            out.append(vals[name].lstrip("|-") if name.startswith("LESS") else vals[name])
+    return out
+
+
 def human_cmd(cmd):
     """Whether a shell command runs a human-only ergon command: approve, reject, close, accept,
     answer, sync, pin, choose, or the interactive review. Only a real call counts: `ergon` (ergon.py, the package's
@@ -1490,11 +1521,14 @@ def human_cmd(cmd):
     verbs inside a quoted grep pattern or commit message are data and pass. Strings given to a
     program that runs them as code are checked as text, as is anything that can't be split. The
     commands git runs from its own arguments (git_commands: rebase --exec, submodule foreach, an
-    alias or a command-valued config key it sets) are checked as commands."""
+    alias or a command-valued config key it sets) are checked as commands, as are the ones it runs
+    from the environment a command line sets for it (env_commands: GIT_PAGER=..., GIT_EDITOR=...)."""
     try:
         cmds = shell_commands(cmd)[0]
     except (ValueError, RecursionError):
         return bool(HUMAN_CMD.search(cmd))
+    if any(human_cmd(t) for t in env_commands(cmds)):
+        return True
     for words, docs in cmds:
         if any(CODE_RUNNER.fullmatch(_program(w)) for w in words):
             if any(HUMAN_CMD.search(t) or (t != cmd and human_cmd(t)) for t in words + [d for d, _ in docs]):
