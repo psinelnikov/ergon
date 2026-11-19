@@ -876,15 +876,22 @@ def init_warnings():
 
 
 def policies_hint():
-    """A one-line hint when the policies file is unset or inside <state>/, where shared mode
-    tracks nothing of it: policies are inlined into every worker's prompt, so they belong on the
-    trunk, under code review (like the approvers file)."""
+    """Hints for trunk files that shared mode would leave on this machine or lose. Policies,
+    unset or inside <state>/, are tracked nothing of there: they are inlined into every worker's
+    prompt, so they belong on the trunk, under code review (like the approvers file). Any other
+    trunk file (worker_rules, retired, log, map) configured under <state>/ sits inside the state
+    worktree, which task worktrees don't see."""
+    state = _config.STATE.resolve()
     pol = _config.POLICIES.resolve()
-    if _config.CFG.get("policies") and not pol.is_relative_to(_config.STATE.resolve()):
-        return
-    print('hint: policies stay on this machine in shared mode (not on the state branch). Set '
-          'policies = ".ergon/policies.md" (or any trunk path) in .ergon.toml and commit the file '
-          'through your normal review flow.')
+    if not (_config.CFG.get("policies") and not pol.is_relative_to(state)):
+        print('hint: policies stay on this machine in shared mode (not on the state branch). Set '
+              'policies = ".ergon/policies.md" (or any trunk path) in .ergon.toml and commit the file '
+              'through your normal review flow.')
+    for key in ("worker_rules", "retired", "log", "map"):
+        val = _config.CFG.get(key)
+        if val and (_config.HOME / val).resolve().is_relative_to(state):
+            print(f'hint: {key} = "{val}" is inside {_config.STATE.name}/, the state branch worktree in '
+                  f'shared mode. Use a trunk path such as ".ergon/{Path(val).name}" instead.')
 
 
 def exclude_state():

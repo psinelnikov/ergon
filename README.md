@@ -89,12 +89,12 @@ state = "tasks"                    # <state>/items, <state>/epics, <state>/runs 
 worktrees = ".claude/worktrees"    # <worktrees>/E-NNN per epic, <worktrees>/T-NNN per dispatched task
 map = "map"                        # cards whose "→ task T-NNN" links `check` keeps honest
 log = "TODO.md"                    # the log that `source: TODO.md:<line>` cites (audit checks the line)
-retired = "tasks/audit-retired.txt"  # `term | gate | note` rows: nouns that make a task stale
-worker_rules = "tasks/WORKER.md"   # inlined into every dispatched prompt; `ergon rules` prints it
+retired = ".ergon/audit-retired.txt" # `term | gate | note` rows: nouns that make a task stale
+worker_rules = ".ergon/WORKER.md"  # inlined into every dispatched prompt; `ergon rules` prints it
 verify = "make test"               # run in the task worktree before landing; non-zero exit blocks (a task's `verify:` field overrides)
 verify_rounds = 2                   # a red verify goes back to the worker this many times first; 0 blocks at once
 review = ["haiku", "sonnet"]       # worker tiers whose branches a reviewer one tier up must pass before landing
-policies = "tasks/policies.md"      # settled review findings, human-written in the interactive review (p); inlined into worker and reviewer prompts
+policies = ".ergon/policies.md"     # settled review findings, human-written in the interactive review (p); inlined into worker and reviewer prompts
 review_rounds = 2                  # a review fail goes back to the worker, then review again, this many times; then the task blocks (0: at once)
 conflict_rounds = 1                # a branch that conflicts with its base goes back to its worker this many times; then it blocks for a hand merge (0: at once)
                                    #   the worker merges the base in its worktree, resolves only the conflicted hunks so both sides' intent

@@ -390,6 +390,23 @@ class TestWhoSyncs(Shared):
         r = self.ergon(c, "sync", "--join")
         self.assertNotIn(hint, r.stdout)
 
+    def test_init_and_join_hint_about_trunk_files_under_state(self):
+        def cfg(v):
+            return SHARED_CONFIG.replace("[shared]", f'worker_rules = "{v}"\n\n[shared]').format(remote=self.remote)
+        (self.a / ".ergon.toml").write_text(cfg("tasks/WORKER.md"))
+        self.ergon(self.a, "new", "task", "One", "--tier", "haiku")
+        r = self.ergon(self.a, "sync", "--init", inp="y\n")
+        self.assertIn('worker_rules = "tasks/WORKER.md"', r.stdout)
+        self.assertIn(".ergon/WORKER.md", r.stdout)
+        (self.b / ".ergon.toml").write_text(cfg("tasks/WORKER.md"))
+        r = self.ergon(self.b, "sync", "--join")
+        self.assertIn(".ergon/WORKER.md", r.stdout)
+        c = Path(self.tmp.name) / "c"
+        sh("git", "clone", "-q", str(self.a), str(c), cwd=self.a)
+        (c / ".ergon.toml").write_text(cfg(".ergon/WORKER.md"))
+        r = self.ergon(c, "sync", "--join")
+        self.assertNotIn("worker_rules", r.stdout)
+
     def test_join_refuses_local_tasks_and_init_refuses_twice(self):
         self.start()
         r = self.ergon(self.a, "sync", "--init", check=False, inp="y\n")

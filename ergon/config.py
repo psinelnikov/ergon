@@ -39,11 +39,11 @@ state = "tasks"                 # task files: <state>/items, <state>/epics, disp
 worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # map = "map"                   # cards whose "-> task T-NNN" links `check` keeps honest
 # log = "TODO.md"               # the log a task's `source: TODO.md:<line>` cites
-# retired = "tasks/audit-retired.txt"   # `term | gate | note` rows for `audit`
-# worker_rules = "tasks/WORKER.md"      # inlined into every dispatched worker's prompt
+# retired = ".ergon/audit-retired.txt"  # `term | gate | note` rows for `audit`
+# worker_rules = ".ergon/WORKER.md"     # inlined into every dispatched worker's prompt
 # concepts = "concepts.toml"    # concept map: [[concern]]s and [[component]]s that `ergon tag` tags tasks
 #                               # with and `ergon related` links them by (skills/ergon/SKILL.md)
-# policies = "tasks/policies.md"        # settled review findings (human-written; inlined into worker and reviewer prompts)
+# policies = ".ergon/policies.md"       # settled review findings (human-written; inlined into worker and reviewer prompts)
 # verify = "make test"          # run in the task worktree before landing; non-zero exit blocks the task
 #                               # (a task's `verify:` frontmatter overrides it)
 # verify_rounds = 2             # on a red verify, resume the worker with the output and verify again, up to
