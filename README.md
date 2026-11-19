@@ -144,7 +144,14 @@ branch = "ergon-state"       # orphan branch holding items/ and epics/
 1. One person runs `ergon sync --init`. It warns if the remote is the trunk's own remote or can be read without logging in, shows how many files it will publish and asks before pushing. Then commit `[shared]` to the trunk.
 2. Everyone else pulls and runs `ergon sync --join`. It needs an `<state>/` with no task files (it refuses otherwise: move them out, join, and file them again with `ergon new`).
 3. Each approver sets up SSH commit signing in their clone (git 2.34+): `git config gpg.format ssh` and `git config user.signingkey ~/.ssh/id_ed25519.pub`. Use a key that needs a touch or a confirmation (a hardware key, `ssh-add -c`, an agent that prompts). A key sitting unlocked in an `ssh-agent` lets an agent in your shell sign for you, and then the signature proves nothing.
-4. Add `.ergon/approvers` to the trunk: a git `allowed_signers` file, one line per approver (`you@example.com namespaces="git" ssh-ed25519 AAAA…`). Ergon reads it from the remote's trunk, never from your working tree, so a change to it has to be merged upstream first. Protect it with a rule so no task below `human` can touch it:
+4. Add `.ergon/approvers` to the trunk: a git `allowed_signers` file, one line per approver (`you@example.com namespaces="git" ssh-ed25519 AAAA…`). A person with two keys puts each key on its own line with the same principal (the first field); lines with the same principal count as one approver:
+
+   ```
+   you@example.com namespaces="git" ssh-ed25519 AAAA…
+   you@example.com namespaces="git" ssh-ed25519 AAAB…
+   ```
+
+   Ergon reads it from the remote's trunk, never from your working tree, so a change to it has to be merged upstream first. Protect it with a rule so no task below `human` can touch it:
 
    ```toml
    [[protect]]
