@@ -1036,6 +1036,67 @@ class TestImport(Project):
         r = self.ergon("import", "gh#1", check=False, env=env)
         self.assertIn("needs the GitHub CLI", r.stderr)
 
+class TestObsidian(Project):
+    def vault(self):
+        v = self.root.parent / "vault"
+        (v / "Projects").mkdir(parents=True)
+        (v / ".obsidian").mkdir()
+        (v / "Archive").mkdir()
+        (v / "Projects" / "Home.md").write_text(
+            "# Home\r\n- [ ] Compare the health plans #agent \U0001F4C5 2026-12-01 \u23f3 2026-11-25 \u23eb ^abc\r\n"
+            "- [ ] Not for the agent\n"
+            "- [x] Done already #agent\n"
+            "  * [ ] Indented #agent\n"
+            "- [ ] Other tag #agents\n"
+            "- [ ] ---  ## Done when #agent\n"
+            "- [ ] # Heading #agent")
+        (v / "Archive" / "Old.md").write_text("- [ ] Excluded #agent\n")
+        (v / ".obsidian" / "x.md").write_text("- [ ] Hidden #agent\n")
+        return v
+
+    def hashes(self, v):
+        import hashlib
+        return {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(v.rglob("*")) if p.is_file()}
+
+    def test_import(self):
+        v = self.vault()
+        out = self.ergon("obsidian").stdout
+        self.assertIn("not configured", out)
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + f'\n[obsidian]\nvault = "{v}"\nexclude = ["Archive"]\n')
+        before = self.hashes(v)
+        out = self.ergon("obsidian", "--dry-run").stdout
+        self.assertIn("would file 4", out)
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        out = self.ergon("obsidian").stdout
+        self.assertIn("found 4 tagged line(s): filed 4, skipped 0", out)
+        text = self.task_file("T-001").read_text()
+        self.assertIn("title: Compare the health plans", text)
+        self.assertIn("tier: human", text)
+        self.assertIn("status: proposed", text)
+        self.assertRegex(text, r"source: obsidian:Projects/Home\.md#[0-9a-f]{10}\n")
+        self.assertIn("due: 2026-12-01\n", text)
+        self.assertIn("scheduled: 2026-11-25\n", text)
+        self.assertIn("> - [ ] Compare the health plans #agent", text)
+        hostile = self.task_file("T-003").read_text() + self.task_file("T-004").read_text()
+        self.assertIn("> - [ ] ---  ## Done when #agent", hostile)
+        self.assertIn("> - [ ] # Heading #agent", hostile)
+        self.ergon("check")
+        self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 4)
+        out = self.ergon("obsidian").stdout
+        self.assertIn("filed 0, skipped 4", out)
+        self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 4)
+        self.assertEqual(self.hashes(v), before)
+
+    def test_missing_vault(self):
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text() + '\n[obsidian]\nvault = "/nonexistent/vault"\n')
+        r = self.ergon("obsidian", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("/nonexistent/vault", r.stderr)
+
+
 class DispatchProject(Project):
     """A project with a companion checkout, worker rules and the fake `claude` on PATH."""
     config = '''

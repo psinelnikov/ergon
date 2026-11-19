@@ -168,6 +168,26 @@ branch = "ergon-state"       # orphan branch holding items/ and epics/
 
 Epic branches are code and still move through your normal git flow, so `set`'s check that an epic's status changes only from its branch can only see local branches.
 
+## Working with Obsidian
+
+`ergon obsidian [--dry-run]` turns tagged checkbox lines in an Obsidian vault into `proposed` tasks. It reads the vault and never writes to it. It needs no plugin and no Obsidian running.
+
+```toml
+[obsidian]
+vault = "~/Notes"        # a path, ~ expanded, may be outside the repo; it must exist
+tag = "agent"            # default
+exclude = ["Archive"]    # fnmatch patterns of vault folders to skip; dot-folders (.obsidian, .trash) are always skipped
+write_back = false       # default; acted on from T-156. With true, lines are still imported with hash keys, and a warning says so
+```
+
+Without the table, `ergon obsidian` says it isn't configured and does nothing.
+
+**The line format** is the Tasks plugin's: an unticked checkbox (`- [ ]` or `* [ ]`, any indent) carrying the tag as a whole tag, such as `- [ ] Compare the health plans #agent 📅 2026-12-01`. Ticked lines, untagged lines and `#agents` don't match. Each new line becomes a task with `tier: human` and `source: obsidian:<note path>#<key>`. The title is the line without the checkbox, the tag, a trailing `^block-id` and the plugin's emoji fields (📅 ⏳ 🛫 ➕ ✅ 🔁 ⏫ 🔼 🔽 and their values), cut to 70 characters. What quotes the line and names the note, and the 📅 and ⏳ dates go into Notes as `due:` and `scheduled:` lines. Vault text is untrusted, like an issue body: a task is never approved by import, and you rewrite it as a brief before approving. The command prints how many lines it found, filed and skipped as already imported. `--dry-run` prints what it would file and files nothing.
+
+**The key** is `sha256(note path + line text)[:10]`. Editing an imported line's text (or moving it to another note) changes the key, so the link to its task is lost while `write_back` is off, and the edited line imports again as a new task. Edit the task in ergon instead, or leave the line alone.
+
+**A view of the tasks in Obsidian.** Symlink `tasks/` into the vault (`ln -s /path/to/repo/tasks ~/Notes/ergon-tasks`) and query it with a Bases view: task files keep their state in YAML frontmatter, including block-style lists. `ergon obsidian` doesn't follow symlinked folders, so it never scans the linked task files.
+
 ## Importing issues
 
 ```bash

@@ -72,6 +72,14 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 #                               # don't count toward --max, they do count toward --budget-total); past it
 #                               # they stay ready for the next run
 
+# Take tasks from an Obsidian vault: `ergon obsidian` files each unticked checkbox line carrying #tag as a
+# proposed task (tier human). Reads the vault only; write_back is acted on from T-156.
+# [obsidian]
+# vault = "~/Notes"             # a path, ~ expanded; must exist
+# tag = "agent"                 # lines tagged #agent
+# exclude = ["Archive"]         # fnmatch patterns of vault folders to skip (dot-folders always are)
+# write_back = false
+
 # Layered gates, cheapest first: static (lint, types, import boundaries), then runtime (tests); the
 # first red stops the rest. `verify` above is an alias for runtime; a task's `verify:` overrides runtime only.
 # Before both, the weakening check: a branch whose diff changes a gate file (protect, fnmatch; a

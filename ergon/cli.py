@@ -24,6 +24,10 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                `gh` CLI: title, quoted body as What, source: gh#123. Tier is
                                human until you size it. When its epic merges, ergon prints (never
                                runs) the `gh issue comment/close` commands
+  ergon obsidian [--dry-run]   unticked checkbox lines tagged #<tag> in the vault named by [obsidian]
+                               in .ergon.toml (vault, tag, exclude, write_back) as proposed tasks,
+                               tier human, source: obsidian:<note>#<key>. Reads the vault, never
+                               writes it; a line already imported is skipped; --dry-run files nothing
   ergon set ID status=doing    agents: ready -> doing -> done | blocked (never approval)
   ergon start E-ID             branch epic/<folder> off the trunk and check it out in its own
                                worktree, <worktrees>/E-ID (also happens on an epic's first `doing`)
@@ -190,6 +194,7 @@ from . import gitops as _gitops
 from . import grade as _grade
 from . import history as _history
 from . import learn as _learn
+from . import obsidian as _obsidian
 from . import report as _report
 from . import serve as _serve
 from . import shared as _shared
@@ -395,6 +400,8 @@ def main():
     im.add_argument("--category", help="feature, bugfix, refactor or chore")
     im.add_argument("--epic")
     im.add_argument("--touches")
+    ob = sub.add_parser("obsidian", help="tagged unticked checkbox lines of an Obsidian vault as proposed tasks")
+    ob.add_argument("--dry-run", action="store_true", help="print what would be filed; file nothing")
     st = sub.add_parser("set")
     st.add_argument("id")
     st.add_argument("pairs", nargs="+", metavar="key=value")
@@ -552,7 +559,7 @@ def run(args):
         # (and tag) around their writes only, not the minutes claude takes to answer
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "breakdown": _dispatch.breakdown, "rules": rules,
-         "import": _tasks.import_issue, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "learn": _learn.learn, "journal": journal, "sync": _shared.sync}[args.cmd](args)
+         "import": _tasks.import_issue, "obsidian": _obsidian.obsidian, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "learn": _learn.learn, "journal": journal, "sync": _shared.sync}[args.cmd](args)
 
 
 if __name__ == "__main__":
