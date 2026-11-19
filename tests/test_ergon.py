@@ -6884,6 +6884,9 @@ class TestLearn(Project):
                                                    "log": None, "base": "x", "tip": "y", "tier": "sonnet"}))
         (d / f"{iid}.patch").write_text(f"+++ b/{iid}.py\n+try:\n+    parse()\n+except:\n+    pass\n")
 
+    def human(self):
+        return dict(self.env, ERGON_ASK_STDIN="1")
+
     def reply(self, *classes):
         return dict(self.env, LEARN_REPLY=json.dumps({"classes": list(classes)}))
 
@@ -6956,6 +6959,49 @@ class TestLearn(Project):
         self.assertEqual(sorted(p.name[:5] for p in (self.root / "tasks").rglob("T-*.md")),
                          ["T-001", "T-002", "T-003", "T-004"])  # nothing new filed
         self.ergon("check")
+
+    def test_class_options_become_the_options_section_and_approval_waits_on_a_choice(self):
+        opts = ["a ruff rule E722", "  an AST test   that flags bare except ", "a grep in the static gate"]
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=opts + ["x"] * 3)))
+        from ergon.tasks import options
+        t = self.fields("T-004")
+        self.assertEqual(options(t), (opts[:1] + ["an AST test that flags bare except", opts[2]] + ["x"], None))
+        self.assertNotIn("No options were offered", t["_body"])
+        r = self.ergon("approve", "T-004", inp="y\n", check=False, env=self.human())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("has options and no choice", r.stderr)
+        r = self.ergon("choose", "T-004", "2", inp="y\n", check=False, env=self.human())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.ergon("approve", "T-004", inp="y\n", check=False, env=self.human())
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_class_options_are_capped_at_four_and_a_class_with_fewer_than_two_gets_a_note(self):
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=["1", "2", "3", "4", "5", " "])))
+        self.assertEqual(len(__import__("ergon").tasks.options(self.fields("T-004"))[0]), 4)
+        for extra in ({}, {"options": []}, {"options": ["only one"]}, {"options": "nope"}):
+            with self.subTest(extra=extra):
+                for f in (self.root / "tasks").rglob("T-004-*.md"):
+                    f.unlink()
+                for r in (self.runs / "learn").glob("*.json"):
+                    r.unlink()
+                self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, **extra)))
+                t = self.fields("T-004")
+                self.assertNotIn("## Options", t["_body"])
+                self.assertIn("No options were offered", t["_body"])
+                self.ergon("approve", "T-004", inp="y\n", env=self.human())
+
+    def test_a_class_joining_an_open_task_leaves_its_options_alone(self):
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=["one", "two"])))
+        self.ergon("choose", "T-004", "1", inp="y\n", env=self.human())
+        before = self.task_file("T-004").read_text()
+        self.incident(self.D, "runtime", "test_parse fails: ValueError swallowed")
+        self.ergon("learn", env=self.reply(self.bare_except(self.D, task="T-004", options=["three", "four"])))
+        after = self.task_file("T-004").read_text()
+        self.assertEqual(after.partition("## Options\n")[2].partition("\n## ")[0],
+                         before.partition("## Options\n")[2].partition("\n## ")[0])
+        self.assertIn("Chosen: 1 by", after)
+        self.assertIn("  - three", after.partition("## Notes")[2])
+        self.assertNotIn("3. three", after)
 
     def test_malformed_reply_files_nothing_and_warns(self):
         before = {p.name: p.read_text() for p in (self.root / "tasks").rglob("T-*.md")}
