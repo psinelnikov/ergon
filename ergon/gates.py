@@ -1365,8 +1365,8 @@ def is_policies(path):
                            or Path(path).as_posix().endswith("/" + rel))
 
 
-RUNS_MSG = ("run logs and history.jsonl under the state's runs/ are written by dispatch and the ergon CLI only; "
-            "read them, don't write them: they're dispatch's record of every round and verdict")
+RUNS_WRITER = "run logs and history.jsonl under the state's runs/ are written by dispatch and the ergon CLI only"
+RUNS_MSG = RUNS_WRITER + ("; read them, don't write them: they're dispatch's record of every round and verdict")
 
 
 def is_runs(path):
@@ -1756,11 +1756,14 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
         if SHELL_WRITE.search(cmd) and names_outside_data(cmd, re.compile(re.escape(_config.POLICIES.name))):
             return POLICY_MSG
-        if (SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd)) and names_outside_data(cmd, _config.RUNS_IN_CMD, cwd or str(_config.HOME)):
-            return RUNS_MSG
-        if (SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd)) and names_outside_data(cmd, _config.TASK_DIR_IN_CMD, cwd or str(_config.HOME)):
-            return ("don't write task files from the shell: use `ergon new` / `ergon set` for state, "
-                    "Edit for a task's body")
+        hit = SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd)
+        if hit and names_outside_data(cmd, _config.RUNS_IN_CMD, cwd or str(_config.HOME)):
+            return (f"{RUNS_WRITER}; this command names runs/ and contains `{' '.join(hit.group(0).split())}`, "
+                    "which counts as a possible write, so it's refused. To read them, use cat, jq, grep, "
+                    "head/tail or the Read tool instead, e.g. `jq . <file under runs/>`")
+        if hit and names_outside_data(cmd, _config.TASK_DIR_IN_CMD, cwd or str(_config.HOME)):
+            return (f"don't write task files from the shell: this command contains `{' '.join(hit.group(0).split())}` "
+                    "and names items/ or epics/; use `ergon new` / `ergon set` for state, Edit for a task's body")
         return None
     path = inp.get("file_path", "")
     if is_policies(path):

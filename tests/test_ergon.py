@@ -6315,6 +6315,20 @@ class TestPolicies(TestReview):
             self.assertIsNone(self.guard("Bash", {"command": cmd}, "--worker"), cmd)
         self.assertIsNone(self.guard("Write", {"file_path": str(self.root / "notes/runs.md"), "content": "x"}, "--worker"))
 
+    def test_guard_runs_refusal_names_match_and_how_to_read(self):
+        """A shell read of runs/ that trips the write guard says what matched and what to use instead (T-212)."""
+        (self.root / "tasks" / "runs").mkdir(parents=True, exist_ok=True)
+        cmd = "python3 -c \"print(open('tasks/runs/history.jsonl').read())\""
+        why = self.guard("Bash", {"command": cmd}, "--worker") or ""
+        self.assertIn("runs/", why)
+        self.assertIn("`python3 -c`", why)
+        self.assertRegex(why, r"\bjq\b")
+        self.assertIn("Read tool", why)
+        self.assertIsNone(self.guard("Bash", {"command": "jq . tasks/runs/history.jsonl"}, "--worker"))
+        edit = {"file_path": str(self.root / "tasks/runs/T-001-x-review.log"), "old_string": "a", "new_string": "b"}
+        self.assertIn("written by dispatch and the ergon CLI only; read them, don't write them",
+                      self.guard("Edit", edit, "--worker") or "")
+
     def test_guard_runs_rule_lets_heredoc_data_through(self):
         """A heredoc that only names history.jsonl or runs/ in its text is data, not a write (T-084)."""
         test = "hist = root / 'tasks/runs/history.jsonl'\nassert 'history.jsonl' in out\n"
