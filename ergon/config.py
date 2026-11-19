@@ -58,6 +58,9 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # remerge_rounds = 3            # a finished branch whose base moved (cleanly) gets the base merged in by
 #                               # dispatch, and its gates run again on the merge, this many passes before
 #                               # it blocks saying the base kept moving (0: block when the base moved)
+# overlap = 1                   # how many running tasks may share a touches: path; above 1, tasks that
+#                               # share one run side by side (relies on the merge gates: remerge_rounds).
+#                               # No touches:, a shared gate file or reproduction, or different bases: held
 # review_resume_secs = 3300     # resume the worker's own session only if its last request is younger
 # review_resume_tokens = 80000  # and its context smaller than these; else a fresh worker on the branch
 # journal = true                # when an epic finishes, have claude write its journal entry (one `claude -p`
@@ -249,7 +252,7 @@ def configure(start=None, need_config=True):
     every worktree shares one set of task files. Config paths resolve the same way."""
     global REPO, HOME, CFG, STATE, ITEMS, EPICS, LOCK, RUNS, WORKTREES, AGENTS, MAIN, MAP, LOG, \
         RETIRED_FILE, WORKER_RULES, CONCEPTS, POLICIES, COMPANIONS, TASK_FILE, TASK_DIR_IN_CMD, RUNS_PATH, RUNS_IN_CMD, REVIEW, ACCEPT, EVIDENCE, \
-        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, REMERGE_ROUNDS, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, LEARN, \
+        REVIEW_ROUNDS, VERIFY_ROUNDS, CONFLICT_ROUNDS, REMERGE_ROUNDS, OVERLAP, RESUME_SECS, RESUME_TOKENS, SHARED, TWO_PERSON, JOURNAL, LEARN, \
         FOLLOW_UP_DEPTH, FOLLOW_UPS, GATE_FILES, SUPPRESS, REPROS, TESTS, PROVE_TIERS
     REPO, HOME = git_toplevels(Path(start or os.getcwd()).resolve())
     # This checkout's config wins: it's tracked, so an epic branch that adds or changes it
@@ -331,6 +334,11 @@ def configure(start=None, need_config=True):
     # A finished branch whose base moved cleanly gets it merged in, and its gates rerun on the merge,
     # up to this many passes (T-196); then the task blocks, saying the base kept moving.
     REMERGE_ROUNDS = count("remerge_rounds", 3)
+    # How many running tasks may share a touches: path (T-197). 1: none, as before. Tasks with no
+    # touches:, a shared gate file or reproduction, or different bases are held whatever this is.
+    OVERLAP = count("overlap", 1)
+    if OVERLAP < 1:
+        raise NotConfigured(f"{CONFIG_FILE}: overlap is a whole number, 1 or more")
     RESUME_SECS = count("review_resume_secs", 3300)
     RESUME_TOKENS = count("review_resume_tokens", 80000)
     # How many FOUND follow-ups deep a non-feature follow-up is approved by inheritance (T-136);

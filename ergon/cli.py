@@ -87,6 +87,10 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                merge before it lands; red goes back to the worker as a verify fix
                                round. A base that moved again by then takes another pass, up to
                                remerge_rounds (default 3); then it blocks. accept does the same
+                               `overlap` in .ergon.toml (default 1): how many running tasks may
+                               share a touches: path. Above 1, tasks sharing one run side by side,
+                               relying on those merge gates; no touches:, a shared gate file or
+                               reproduction, or different bases are held whatever it is
                                --until-done N (default 0): a worker that stops short (timeout,
                                error, output that isn't JSON, no RESULT line) runs again on the
                                same branch, up to N more rounds (session resumed, or a fresh

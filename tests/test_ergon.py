@@ -1479,6 +1479,75 @@ class TestDispatch(DispatchProject):
                     self.assertEqual(order[:2], ["doingT-001", "doingT-002"], out)
                     self.assertEqual(held, [])
 
+    def overlap_tasks(self, *touches, overlap=None):
+        if overlap:
+            cfg = self.root / ".ergon.toml"
+            cfg.write_text(f"overlap = {overlap}\n" + cfg.read_text())
+        for i, tt in enumerate(touches, 1):
+            self.ergon("new", "task", f"Job {i}", "--tier", "sonnet", *(["--touches", tt] if tt else []))
+            stamp(self.task_file(f"T-{i:03d}"))
+
+    def test_overlap_unset_holds_as_before(self):
+        self.overlap_tasks("ergon/x.py", "ergon/x.py")
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertIn("held       T-002 behind T-001: both touch ergon/x.py", dry)
+        self.assertNotIn("beside", dry)
+        self.ergon("dispatch", "--jobs", "2")
+        self.assertEqual([r.get("beside") for r in history(self.root) if r["event"] == "dispatched"], [None, None])
+
+    def test_overlap_two_runs_two_and_holds_a_third(self):
+        self.overlap_tasks("ergon/x.py", "ergon/x.py", "ergon/x.py", overlap=2)
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertIn("beside     T-002 with T-001: both touch ergon/x.py (overlap = 2)", dry)
+        self.assertIn("held       T-003 behind T-001", dry)
+        self.env["FAKE_SLEEP"] = "1"
+        out = self.ergon("dispatch", "--jobs", "3").stdout
+        self.assertEqual(self.status("T-003"), "done", out)
+        order = [l.split()[0] + l.split()[1] for l in out.splitlines() if l.split()[:1] in (["doing"], ["done"])]
+        self.assertEqual(order[:2], ["doingT-001", "doingT-002"], out)
+        self.assertLess(order.index("doingT-003"), len(order))
+        self.assertTrue(any(o.startswith("done") for o in order[:order.index("doingT-003")]), out)
+        rows = {r["task"]: r for r in history(self.root) if r["event"] == "dispatched"}
+        self.assertEqual(rows["T-002"]["beside"], ["T-001"])
+        self.assertEqual(rows["T-002"]["beside_touches"], ["ergon/x.py"])
+        self.assertNotIn("beside", rows["T-001"])
+        self.assertTrue([r for r in history(self.root) if r["event"] == "held" and r["task"] == "T-003"])
+
+    def test_overlap_two_still_holds_gate_files_no_touches_and_other_bases(self):
+        for one, two, word in ((".ergon.toml", ".ergon.toml", "gate file"), ("", "a.py", "no touches"),
+                               ("tests/harden/a.patch", "tests/harden", "reproduction")):
+            with self.subTest(word):
+                self.setUp()
+                self.overlap_tasks(one, two, overlap=2)
+                dry = self.ergon("dispatch", "--dry-run").stdout
+                self.assertRegex(dry, rf"held       T-002 behind T-001: .*{word}")
+                self.assertNotIn("beside", dry)
+                self.env["FAKE_SLEEP"] = "1"
+                self.ergon("dispatch", "--jobs", "2")
+                held = [r for r in history(self.root) if r["event"] == "held"]
+                self.assertEqual([r["task"] for r in held], ["T-002"])
+                self.assertIn(word, held[0]["why"])
+        self.setUp()
+        self.ergon("new", "epic", "Big thing")
+        approve_epic(self)
+        self.ergon("new", "task", "In epic", "--tier", "sonnet", "--touches", "x.py", "--epic", "E-001")
+        self.ergon("new", "task", "Loose", "--tier", "sonnet", "--touches", "x.py")
+        for t in ("T-001", "T-002"):
+            stamp(self.task_file(t))
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text("overlap = 2\n" + cfg.read_text())
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertRegex(dry, r"held       T-002 behind T-001: .*different bases")
+
+    def test_check_refuses_a_bad_overlap(self):
+        for bad in ("0", "-1", '"two"', "1.5", "true"):
+            with self.subTest(bad):
+                (self.root / ".ergon.toml").write_text(f"overlap = {bad}\n" + (self.root / ".ergon.toml").read_text())
+                r = self.ergon("check", check=False)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("overlap is a whole number", r.stderr + r.stdout)
+                self.setUp()
+
     def test_companion_name_alone_does_not_hold(self):
         for title in ("One", "Two"):
             self.ergon("new", "task", title, "--tier", "sonnet", "--touches", "acme/public")

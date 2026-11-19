@@ -4238,6 +4238,37 @@ def dispatch(args):
             return " and ".join(who) + (" has" if len(who) == 1 else " have") + " no touches: declared"
         return "both touch " + ", ".join(got)
 
+    def always_held(a, b, got):
+        """Why a and b never run side by side whatever `overlap` is (T-197), else None: one has no
+        touches:, a shared path is a gate file or reproduction, or their bases differ."""
+        if got == [NO_TOUCHES]:
+            return why_shared(a, b)
+        for x in got:
+            px = x.strip("/").split("/")
+            for g in [*_config.GATE_FILES, _config.REPROS]:
+                pg = g.strip("/").split("/")
+                n = min(len(px), len(pg))
+                if px[:n] == pg[:n] or (g in _config.GATE_FILES and gate_file_hit(x)):
+                    return f"{x} is a " + ("gate file" if g in _config.GATE_FILES else "reproduction path")
+        ea, eb = (t.get("epic") if t.get("epic") in epics else None for t in (a, b))
+        if ea != eb:
+            return f"different bases ({ea or _config.MAIN} and {eb or _config.MAIN})"
+        return None
+
+    def beside_check(t, others):
+        """Decide t against the running tasks `others`: (blocker, why, sharing), the blocker being
+        the task t is held behind (None: it may launch), `sharing` the (task, paths) it runs beside."""
+        sharing = [(o, got) for o in others for got in [shared(t, o)] if got]
+        for o, got in sharing:
+            why = always_held(t, o, got)
+            if why:
+                return o, why, sharing
+        if sharing and len(sharing) >= _config.OVERLAP:
+            o, got = sharing[0]
+            return o, (f"{why_shared(t, o)} (overlap = {_config.OVERLAP}"
+                       + (f", {len(sharing)} running" if _config.OVERLAP > 1 else "") + ")"), sharing
+        return None, None, sharing
+
     def also(t):
         return "".join(f" + {c['name']} {c['trunk']}" for c in _config.COMPANIONS if companion_touch(t, c))
 
@@ -4361,11 +4392,16 @@ def dispatch(args):
                      if args.budget else "; no --budget, so no estimate"))
         # Shared touches: whichever lands second (task into epic, or epic into trunk) may conflict,
         # so a task sharing a path with an earlier one is held until that one lands.
+        started = []  # with overlap above 1: the plan's tasks that may run together
         for i, a in enumerate(plan):
-            for b in plan[:i]:
-                if shared(a, b):
-                    print(f"  held       {a['id']} behind {b['id']}: {why_shared(a, b)}")
-                    break
+            blocker, why, sharing = beside_check(a, plan[:i] if _config.OVERLAP == 1 else started)
+            if blocker:
+                print(f"  held       {a['id']} behind {blocker['id']}: "
+                      + (why if _config.OVERLAP > 1 else why_shared(a, blocker)))
+            else:
+                started.append(a)
+                for b, _ in sharing:
+                    print(f"  beside     {a['id']} with {b['id']}: {why_shared(a, b)} (overlap = {_config.OVERLAP})")
         for a in plan:
             for b in (t for t in tasks.values() if t["status"] in ("doing", "review")):
                 if shared(a, b):
@@ -4415,11 +4451,12 @@ def dispatch(args):
                                     continue
                                 if not follow and launched >= args.max:
                                     continue
-                                behind = next((o for o in active.values() if shared(t, o)), None)
+                                behind, why_held, sharing = beside_check(t, active.values())
                                 if behind:  # held: stays eligible, retried when a running task lands
                                     if held_on.get(t["id"]) != behind["id"]:  # once per blocker, not per scan
                                         held_on[t["id"]] = behind["id"]
-                                        _history.record("held", t, behind=behind["id"], touches=shared(t, behind))
+                                        _history.record("held", t, behind=behind["id"], touches=shared(t, behind),
+                                                        why=why_held)
                                     continue
                                 tried.add(t["id"])
                                 # An answered question rides along to the worker; the mark goes with
@@ -4461,7 +4498,10 @@ def dispatch(args):
                                                 companions=[c["name"] for c, _ in pubs],
                                                 **approval_record(t),  # approved_touches, _harden, _suppress_ok
                                                 **({"answered": True} if answered else {}),
-                                                **({"after": "limit", "step": lim[1]} if lim else {}))
+                                                **({"after": "limit", "step": lim[1]} if lim else {}),
+                                                **({"beside": [o["id"] for o, _ in sharing],
+                                                    "beside_touches": sorted({x for _, g in sharing for x in g})}
+                                                   if sharing else {}))
                                 print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
                                       + also(t) + (f"  (after the usage limit: {limit_step_text(lim[1])})" if lim else "")
                                       + f"  {t['title']}"
