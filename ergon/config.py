@@ -43,6 +43,8 @@ worktrees = ".claude/worktrees" # one per started epic and per dispatched task
 # worker_rules = ".ergon/WORKER.md"     # inlined into every dispatched worker's prompt
 # concepts = "concepts.toml"    # concept map: [[concern]]s and [[component]]s that `ergon tag` tags tasks
 #                               # with and `ergon related` links them by (skills/ergon/SKILL.md)
+# hold_by = "touches"           # or "component" (opt-in, T-144): overlapping touches hold only when they also
+#                               # share a component; needs the concepts map above
 # policies = ".ergon/policies.md"       # settled review findings (human-written; inlined into worker and reviewer prompts)
 # verify = "make test"          # run in the task worktree before landing; non-zero exit blocks the task
 #                               # (a task's `verify:` frontmatter overrides it)
