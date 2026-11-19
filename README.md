@@ -101,6 +101,7 @@ conflict_rounds = 1                # a branch that conflicts with its base goes 
                                    #   parent, no <<<<<<< / >>>>>>> lines are left, the worktree is clean and the merge is now clean; then
                                    #   the done checks, verify and review run again. Above 0, an epic whose last task lands into a
                                    #   conflicting trunk gets one resolver too (as `ergon finish E-NNN --resolve`)
+                                   #   On a conflict round the worker (and the epic resolver, and the review after) is also shown the title, What and Done when of each task that landed on the base since the fork, trimmed and capped, so the other side's intent survives the merge
 remerge_rounds = 3                 # a finished branch whose base moved but merges cleanly: dispatch merges the base in itself
                                    #   ("Merge <base> into task/<ID> (<ID>)", no worker) and reruns the done checks, the weakening check
                                    #   and the gates on the merge, so nothing lands that no gate saw; red goes to a verify fix round
