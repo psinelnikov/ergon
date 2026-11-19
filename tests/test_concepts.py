@@ -419,6 +419,43 @@ class TestHoldByComponent(DispatchProject):
                 self.assertEqual(held[0]["touches"], ["shared.py"])
                 self.assertEqual(events(self.root, "T-002")[1:3], ["held", "dispatched"])
 
+    def tag_all(self, specs, overlap=2):
+        """One task per (touches, tags) in specs, all current-tagged and approved, with `overlap`."""
+        (self.root / "concepts.toml").write_text(MAP)
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "map", cwd=self.root)
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(f"overlap = {overlap}\n" + cfg.read_text())
+        for i, (touches, _) in enumerate(specs, 1):
+            self.ergon("new", "task", f"Job {i}", "--tier", "sonnet", "--touches", touches)
+        for i, (_, tags) in enumerate(specs, 1):
+            tid = f"T-{i:03d}"
+            stamp(self.task_file(tid))
+            set_field(self.task_file(tid), "concepts", f"[{tags}]")
+            _config.configure(self.root)
+            digest = T.brief_digest(T.load(_config.ITEMS)[tid])
+            set_field(self.task_file(tid), "tagged", f"2026-01-01 {digest[:12]}")
+
+    def test_overlap_above_one_counts_only_tasks_sharing_a_component(self):
+        # T-002 shares shared.py but no component with T-001: it doesn't count toward overlap = 2,
+        # so T-003 (sharing approval.guard with T-001 only) still starts with both running.
+        # T-004 shares approval.guard with T-001 and T-003: two counted, held despite T-002.
+        self.tag_all([("shared.py", "approval.guard"), ("shared.py", "ui.board"),
+                      ("shared.py", "approval.guard"), ("shared.py", "approval.guard")])
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertIn("beside     T-002 with T-001: both touch shared.py, but they share no component (overlap = 2)", dry)
+        self.assertRegex(dry, r"beside     T-003 with T-001: both touch shared.py; both are about approval.guard")
+        self.assertIn("beside     T-003 with T-002: both touch shared.py, but they share no component", dry)
+        self.assertNotIn("held       T-003", dry)
+        self.assertRegex(dry, r"held       T-004 behind T-\d+: both touch shared.py; both are about approval.guard "
+                              r"\(overlap = 2, 2 running\)")
+
+    def test_overlap_above_one_still_holds_a_shared_gate_file_without_a_shared_component(self):
+        self.tag_all([(".ergon.toml", "approval.guard"), (".ergon.toml", "ui.board")])
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertRegex(dry, r"held       T-002 behind T-001: .*gate file")
+        self.assertNotIn("beside", dry)
+
     def test_a_brief_edited_after_tagging_holds_again(self):
         self.make("approval.guard", "ui.board")
         f = self.task_file("T-002")
