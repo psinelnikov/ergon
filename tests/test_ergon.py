@@ -793,6 +793,31 @@ class TestMapAndAudit(Project):
         self.assertIn("LOG.md has", out)
 
 
+class TestAuditEpicCitations(Project):
+    def test_epic_task_cites_lines_on_the_epic_branch(self):
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg" / "mod.py").write_text("a\nb\n")
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "mod", cwd=self.root)
+        self.ergon("new", "epic", "Big thing")
+        approve_epic(self)
+        branch = next((self.root / "tasks/epics").glob("E-001-*")).name
+        sh("git", "branch", f"epic/{branch}", cwd=self.root)
+        wt = self.root.parent / "epicwt"
+        sh("git", "worktree", "add", "-q", str(wt), f"epic/{branch}", cwd=self.root)
+        (wt / "pkg" / "mod.py").write_text("a\n" * 50)
+        sh("git", "commit", "-qam", "grow", cwd=wt)
+        for epic in ("E-001", None):
+            args = ["new", "task", "Cite", "--tier", "haiku"] + (["--epic", epic] if epic else [])
+            self.ergon(*args)
+        for tid in ("T-001", "T-002"):
+            f = self.task_file(tid)
+            f.write_text(f.read_text().replace("## What", "## What\nSee pkg/mod.py:40."))
+        out = self.ergon("audit").stdout
+        self.assertNotIn("T-001 cites pkg/mod.py", out)
+        self.assertIn("T-002 cites pkg/mod.py:40: file has 3 lines", out)
+
+
 class TestEpicBranch(Project):
     def test_dry_run_estimate_counts_the_epic_resolver(self):
         self.ergon("new", "epic", "Big thing")

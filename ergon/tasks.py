@@ -1103,6 +1103,43 @@ def tracked_files():
     return index
 
 
+class BranchFile:
+    """A file at a branch's tip, read through git; stands in for a Path in the audit."""
+    def __init__(self, branch, rel):
+        self.branch, self.rel = branch, rel
+
+    def _show(self):
+        try:
+            return _gitops.git("show", f"{self.branch}:{self.rel}", raw=True)
+        except _gitops.GitError:
+            return None
+
+    def is_file(self):
+        return self._show() is not None
+
+    def read_text(self, errors="strict"):
+        return self._show() or ""
+
+
+class BranchRoot:
+    def __init__(self, branch):
+        self.branch = branch
+
+    def __truediv__(self, rel):
+        return BranchFile(self.branch, str(rel))
+
+
+def epic_index(index, epic):
+    """`index` with "here" read from the epic's branch tip, or `index` when the epic has no branch."""
+    if not epic:
+        return index
+    branch = _gitops.epic_branch(epic)
+    if not _gitops.branch_exists(branch):
+        return index
+    names = set(_gitops.git("ls-tree", "-r", "--name-only", branch, raw=True).splitlines())
+    return {**index, "here": (BranchRoot(branch), names)}
+
+
 def resolve(path, index):
     """Where a cited path lives: (where, Path) or (None, None). A path that isn't repo-rooted
     (`server/src/main.rs`) matches when exactly one file ends with it."""
@@ -1120,7 +1157,8 @@ def resolve(path, index):
 
 def audit(args):
     tasks, epics = load(_config.ITEMS), load(_config.EPICS)
-    index = tracked_files()
+    base_index = tracked_files()
+    epic_indexes = {}
     open_ = {i: t for i, t in tasks.items() if t["status"] not in ("done", "dropped")
              and (not args.epic or t.get("epic") == args.epic)}
     cited = {}
@@ -1152,6 +1190,10 @@ def audit(args):
             found["cited"].append(f"{i} [{t['status']}] cited by {len(cited[i])} commit(s), e.g. "
                                   f"{cited[i][0][:90]}")
 
+        eid = t.get("epic")
+        if eid not in epic_indexes:
+            epic_indexes[eid] = epic_index(base_index, epics.get(eid))
+        index = epic_indexes[eid]
         uses = set()  # companions whose files the task cites
         touches = [p.strip("/") for p in t.get("touches") or []]
         for p in touches:
