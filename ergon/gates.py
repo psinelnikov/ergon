@@ -1226,59 +1226,146 @@ def _program(word):
 # git's global options that take the next word as their value (git -C dir, git -c key=value).
 GIT_OPT_ARG = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env",
                "--attr-source"}
+# The config keys whose value git runs as a command (from git-config(1) and the commands' own pages),
+# lowercased: section and variable names are case-insensitive. git_config_command reads a value
+# as the command line it becomes; T-060 refuses a definition of one of these whose value it can't see.
+# Paths to a tool's binary (difftool.<tool>.path, ...) name a program, not a command line, so aren't here.
+GIT_COMMAND_KEYS = re.compile(
+    r"alias\..+"                                       # a `!` alias is shell text, any other a git call
+    r"|core\.(editor|pager|sshcommand|fsmonitor|askpass|gitproxy|alternaterefscommand)"
+    r"|sequence\.editor|pager\..+|interactive\.difffilter"
+    r"|diff\.external|diff\..+\.(textconv|command)"
+    r"|(diff|merge)tool\..+\.cmd|merge\..+\.driver"
+    r"|filter\..+\.(clean|smudge|process)"
+    r"|credential\.(.+\.)?helper"                      # run as `git credential-<value>` unless `!` or a path
+    r"|gpg\.program|gpg\..+\.program|gpg\.ssh\.defaultkeycommand"
+    r"|remote\..+\.(uploadpack|receivepack)|uploadpack\.packobjectshook"
+    r"|submodule\..+\.update"                          # only a `!` value is a command
+    r"|tar\..+\.command|trailer\..+\.(command|cmd)|hook\..+\.command"
+    r"|sendemail\.(.+\.)?(smtpserver|sendmailcmd|tocmd|cccmd|headercmd)|imap\.tunnel"
+    r"|(browser|man)\..+\.cmd|guitool\..+\.cmd|instaweb\.httpd")
+# Per git subcommand, the options whose value git runs as a command ("cmd"; "cmd=" when the value
+# must be attached, as for an optional one) or sets as config ("config", key=value): long options as
+# "<shortest abbreviation>|<rest>", then short letters, then the other short letters that take a value
+# (the rest of a cluster is theirs).
+GIT_CMD_OPTS = {
+    "rebase": ({"--ex|ec": "cmd"}, {"x": "cmd"}, "sXCS"),
+    "difftool": ({"--e|xtcmd": "cmd"}, {"x": "cmd"}, "t"),
+    "filter-branch": ({f"--{o}|": "cmd" for o in ("setup", "env-filter", "tree-filter", "index-filter",
+                                                  "parent-filter", "msg-filter", "commit-filter",
+                                                  "tag-name-filter")}, {}, ""),
+    "clone": ({"--u|pload-pack": "cmd", "--c|onfig": "config"}, {"u": "cmd", "c": "config"}, "obj"),
+    "fetch": ({"--u|pload-pack": "cmd"}, {}, "jo"),
+    "pull": ({"--u|pload-pack": "cmd"}, {}, "josX"),
+    "ls-remote": ({"--u|pload-pack": "cmd", "--e|xec": "cmd"}, {"u": "cmd"}, "o"),
+    "fetch-pack": ({"--u|pload-pack": "cmd", "--e|xec": "cmd"}, {}, ""),
+    "push": ({"--r|eceive-pack": "cmd", "--e|xec": "cmd"}, {}, "o"),
+    "send-pack": ({"--r|eceive-pack": "cmd", "--e|xec": "cmd"}, {}, ""),
+    "archive": ({"--e|xec": "cmd"}, {}, "o"),
+    "grep": ({"--o|pen-files-in-pager": "cmd="}, {"O": "cmd="}, "efABCm"),
+    "send-email": ({"--to-c|md": "cmd", "--cc-c|md": "cmd", "--header-c|md": "cmd", "--sendmail-c|md": "cmd",
+                    "--smtp-server|": "cmd"}, {}, ""),
+}
+
+
+def git_config_command(key, val):
+    """The command line git runs from config key = val, or None if it runs none: a `!` alias as shell
+    text and any other as the git call it expands to, a credential helper as `git credential-<val>`
+    unless it's `!` text or an absolute path, a submodule's update only if it's `!` text, and the
+    value itself for the other GIT_COMMAND_KEYS."""
+    k = key.lower()
+    if not GIT_COMMAND_KEYS.fullmatch(k):
+        return None
+    if k.startswith("alias."):
+        return val[1:] if val.startswith("!") else "git " + val
+    if k.startswith("credential."):
+        return val[1:] if val.startswith("!") else val if val.startswith("/") else "git credential-" + val
+    if k.startswith("submodule."):
+        return val[1:] if val.startswith("!") else None
+    return val
+
+
+def _option_values(rest, longs, shorts, valued):
+    """(kind, value) for each option of GIT_CMD_OPTS' kinds in rest, up to `--`: `--opt value`,
+    `--opt=value`, or an abbreviation of it; `-x value`, `-xvalue`, or x late in a cluster."""
+    j = 0
+    while j < len(rest):
+        a, j = rest[j], j + 1
+        if a == "--":
+            break
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            kind = next((kd for o, kd in longs.items()
+                         if name.startswith(o.split("|")[0]) and o.replace("|", "").startswith(name)), None)
+            if kind and eq:
+                yield kind.rstrip("="), val
+            elif kind and not kind.endswith("=") and j < len(rest):
+                yield kind, rest[j]
+                j += 1
+        elif re.match(r"-[^-]", a):  # a cluster of short options: -x cmd, -xcmd, -ix cmd
+            for p, c in enumerate(a[1:], 2):
+                if c in shorts:
+                    kind = shorts[c]
+                    if a[p:]:
+                        yield kind.rstrip("="), a[p:]
+                    elif not kind.endswith("=") and j < len(rest):
+                        yield kind, rest[j]
+                        j += 1
+                    break
+                if c in valued:  # takes the rest of the word as its value
+                    break
 
 
 def git_commands(words):
     """The command lines a git call among words runs from its own arguments, which the lexer saw
-    as data: each value of rebase's --exec / -x, and each alias it defines (`git -c alias.x=...`,
-    `git config alias.x ...`), a `!` alias as shell text and any other as the git call it expands
-    to. A later `git x` names no verb, so an alias is checked where it is defined."""
+    as data: the value of each GIT_CMD_OPTS option (rebase --exec, filter-branch's filters, difftool
+    --extcmd, ...), `submodule foreach`'s command, and each GIT_COMMAND_KEYS value it sets
+    (`git -c key=...`, `git config key ...`, `git clone -c key=...`) as git_config_command reads it.
+    A later `git x` names no verb, so an alias is checked where it is defined."""
     out = []
 
-    def alias(key, val):
-        if key.lower().startswith("alias."):
-            out.append(val[1:] if val.startswith("!") else "git " + val)
+    def config(key, val):
+        if (c := git_config_command(key, val)) is not None:
+            out.append(c)
 
     for k, w in enumerate(words):
-        if _program(w) != "git":
-            continue
-        i = k + 1
-        while i < len(words) and words[i].startswith("-"):
-            if words[i] in GIT_OPT_ARG and i + 1 < len(words):
-                if words[i] == "-c":
-                    key, eq, val = words[i + 1].partition("=")
-                    if eq:
-                        alias(key, val)
+        prog, i = _program(w), k + 1
+        if prog == "git":
+            while i < len(words) and words[i].startswith("-"):
+                if words[i] in GIT_OPT_ARG and i + 1 < len(words):
+                    if words[i] == "-c":
+                        key, eq, val = words[i + 1].partition("=")
+                        if eq:
+                            config(key, val)
+                    i += 1
                 i += 1
-            i += 1
-        sub, rest = (words[i], words[i + 1:]) if i < len(words) else ("", [])
+            sub, rest = (words[i], words[i + 1:]) if i < len(words) else ("", [])
+        elif prog.startswith("git-"):  # a dashed form: $(git --exec-path)/git-filter-branch
+            sub, rest = prog[4:], words[i:]
+        else:
+            continue
         if sub == "config":
             for j, a in enumerate(rest[:-1]):
                 if "=" not in a:
-                    alias(a, rest[j + 1])
-        elif sub == "rebase":
-            j = 0
-            while j < len(rest):
-                a, j = rest[j], j + 1
-                if a == "--":
-                    break
-                if m := re.fullmatch(r"--ex(?:ec?)?(?:=(.*))?", a, re.S):  # --ex and --exe abbreviate --exec
-                    if m.group(1) is not None:
-                        out.append(m.group(1))
-                    elif j < len(rest):
-                        out.append(rest[j])
-                        j += 1
-                elif re.match(r"-[^-]", a):  # a cluster of short options: -x cmd, -xcmd, -ix cmd
-                    for p, c in enumerate(a[1:], 2):
-                        if c == "x":
-                            if a[p:]:
-                                out.append(a[p:])
-                            elif j < len(rest):
-                                out.append(rest[j])
-                                j += 1
-                            break
-                        if c in "sXCS":  # takes the rest of the word as its value
-                            break
+                    config(a, rest[j + 1])
+        elif sub in ("submodule", "submodule--helper"):
+            j = next((m for m, a in enumerate(rest) if not a.startswith("-") or a == "--"), len(rest))
+            if rest[j:j + 1] == ["foreach"]:  # one word is shell text, more are a command and its args
+                args = rest[j + 1:]
+                while args and args[0].startswith("-"):
+                    args, dashdash = args[1:], args[0] == "--"
+                    if dashdash:
+                        break
+                if args:
+                    out.append(args[0] if len(args) == 1 else shlex.join(args))
+        elif sub in GIT_CMD_OPTS:
+            for kind, val in _option_values(rest, *GIT_CMD_OPTS[sub]):
+                if kind == "cmd":
+                    out.append(val)
+                else:
+                    key, eq, v = val.partition("=")
+                    if eq:
+                        config(key, v)
     return out
 
 
@@ -1289,8 +1376,8 @@ def human_cmd(cmd):
     command sits (after &&, inside $(...), behind sudo or xargs, in a heredoc fed to a shell). The
     verbs inside a quoted grep pattern or commit message are data and pass. Strings given to a
     program that runs them as code are checked as text, as is anything that can't be split. The
-    commands git runs from its own arguments (rebase --exec, an alias it defines) are checked as
-    commands."""
+    commands git runs from its own arguments (git_commands: rebase --exec, submodule foreach, an
+    alias or a command-valued config key it sets) are checked as commands."""
     try:
         cmds = shell_commands(cmd)[0]
     except (ValueError, RecursionError):

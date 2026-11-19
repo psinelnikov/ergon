@@ -653,6 +653,59 @@ class TestBasics(Project):
                     "git -c alias.x commit -m 'ergon approve'", "git config --get alias.st", "git rebase -- -x"]:
             self.assertFalse(human_cmd(cmd), cmd)
 
+    def test_guard_human_cmd_git_runs_other_arguments(self):
+        """T-059: git also runs submodule foreach's command, filter-branch's filters, difftool's
+        --extcmd, the commands transport options name, and the value of every command-valued config
+        key (GIT_COMMAND_KEYS) set with -c or git config. A human-only verb in any of them is refused;
+        a harmless command in the same place passes."""
+        from ergon.gates import GIT_COMMAND_KEYS, git_config_command, human_cmd
+        forms = ["git submodule foreach '{c}'", "git submodule foreach --recursive '{c}'",
+                 "git submodule --quiet foreach -q -- '{c}'", "git submodule foreach sh -c '{c}'",
+                 "git -C sub submodule--helper foreach '{c}'"]
+        forms += [f"git filter-branch -f --{o} '{{c}}' -- --all" for o in
+                  ["tree-filter", "index-filter", "msg-filter", "env-filter", "commit-filter", "parent-filter",
+                   "tag-name-filter", "setup"]]
+        forms += ["git filter-branch --tree-filter='{c}' HEAD", "$(git --exec-path)/git-filter-branch --msg-filter '{c}'",
+                  "git difftool -x '{c}'", "git difftool -yx'{c}' HEAD~", "git difftool --extcmd='{c}'",
+                  "git difftool --extcmd '{c}' main", "git difftool --ext '{c}'",
+                  "git clone -u '{c};' . d", "git clone --upload-pack='{c};' . d", "git fetch --upload-pack '{c};' .",
+                  "git ls-remote --exec='{c};' .", "git push --receive-pack='{c};' . HEAD", "git archive --exec='{c};' x",
+                  "git grep -O'{c};' foo", "git grep --open-files-in-pager='{c};' foo",
+                  "git send-email --to-cmd='{c}' x.patch"]
+        for key in ["core.editor", "core.pager", "pager.log", "sequence.editor", "core.sshCommand", "core.fsmonitor",
+                    "core.askPass", "core.gitProxy", "core.alternateRefsCommand", "interactive.diffFilter",
+                    "diff.external", "diff.x.textconv", "Diff.X.Command", "difftool.x.cmd", "mergetool.x.cmd",
+                    "filter.x.clean", "filter.x.smudge", "filter.x.process", "merge.x.driver", "gpg.program",
+                    "gpg.ssh.program", "gpg.x509.program", "gpg.ssh.defaultKeyCommand", "remote.origin.uploadpack",
+                    "remote.origin.receivepack", "uploadpack.packObjectsHook", "tar.tgz.command", "trailer.x.command",
+                    "hook.x.command", "sendemail.sendmailCmd", "sendemail.work.ccCmd", "imap.tunnel",
+                    "man.x.cmd", "browser.x.cmd", "guitool.x.cmd"]:
+            self.assertTrue(GIT_COMMAND_KEYS.fullmatch(key.lower()), key)
+            forms += [f"git -c {key}='{{c}}' log", f"git config {key} '{{c}}'", f"git config --global --add {key} '{{c}}'",
+                      f"git config set {key} '{{c}}'", f"git clone -c {key}='{{c}}' u d", f"git clone --config={key}='{{c}}' u d"]
+        for key in ["credential.helper", "credential.https://x.helper", "submodule.x.update", "alias.x"]:
+            forms += [f"git -c {key}='!{{c}}' log", f"git config {key} '!{{c}}'"]
+        forms += ["git -c credential.helper='store; {c}' fetch", "git -c credential.helper='/bin/{c}' fetch"]
+        for verb in ["approve", "reject", "close", "accept", "answer", "sync", "pin", "choose", "review -i"]:
+            for form in forms:
+                cmd = form.format(c=f"ergon {verb} T-1")
+                self.assertTrue(human_cmd(cmd), cmd)
+        for form in forms:  # the same places running a harmless command
+            cmd = form.format(c="git status")
+            self.assertFalse(human_cmd(cmd), cmd)
+        for cmd in ["git submodule foreach 'git status'", "git -c core.pager=less log", "git config core.editor vim",
+                    "git -c credential.helper=store fetch", "git -c submodule.x.update=rebase submodule update",
+                    "git -c credential.helper='ergon approve' fetch",  # runs `git credential-ergon approve`
+                    "git -c submodule.x.update='ergon approve' submodule update",  # not `!`: not a command
+                    "git -c difftool.x.path='ergon approve' difftool", "git -c user.name='ergon approve' commit",
+                    "git grep -O 'ergon approve'", "git grep -e x -O 'ergon accept'",  # -O's value must be attached
+                    "git send-email --to 'ergon close' x.patch", "git filter-branch --subdirectory-filter 'ergon approve'",
+                    "git filter-branch -- --tree-filter 'ergon approve'", "git log --format='ergon close' -x",
+                    "git submodule status 'ergon approve'", "git fetch -u 'ergon approve'", "git rebase --e 'ergon approve'"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+        self.assertIsNone(git_config_command("user.email", "ergon approve"))
+        self.assertEqual(git_config_command("ALIAS.st", "status"), "git status")
+
     def test_stop_hook_blocks_on_lint_failure(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")
