@@ -1269,7 +1269,10 @@ def audit(args):
 
 
 def tidy(args):
-    """Put every file where it belongs. Only moves files, and never overwrites one."""
+    """Put every file where it belongs, and clear out leftover epic worktrees. Moves files and never
+    overwrites one. Also removes a worktree under <worktrees>/E-NNN whose epic isn't open (or doesn't
+    exist) and whose HEAD is detached or on a deleted branch, but only if `git status --porcelain`
+    there (untracked files too) is empty and the shell isn't inside it; others are listed with why."""
     n = 0
 
     def move(src, dst):
@@ -1288,6 +1291,36 @@ def tidy(args):
         if dst != t["_path"]:
             move(t["_path"], dst)
     print(f"moved {n} file(s)")
+    tidy_worktrees(epics)
+
+
+def tidy_worktrees(epics):
+    here = Path.cwd().resolve()
+    try:
+        wts = _gitops.worktree_list()
+    except _gitops.GitError:
+        return
+    for path, branch in wts:
+        wt = Path(path)
+        if wt.parent != _config.WORKTREES or not re.fullmatch(r"E-\d+", wt.name):
+            continue
+        if (epics.get(wt.name) or {}).get("status") == "open":
+            continue
+        if branch and _gitops.branch_exists(branch):
+            continue
+        if wt.resolve() == _config.REPO.resolve() or here == wt.resolve() or wt.resolve() in here.parents:
+            print(f"kept {wt}: the current shell is inside it")
+            continue
+        try:
+            dirty = _gitops.git("status", "--porcelain", "--untracked-files=all", raw=True, cwd=wt).strip()
+            if dirty:
+                print(f"kept {wt}: it has uncommitted or untracked changes")
+                continue
+            _gitops.git("worktree", "remove", str(wt))
+        except _gitops.GitError as err:
+            print(f"kept {wt}: {str(err).splitlines()[0]}")
+            continue
+        print(f"removed {wt}: {wt.name} is not open and it was clean")
 
 
 def protect_problems(t):

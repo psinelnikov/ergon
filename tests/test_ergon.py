@@ -958,6 +958,41 @@ class TestEpicBranch(Project):
         self.assertEqual(branches.strip(), "")
 
 
+class TestTidyWorktrees(Project):
+    def wt(self, eid):
+        path = self.root / ".claude" / "worktrees" / eid
+        sh("git", "worktree", "add", "-q", "--detach", str(path), "main", cwd=self.root)
+        return path
+
+    def test_removes_clean_closed_epic_worktree(self):
+        path = self.wt("E-009")
+        out = self.ergon("tidy").stdout
+        self.assertIn(f"removed {path}", out)
+        self.assertFalse(path.exists())
+
+    def test_keeps_dirty_and_the_one_the_shell_is_in(self):
+        a, b = self.wt("E-008"), self.wt("E-009")
+        (a / "scratch.txt").write_text("mine\n")  # untracked
+        out = self.ergon("tidy", cwd=b).stdout
+        self.assertTrue(a.exists())
+        self.assertIn(f"kept {a}: it has uncommitted or untracked changes", out)
+        self.assertTrue(b.exists())
+        self.assertIn(f"kept {b}: the current shell is inside it", out)
+
+    def test_never_touches_open_epic_or_task_worktrees(self):
+        self.ergon("new", "epic", "Big thing")
+        approve_epic(self)
+        self.ergon("start", "E-001")
+        epic = self.root / ".claude" / "worktrees" / "E-001"
+        self.assertTrue(epic.is_dir())
+        sh("git", "switch", "-q", "--detach", cwd=epic)  # detached, clean, but its epic is open
+        task = self.wt("T-005")
+        out = self.ergon("tidy").stdout
+        self.assertTrue(epic.exists())
+        self.assertTrue(task.exists())
+        self.assertNotIn("removed", out)
+
+
 def approve_epic(test, eid="E-001"):
     """What a human does: approve the epic's brief from their own terminal, which opens it."""
     r = test.ergon("approve", eid, env=clean_env(ERGON_ASK_STDIN="1"), inp="y\n")
