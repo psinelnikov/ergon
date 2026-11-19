@@ -318,6 +318,7 @@ def release_breakdown(eid, mine, push=False):
 # questions and answer in its prompt when resume_choice() says the cache is gone).
 
 ASKING_MARK = "dispatch: asking:"
+ACCEPT_CONFLICT_MARK = "the next dispatch resolves it, and it returns to review for your accept"
 NO_SESSION = "-"
 
 
@@ -3362,7 +3363,18 @@ def dispatch(args):
 
     def one(t, base, wt, branch, pubs, answered=None, lim=None):
         up = first = why1 = None
-        if lim is not None:  # the usage limit stopped it and has reset: restart that step
+        if lim is None and not answered and _config.CONFLICT_ROUNDS and ACCEPT_CONFLICT_MARK in _report.last_note(t):
+            # `accept` found the branch conflicting with its base (T-097): no fresh attempt at the task,
+            # straight to the conflict round on the existing branch. The earlier acceptance is not carried over.
+            print(f"  conflict {t['id']}  accepted, but its branch conflicts with its base: resolving it", flush=True)
+            verdict, why, up = "done", "", None
+            info = {"found": [], "evidence": [], "policy": [], "session": None, "log": "(none)", "cost": 0}
+            skip_gate = True
+        else:
+            skip_gate = False
+        if skip_gate:
+            pass
+        elif lim is not None:  # the usage limit stopped it and has reset: restart that step
             verdict, why, info, up = resume_limited(t, base, wt, branch, pubs, lim)
             if up:
                 first, why1 = t["tier"], lim.get("escalated") or "(before the usage limit stopped it)"
@@ -3381,7 +3393,7 @@ def dispatch(args):
             info["resumed"], info["fresh_because"] = resume, fresh_because
         else:
             verdict, why, info = run_worker(t, base, wt, branch, pubs, args, agents, settings)
-        if args.until_done:
+        if args.until_done and not skip_gate:
             with live_lock:
                 live[t["id"]] = info.get("cost", 0)
             verdict, why = until_done(t, base, wt, branch, pubs, verdict, why, info, tier=up)
@@ -3401,11 +3413,16 @@ def dispatch(args):
         with live_lock:
             live[t["id"]] = info.get("cost", 0)
         tier = up or t["tier"]
-        if verdict == "done":
+        if verdict == "done" and not skip_gate:
             verdict, why = fix_loop(t, tier, base, wt, branch, pubs, info)
         while True:  # a conflict found under the lock loops back here for another round
             if verdict == "done" and _config.CONFLICT_ROUNDS:
                 verdict, why = resolve(t, tier, base, wt, branch, pubs, info)
+                if skip_gate and verdict == "done":  # no conflict left to resolve: nothing has gated the branch yet
+                    skip_gate = False
+                    if not info.get("conflicts"):
+                        verdict, why = fix_loop(t, tier, base, wt, branch, pubs, info)
+                        continue
             if verdict == "limited" and "resets_at" not in info:  # may probe: not under the lock
                 info["resets_at"] = _limits.resets_at(info.get("limited") or {})
             with _gitops.state_lock():  # also serializes every merge into a companion's trunk

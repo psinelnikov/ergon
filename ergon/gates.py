@@ -765,6 +765,20 @@ def accept(args):
                 failed += 1
                 continue
             _history.record("accepted", t, by=approver())
+            if _config.CONFLICT_ROUNDS:
+                try:
+                    found = _dispatch.find_conflicts(base, wt, branch, pubs)
+                except _gitops.GitError:
+                    found = None  # land() reports it, and blocks as before
+                if found:  # the base moved while it waited: a conflict round, then a new accept
+                    for s in found:
+                        _history.record("conflict", t, files=s["files"], base=s["base"], after="accept",
+                                        companion=s["c"]["name"] if s["c"] else None)
+                    where = "; ".join(f"{s['base']} in {', '.join(s['files'])}" if s["files"] else s["base"] for s in found)
+                    _dispatch.put_status(tid, "ready", f"accepted by {who}, but it conflicts with {where}; "
+                                         f"{_dispatch.ACCEPT_CONFLICT_MARK}", who="accept")
+                    print(f"  ready    {tid}  conflicts with {where}: the next dispatch resolves it")
+                    continue
             verdict, why = _dispatch.land(t, base, wt, branch, pubs, accepted=who)
             if verdict != "done":
                 _dispatch.put_status(tid, "blocked", f"couldn't land it for {who}: {why}", who="accept")

@@ -3496,6 +3496,52 @@ class TestAccept(DispatchProject):
         self.assertIn("no branch task/T-002", out)
         self.assertEqual(self.status("T-002"), "review")
 
+    def held_task_with_moved_base(self, move=True):
+        """T-001 (accept: yes) rewrites shared.txt and is held at review; then main rewrites it too."""
+        (self.root / "shared.txt").write_text("base\n")
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "shared file", cwd=self.root)
+        self.env["FAKE_SHARED"] = "shared.txt"
+        self.ergon("new", "task", "Shared", "--tier", "sonnet", "--touches", "s.py")
+        stamp(self.task_file("T-001"))
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("\ntier:", "\naccept: yes\ntier:", 1))
+        self.ergon("dispatch")
+        self.assertEqual(self.status("T-001"), "review")
+        if move:
+            (self.root / "shared.txt").write_text("moved\n")
+            sh("git", "commit", "-qam", "Move the base", cwd=self.root)
+
+    def test_accept_that_conflicts_goes_back_for_a_conflict_round(self):
+        self.held_task_with_moved_base()
+        tip = sh("git", "rev-parse", "task/T-001", cwd=self.root).stdout
+        code, out = self.human("accept", "T-001")
+        self.assertEqual(self.status("T-001"), "ready", out)
+        self.assertRegex(self.task_file("T-001").read_text(),
+                         r"accept: accepted by Tester \d{4}-\S+, but it conflicts with main in shared\.txt; "
+                         r"the next dispatch resolves it, and it returns to review for your accept")
+        self.assertEqual(sh("git", "rev-parse", "task/T-001", cwd=self.root).stdout, tip)  # branch unchanged
+        self.assertTrue((self.root / ".claude" / "worktrees" / "T-001").is_dir())
+        c = [r for r in history(self.root) if r["event"] == "conflict"]
+        self.assertEqual([(r["files"], r["after"]) for r in c], [(["shared.txt"], "accept")])
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(self.status("T-001"), "review", out)  # the resolution is new code: accept again
+        self.assertNotEqual(sh("git", "rev-parse", "task/T-001", cwd=self.root).stdout, tip)
+        self.assertFalse(self.on("main", "T-001.txt"))
+        code, out = self.human("accept", "T-001")
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertRegex(sh("git", "log", "--format=%B", "main", cwd=self.root).stdout,
+                         r"Merge T-001: Shared\n\nAccepted by Tester \d{4}-")
+        self.assertEqual(sorted((self.root / "shared.txt").read_text().split()), ["T-001", "moved"])
+
+    def test_accept_landing_failure_that_isnt_a_conflict_still_blocks(self):
+        self.held_task_with_moved_base(move=False)
+        (self.root / "T-001.txt").write_text("in the way\n")  # untracked in the trunk: the merge would overwrite it
+        code, out = self.human("accept", "T-001")
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertIn("couldn't land it for Tester", self.task_file("T-001").read_text())
+        self.assertEqual([r for r in history(self.root) if r["event"] == "conflict"], [])
+
     def test_bad_accept_config(self):
         (self.root / ".ergon.toml").write_text('[[accept]]\ntiers = ["human"]\n')
         r = self.ergon("board", check=False)
