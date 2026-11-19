@@ -681,6 +681,15 @@ def reject(args):
     back = [t for t in named if t["status"] == "review"]
     if not briefs and not todo and not back:
         raise SystemExit("nothing in `proposed` or `review` among those ids")
+    # shared mode: the branch is only in the clone dispatch held it on, so only that clone can reject it
+    away = {t["id"]: who for t in back
+            if (who := _tasks.held_elsewhere(t)) and not _gitops.branch_exists(_config.TASK_BRANCH + t["id"])}
+    if away:
+        back = [t for t in back if t["id"] not in away]
+        said = "\n".join(f"refused: {tid} is held on {who}: reject it there" for tid, who in away.items())
+        if not briefs and not todo and not back:
+            raise SystemExit(said)
+        print(said)
     if back and not args.reason:
         raise SystemExit("rejecting work in `review` needs --reason: it's what the next worker is told to fix")
     sign = signing()
