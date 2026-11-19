@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_ergon import Project, clean_env, sh, stamp  # noqa: E402
+from test_ergon import DispatchProject, Project, clean_env, events, history, sh, stamp  # noqa: E402
 from ergon import concepts as C  # noqa: E402
 from ergon import config as _config  # noqa: E402
 from ergon import tasks as T  # noqa: E402
@@ -355,6 +355,99 @@ class TestTag(ConceptProject):
         out = self.ergon("tag", "T-404", "E-404", "--dry-run").stdout
         self.assertIn("skip T-404: no such task", out)
         self.assertIn("skip E-404: no tasks in that epic", out)
+
+
+class TestHoldByComponent(DispatchProject):
+    """hold_by = "component" (T-144): touches that overlap hold two tasks apart only when they share
+    a component, or when either one's tags aren't known (stale, hand-written or empty)."""
+    config = DispatchProject.config.replace('trunk = "main"\n', 'trunk = "main"\n'
+                                           '        concepts = "concepts.toml"\n        hold_by = "component"\n', 1)
+
+    def make(self, one, two, tag_two=True):
+        """T-001 and T-002, both touching shared.py, tagged `one` and `two` (current stamps unless
+        tag_two is False, which leaves T-002's tags hand-written), both approved."""
+        (self.root / "concepts.toml").write_text(MAP)
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "map", cwd=self.root)
+        for title in ("One", "Two"):
+            self.ergon("new", "task", title, "--tier", "sonnet", "--touches", "shared.py,x/" + title)
+        for tid, ids in (("T-001", one), ("T-002", two)):
+            stamp(self.task_file(tid))
+            set_field(self.task_file(tid), "concepts", f"[{ids}]")
+            if tid == "T-001" or tag_two:
+                _config.configure(self.root)
+                digest = T.brief_digest(T.load(_config.ITEMS)[tid])
+                set_field(self.task_file(tid), "tagged", f"2026-01-01 {digest[:12]}")
+
+    def run_both(self):
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        out = self.ergon("dispatch", "--jobs", "2").stdout
+        for tid in ("T-001", "T-002"):
+            self.assertEqual(self.status(tid), "done", out)
+        order = [l.split()[0] + l.split()[1] for l in out.splitlines() if l.split()[:1] in (["doing"], ["done"])]
+        return dry, out, order
+
+    def test_overlap_without_a_shared_component_runs_side_by_side(self):
+        self.make("approval.guard", "ui.board")
+        dry, out, order = self.run_both()
+        self.assertIn("hold_by    component", dry)
+        self.assertIn("beside     T-002 with T-001: both touch shared.py, but they share no component", dry)
+        self.assertNotIn("held       T-002", dry)
+        self.assertEqual(order[:2], ["doingT-001", "doingT-002"], out)
+        self.assertIn("(beside T-001: touches overlap, no shared component)", out)
+        self.assertEqual([r for r in history(self.root) if r["event"] == "held"], [])
+        row = next(r for r in history(self.root) if r["event"] == "dispatched" and r["task"] == "T-002")
+        self.assertEqual(row["beside"], ["T-001"])
+
+    def test_a_shared_component_or_unknown_tags_still_hold(self):
+        cases = [  # (T-002's tags, current stamp?, what the held row says)
+            ("ui.board, approval.guard", True, {"components": ["approval.guard"]}),
+            ("ui.board", False, {"untagged": ["T-002"]}),  # hand-written: no tagged: stamp
+            ("", True, {"untagged": ["T-002"]}),  # tagged, but nothing fit
+        ]
+        for two, current, says in cases:
+            with self.subTest(two=two, current=current):
+                self.setUp()
+                self.make("approval.guard", two, tag_two=current)
+                dry, out, order = self.run_both()
+                self.assertIn("held       T-002 behind T-001: both touch shared.py", dry)
+                self.assertNotIn("beside", dry)
+                self.assertEqual(order, ["doingT-001", "doneT-001", "doingT-002", "doneT-002"], out)
+                held = [r for r in history(self.root) if r["event"] == "held"]
+                self.assertEqual(len(held), 1, held)
+                self.assertEqual({k: held[0][k] for k in says}, says)
+                self.assertEqual(held[0]["touches"], ["shared.py"])
+                self.assertEqual(events(self.root, "T-002")[1:3], ["held", "dispatched"])
+
+    def test_a_brief_edited_after_tagging_holds_again(self):
+        self.make("approval.guard", "ui.board")
+        f = self.task_file("T-002")
+        f.write_text(f.read_text().replace("## What\n", "## What\nNow it also guards heredocs.\n", 1))
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertIn("held       T-002 behind T-001: both touch shared.py; no current concepts: tags on T-002", dry)
+
+    def test_off_by_default(self):
+        self.make("approval.guard", "ui.board")
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text(cfg.read_text().replace('hold_by = "component"\n', ""))
+        self.assertNotIn("hold_by", cfg.read_text())
+        dry = self.ergon("dispatch", "--dry-run").stdout
+        self.assertIn("held       T-002 behind T-001: both touch shared.py", dry)
+        self.assertNotIn("component", dry)
+
+    def test_bad_settings_fail_check_and_dispatch(self):
+        cfg = self.root / ".ergon.toml"
+        base = cfg.read_text()
+        for text, want in (('hold_by = "files"\n', 'hold_by is "touches" (the default) or "component", not \'files\''),
+                           (base.replace('concepts = "concepts.toml"\n', ""), 'hold_by = "component" needs a concept map')):
+            with self.subTest(want=want):
+                cfg.write_text(base.replace('hold_by = "component"\n', text) if "files" in text else text)
+                r = self.ergon("check", check=False)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn(want, r.stdout)
+                r = self.ergon("dispatch", "--dry-run", check=False)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(want, r.stderr)
 
 
 if __name__ == "__main__":

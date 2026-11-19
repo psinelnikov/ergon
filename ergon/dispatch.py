@@ -17,6 +17,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import concepts as _concepts
 from . import config as _config
 from . import gates as _gates
 from . import gitops as _gitops
@@ -3228,6 +3229,9 @@ def dispatch(args):
         for c in _config.COMPANIONS:  # forget companion worktrees whose directory is gone (a removed task worktree)
             if has_checkout(c):
                 _gitops.git("worktree", "prune", cwd=c["path"])
+    # hold_by = "component" (T-144): overlapping touches hold two tasks apart only when they share a
+    # component too (hold()). Read once a run; a setting or map that doesn't hold refuses the run.
+    cmap = _concepts.hold_map("ergon dispatch")
     links, epics = gitlinks(), _tasks.load(_config.EPICS)
     ids = set(args.ids.split(",")) if args.ids else None
     agents, settings = worker_agents(), worker_settings()
@@ -3954,12 +3958,37 @@ def dispatch(args):
                     out.add(x if len(px) >= len(py) else y)
         return sorted(out - every_touch)
 
+    def hold(a, b):
+        """The paths that hold a back while b runs (shared()), or [] when they may run side by
+        side. With hold_by = "component", touches that overlap hold only when the two share a
+        component or either one's tags aren't known (concepts.apart); no touches always holds."""
+        got = shared(a, b)
+        if not got or cmap is None or got == [NO_TOUCHES]:
+            return got
+        comps, unknown = _concepts.apart(a, b, cmap)
+        return got if comps or unknown else []
+
+    def hold_fields(a, b):
+        """What a `held` history row says about the components, with hold_by = "component"."""
+        if cmap is None or shared(a, b) == [NO_TOUCHES]:
+            return {}
+        comps, unknown = _concepts.apart(a, b, cmap)
+        return {"components": comps} if comps else {"untagged": unknown}
+
     def why_shared(a, b):
         got = shared(a, b)
         if got == [NO_TOUCHES]:
             who = [t["id"] for t in (a, b) if not t.get("touches")]
             return " and ".join(who) + (" has" if len(who) == 1 else " have") + " no touches: declared"
-        return "both touch " + ", ".join(got)
+        why = "both touch " + ", ".join(got)
+        if cmap is None:
+            return why
+        comps, unknown = _concepts.apart(a, b, cmap)
+        if comps:
+            return why + "; both are about " + ", ".join(comps)
+        if unknown:
+            return why + "; no current concepts: tags on " + " and ".join(unknown) + " (`ergon tag`)"
+        return why + ", but they share no component"
 
     def also(t):
         return "".join(f" + {c['name']} {c['trunk']}" for c in _config.COMPANIONS if companion_touch(t, c))
@@ -4082,11 +4111,17 @@ def dispatch(args):
                      if args.budget else "; no --budget, so no estimate"))
         # Shared touches: whichever lands second (task into epic, or epic into trunk) may conflict,
         # so a task sharing a path with an earlier one is held until that one lands.
+        # hold_by = "component": a shared path alone doesn't hold, so `beside` lists those pairs.
+        if cmap is not None:
+            print('  hold_by    component: tasks whose touches overlap run side by side unless they share a '
+                  'component, or one has no current concepts: tags')
         for i, a in enumerate(plan):
             for b in plan[:i]:
-                if shared(a, b):
+                if hold(a, b):
                     print(f"  held       {a['id']} behind {b['id']}: {why_shared(a, b)}")
                     break
+                if shared(a, b):
+                    print(f"  beside     {a['id']} with {b['id']}: {why_shared(a, b)}")
         for a in plan:
             for b in (t for t in tasks.values() if t["status"] in ("doing", "review")):
                 if shared(a, b):
@@ -4136,12 +4171,15 @@ def dispatch(args):
                                     continue
                                 if not follow and launched >= args.max:
                                     continue
-                                behind = next((o for o in active.values() if shared(t, o)), None)
+                                behind = next((o for o in active.values() if hold(t, o)), None)
                                 if behind:  # held: stays eligible, retried when a running task lands
                                     if held_on.get(t["id"]) != behind["id"]:  # once per blocker, not per scan
                                         held_on[t["id"]] = behind["id"]
-                                        _history.record("held", t, behind=behind["id"], touches=shared(t, behind))
+                                        _history.record("held", t, behind=behind["id"], touches=shared(t, behind),
+                                                        **hold_fields(t, behind))
                                     continue
+                                # hold_by = "component": running tasks it overlaps but shares no component with
+                                beside = [o["id"] for o in active.values() if shared(t, o)]
                                 tried.add(t["id"])
                                 # An answered question rides along to the worker; the mark goes with
                                 # the launch, so a retry after this run starts over.
@@ -4182,9 +4220,12 @@ def dispatch(args):
                                                 companions=[c["name"] for c, _ in pubs],
                                                 **approval_record(t),  # approved_touches, _harden, _suppress_ok
                                                 **({"answered": True} if answered else {}),
+                                                **({"beside": beside} if beside else {}),
                                                 **({"after": "limit", "step": lim[1]} if lim else {}))
                                 print(f"  doing    {t['id']}  {t['tier']:<6}  {branch} from {base}"
                                       + also(t) + (f"  (after the usage limit: {limit_step_text(lim[1])})" if lim else "")
+                                      + (f"  (beside {', '.join(beside)}: touches overlap, no shared component)"
+                                         if beside else "")
                                       + f"  {t['title']}"
                                       + ("" if follow or lim or t["id"] in first_ready else "  (approved during this run)"))
                                 row = (limited_row(t) or {"step": lim[1]}) if lim else None

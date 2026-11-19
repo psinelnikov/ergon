@@ -30,8 +30,15 @@ un-approves a task and a signed approval still verifies.
 - missing depends: a component it uses whose `introduced_by` task is still open and isn't in its
   `depends:` closure. `ergon check` warns about these, and fails a map that doesn't hold.
 
-Without a `concepts` key none of this runs: `tag` and `related` say so, and `check` and the task
-page are as they were.
+Dispatch holds a ready task back while a running one shares a `touches:` path with it. With
+`hold_by = "component"` in .ergon.toml (opt-in, T-144) it also wants a shared component: two tasks
+whose touches overlap but whose current tags share no component run side by side (`apart`). A task
+whose tags aren't current, or are empty, counts as sharing everything, as does a task with no
+touches, so missing knowledge never runs two tasks at once. The default, `hold_by = "touches"`,
+ignores the map.
+
+Without a `concepts` key none of this runs: `tag` and `related` say so, `check` and the task
+page are as they were, and `hold_by = "component"` is an error.
 """
 import re
 import secrets
@@ -342,6 +349,47 @@ def tag(args):
             print(f"record: {record.relative_to(_config.HOME)}")
 
 
+# ---------- scheduling (T-144) ----------
+
+HOLD_BY = ("touches", "component")
+
+
+def hold_by_problem():
+    """Why the `hold_by` setting doesn't hold, or ''. `check` fails on it and dispatch refuses."""
+    v = _config.CFG.get("hold_by", "touches")
+    if v not in HOLD_BY:
+        return (f"{_config.CONFIG_FILE}: hold_by is \"touches\" (the default) or \"component\", "
+                f"not {v!r}")
+    if v == "component" and not _config.CONCEPTS:
+        return (f"{_config.CONFIG_FILE}: hold_by = \"component\" needs a concept map: set "
+                f"concepts = \"<path>\" (skills/ergon/SKILL.md, \"Concept map\")")
+    return ""
+
+
+def hold_map(who="ergon dispatch"):
+    """The map dispatch schedules by: None for `hold_by = "touches"` (the default), the map for
+    "component". SystemExit when the setting or the map doesn't hold."""
+    why = hold_by_problem()
+    if why:
+        raise SystemExit(f"{who}: {why}")
+    return load(who) if _config.CFG.get("hold_by") == "component" else None
+
+
+def known_tags(t, cmap):
+    """t's component ids when its tags are current and not empty, else None: nothing is known
+    about what it's about, so scheduling treats it as sharing every component."""
+    got = tags(t, cmap)
+    return got if got and current(t, cmap) else None
+
+
+def apart(a, b, cmap):
+    """(shared component ids, task IDs whose tags aren't known) for two tasks. Dispatch runs two
+    tasks with overlapping touches side by side only when both lists are empty."""
+    ta, tb = known_tags(a, cmap), known_tags(b, cmap)
+    unknown = [t["id"] for t, got in ((a, ta), (b, tb)) if got is None]
+    return (sorted(set(ta) & set(tb)) if ta and tb else []), unknown
+
+
 # ---------- links ----------
 
 def closure(tid, tasks):
@@ -457,10 +505,13 @@ def related(args):
 def lint(tasks):
     """(errors, warnings) for `ergon check`: the map's problems and introduced_by IDs that name no
     task are errors; missing depends, tags the map lacks and a dropped introducer are warnings.
-    Nothing without a `concepts` key."""
+    Without a `concepts` key, only a `hold_by` that doesn't hold."""
+    hold = hold_by_problem()
     if not _config.CONCEPTS:
-        return [], []
+        return [hold] if hold else [], []
     cmap, errs = read_map()
+    if hold:
+        errs.append(hold)
     name = _config.CONCEPTS.name
     warns = []
     for c in cmap["components"].values():
