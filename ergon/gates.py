@@ -1316,39 +1316,58 @@ def _option_values(rest, longs, shorts, valued):
                     break
 
 
-def git_commands(words):
-    """The command lines a git call among words runs from its own arguments, which the lexer saw
-    as data: the value of each GIT_CMD_OPTS option (rebase --exec, filter-branch's filters, difftool
-    --extcmd, ...), `submodule foreach`'s command, and each GIT_COMMAND_KEYS value it sets
-    (`git -c key=...`, `git config key ...`, `git clone -c key=...`) as git_config_command reads it.
-    A later `git x` names no verb, so an alias is checked where it is defined."""
-    out = []
-
-    def config(key, val):
-        if (c := git_config_command(key, val)) is not None:
-            out.append(c)
-
+def _git_calls(words):
+    """Each git call among words, as (the settings its -c and --config-env options make, its
+    subcommand, the words after it). A setting is (key, value); --config-env's value is None, as
+    git reads it from the environment variable it names."""
     for k, w in enumerate(words):
-        prog, i = _program(w), k + 1
+        prog, i, sets = _program(w), k + 1, []
         if prog == "git":
             while i < len(words) and words[i].startswith("-"):
-                if words[i] in GIT_OPT_ARG and i + 1 < len(words):
-                    if words[i] == "-c":
-                        key, eq, val = words[i + 1].partition("=")
-                        if eq:
-                            config(key, val)
+                a = words[i]
+                if a.startswith("--config-env="):
+                    sets.append((a[len("--config-env="):].partition("=")[0], None))
+                elif a in GIT_OPT_ARG and i + 1 < len(words):
                     i += 1
+                    key, eq, val = words[i].partition("=")
+                    if a == "-c" and eq:
+                        sets.append((key, val))
+                    elif a == "--config-env":
+                        sets.append((key, None))
                 i += 1
             sub, rest = (words[i], words[i + 1:]) if i < len(words) else ("", [])
         elif prog.startswith("git-"):  # a dashed form: $(git --exec-path)/git-filter-branch
             sub, rest = prog[4:], words[i:]
         else:
             continue
+        yield sets, sub, rest
+
+
+def git_config_sets(words):
+    """(key, value) for each config entry a git call among words sets: `git -c key=value`,
+    `git --config-env key=VAR` (value None: it's in the environment), `git config key value` (any
+    adjacent pair, so every form of it) and `git clone -c/--config key=value`."""
+    out = []
+    for sets, sub, rest in _git_calls(words):
+        out += sets
         if sub == "config":
-            for j, a in enumerate(rest[:-1]):
-                if "=" not in a:
-                    config(a, rest[j + 1])
-        elif sub in ("submodule", "submodule--helper"):
+            out += [(a, rest[j + 1]) for j, a in enumerate(rest[:-1]) if "=" not in a]
+        elif sub == "clone":
+            out += [tuple(v.split("=", 1)) for kind, v in _option_values(rest, *GIT_CMD_OPTS[sub])
+                    if kind == "config" and "=" in v]
+    return out
+
+
+def git_commands(words):
+    """The command lines a git call among words runs from its own arguments, which the lexer saw
+    as data: the value of each GIT_CMD_OPTS option (rebase --exec, filter-branch's filters, difftool
+    --extcmd, ...), `submodule foreach`'s command, and each GIT_COMMAND_KEYS value it sets
+    (git_config_sets) as git_config_command reads it. A later `git x` names no verb, so an alias is
+    checked where it is defined; one whose value the text doesn't hold is git_config_reason's."""
+    out = [c for key, val in git_config_sets(words)
+           if val is not None and (c := git_config_command(key, val)) is not None]
+    for _, sub, rest in _git_calls(words):
+        if sub in ("submodule", "submodule--helper"):
             j = next((m for m, a in enumerate(rest) if not a.startswith("-") or a == "--"), len(rest))
             if rest[j:j + 1] == ["foreach"]:  # one word is shell text, more are a command and its args
                 args = rest[j + 1:]
@@ -1359,13 +1378,7 @@ def git_commands(words):
                 if args:
                     out.append(args[0] if len(args) == 1 else shlex.join(args))
         elif sub in GIT_CMD_OPTS:
-            for kind, val in _option_values(rest, *GIT_CMD_OPTS[sub]):
-                if kind == "cmd":
-                    out.append(val)
-                else:
-                    key, eq, v = val.partition("=")
-                    if eq:
-                        config(key, v)
+            out += [val for kind, val in _option_values(rest, *GIT_CMD_OPTS[sub]) if kind == "cmd"]
     return out
 
 
@@ -1403,6 +1416,285 @@ def human_cmd(cmd):
                                             for a in rest[at + 1:]):
                 return True
     return False
+
+
+HUMAN_MSG = ("approve / reject / close / accept / answer / sync / pin / choose / review -i are human-only; ask the "
+             "user to run them in their own terminal")
+# The sections GIT_COMMAND_KEYS names keys in: `git config --rename-section user alias` turns keys the
+# guard never read as commands (user.name) into ones git runs.
+GIT_COMMAND_SECTIONS = {"alias", "core", "sequence", "pager", "interactive", "diff", "difftool", "mergetool", "merge",
+                        "filter", "credential", "gpg", "remote", "uploadpack", "submodule", "tar", "trailer", "hook",
+                        "sendemail", "imap", "browser", "man", "guitool", "instaweb"}
+# git's config from the environment: GIT_CONFIG_PARAMETERS ('key'='value' ...) and the GIT_CONFIG_COUNT
+# entries GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n>. Group 1 the name, 2 the <n>, 3 `=value` (or `+=...`).
+GIT_CONFIG_ENV = re.compile(r"(GIT_CONFIG_PARAMETERS|GIT_CONFIG_(?:KEY|VALUE)_([0-9]+))(\+?=.*)?", re.S)
+# One of those names anywhere in a word, and what before it makes a mention a read: `$NAME`, `${NAME}`,
+# `${!NAME}`, `${#NAME}`, `env -uNAME`, `env --unset=NAME`. A `${NAME:=value}` sets it.
+GIT_CONFIG_ENV_IN = re.compile(r"GIT_CONFIG_(?:PARAMETERS|KEY_|VALUE_)")
+GIT_CONFIG_ENV_READ = re.compile(r"(?:\$|\$\{[!#]?|-u|--unset=)$")
+# Programs whose arguments name an environment variable without setting it.
+ENV_READERS = {"printenv", "echo", "grep", "egrep", "fgrep", "rg", "unset"}
+DYNAMIC_ENV_MSG = ("this command sets a GIT_CONFIG_* variable whose name the guard can't read (an expansion in the "
+                   "name, a nameref, `${NAME:=value}`): git can read an alias or command-valued key from it, so it's "
+                   "refused. Write `git -c <key>=<value> ...` out in full, or ask the user")
+
+
+def _unseen(val):
+    """Whether a config value isn't all in the text: a `$` or backtick expands it, in the shell now
+    or, for a value git runs as shell text, when git runs it (`!$V` reads V then, `!$1` the alias's
+    arguments)."""
+    return "$" in val or "`" in val
+
+
+def unseen_config_msg(key, why):
+    return (f"git runs the value of `{key}` as a command, and the guard checks that command where it is "
+            f"defined, but here it can't see it: {why}. So the definition is refused. Write the value out "
+            f"in full (`git -c {key}=<command> ...` or `git config {key} <command>`), or ask the user")
+
+
+def git_config_reason(cmd):
+    """Why a shell command defines a git alias or GIT_COMMAND_KEYS key in a way human_cmd can't
+    check, or None: with `git --config-env` (the value is in an environment variable), with a `$` or
+    backtick in the value, by renaming a section into or out of one that holds such keys, or through
+    GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_<n> + GIT_CONFIG_VALUE_<n>. A value the text holds there
+    is read like `git -c`'s, a human-only verb in it refused; a key or value set by an earlier command
+    can't be seen, so its other half is refused. Strings run as code are checked too."""
+    try:
+        cmds = shell_commands(cmd)[0]
+    except (ValueError, RecursionError):
+        if re.search(r"--config-env|rename-section|GIT_CONFIG_(PARAMETERS|KEY_|VALUE_)", cmd):
+            return ("this command sets git config through --config-env, a section rename or GIT_CONFIG_*, and "
+                    "the guard can't split it to see what it defines, so it's refused")
+        return None
+    env = []  # (name, n, value or None) of each GIT_CONFIG_* any of its commands sets
+    for words, docs in cmds:
+        # bash -c '...', a heredoc fed to sh. env's own words are read below; so is a lone NAME=value.
+        if any(CODE_RUNNER.fullmatch(_program(w)) and _program(w) != "env" for w in words):
+            for t in words + [d for d, _ in docs]:
+                if t == cmd or (GIT_CONFIG_ENV.fullmatch(t) and not re.search(r"\s", t)):
+                    continue
+                if why := git_config_reason(t):
+                    return why
+        for key, val in git_config_sets(words):
+            if git_config_command(key, "!") is None:
+                continue
+            if val is None:
+                return unseen_config_msg(key, "`--config-env` has git read it from an environment variable")
+            if _unseen(val):
+                return unseen_config_msg(key, f"`{val}` holds a `$` or backtick expansion")
+        for _, sub, rest in _git_calls(words):
+            at = next((j for j, a in enumerate(rest) if a in ("--rename-section", "rename-section")), None)
+            if sub != "config" or at is None:
+                continue
+            names = [a for j, a in enumerate(rest[at + 1:]) if not a.startswith("-")
+                     and (j == 0 or rest[at + j] not in ("-f", "--file", "--blob"))]
+            if any(_unseen(a) or a.partition(".")[0].lower() in GIT_COMMAND_SECTIONS for a in names):
+                return ("`git config --rename-section` into or out of a section that holds git aliases or "
+                        "command-valued keys turns values the guard never read as commands into ones git "
+                        "runs, so it's refused; ask the user")
+        if _program(words[0]) in ENV_READERS:
+            continue
+        words = _without_messages(words)
+        for k, w in enumerate(words):
+            m = GIT_CONFIG_ENV.fullmatch(w)
+            if m:
+                if (m.group(3) or k > 0) and (k == 0 or words[k - 1] not in ("-u", "--unset")):
+                    # NAME=value; or `read NAME`, `printf -v NAME`, `export NAME`, NAME+=...: a value the text doesn't hold
+                    val = m.group(3)[1:] if m.group(3) and m.group(3).startswith("=") else None
+                    env.append((m.group(1), m.group(2), val))
+                continue
+            for h in GIT_CONFIG_ENV_IN.finditer(w):
+                # `GIT_CONFIG_KEY_$i=...`, `declare -n r=GIT_CONFIG_KEY_0`, `${GIT_CONFIG_KEY_0:=...}`
+                read = GIT_CONFIG_ENV_READ.search(w[:h.start()])
+                if not read or (read.group(0).startswith("${") and re.match(r"\w*:?=", w[h.end():])):
+                    return DYNAMIC_ENV_MSG
+    keys = {n: v for name, n, v in env if name.startswith("GIT_CONFIG_KEY_")}
+    for name, n, val in env:
+        if name == "GIT_CONFIG_PARAMETERS":
+            if val is None or _unseen(val):
+                return unseen_config_msg(name, "its value comes from the environment or an expansion")
+            try:
+                entries = [e.partition("=")[::2] for e in shlex.split(val)]
+            except ValueError:
+                return unseen_config_msg(name, "the guard can't split its value")
+            for key, v in entries:
+                if (c := git_config_command(key, v)) is not None and human_cmd(c):
+                    return HUMAN_MSG
+        elif name.startswith("GIT_CONFIG_KEY_"):
+            if val is None or _unseen(val):
+                return unseen_config_msg(name, "the key comes from the environment or an expansion, so git may "
+                                         f"run GIT_CONFIG_VALUE_{n}")
+            if git_config_command(val, "!") is not None and not any(
+                    nm.startswith("GIT_CONFIG_VALUE_") and m == n for nm, m, _ in env):
+                return unseen_config_msg(val, f"its value, GIT_CONFIG_VALUE_{n}, is set by another command")
+        else:  # GIT_CONFIG_VALUE_<n>: read as its key, or as any command when the key isn't in the text
+            key = keys.get(n)
+            if key is not None and git_config_command(key, "!") is None:
+                continue
+            if val is None or _unseen(val):
+                return unseen_config_msg(key or name, f"{name} comes from the environment or an expansion")
+            runs = [git_config_command(key, val)] if key else [val, val[1:], "git " + val]
+            if any(c and human_cmd(c) for c in runs):
+                return HUMAN_MSG
+    return None
+
+
+# A section header as git reads one: [section], [section.sub], or [section "sub"] (whitespace on one
+# line before the quote).
+GIT_CONFIG_HEADER = re.compile(r"\[([A-Za-z0-9.-]*)(?:\]|[ \t\v\f\r]+\"((?:[^\"\\\n]|\\[^\n])*)\"\])")
+
+
+def git_config_entries(text):
+    """The entries of text read as a git config file, the way git's own parser (config.c) reads it:
+    (key, value) with the key lowercased and qualified by its section, value None for a key with no
+    `=`. None if git would refuse the file, so that nothing in it is config."""
+    s = text.replace("\r\n", "\n")
+    n, i, out, base = len(s), 1 if s.startswith("﻿") else 0, [], ""
+    while i < n:
+        c = s[i]
+        if c in " \t\n\v\f\r":
+            i += 1
+        elif c in "#;":
+            j = s.find("\n", i)
+            i = n if j < 0 else j
+        elif c == "[":  # [section], [section.sub] or [section "sub"]; a key may follow on the same line
+            m = GIT_CONFIG_HEADER.match(s, i)
+            if not m:
+                return None
+            sub = m.group(2)
+            base = m.group(1).lower() + ("" if sub is None else "." + re.sub(r"\\(.)", r"\1", sub))
+            i = m.end()
+        elif c.isascii() and c.isalpha():
+            j = i
+            while j < n and (s[j].isascii() and s[j].isalnum() or s[j] == "-"):
+                j += 1
+            key, i = base + "." + s[i:j].lower(), j
+            while i < n and s[i] in " \t":
+                i += 1
+            if i >= n or s[i] == "\n":
+                out.append((key, None))
+                continue
+            if s[i] != "=":
+                return None
+            val, quote, comment, space, i = [], False, False, 0, i + 1
+            while True:
+                c, i = (s[i] if i < n else "\n"), i + 1
+                if c == "\n":
+                    if quote:
+                        return None
+                    break
+                if comment:
+                    continue
+                if c in " \t\v\f\r" and not quote:
+                    space += any(val)
+                    continue
+                if c in ";#" and not quote:
+                    comment = True
+                    continue
+                val.append(" " * space)
+                space = 0
+                if c == "\\":
+                    c, i = (s[i] if i < n else "\n"), i + 1
+                    if c == "\n":  # a continued line
+                        continue
+                    if c not in 'tbn\\"':
+                        return None
+                    val.append({"t": "\t", "b": "\b", "n": "\n"}.get(c, c))
+                elif c == '"':
+                    quote = not quote
+                else:
+                    val.append(c)
+            out.append((key, "".join(val)))
+        else:
+            return None
+    return out
+
+
+def _command_entries(text):
+    """The git aliases and command-valued entries (git_config_command) of text read as git config."""
+    return [(k, v) for k, v in git_config_entries(text) or [] if git_config_command(k, v or "") is not None]
+
+
+def edit_result(path, tool, inp):
+    """(the file's text before, its text after) a Write, Edit or MultiEdit."""
+    p = Path(path)
+    try:
+        before = p.read_text(errors="replace") if p.is_file() else ""
+    except OSError:
+        before = ""
+    if tool == "Write":
+        return before, inp.get("content", "")
+    after = before
+    for e in inp.get("edits") or [inp]:
+        old, new = e.get("old_string", ""), e.get("new_string", "")
+        after = after.replace(old, new) if e.get("replace_all") else after.replace(old, new, 1)
+    return before, after
+
+
+def config_edit_reason(path, tool, inp):
+    """Why an Edit or Write must not run: the file reads as git config afterwards and the edit adds
+    an alias or command-valued entry. Any file counts, not only .git/config or ~/.gitconfig: one
+    include.path names is config too, and the guard can't tell which files git will include."""
+    if not path:
+        return None
+    before, after = edit_result(path, tool, inp)
+    added = _command_entries(after)
+    for e in _command_entries(before):
+        if e in added:
+            added.remove(e)
+    if not added:
+        return None
+    key = added[0][0]
+    return (f"after this edit {Path(path).name} reads as a git config file and defines `{key}`, which git runs as "
+            f"a command (a git alias or a command-valued key): the guard can't tell which files git reads config "
+            f"from, so an edit doesn't define one. Use `git config {key} <value>`, which it checks, or ask the user")
+
+
+# Files git reads config from, named in shell text: .git/config (and a worktree's or submodule's under
+# .git/), config.worktree, ~/.gitconfig and kin, /etc/gitconfig, $XDG_CONFIG_HOME/git/config, and
+# `$(git rev-parse --git-dir)/config` or `$GIT_DIR/config`; as a word ends, or inside code.
+GIT_CONFIG_NAME = re.compile(r"(?:^|[/\s'\"=(:])(?:\.?gitconfig[\w.-]*|config\.worktree|\.git/(?:[^\s'\"]*/)?config)"
+                             r"(?![\w./-])|(?:/git|\)|\$\{?\w+\}?)/config(?:\.worktree)?(?![\w./-])")
+# A bare `config` counts where it names a file in a git directory: `cd .git && echo ... >> config`.
+GIT_DIR_CONFIG = re.compile(r"/\.git/(?:[^/]+/)*config(?:\.worktree)?$")
+CONFIG_WRITE = re.compile(r"\b(?:ln|dd|rsync)\s")
+
+
+def git_config_files(cwd):
+    """The files git reads config from in cwd (`git config --list --show-origin --includes`): the
+    system, global and repository files and every file they include, each as git names it and resolved."""
+    try:
+        r = subprocess.run(["git", "config", "--list", "--show-origin", "--includes", "-z"], cwd=cwd,
+                           capture_output=True, text=True, timeout=10, errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    out = set()
+    for origin in r.stdout.split("\0")[::2]:
+        if origin.startswith("file:"):
+            f = os.path.join(cwd, os.path.expanduser(origin[5:]))
+            out |= {os.path.normpath(f), os.path.realpath(f)}
+    return out
+
+
+def config_write_reason(cmd, cwd):
+    """Why a shell command must not run because it may write a file git reads config from: it holds a
+    shell write and names one (GIT_CONFIG_NAME, a `config` inside a .git directory, or a file git
+    reads or includes from cwd). What it writes can define an alias or command-valued key the guard
+    never sees, so `git config` (checked by human_cmd) or Edit (config_edit_reason) is the way."""
+    hit = SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd) or CONFIG_WRITE.search(cmd)
+    if not hit:
+        return None
+    named = names_outside_data(cmd, GIT_CONFIG_NAME) or names_outside_data(cmd, GIT_DIR_CONFIG, cwd)
+    if not named:
+        files = git_config_files(cwd)
+        named = bool(files) and names_outside_data(
+            cmd, re.compile("|".join(rf"^{re.escape(f)}$" for f in sorted(files))), cwd)
+    if not named:
+        return None
+    return (f"this command contains `{' '.join(hit.group(0).split())}` and names a file git reads config from "
+            f"(.git/config, config.worktree, ~/.gitconfig, git/config or one git includes): a shell write there "
+            f"can define a git alias or command-valued key the guard can't see, so it's refused. Use "
+            f"`git config <key> <value>`, which the guard checks, or Edit; or ask the user")
 
 
 def frontmatter(text):
@@ -1836,8 +2128,10 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
         if why:
             return why
         if human_cmd(cmd):
-            return ("approve / reject / close / accept / answer / sync / pin / choose / review -i are human-only; ask the "
-                    "user to run them in their own terminal")
+            return HUMAN_MSG
+        why = git_config_reason(cmd)
+        if why:
+            return why
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
                      r"\b(CLAUDECODE|AI_AGENT)=", cmd):
             return "don't change CLAUDECODE / AI_AGENT: they're how ergon knows an agent is running"
@@ -1851,23 +2145,19 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
         if hit and names_outside_data(cmd, _config.TASK_DIR_IN_CMD, cwd or str(_config.HOME)):
             return (f"don't write task files from the shell: this command contains `{' '.join(hit.group(0).split())}` "
                     "and names items/ or epics/; use `ergon new` / `ergon set` for state, Edit for a task's body")
-        return None
+        return config_write_reason(cmd, cwd or str(_config.HOME))
     path = inp.get("file_path", "")
     if is_policies(path):
         return POLICY_MSG
     if is_runs(path):
         return RUNS_MSG
+    why = config_edit_reason(path, tool, inp)
+    if why:
+        return why
     if not (_config.TASK_FILE.search(path) or is_flat_epic(path)):
         return None
     p = Path(path)
-    before = p.read_text() if p.exists() else ""
-    after = before
-    if tool == "Write":
-        after = inp.get("content", "")
-    else:
-        for e in inp.get("edits") or [inp]:
-            old, new = e.get("old_string", ""), e.get("new_string", "")
-            after = after.replace(old, new) if e.get("replace_all") else after.replace(old, new, 1)
+    before, after = edit_result(path, tool, inp)
     fb, fa = frontmatter(before), frontmatter(after)
     if fb.get("approved", "") != fa.get("approved", ""):
         return "`approved:` is written by a human only (the one rule: `ergon guide`)"
