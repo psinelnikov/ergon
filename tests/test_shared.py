@@ -800,6 +800,7 @@ class TestDispatchClaims(Shared):
 BREAKDOWN_ONE = """TASK: Add the schema
 tier: haiku
 tier_why: the exact change is written below
+category: chore
 touches: db/schema.sql
 depends:
 ## What

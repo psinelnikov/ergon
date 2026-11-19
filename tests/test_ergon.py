@@ -4108,6 +4108,7 @@ BREAKDOWN_REPLY = """Read the code.
 TASK: Add the schema
 tier: haiku
 tier_why: the exact change is written below
+category: chore
 touches: db/schema.sql
 depends:
 ## What
@@ -4119,6 +4120,7 @@ END TASK
 **TASK: Read widgets in the API**
 tier: sonnet
 tier_why: one subsystem, has to run its tests
+category: chore
 touches: api/widgets.py
 depends: 1
 ## What
@@ -4132,17 +4134,22 @@ END TASK
 TASK: Sign widget exports
 tier: opus
 tier_why: signing
+category: feature
 touches: server/auth/sign.py, api/export.py
 depends: 1, 2
 ## What
 Sign each export.
 ## Done when
 - exports verify
+## Options
+1. Sign with the account key (recommended)
+2. Sign with a per-export key
 END TASK
 
 TASK: Rotate the signing key
 tier: sonnet
 tier_why: it looks small
+category: chore
 touches: server/auth/keys.py
 depends:
 ## What
@@ -4154,6 +4161,7 @@ END TASK
 TASK: Announce the rotation
 tier: haiku
 tier_why: a doc row
+category: chore
 touches: docs/keys.md
 depends: 4
 ## What
@@ -4267,6 +4275,11 @@ class TestBreakdown(DispatchProject):
         self.assertIn("## What\nServe the table from api/widgets.py.\n", text)
         self.assertIn("## Done when\n- GET /widgets returns the rows\n", text)
         self.assertIn("## Notes\nKeep it small.\n", text)
+        self.assertEqual(self.field("T-002", "category"), "chore")
+        self.assertNotIn("## Options", text)
+        text = self.task_file("T-003").read_text()
+        self.assertEqual(self.field("T-003", "category"), "feature")
+        self.assertIn("## Options\n1. Sign with the account key (recommended)\n2. Sign with a per-export key\n\n## Notes", text)
         # the rest are refused with a warning, never repaired
         self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 3)
         self.assertIn("warning: breakdown E-001 block 4 refused (Rotate the signing key): touches "
@@ -4307,6 +4320,42 @@ class TestBreakdown(DispatchProject):
         self.assertIn("two `## What` sections", got[3][2])
         self.assertEqual(got[0][1]["title"], "T")
 
+    def test_feature_blocks_need_two_to_four_options_and_a_known_category(self):
+        from ergon import dispatch as D
+        head = "TASK: T\ntier: haiku\ntier_why: w\n%stouches:\ndepends:\n## What\nx\n## Done when\n- y\n"
+        opts = lambda n: "## Options\n" + "".join(f"{i}. approach {i}\n" for i in range(1, n + 1))
+        replies = [head % "category: feature\n" + opts(2), head % "category: feature\n" + opts(1),
+                   head % "" + opts(5), head % "category: chore\n", head % "category: chore\n" + opts(1),
+                   head % "category: bugfix\n" + "## Options\nsome prose\n", head % "category: epic\n" + opts(2),
+                   head % "category: feature\n" + opts(2) + "Chosen: 1 by me 2026-01-01\n"]
+        got = D.parse_blocks("".join(r + "END TASK\n" for r in replies))
+        why = []
+        for n, f, w in got:
+            why.append(w or D.check_block(n, f, {}, {}, set()))
+        self.assertIsNone(why[0])
+        self.assertEqual(got[0][1]["options"], "1. approach 1\n2. approach 2")
+        self.assertIn("a feature block needs 2 to 4 options under `## Options`, has 1", why[1])
+        self.assertIn("a feature block needs 2 to 4 options", why[2])  # no category reads as feature
+        self.assertIsNone(why[3])
+        self.assertIn("a block with options needs 2 to 4", why[4])
+        self.assertIn("isn't a numbered option", why[5])
+        self.assertIn("category 'epic' not in", why[6])
+        self.assertIn("`Chosen:` line", why[7])
+
+    def test_breakdown_refuses_a_one_option_feature_and_files_the_rest(self):
+        self.new_epic()
+        approve_epic(self)
+        blk = "TASK: %s\ntier: haiku\ntier_why: w\ncategory: %s\ntouches:\ndepends:\n## What\nx\n## Done when\n- y\n%sEND TASK\n"
+        self.env["FAKE_BREAKDOWN"] = (blk % ("Two", "feature", "## Options\n1. a\n2. b\n") + blk % ("One", "feature", "## Options\n1. a\n")
+                                      + blk % ("Plain", "chore", "") + blk % ("Odd", "wish", "") + "RESULT: done\n")
+        out = self.ergon("breakdown", "E-001").stdout
+        self.assertIn("block 2 refused (One): a feature block needs 2 to 4 options under `## Options`, has 1", out)
+        self.assertIn("block 4 refused (Odd): category 'wish' not in", out)
+        self.assertIn("## Options\n1. a (recommended)\n2. b\n", self.task_file("T-001").read_text())
+        self.assertNotIn("## Options", self.task_file("T-002").read_text())
+        self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 2)
+        self.ergon("check")
+
     def new_epic_dir(self):
         return next((self.root / "tasks" / "epics").glob("E-001-*")).name
 
@@ -4341,7 +4390,7 @@ class TestBreakdown(DispatchProject):
         self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
         self.assertEqual(len(self.calls()), 1)
         # by hand it runs again, and again only adds
-        one = "TASK: First\ntier: haiku\ntier_why: w\ntouches: a.md\ndepends:\n## What\nx\n## Done when\n- y\nEND TASK\nRESULT: done\n"
+        one = "TASK: First\ntier: haiku\ntier_why: w\ncategory: chore\ntouches: a.md\ndepends:\n## What\nx\n## Done when\n- y\nEND TASK\nRESULT: done\n"
         self.env["FAKE_BREAKDOWN"] = one
         out = self.ergon("breakdown", "E-001", "--budget", "1").stdout
         self.assertIn("proposed T-001  (breakdown E-001)  First", out)

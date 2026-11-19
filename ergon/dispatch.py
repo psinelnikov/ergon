@@ -2742,8 +2742,9 @@ BREAKDOWN_MAX = 30  # TASK blocks filed per run; past that every block is refuse
 BREAKDOWN_SOURCE = "breakdown {eid}"
 BLOCK_START = re.compile(r"^\W*TASK:[ \t]*(.*?)[ \t*`]*$")
 BLOCK_END = re.compile(r"^\W*END TASK\W*$")
-BLOCK_FIELDS = ("tier", "tier_why", "touches", "depends")
-BLOCK_SECTIONS = ("what", "done when", "notes")
+BLOCK_FIELDS = ("tier", "tier_why", "category", "touches", "depends")  # category may be left out (a feature)
+BLOCK_SECTIONS = ("what", "done when", "options", "notes")
+BLOCK_OPTIONS = (2, 4)  # a feature block's number of options, at least and at most
 
 BREAKDOWN_PROMPT = """Break down epic {eid} into tasks.
 
@@ -2763,18 +2764,24 @@ If the brief can't be broken down as it stands, write no blocks and end with
 TASK: <title: what changes, one line>
 tier: <haiku | sonnet | opus | human>
 tier_why: <one line: why that tier>
+category: <feature | bugfix | refactor | chore; empty reads as feature>
 touches: <comma-separated paths or names it changes; may be empty>
 depends: <comma-separated numbers of earlier blocks in this reply, or existing T-NNN IDs; may be empty>
 ## What
 <the change, citing file:line>
 ## Done when
 <outcomes a reviewer can check>
+## Options
+1. <the recommended approach, one line>
+2. <an alternative approach, one line>
 END TASK
 
-Blocks are numbered 1, 2, 3, … in the order you write them, and `depends` may name only an earlier
+`## Options` lists 2 to 4 alternative approaches, the one you recommend first, one line each, and every
+option stays within the epic's Goal and Constraints. A feature block needs it; a bugfix, refactor or
+chore block may leave it out. Blocks are numbered 1, 2, 3, … in the order you write them, and `depends` may name only an earlier
 block. Each block is checked as `ergon check` would check it. A block with an unknown field, a tier
-below a `[[protect]]` minimum for a path it touches, an empty What or Done when, or a missing
-END TASK line is refused and never repaired. So is a block that depends on a refused one. At most
+below a `[[protect]]` minimum for a path it touches, an unknown category, a feature with fewer than 2 or more than 4 options, an empty What or
+Done when, or a missing END TASK line is refused and never repaired. So is a block that depends on a refused one. At most
 {max} blocks are filed.
 """
 
@@ -2922,7 +2929,7 @@ def check_block(n, f, tasks, ids, refused):
     if re.search(r"(?:^|\s)#", title) or title.startswith("["):
         return "title would not survive frontmatter (a ` #` starts a comment, a leading `[` a list)"
     for k in BLOCK_FIELDS:
-        if k not in f:
+        if k not in f and k != "category":
             return f"no `{k}:` line"
     if f["tier"] not in _tasks.TIERS:
         return f"tier {f['tier']!r} not in {_tasks.TIERS}"
@@ -2934,6 +2941,19 @@ def check_block(n, f, tasks, ids, refused):
         return "empty or missing `## What`"
     if not f.get("done when"):
         return "empty or missing `## Done when`"
+    cat = f.get("category", "").strip().lower() or "feature"
+    if cat not in _tasks.CATEGORIES:
+        return f"category {f['category']!r} not in {_tasks.CATEGORIES}"
+    f["_category"] = cat
+    opts = [m[2] for l in f.get("options", "").split("\n") if (m := _tasks.OPTION_ITEM.match(l)) and m[2]]
+    if any(l.strip().startswith("Chosen:") for l in f.get("options", "").split("\n")):
+        return "`## Options` has a `Chosen:` line (a human chooses)"
+    if f.get("options") and len(opts) != len([l for l in f["options"].split("\n") if l.strip()]):
+        return "`## Options` holds a line that isn't a numbered option (`1. …`)"
+    if (cat == "feature" or opts) and not BLOCK_OPTIONS[0] <= len(opts) <= BLOCK_OPTIONS[1]:
+        return (f"{'a feature block' if cat == 'feature' else 'a block with options'} needs "
+                f"{BLOCK_OPTIONS[0]} to {BLOCK_OPTIONS[1]} options under `## Options`, has {len(opts)}")
+    f["_options"] = [_tasks.RECOMMENDED.sub("", o) for o in opts]
     touches = split_list(f["touches"])
     if any(re.search(r"[\[\]#]", x) for x in touches):
         return f"a touches: entry holds `[`, `]` or `#`: {f['touches']}"
@@ -3075,10 +3095,11 @@ def file_blocks(e, blocks, info):
             info["refused"].append((n, title, why))
             continue
         tid = _tasks.next_id(_config.ITEMS, "T")
-        body = f"\n## What\n{f['what']}\n\n## Done when\n{f['done when']}\n\n## Notes\n" + (
-            f"{f['notes']}\n" if f.get("notes") else "")
+        body = (f"\n## What\n{f['what']}\n\n## Done when\n{f['done when']}\n"
+                + (_tasks.options_section(f["_options"]) if f["_options"] else "") + "\n## Notes\n"
+                + (f"{f['notes']}\n" if f.get("notes") else ""))
         source = BREAKDOWN_SOURCE.format(eid=e["id"])
-        meta = {"id": tid, "title": title, "tier": f["tier"], "status": "proposed", "epic": e["id"],
+        meta = {"id": tid, "title": title, "tier": f["tier"], "category": f["_category"], "status": "proposed", "epic": e["id"],
                 "depends": f["_depends"], "touches": f["_touches"], "source": source,
                 "created": _tasks.today(), "approved": "", "tier_why": f["tier_why"],
                 "_path": e["_path"].parent / f"{tid}-{_tasks.slug(title)}.md", "_body": body}
