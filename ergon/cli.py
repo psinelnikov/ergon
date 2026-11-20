@@ -91,6 +91,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                While workers run, every --interval seconds it also picks up tasks
                                approved meanwhile and runs those that share no touches: path with
                                a running task beside it; an overlapping one waits for its blocker.
+                               With no --max (and no --watch) the run drains the queue: every
+                               eligible task, follow-ups too (follow_ups ignored), until nothing
+                               runs and nothing is launchable; a held or `limited` task keeps it
+                               alive until it can launch. A cap (--max, follow_ups, budget) that
+                               keeps a ready task back prints `capped` with which tasks.
                                --watch (needs --budget-total) keeps rescanning for newly ready
                                tasks every --interval seconds (default 30) until the cap is hit
                                or Ctrl-C (stop launching, let workers finish; a second kills them)
@@ -547,7 +552,10 @@ def main():
     d.add_argument("--tier", choices=_config.WORKER_TIERS)
     d.add_argument("--epic")
     d.add_argument("--ids", help="comma-separated task IDs (still only ready ones)")
-    d.add_argument("--max", type=int, help="tasks to launch this run (default 6; no limit with --watch)")
+    d.add_argument("--max", type=int, help="tasks to launch this run. Without it (and without --watch) dispatch drains the queue: "
+                        "every eligible task and auto-approved follow-up launches (follow_ups is ignored) until "
+                        "nothing runs and nothing is launchable; --budget-total, if given, still caps it, "
+                        "and with no cap the run says spend is uncapped. With --max N follow_ups applies")
     d.add_argument("--jobs", type=int, default=3, help="workers at once (default 3)")
     d.add_argument("--permission-mode", default="auto",
                    choices=["auto", "acceptEdits", "dontAsk", "bypassPermissions"])

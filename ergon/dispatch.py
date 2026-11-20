@@ -3518,8 +3518,12 @@ def dispatch(args):
     if args.watch and args.dry_run:
         raise SystemExit("--watch and --dry-run don't combine")
     args.until_done = max(0, getattr(args, "until_done", 0) or 0)
+    # T-235: a plain run with no --max drains the queue (every eligible task, follow-ups included,
+    # until nothing runs and nothing is launchable); --max N or --watch keep their own bounds.
+    args.drain = args.max is None and not args.watch
     if args.max is None:
-        args.max = float("inf") if args.watch else 6
+        args.max = float("inf")
+    fu_cap = float("inf") if args.drain else _config.FOLLOW_UPS  # follow_ups is ignored when draining
     if _config.REPO != _config.HOME and not args.dry_run:  # a dry run only reads, so any checkout will do
         raise SystemExit(f"run dispatch from the main checkout ({_config.HOME})")
     claims = bool(_config.SHARED) and not args.dry_run  # a dry run reads local state and pushes nothing
@@ -3552,6 +3556,7 @@ def dispatch(args):
     learns, learn_asked = [], set()  # this run's learn runs (their info), and the incidents they sent
     first_ready = None  # ids ready at the run's first scan; a launch of any other says it was approved meanwhile
     cap = args.budget_total * args.budget_pct / 100 if args.budget_total else None
+    limited_until = {}  # task id -> reset time of a task the usage limit still holds (this scan)
     capped = stopped = False
     paused = 0.0
     probing = not args.dry_run and _limits.enabled()  # the 5-hour window, read before and after
@@ -3574,6 +3579,7 @@ def dispatch(args):
                     or (args.epic and t.get("epic") != args.epic)):
                 continue
             if lim and lim[0] > now:
+                limited_until[t["id"]] = lim[0]
                 skipped[t["id"]] = (f"limited until {_limits.clock(lim[0])}: the usage limit stopped "
                                     f"{limit_step_text(lim[1])}; a dispatch at or after then resumes it")
                 continue
@@ -4528,7 +4534,12 @@ def dispatch(args):
         if not plan and not bplan:
             print("nothing to dispatch")
         obsidian_write_back(dry=True)
-        if _config.FOLLOW_UPS and _config.FOLLOW_UP_DEPTH and not _config.signed():
+        if args.drain:
+            print("  mode       drain: no --max, so every eligible task launches, auto-approved follow-ups too "
+                  f"(follow_ups is ignored), until nothing runs and nothing is launchable; depth "
+                  f"{_config.FOLLOW_UP_DEPTH} (follow_up_depth)"
+                  + ("" if cap is not None else "; spend is uncapped (no --budget-total)"))
+        if fu_cap and _config.FOLLOW_UP_DEPTH and not _config.signed() and not args.drain:
             print(f"  follow-ups  auto-approved follow-ups (bugfix, refactor, chore) a worker files may run in this "
                   f"same run, up to {_config.FOLLOW_UPS} (follow_ups), depth {_config.FOLLOW_UP_DEPTH} "
                   f"(follow_up_depth); they don't count toward --max")
@@ -4627,6 +4638,12 @@ def dispatch(args):
     else:
         running, launched, active = {}, 0, {}  # active: running task id -> task
         fu_launched = 0  # auto-approved follow-ups launched, bounded by follow_ups
+        limit_wait = False
+        capped_said = set()  # (cap, task id) pairs already reported as held back by a cap
+        if args.drain:
+            print("draining the queue: no --max or follow_ups cap; stops when nothing is left to launch"
+                  + (f" or the budget cap ${cap:.2f} is reached" if cap is not None
+                     else "; spend is uncapped (no --budget-total)"), flush=True)
         held_on = {}  # task id -> the running task it was last recorded held behind
         stops, tick = [], 0.25
         stop_evt = threading.Event()
@@ -4649,7 +4666,7 @@ def dispatch(args):
                     stopping = bool(stops)
                     if scan and not stopping:
                         # shared mode: see what the team did (approvals, claims) before choosing
-                        unsynced = sync_state() if claims and (launched < args.max or fu_launched < _config.FOLLOW_UPS) \
+                        unsynced = sync_state() if claims and (launched < args.max or fu_launched < fu_cap) \
                             and not capped else None
                         if unsynced:
                             say_sync(f"failed, so nothing launches this scan: {unsynced}")
@@ -4658,16 +4675,20 @@ def dispatch(args):
                         with _gitops.state_lock():
                             if cap is not None and spent() >= cap:
                                 capped = True
+                            limited_until.clear()
                             queue = [] if capped or unsynced or limit_wait else list(eligible(_tasks.load(_config.ITEMS)))
                             if first_ready is None and not unsynced and not limit_wait:
                                 first_ready = {t["id"] for t in queue}
+                            cap_held = {}
                             while queue and len(running) < args.jobs:
                                 t = queue.pop(0)
                                 # an auto-approved follow-up isn't one of the --max, but follow_ups bounds them
                                 follow = _tasks.is_auto(t)
-                                if follow and fu_launched >= _config.FOLLOW_UPS:
+                                if follow and fu_launched >= fu_cap:
+                                    cap_held.setdefault(f"follow_ups ({fu_cap})", []).append(t["id"])
                                     continue
                                 if not follow and launched >= args.max:
+                                    cap_held.setdefault(f"--max ({args.max})", []).append(t["id"])
                                     continue
                                 behind, why_held, sharing = beside_check(t, active.values())
                                 if behind:  # held: stays eligible, retried when a running task lands
@@ -4738,6 +4759,14 @@ def dispatch(args):
                                     fu_launched += 1
                                 else:
                                     launched += 1
+                            for why_cap, held_ids in cap_held.items():
+                                new = [i for i in held_ids if (why_cap, i) not in capped_said]
+                                if new:
+                                    capped_said.update((why_cap, i) for i in new)
+                                    print(f"  capped   {why_cap} keeps {', '.join(new)} from launching; "
+                                          "still ready for the next run"
+                                          + ("" if not args.watch else " (--watch has nothing else to launch)"
+                                             if not running and len(new) == len(held_ids) else ""), flush=True)
                             # an approved epic with no tasks: break it down (a slot, not a launch)
                             bq = [] if capped or unsynced or limit_wait or len(running) >= args.jobs else \
                                 to_break(_tasks.load(_config.ITEMS))
@@ -4762,7 +4791,9 @@ def dispatch(args):
                     scan = False
                     # nothing running means no worker can file a follow-up now, and the scan above has launched any ready
                     over = stopping or capped or launched >= args.max
-                    if not running and (not args.watch or over):
+                    # drain: a task held by the usage limit keeps the run alive until its reset
+                    waiting = args.drain and not stopping and not capped and (limit_wait or bool(limited_until))
+                    if not running and (not args.watch or over) and not waiting:
                         break
                     if running:
                         finished, _ = wait(running, timeout=tick, return_when=FIRST_COMPLETED)
@@ -4791,11 +4822,12 @@ def dispatch(args):
                                 paused = res[3]["resets_at"]
                                 print(f"  limit    the usage limit is hit: nothing launches before "
                                       f"{_limits.clock(paused)}" + ("; --watch waits for it" if args.watch else
+                                                                    "; the drain waits for it" if args.drain else
                                                                     "; running workers finish"), flush=True)
                         scan = True
                         if args.watch and res[1] == "done":
                             obsidian_write_back()
-                    if (args.watch or running) and time.monotonic() >= next_scan:
+                    if (args.watch or running or waiting) and time.monotonic() >= next_scan:
                         scan = True
         finally:
             signal.signal(signal.SIGINT, old_handler)

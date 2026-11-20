@@ -4205,7 +4205,7 @@ class TestConflictRounds(DispatchProject):
                 # an old transcript (age 4000) makes the restart a fresh worker
                 self.env.update(FAKE_STOPS="ok|ok|limit|ok", FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"),
                                 FAKE_LIMIT_TEXT=f"Claude AI usage limit reached|{at}", FAKE_TRANSCRIPT_AGE=age)
-                out = self.ergon("dispatch", "--jobs", "2").stdout
+                out = self.ergon("dispatch", "--max", "6", "--jobs", "2").stdout
                 self.assertEqual(self.status("T-002"), "blocked", out)
                 self.assertRegex(self.task_file("T-002").read_text(), r"(?m)^limited: \S+ conflict 1$")
                 lim = self.rows("limited")[0]
@@ -6284,6 +6284,44 @@ class TestAutoApprove(DispatchProject):
         self.assertIn(f"auto-approved, worked this run: {done[0]} (done)", out)
         self.assertIn(f"auto-approved, left ready: {left[0]}", out)
 
+    def test_drain_runs_follow_ups_past_follow_ups_and_ends_when_empty(self):
+        self.write_follow_ups(1)  # ignored when draining: a chain of 3 follow-ups all run
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="A — a\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix")
+        out = self.ergon("dispatch").stdout
+        self.assertEqual([self.status(t) for t in ("T-001", "T-002", "T-003", "T-004")], ["done"] * 4, out)
+        self.assertIn("spend is uncapped", out)
+        self.assertIn("4/4 done", out)
+        self.assertNotIn("capped  ", out)
+        self.assertIn("mode       drain", self.ergon("dispatch", "--dry-run").stdout)
+
+    def test_drain_stops_at_the_budget_cap(self):
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="A — a\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix")
+        out = self.ergon("dispatch", "--budget-total", "0.01").stdout
+        self.assertEqual([self.status("T-001"), self.status("T-002")], ["done", "ready"], out)
+        self.assertIn("budget cap", out)
+        self.assertNotIn("spend is uncapped", out)
+
+    def test_capped_tasks_are_named_once(self):
+        self.write_follow_ups(1)
+        self.ergon("new", "task", "Source", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        self.env.update(FAKE_FOUND="A — a\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix|B — b\nTOUCHES: b.py\nDONE WHEN: ok\nCATEGORY: bugfix")
+        out = self.ergon("dispatch", "--max", "1").stdout
+        self.assertRegex(out, r"capped\s+follow_ups \(1\) keeps T-003 from launching")
+        self.assertEqual(out.count("T-003 from launching"), 1, out)
+
+    def test_max_cap_names_the_tasks_it_holds_back(self):
+        for n in "AB":
+            self.ergon("new", "task", f"Job {n}", "--tier", "sonnet")
+        stamp(self.task_file("T-001"))
+        stamp(self.task_file("T-002"))
+        out = self.ergon("dispatch", "--max", "1").stdout
+        self.assertRegex(out, r"capped\s+--max \(1\) keeps T-002 from launching", out)
+
     def test_follow_up_without_done_when_is_proposed_with_a_fill_note(self):
         out = self.found("Fix X — y breaks\nTOUCHES: a.py\nCATEGORY: bugfix")
         self.assert_proposed()
@@ -6307,7 +6345,7 @@ class TestAutoApprove(DispatchProject):
     def test_dry_run_and_proposed_group(self):
         self.ergon("new", "task", "Source", "--tier", "sonnet")
         stamp(self.task_file("T-001"))
-        out = self.ergon("dispatch", "--dry-run", "--budget", "1", "--budget-total", "5").stdout
+        out = self.ergon("dispatch", "--dry-run", "--max", "6", "--budget", "1", "--budget-total", "5").stdout
         self.assertIn("auto-approved follow-ups", out)
         self.assertIn("up to 10 (follow_ups), depth 3 (follow_up_depth)", out)
         self.assertIn("not counting auto-approved follow-ups", out)
@@ -6892,7 +6930,7 @@ class TestUsageLimit(DispatchProject):
     def test_worker_hit_parks_files_nothing_uses_no_round_then_resumes_after_the_reset(self):
         at = self.limit_at(3600)
         self.env["FAKE_STOPS"] = "limit|ok"
-        out = self.ergon("dispatch", "--escalate", "--until-done", "2").stdout
+        out = self.ergon("dispatch", "--max", "6", "--escalate", "--until-done", "2").stdout
         self.assertEqual(self.status("T-001"), "blocked", out)
         self.assertEqual(self.mark(), time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at)) + " worker")
         self.assertIn("limited  T-001  its run stopped by the usage limit", out)
@@ -6912,7 +6950,7 @@ class TestUsageLimit(DispatchProject):
         self.ergon("check")
 
         # Before the reset a scan skips it, and says until when.
-        out = self.ergon("dispatch").stdout
+        out = self.ergon("dispatch", "--max", "6").stdout
         self.assertIn(f"skipped  T-001  limited until {self.clock(at)}", out)
         self.assertIn(f"limited until {self.clock(at)}", self.ergon("dispatch", "--dry-run").stdout)
         self.assertEqual(self.status("T-001"), "blocked")
@@ -6922,7 +6960,7 @@ class TestUsageLimit(DispatchProject):
         self.reset_passes()
         self.assertIn("restarts its run (the usage limit has reset)", self.ergon("dispatch", "--dry-run").stdout)
         time.sleep(1.1)  # run logs are named to the second
-        out = self.ergon("dispatch").stdout
+        out = self.ergon("dispatch", "--max", "6").stdout
         self.assertEqual(self.status("T-001"), "done", out)
         self.assertIsNone(self.mark())
         self.assertIn("approved: Tester 2026-01-01", self.text())
@@ -6937,7 +6975,7 @@ class TestUsageLimit(DispatchProject):
     def test_no_reset_in_the_message_waits_half_an_hour(self):
         self.env.update(FAKE_STOPS="limit", FAKE_LIMIT_TEXT="You've hit your limit")
         start = time.time()
-        self.ergon("dispatch")
+        self.ergon("dispatch", "--max", "6")
         at = self.rows("limited")[0]["resets_at"]
         self.assertTrue(start + 29 * 60 <= at <= time.time() + 31 * 60, at - start)
 
@@ -6946,7 +6984,7 @@ class TestUsageLimit(DispatchProject):
         stamp(self.task_file("T-002"))
         at = self.limit_at(3600)
         self.env["FAKE_STOPS"] = "limit|ok"
-        out = self.ergon("dispatch", "--jobs", "1").stdout
+        out = self.ergon("dispatch", "--max", "6", "--jobs", "1").stdout
         statuses = sorted([self.status("T-001"), self.status("T-002")])
         self.assertEqual(statuses, ["blocked", "ready"], out)
         hit = "T-001" if self.status("T-001") == "blocked" else "T-002"
@@ -6981,7 +7019,7 @@ class TestUsageLimit(DispatchProject):
         cfg.write_text('review = ["sonnet"]\nverify = "true"\n' + cfg.read_text())
         self.limit_at(3600)
         self.env["FAKE_REVIEWS"] = "LIMIT|REVIEW: pass"
-        out = self.ergon("dispatch").stdout
+        out = self.ergon("dispatch", "--max", "6").stdout
         self.assertEqual(self.status("T-001"), "blocked", out)
         self.assertTrue(self.mark().endswith(" review"), self.mark())
         self.assertIn("stopped by the usage limit", out)
@@ -6990,7 +7028,7 @@ class TestUsageLimit(DispatchProject):
         self.assertFalse(list(self.root.glob("tasks/**/T-002*")))
         self.reset_passes()
         time.sleep(1.1)
-        out = self.ergon("dispatch").stdout
+        out = self.ergon("dispatch", "--max", "6").stdout
         self.assertEqual(self.status("T-001"), "done", out)
         self.assertEqual([c["agent"] for c in self.calls()], ["SONNET", "REVIEW", "REVIEW"])
         self.assertEqual([r["verdict"] for r in self.rows("review")], ["limited", "pass"])
@@ -7000,13 +7038,13 @@ class TestUsageLimit(DispatchProject):
         cfg.write_text('review = ["sonnet"]\nverify = "true"\n' + cfg.read_text())
         self.limit_at(3600)
         self.env.update(FAKE_STOPS="ok|limit|ok", FAKE_REVIEWS="REVIEW: fail — name it better|REVIEW: pass")
-        out = self.ergon("dispatch").stdout
+        out = self.ergon("dispatch", "--max", "6").stdout
         self.assertEqual(self.status("T-001"), "blocked", out)
         self.assertTrue(self.mark().endswith(" fix 1"), self.mark())
         self.assertIn("review (opus) failed: name it better", self.rows("limited")[0]["fixing"])
         self.reset_passes()
         time.sleep(1.1)
-        out = self.ergon("dispatch").stdout
+        out = self.ergon("dispatch", "--max", "6").stdout
         self.assertEqual(self.status("T-001"), "done", out)
         calls = self.calls()
         self.assertEqual([(c["agent"], c["resume"]) for c in calls],
@@ -7016,7 +7054,7 @@ class TestUsageLimit(DispatchProject):
     def test_only_dispatch_writes_the_mark(self):
         self.limit_at(3600)
         self.env["FAKE_STOPS"] = "limit"
-        self.ergon("dispatch")
+        self.ergon("dispatch", "--max", "6")
         mark = self.mark()
         f = str(self.task_file("T-001"))
         self.assertIn("dispatch only", self.guard("Edit", {"file_path": f, "old_string": f"limited: {mark}\n",
