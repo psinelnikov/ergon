@@ -171,7 +171,8 @@ def approver_signals(tasks, rows, since=None, epic=None, until=None):
     {name: {"approved", "tiers", "landed", "escalated", "blocked", "asked", "fails", "sent_back",
     "weeks": {week: {"landed", "tiers", "escalated", "fails"}}}}; `fails` counts the review fails
     of landed tasks. Rows outside since/until/epic are left out. A task with no `approved` row
-    is attributed from its `approved:` stamp; one nobody can be found for goes under "(unknown)".
+    is attributed from its `approved:` stamp; one nobody can be found for goes under "(unknown)". A task approved by inheritance (`by: auto`)
+    counts under its root's approver(s), or under "auto" when the root's can't be found.
     Never raises on odd rows."""
     keep = []
     for r in rows:
@@ -183,13 +184,28 @@ def approver_signals(tasks, rows, since=None, epic=None, until=None):
     for r in keep:
         by.setdefault(r.get("task"), []).append(r)
     has_row = {r.get("task") for r in rows if r.get("event") == "approved"}
+    def stamp_names(text):
+        m = _STAMP.match(re.sub(r"\s*sha256:\S+\s*$", "", str(text or "")).strip())
+        return [n.strip() for n in m["who"].split(" and ") if n.strip()] if m else []
+
+    def root_names(root):
+        """The human approvers an auto approval inherits from `root`, or [] if none can be found."""
+        ap = [r for r in rows if r.get("event") == "approved" and r.get("task") == root and r.get("by") != "auto"]
+        if ap:
+            names = ap[-1].get("approvers") if isinstance(ap[-1].get("approvers"), list) else None
+            return [str(n) for n in (names or [ap[-1].get("by")]) if n]
+        return stamp_names((tasks.get(root) or {}).get("approved"))
+
     who_of = {}  # task -> (names, tier)
     for tid, trail in by.items():
         ap = [r for r in trail if r["event"] == "approved"]
         if ap:
             r = ap[-1]
             names = r.get("approvers") if isinstance(r.get("approvers"), list) and r["approvers"] else [r.get("by")]
-            who_of[tid] = ([str(n) for n in names if n] or ["(unknown)"], r.get("tier"))
+            names = [str(n) for n in names if n]
+            if r.get("by") == "auto" and r.get("root"):  # approved by inheritance: credit the root's approver
+                names = root_names(r["root"]) or ["auto"]
+            who_of[tid] = (names or ["(unknown)"], r.get("tier"))
     for tid, t in tasks.items():
         if tid in has_row or not t.get("approved"):
             continue
@@ -198,7 +214,10 @@ def approver_signals(tasks, rows, since=None, epic=None, until=None):
         m = _STAMP.match(re.sub(r"\s*sha256:\S+\s*$", "", str(t["approved"])).strip())
         if m and ((since and m["day"] < since) or (until and m["day"] > until)):
             continue
-        names = [n.strip() for n in m["who"].split(" and ") if n.strip()] if m else []
+        names = stamp_names(t["approved"])
+        am = re.match(r"^auto \S+ follow-up of T-\d+ \(root (T-\d+), ", str(t["approved"]))
+        if am:  # an auto stamp: credit the root's approver
+            names = root_names(am[1]) or ["auto"]
         who_of[tid] = (names or ["(unknown)"], None)
     out = {}
     for tid, (names, tier) in who_of.items():

@@ -6680,6 +6680,18 @@ class TestApproverSignals(Project):
                                 "event": "approved", "tier": "haiku"}) + "\n")
         self.assertRegex(self.stats("--approvers"), r"(?m)^\(unknown\) +1 ")
 
+    def test_auto_approved_counts_under_root_approver(self):
+        def r(tid, **kw):
+            return {"at": "2026-11-03T10:00:00+00:00", "task": tid, "epic": None, **kw}
+        with (self.root / "tasks" / "runs" / "history.jsonl").open("a") as h:
+            for row in (r("T-020", event="approved", by="auto", tier="haiku", root="T-004", parent="T-004", depth=1),
+                        r("T-020", event="landed"),
+                        r("T-021", event="approved", by="auto", tier="haiku", root="T-999", parent="T-999", depth=1)):
+                h.write(json.dumps(row) + "\n")
+        out = self.stats("--approvers")
+        self.assertEqual(self.line(out, "Bob").split()[1:3], ["4", "4"])  # T-002, T-004, T-007 and T-020
+        self.assertEqual(self.line(out, "auto").split()[1], "1")  # root unknown: its own line
+
     def test_no_approvals_no_section(self):
         (self.root / "tasks" / "runs" / "history.jsonl").write_text("")
         f = self.task_file("T-008")
