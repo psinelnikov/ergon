@@ -970,8 +970,9 @@ class TestEpicBranch(Project):
         without = self.ergon(*args).stdout
         m0 = re.search(r"estimated at most \$(\d+\.\d\d) for 1 task", without)
         self.assertNotIn("resolver", without)
-        # conflict_rounds = 1 adds its worker round, and the resolver one more call
-        self.assertEqual(float(m.group(1)) - float(m0.group(1)), 2.0)
+        # conflict_rounds = 1 adds its worker round and the 2 verify fix rounds that rerun on the
+        # merge after it (T-111), and the resolver one more call
+        self.assertEqual(float(m.group(1)) - float(m0.group(1)), 4.0)
 
     def test_epic_lifecycle(self):
         self.ergon("new", "epic", "Big thing")
@@ -2155,15 +2156,17 @@ class TestReview(DispatchProject):
         for t in ("T-001", "T-002"):
             stamp(self.task_file(t))
         # T-001: its worker + 2 verify fixes = 3; T-002 (opus): worker + review + 2 verify fixes
-        # (a weakening veto needs no gate command) = 4; each + 1 conflict round.
+        # (a weakening veto needs no gate command) = 4; each + 1 conflict round, which is a worker
+        # and then those verify fixes and that review again (T-111): 3 + 3 and 4 + 4.
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout
-        self.assertIn("estimated at most $9.00 for 2 task(s)", dry)
+        self.assertIn("estimated at most $14.00 for 2 task(s)", dry)
         self.assertIn("plus the review and no fix rounds for a reviewed tier, "
                       "plus up to 2 verify fix rounds (a fix each) (with or without a verify: a weakening veto or failed harden proof takes one too)", dry)
         # --escalate: T-001 may finish as opus, which is reviewed: 2 workers + review + 2 verify fixes
-        # + 1 conflict round = 6. T-002 (opus: 5) is already opus, so nothing escalates it.
+        # + 1 conflict round (worker + review + 2 verify fixes) = 9. T-002 (opus: 8) is already opus,
+        # so nothing escalates it.
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1", "--escalate").stdout
-        self.assertIn("estimated at most $11.00 for 2 task(s)", dry)
+        self.assertIn("estimated at most $17.00 for 2 task(s)", dry)
         self.assertEqual(self.calls(), [])
 
     def test_dry_run_estimate_counts_verify_fix_rounds_without_a_gate(self):
@@ -2312,18 +2315,44 @@ class TestReviewRounds(DispatchProject):
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout
         self.assertIn(", reviewed by sonnet (up to 2 fix rounds)", [l for l in dry.splitlines() if "T-001" in l][0])
         self.assertNotIn("reviewed by", [l for l in dry.splitlines() if "T-002" in l][0])
-        # verify = "true": T-001: worker + review + 2 x (fix + review) + 2 verify fixes + 1 conflict
-        # round = 9 calls; T-002: its worker + 2 verify fixes + 1 conflict round = 4.
-        self.assertIn("estimated at most $13.00 for 2 task(s) at --budget $1 per call, counting a task as its "
+        # verify = "true": T-001: worker + review + 2 x (fix + review) + 2 verify fixes = 8, and 1
+        # conflict round = its worker and those 7 again = 16 calls; T-002: its worker + 2 verify
+        # fixes = 3, and 1 conflict round = its worker and the 2 verify fixes again = 6.
+        self.assertIn("estimated at most $22.00 for 2 task(s) at --budget $1 per call, counting a task as its "
                       "worker plus the review and up to 2 fix rounds (a fix and a review each) for a reviewed tier, "
                       "plus up to 2 verify fix rounds (a fix each) (with or without a verify: a weakening veto or failed harden proof takes one too)", dry)
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1", "--max", "1").stdout
-        self.assertIn("estimated at most $9.00 for 1 task(s)", dry)  # the costliest one
-        # --escalate adds a second worker a tier up: T-001 10 calls, T-002 (sonnet → opus, unreviewed) 5.
+        self.assertIn("estimated at most $16.00 for 1 task(s)", dry)  # the costliest one
+        # --escalate adds a second worker a tier up: T-001 17 calls, T-002 (sonnet → opus, unreviewed) 7.
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1", "--escalate").stdout
-        self.assertIn("estimated at most $15.00 for 2 task(s) at --budget $1 per call, counting a task as its "
+        self.assertIn("estimated at most $24.00 for 2 task(s) at --budget $1 per call, counting a task as its "
                       "worker plus a second worker if --escalate retries it a tier up, plus the review", dry)
         self.assertEqual(self.calls(), [])  # a dry run runs nothing
+
+    def test_dry_run_estimate_counts_the_review_that_reruns_after_a_conflict_round(self):
+        # T-111: after a conflict round resolve() runs fix_loop again on the merge, so the review and
+        # its fix rounds (and verify fix rounds) may all run again. verify_rounds = 0 keeps only the review.
+        toml = self.root / ".ergon.toml"
+        toml.write_text("verify_rounds = 0\nconflict_rounds = 1\n" + toml.read_text())
+        est = lambda: float(re.search(r"estimated at most \$([\d.]+)",
+                                      self.ergon("dispatch", "--dry-run", "--budget-total", "100",
+                                                 "--budget", "1").stdout)[1])
+        # T-001 (haiku, reviewed): worker + review + 2 x (fix + review) = 6, then the conflict round's
+        # worker + review + 2 x (fix + review) = 6 more: 12, where it was 7 before T-111.
+        self.assertEqual(est(), 12.0)
+        dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout
+        self.assertIn("plus up to 1 conflict round (a worker each, then the review and its fix rounds again) "
+                      "if the branch conflicts", dry)
+        self.ergon("new", "task", "Unreviewed", "--tier", "sonnet")
+        stamp(self.task_file("T-002"))
+        # T-002 (sonnet, unreviewed): its worker + the conflict round's worker = 2, as before T-111.
+        self.assertEqual(est(), 14.0)
+        # with verify fix rounds, those rerun on the merge too: T-001 is (1 + 7) x 2 = 16, T-002 (1 + 2) x 2 = 6
+        toml.write_text(toml.read_text().replace("verify_rounds = 0", "verify_rounds = 2", 1))
+        self.assertEqual(est(), 22.0)
+        self.assertIn("(a worker each, then the verify fix rounds and the review and its fix rounds again)",
+                      self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout)
+        self.assertEqual(self.calls(), [])
 
     def test_fail_then_fix_then_pass_lands(self):
         self.env["FAKE_REVIEWS"] = "REVIEW: fail — no test for the empty list|REVIEW: pass"

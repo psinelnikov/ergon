@@ -4542,7 +4542,9 @@ def dispatch(args):
                 if --escalate retries it; then fix_loop's calls: per verify fix round a fix worker
                 (a red verify, a weakening veto or a failed harden proof, so with or without a gate
                 command), and for a reviewed tier the review plus every fix round
-                (a fix worker and a review again); and a worker per conflict round."""
+                (a fix worker and a review again); and per conflict round a worker plus those
+                fix_loop calls again, since resolve() reruns fix_loop on the merge with its verify fix
+                rounds and review rounds counted from zero (T-111)."""
                 verified = bool(vr)
                 if verified:
                     counted.add("verify")
@@ -4554,11 +4556,12 @@ def dispatch(args):
                 own = t["tier"] in _config.REVIEW
                 if cr:
                     counted.add("conflict")
-                calls = 1 + cr + after(own)
+                calls = 1 + after(own) + cr * (1 + after(own))
                 if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1]:
                     counted.add("escalate")  # after it the tier that finished is reviewed too
                     up = _config.WORKER_TIERS[_config.WORKER_TIERS.index(t["tier"]) + 1]
-                    calls = max(calls, 2 + cr + after(own or up in _config.REVIEW))
+                    reviewed = own or up in _config.REVIEW
+                    calls = max(calls, 2 + after(reviewed) + cr * (1 + after(reviewed)))
                 if args.until_done:
                     counted.add("until-done")
                 return calls + args.until_done
@@ -4576,13 +4579,17 @@ def dispatch(args):
                         resolvers += 1
                 if resolvers:
                     counted.add("resolver")
+            # what reruns on the merge after a conflict round: fix_loop, its rounds counted afresh
+            again = " and ".join(x for k, x in (("verify", "the verify fix rounds"),
+                                                ("review", "the review" + (" and its fix rounds" if rr else ""))) if k in counted)
+            again = f", then {again} again" if again else ""
             what = [x for k, x in (
                 ("escalate", "a second worker if --escalate retries it a tier up"),
                 ("review", f"the review and {rounds}" + (" (a fix and a review each)" if rr else "")
                            + " for a reviewed tier"),
                 ("verify", f"up to {vr} verify fix round{'s' if vr != 1 else ''} (a fix each) "
                            "(with or without a verify: a weakening veto or failed harden proof takes one too)"),
-                ("conflict", f"{crounds} (a worker each) if the branch conflicts"),
+                ("conflict", f"{crounds} (a worker each{again}) if the branch conflicts"),
                 ("until-done", f"up to {args.until_done} until-done rounds (a worker each) if it stops short"),
                 ("resolver", f"{resolvers} epic resolver call{'s' if resolvers != 1 else ''} "
                              "(one per epic whose last task lands, if its branch conflicts)"))
