@@ -928,6 +928,59 @@ class TestBasics(Project):
         self.assertIn("human-only", self.guard("Bash", {"command": "GIT_SSH_COMMAND='ergon approve T-1' git fetch"}))
         self.assertIsNone(self.guard("Bash", {"command": "GIT_CONFIG_PARAMETERS=\"'core.pager'='less -R'\" git log"}))
 
+    def test_guard_git_command_env_unseen_value(self):
+        """T-223: git runs GIT_EDITOR, GIT_PAGER, GIT_SSH_COMMAND, ... as a command. A human-only verb set
+        through any of them on or before a git call is refused through the hook; for git's own ones
+        (GIT_ONLY_ENV) a value the text can't show is refused too: an expansion, `+=` onto an outside
+        value, an export, read, printf -v, loop, nameref or ${NAME:=...} the guard can't read. A plain
+        value, the shared EDITOR / PAGER / VISUAL / SSH_ASKPASS, and the same text as data pass."""
+        from ergon.gates import GIT_COMMAND_ENV, GIT_ONLY_ENV, git_env_reason, human_cmd
+        listed = ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXTERNAL_DIFF",
+                  "GIT_ASKPASS", "SSH_ASKPASS", "EDITOR", "VISUAL", "PAGER"]
+        self.assertLessEqual(set(listed), GIT_COMMAND_ENV)
+        self.assertEqual(GIT_ONLY_ENV, {v for v in listed if v.startswith("GIT_")} | {"GIT_PROXY_COMMAND"})
+        verbs = ["approve", "reject", "close", "accept", "answer", "sync", "pin", "choose", "review -i"]
+        for var in listed:
+            for verb in verbs:
+                for form in ["{v}='ergon {b} T-1' git commit", "export {v}='ergon {b} T-1'; git commit"]:
+                    self.assertTrue(human_cmd(form.format(v=var, b=verb)), form.format(v=var, b=verb))
+        unseen = ["{v}=\"$X\" git commit", "{v}=$X git log", "{v}='$X' git log", "{v}=\"$(cat f)\" git log",
+                  "{v}=`cat f` git log", "{v}=\"ergon ${{V}}\" git log", "{v}=\"ergon $1\" git rebase -i",
+                  "X=1 {v}=\"$X\" git log", "sudo {v}=$X git log", "env {v}=$X git log", "nice {v}=$X /usr/bin/git log",
+                  "{v}=$X; git log", "export {v}=$X; git log", "declare -x {v}=$X", "{v}+=' x' git log",
+                  "export {v}; git log", "declare -x {v}", "typeset -x {v}=vim {v}+=$X", "read {v} <f; git log",
+                  "read -r {v} <<< x; git log", "mapfile {v} <f", "printf -v {v} %s x; git log", "printf -v{v} %s x",
+                  "for {v} in a b; do git log; done", "declare -n r={v}; r=x; git log", ": ${{{v}:=$X}}; git log",
+                  ": \"${{{v}=x\"", "bash -c '{v}=$X git log'", "sh <<'EOF'\n{v}=$X git log\nEOF",
+                  "cd x && {v}=$X git log | cat", "{v}=\"unclosed git log"]
+        for var in listed:
+            for form in unseen:
+                cmd = form.format(v=var)
+                if var in GIT_ONLY_ENV:
+                    why = git_env_reason(cmd)
+                    self.assertIsNotNone(why, cmd)
+                    self.assertIn("can't see", why)
+                else:
+                    self.assertIsNone(git_env_reason(cmd), cmd)
+        self.assertIsNotNone(git_env_reason(": \"${GIT_PAGER:=ergon approve T-1}\"; git log"))
+        for cmd in ["GIT_EDITOR=vim git commit", "GIT_PAGER=cat git log", "GIT_PAGER='less -R' git log",
+                    "GIT_SSH_COMMAND='ssh -i ~/.ssh/k' git fetch", "GIT_EDITOR=vim; export GIT_EDITOR; git commit",
+                    "export GIT_PAGER=cat GIT_PAGER", "GIT_PAGER=less; GIT_PAGER+=' -R'; git log",
+                    ": ${GIT_EDITOR:=vim}; git commit", "echo ${GIT_PAGER:-less} $GIT_EDITOR", "export -n GIT_EDITOR",
+                    "unset GIT_EDITOR", "declare GIT_EDITOR", "grep GIT_EDITOR f", "git grep -n GIT_PAGER",
+                    "git commit -m \"GIT_EDITOR=$X\"", "echo GIT_EDITOR=$X", "git log --grep 'GIT_PAGER=$X'",
+                    "X=$Y git log", "EDITOR=\"$X\" git commit", "export PAGER=$P; git log"]:
+            self.assertIsNone(git_env_reason(cmd), cmd)
+        # end to end through the hook
+        for cmd in ["GIT_EDITOR='ergon approve T-1' git commit", "export GIT_PAGER='ergon close T-1'; git log",
+                    "GIT_SSH_COMMAND='ergon answer T-1' git fetch", "EDITOR='ergon review -i' git commit"]:
+            self.assertIn("human-only", self.guard("Bash", {"command": cmd}), cmd)
+        for cmd in ["GIT_EDITOR=\"$X\" git commit", "read GIT_PAGER <f; export GIT_PAGER; git log",
+                    "GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch"]:
+            self.assertIn("can't see", self.guard("Bash", {"command": cmd}) or "", cmd)
+        for cmd in ["GIT_EDITOR=vim git commit", "GIT_PAGER=cat git log", "EDITOR=\"$X\" git commit"]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+
     def test_stop_hook_blocks_on_lint_failure(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")

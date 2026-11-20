@@ -1522,6 +1522,20 @@ def _env_config_commands(vals, name):
             if key is not None and val is not None and (c := git_config_command(key, val)) is not None]
 
 
+def _env_assignments(words):
+    """(name, "+" or "", value) of each NAME=value or NAME+=value among a simple command's words that
+    sets the environment of what it runs or of later commands: ahead of its program (or alone),
+    as an argument of export / declare, or ahead of a git call behind a wrapper (sudo, env, nice).
+    Anywhere else (after git, as echo's argument) it's data."""
+    git_at = next((k for k, w in enumerate(words) if _program(w) == "git" or _program(w).startswith("git-")), -1)
+    head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+    declares = head < len(words) and _program(words[head]) in SHELL_DECLARE
+    for k, w in enumerate(words):
+        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)", w, re.S)
+        if m and (k < head or declares or k < git_at):
+            yield m.groups()
+
+
 def env_commands(cmds):
     """The command lines git runs from the environment a list of shell commands sets, in order: the
     GIT_COMMAND_ENV variables, and the command-valued config of GIT_CONFIG_PARAMETERS and of each
@@ -1532,16 +1546,9 @@ def env_commands(cmds):
     message), is data."""
     vals, out = {}, []
     for words, _ in cmds:
-        git_at = next((k for k, w in enumerate(words) if _program(w) == "git" or _program(w).startswith("git-")),
-                      -1)
-        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
-        declares = head < len(words) and _program(words[head]) in SHELL_DECLARE
-        for k, w in enumerate(words):
-            m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)", w, re.S)
-            if not m or not (m.group(1) in GIT_COMMAND_ENV or GIT_CONFIG_ENV.fullmatch(m.group(1))) \
-                    or not (k < head or declares or k < git_at):
+        for name, append, val in _env_assignments(words):
+            if not (name in GIT_COMMAND_ENV or GIT_CONFIG_ENV.fullmatch(name)):
                 continue
-            name, append, val = m.groups()
             vals[name] = (vals.get(name, "") if append else "") + val
             if name.startswith("GIT_CONFIG_"):
                 out += _env_config_commands(vals, name)
@@ -1708,6 +1715,82 @@ def git_config_reason(cmd):
             runs = [git_config_command(key, val)] if key else [val, val[1:], "git " + val]
             if any(c and human_cmd(c) for c in runs):
                 return HUMAN_MSG
+    return None
+
+
+# The GIT_COMMAND_ENV variables only git reads. A value the text doesn't show is refused for these
+# (git_env_reason) but not for EDITOR, VISUAL, PAGER, SSH_ASKPASS or LESSOPEN, which other programs read
+# too and which a profile or script often sets from another variable.
+GIT_ONLY_ENV = {n for n in GIT_COMMAND_ENV if n.startswith("GIT_")}
+GIT_ONLY_ENV_IN = re.compile(r"\b(?:" + "|".join(sorted(GIT_ONLY_ENV, key=len, reverse=True)) + r")\b")
+# Programs that set the variables they name to a value from their input.
+ENV_FROM_INPUT = {"read", "mapfile", "readarray"}
+
+
+def unseen_env_msg(name, why):
+    return (f"git runs the value of {name} as a command, and the guard checks that command where {name} is set, "
+            f"but here it can't see it: {why}. So it's refused. Write the value out in full (`{name}=<command> "
+            f"git ...`; `~` for your home directory), or ask the user")
+
+
+def git_env_reason(cmd):
+    """Why a shell command sets one of git's own command variables (GIT_ONLY_ENV: GIT_EDITOR, GIT_PAGER,
+    GIT_SSH_COMMAND, ...) to a value human_cmd can't check, or None. Where env_commands reads an
+    assignment (ahead of a program or a git call, alone, exported): a value with a `$` or backtick
+    expansion, now or when git runs it through the shell, or a `+=` onto a value the text didn't set.
+    Anywhere: exporting it with no value the text set earlier, `read` / `mapfile` / `printf -v` into
+    it, a `for` / `select` loop over it, a nameref to it, or `${NAME:=value}` with an unseen value (a
+    value the text shows is checked by human_cmd). Strings run as code are checked too."""
+    try:
+        cmds = shell_commands(cmd)[0]
+    except (ValueError, RecursionError):
+        if m := GIT_ONLY_ENV_IN.search(cmd):
+            return unseen_env_msg(m.group(0), "the guard can't split this command")
+        return None
+    seen = set()  # the GIT_ONLY_ENV names the text has set to a value it shows
+    for words, docs in cmds:
+        # bash -c '...', a heredoc fed to sh. env's own words are read below.
+        if any(CODE_RUNNER.fullmatch(_program(w)) and _program(w) != "env" for w in words):
+            for t in words + [d for d, _ in docs]:
+                if t != cmd and (why := git_env_reason(t)):
+                    return why
+        for name, append, val in _env_assignments(words):
+            if name not in GIT_ONLY_ENV:
+                continue
+            if _unseen(val):
+                return unseen_env_msg(name, f"`{val}` holds a `$` or backtick expansion")
+            if append and name not in seen:
+                return unseen_env_msg(name, "`+=` adds to a value set outside this command")
+            seen.add(name)
+        for w in _without_messages(words):
+            for m in re.finditer(r"\$\{(\w+):?=([^}]*)(\}?)", w):
+                if m.group(1) not in GIT_ONLY_ENV:
+                    continue
+                if _unseen(m.group(2)) or "{" in m.group(2) or not m.group(3):
+                    return unseen_env_msg(m.group(1), f"`{m.group(0)}` sets it to a value it can't read")
+                if human_cmd(m.group(2)):
+                    return HUMAN_MSG
+                seen.add(m.group(1))
+        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        if head == len(words):
+            continue
+        prog, args = _program(words[head]), words[head + 1:]
+        opts = "".join(a[1:] for a in args if re.fullmatch(r"-[A-Za-z]+", a))
+        for j, a in enumerate(args):
+            if prog in ("declare", "typeset", "local") and "n" in opts and a.partition("=")[2] in GIT_ONLY_ENV:
+                return unseen_env_msg(a.partition("=")[2], f"`{a}` makes a nameref that sets it under another name")
+            if prog == "printf" and a.startswith("-v") and (a[2:] or (args[j + 1] if j + 1 < len(args) else "")) \
+                    in GIT_ONLY_ENV:
+                return unseen_env_msg(a[2:] or args[j + 1], "`printf -v` sets it")
+            if a not in GIT_ONLY_ENV:
+                continue
+            if prog in ENV_FROM_INPUT:
+                return unseen_env_msg(a, f"`{prog}` sets it from its input")
+            if prog in ("for", "select") and j == 0:
+                return unseen_env_msg(a, f"a `{prog}` loop sets it to each of its words")
+            if a not in seen and ((prog == "export" and "n" not in opts)
+                                  or (prog in ("declare", "typeset", "local") and "x" in opts)):
+                return unseen_env_msg(a, f"`{prog}` exports a value set outside this command")
     return None
 
 
@@ -2302,6 +2385,9 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
         if human_cmd(cmd):
             return HUMAN_MSG
         why = git_config_reason(cmd)
+        if why:
+            return why
+        why = git_env_reason(cmd)
         if why:
             return why
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
