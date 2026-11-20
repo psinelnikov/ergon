@@ -881,6 +881,53 @@ class TestBasics(Project):
                     "X='ergon approve T-1' git log", "printf '%s\\n' \"GIT_PAGER=ergon approve\""]:
             self.assertFalse(human_cmd(cmd), cmd)
 
+    def test_guard_human_cmd_git_config_env_vars(self):
+        """T-218: GIT_CONFIG_PARAMETERS and GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> set before a git call
+        are config git reads; a human-only verb in a GIT_COMMAND_KEYS (or URL) value set there is a
+        command human_cmd refuses, as is the same verb in the GIT_COMMAND_ENV variables. A harmless
+        command, a key git doesn't run, and the same text as data pass."""
+        from ergon.gates import git_config_reason, human_cmd
+        verbs = ["approve", "reject", "close", "accept", "answer", "sync", "pin", "choose", "review -i"]
+        cfg =["core.pager", "core.editor", "core.sshCommand", "sequence.editor", "diff.external", "pager.log",
+               "credential.helper", "core.fsmonitor", "gpg.program", "filter.x.clean"]
+        forms = ["GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0={k} GIT_CONFIG_VALUE_0='{c}' git log",
+                 "GIT_CONFIG_VALUE_3='{c}' GIT_CONFIG_KEY_3={k} git log",
+                 "GIT_CONFIG_PARAMETERS=\"'{k}'='{c}'\" git log",
+                 "GIT_CONFIG_PARAMETERS=\"'x.y'='1' '{k}'='{c}'\" git log",
+                 "GIT_CONFIG_PARAMETERS=\"'{k}={c}'\" git log",
+                 "sudo GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0={k} GIT_CONFIG_VALUE_0='{c}' git log",
+                 "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0={k} GIT_CONFIG_VALUE_0='{c}'; git log",
+                 "GIT_CONFIG_KEY_0={k}; GIT_CONFIG_VALUE_0='{c}'; git log"]
+        for form in forms:
+            for key in cfg:
+                val = "!{c}" if key == "credential.helper" else "{c}"
+                for verb in verbs:
+                    cmd = form.format(k=key, c=val.format(c=f"ergon {verb} T-1"))
+                    self.assertTrue(human_cmd(cmd), cmd)
+                cmd = form.format(k=key, c=val.format(c="less -R"))
+                self.assertFalse(human_cmd(cmd), cmd)
+                self.assertIsNone(git_config_reason(cmd), cmd)
+        for cmd in ["GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='!ergon approve T-1' git x",
+                    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=\"-c core.pager='ergon close T-1' "
+                    "log\" git x",
+                    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0='ext::ergon accept T-1' "
+                    "git fetch",
+                    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='url.ext::ergon approve T-1.insteadOf' GIT_CONFIG_VALUE_0=o "
+                    "git fetch o",
+                    "GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=ergon GIT_CONFIG_VALUE_0+=' approve T-1' git log"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0='ergon approve T-1' git commit",
+                    "GIT_CONFIG_PARAMETERS=\"'user.name'='ergon approve T-1'\" git commit",
+                    "GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_1='ergon approve T-1' git log",
+                    "git commit -m \"GIT_CONFIG_VALUE_0='ergon approve T-1'\"",
+                    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0=https://x/r git fetch"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+        # end to end through the hook: refused with the human-only message, a harmless value let through
+        self.assertIn("human-only", self.guard("Bash", {"command": "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.o.url "
+                                                                   "GIT_CONFIG_VALUE_0='ext::ergon approve T-1' git fetch o"}))
+        self.assertIn("human-only", self.guard("Bash", {"command": "GIT_SSH_COMMAND='ergon approve T-1' git fetch"}))
+        self.assertIsNone(self.guard("Bash", {"command": "GIT_CONFIG_PARAMETERS=\"'core.pager'='less -R'\" git log"}))
+
     def test_stop_hook_blocks_on_lint_failure(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")

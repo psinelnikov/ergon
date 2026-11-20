@@ -1504,12 +1504,32 @@ def git_commands(words):
     return out
 
 
+def _env_config_commands(vals, name):
+    """The command lines git runs from the config the GIT_CONFIG_* variable name sets, given the
+    values vals holds so far: each GIT_CONFIG_PARAMETERS entry ('key'='value' ...), or the
+    GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> pair it is half of, as git_config_command reads them
+    (so a URL key's ext:: value too). A half the text doesn't hold, or a value that can't be split,
+    gives none: git_config_reason refuses those."""
+    if name == "GIT_CONFIG_PARAMETERS":
+        try:
+            pairs = [e.partition("=")[::2] for e in shlex.split(vals[name])]
+        except ValueError:
+            return []
+    else:
+        n = name.rsplit("_", 1)[1]
+        pairs = [(vals.get(f"GIT_CONFIG_KEY_{n}"), vals.get(f"GIT_CONFIG_VALUE_{n}"))]
+    return [c for key, val in pairs
+            if key is not None and val is not None and (c := git_config_command(key, val)) is not None]
+
+
 def env_commands(cmds):
-    """The command lines git runs from the GIT_COMMAND_ENV variables a list of shell commands sets,
-    in order: `GIT_PAGER=x git log`, `sudo GIT_EDITOR=x git commit` (an assignment ahead of a git
-    call), a lone `PAGER=x` or `export PAGER=x` a later git call inherits. `NAME+=x` appends to the
-    value set earlier in the text. An assignment-shaped word after git, or as another program's
-    argument (echo, a commit message), is data."""
+    """The command lines git runs from the environment a list of shell commands sets, in order: the
+    GIT_COMMAND_ENV variables, and the command-valued config of GIT_CONFIG_PARAMETERS and of each
+    GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> pair (_env_config_commands). Set as `GIT_PAGER=x git
+    log`, `sudo GIT_EDITOR=x git commit` (an assignment ahead of a git call), or a lone `PAGER=x` or
+    `export PAGER=x` a later git call inherits. `NAME+=x` appends to the value set earlier in the
+    text. An assignment-shaped word after git, or as another program's argument (echo, a commit
+    message), is data."""
     vals, out = {}, []
     for words, _ in cmds:
         git_at = next((k for k, w in enumerate(words) if _program(w) == "git" or _program(w).startswith("git-")),
@@ -1518,11 +1538,15 @@ def env_commands(cmds):
         declares = head < len(words) and _program(words[head]) in SHELL_DECLARE
         for k, w in enumerate(words):
             m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)", w, re.S)
-            if not m or m.group(1) not in GIT_COMMAND_ENV or not (k < head or declares or k < git_at):
+            if not m or not (m.group(1) in GIT_COMMAND_ENV or GIT_CONFIG_ENV.fullmatch(m.group(1))) \
+                    or not (k < head or declares or k < git_at):
                 continue
             name, append, val = m.groups()
             vals[name] = (vals.get(name, "") if append else "") + val
-            out.append(vals[name].lstrip("|-") if name.startswith("LESS") else vals[name])
+            if name.startswith("GIT_CONFIG_"):
+                out += _env_config_commands(vals, name)
+            else:
+                out.append(vals[name].lstrip("|-") if name.startswith("LESS") else vals[name])
     return out
 
 
@@ -1535,7 +1559,8 @@ def human_cmd(cmd):
     program that runs them as code are checked as text, as is anything that can't be split. The
     commands git runs from its own arguments (git_commands: rebase --exec, submodule foreach, an
     alias or a command-valued config key it sets) are checked as commands, as are the ones it runs
-    from the environment a command line sets for it (env_commands: GIT_PAGER=..., GIT_EDITOR=...)."""
+    from the environment a command line sets for it (env_commands: GIT_PAGER=..., GIT_EDITOR=...,
+    GIT_CONFIG_PARAMETERS=..., GIT_CONFIG_KEY_<n>=... GIT_CONFIG_VALUE_<n>=...)."""
     try:
         cmds = shell_commands(cmd)[0]
     except (ValueError, RecursionError):
