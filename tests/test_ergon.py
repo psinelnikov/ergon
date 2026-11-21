@@ -759,6 +759,23 @@ class TestBasics(Project):
         self.assertIn("human-only", self.guard("Bash", {"command": bash[8].format(c="ergon approve T-1")}))
         self.assertIn("--config-env", self.guard("Bash", {"command": bash[0].format(c="ergon approve T-1")}))
         self.assertIsNone(self.guard("Bash", {"command": "git --config-env=user.name=N commit"}))
+        # T-233: a name handed to git, grep or rg is text to search for, not a variable they set; a
+        # setter builtin, a `${NAME:=value}` in their words, or a function or alias in their place sets it.
+        for cmd in ["git grep GIT_CONFIG_PARAMETERS", "git log -S GIT_CONFIG_KEY_0", "rg GIT_CONFIG_VALUE_0",
+                    "GIT_PAGER=cat git log -S GIT_CONFIG_KEY_0 -p", "git grep -n 'GIT_CONFIG_KEY_' -- ergon",
+                    "git grep GIT_CONFIG_KEY_0=alias.x", "echo \"${GIT_CONFIG_KEY_0:-}\" GIT_CONFIG_VALUE_0"]:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+        for cmd in ["read GIT_CONFIG_KEY_0", "export GIT_CONFIG_PARAMETERS", "printf -v GIT_CONFIG_VALUE_0 x",
+                    "git grep x; read GIT_CONFIG_KEY_0", "command git grep GIT_CONFIG_PARAMETERS",
+                    "git() { read \"$1\"; export \"$1\"; }; git GIT_CONFIG_PARAMETERS",
+                    "function grep { export \"$1\"; }; grep GIT_CONFIG_PARAMETERS",
+                    "'rg' () { export \"$1\"; }; rg GIT_CONFIG_PARAMETERS", "alias git=read\ngit GIT_CONFIG_KEY_0",
+                    "set -a; git grep \"${GIT_CONFIG_PARAMETERS:='alias.x=!ergon approve T-1'}\"; git x",
+                    "set -a; echo \"${GIT_CONFIG_PARAMETERS='alias.x=!ergon approve T-1'}\"; git x",
+                    "set -a; : ${GIT_CONFIG_PARAMETERS::=\"'alias.x=!ergon approve T-1'\"}; git x",
+                    "set -a; echo ${(L)GIT_CONFIG_PARAMETERS::=\"'alias.x=!ergon approve T-1'\"}; git x"]:
+            self.assertTrue(git_config_reason(cmd), cmd)
         self.assertTrue(all(k.partition(".")[0] in GIT_COMMAND_SECTIONS for k in
                             ["alias", "core", "pager", "diff", "difftool", "mergetool", "merge", "filter", "credential",
                              "gpg", "remote", "submodule", "sendemail", "imap", "hook"]))

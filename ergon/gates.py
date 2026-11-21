@@ -1708,8 +1708,16 @@ GIT_CONFIG_ENV = re.compile(r"(GIT_CONFIG_PARAMETERS|GIT_CONFIG_(?:KEY|VALUE)_([
 # `${!NAME}`, `${#NAME}`, `env -uNAME`, `env --unset=NAME`. A `${NAME:=value}` sets it.
 GIT_CONFIG_ENV_IN = re.compile(r"GIT_CONFIG_(?:PARAMETERS|KEY_|VALUE_)")
 GIT_CONFIG_ENV_READ = re.compile(r"(?:\$|\$\{[!#]?|-u|--unset=)$")
-# Programs whose arguments name an environment variable without setting it.
-ENV_READERS = {"printenv", "echo", "grep", "egrep", "fgrep", "rg", "unset"}
+# What after a name in `${NAME...}` sets it: `=`, `:=`, zsh's `::=` (the name ends at a non-word character).
+GIT_CONFIG_ENV_SETS = re.compile(r"\w*:{0,2}=")
+# Programs whose arguments name an environment variable without setting it: `git grep NAME`,
+# `git log -S NAME`, `rg NAME`. The shell still expands their words, so `${NAME:=value}` in one sets it.
+ENV_READERS = {"printenv", "echo", "grep", "egrep", "fgrep", "rg", "unset", "git"}
+# Text that may make a program's name run something else in this shell (a function, an alias, a
+# zsh functions[]/aliases[] entry, an autoloaded function, a loaded builtin), which can set the
+# variable it is handed. Where it shows, ENV_READERS' arguments are read like any program's.
+SHELL_REDEFINES = re.compile(r"\(\s*\)|\b(?:function|functions|alias|aliases|galiases|autoload|enable)"
+                             r"(?=[\s\[;&|)]|$)")  # `alias git=read`, `functions[git]=`, not `alias.x`
 DYNAMIC_ENV_MSG = ("this command sets a GIT_CONFIG_* variable whose name the guard can't read (an expansion in the "
                    "name, a nameref, `${NAME:=value}`): git can read an alias or command-valued key from it, so it's "
                    "refused. Write `git -c <key>=<value> ...` out in full, or ask the user")
@@ -1763,6 +1771,7 @@ def git_config_reason(cmd):
                     "the guard can't split it to see what it defines, so it's refused")
         return None
     env = []  # (name, n, value or None) of each GIT_CONFIG_* any of its commands sets
+    redefines = SHELL_REDEFINES.search(re.sub(r"[\\'\"]", "", cmd))  # quotes can't hide `function`
     for words, docs in cmds:
         # bash -c '...', a heredoc fed to sh. env's own words are read below; so is a lone NAME=value.
         if any(CODE_RUNNER.fullmatch(_program(w)) and _program(w) != "env" for w in words):
@@ -1801,12 +1810,16 @@ def git_config_reason(cmd):
                 return ("`git config --rename-section` into or out of a section that holds git aliases or "
                         "command-valued keys turns values the guard never read as commands into ones git "
                         "runs, so it's refused; ask the user")
-        if _program(words[0]) in ENV_READERS:
-            continue
         words = _without_messages(words)
+        # The program after any NAME=value words. An ENV_READERS one is handed the names after it as
+        # text (`git grep NAME`, `echo NAME=value`), unless the text may have made it a function.
+        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        reader = head < len(words) and _program(words[head]) in ENV_READERS and not redefines
         for k, w in enumerate(words):
             m = GIT_CONFIG_ENV.fullmatch(w)
             if m:
+                if reader and k > head:
+                    continue
                 if (m.group(3) or k > 0) and (k == 0 or words[k - 1] not in ("-u", "--unset")):
                     # NAME=value; or `read NAME`, `printf -v NAME`, `export NAME`, NAME+=...: a value the text doesn't hold
                     val = m.group(3)[1:] if m.group(3) and m.group(3).startswith("=") else None
@@ -1814,8 +1827,14 @@ def git_config_reason(cmd):
                 continue
             for h in GIT_CONFIG_ENV_IN.finditer(w):
                 # `GIT_CONFIG_KEY_$i=...`, `declare -n r=GIT_CONFIG_KEY_0`, `${GIT_CONFIG_KEY_0:=...}`
+                # (zsh: `${NAME::=...}`, `${(L)NAME:=...}`). A reader's word only sets it the last way.
+                sets = GIT_CONFIG_ENV_SETS.match(w, h.end())
+                if reader and k > head:
+                    if sets and "${" in w[:h.start()]:
+                        return DYNAMIC_ENV_MSG
+                    continue
                 read = GIT_CONFIG_ENV_READ.search(w[:h.start()])
-                if not read or (read.group(0).startswith("${") and re.match(r"\w*:?=", w[h.end():])):
+                if not read or (read.group(0).startswith("${") and sets):
                     return DYNAMIC_ENV_MSG
     keys = {n: v for name, n, v in env if name.startswith("GIT_CONFIG_KEY_")}
     for name, n, val in env:
