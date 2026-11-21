@@ -977,6 +977,53 @@ class TestBasics(Project):
                     "X='ergon approve T-1' git log", "printf '%s\\n' \"GIT_PAGER=ergon approve\""]:
             self.assertFalse(human_cmd(cmd), cmd)
 
+    def test_guard_human_cmd_follows_shell_variables(self):
+        """T-228: a variable assigned earlier in the same text is read as its value, so a human-only verb
+        reached through one (as the verb, the program, a git command variable's value, a string run as
+        code, an expanding heredoc fed to a shell) is refused; so is an ergon call whose verb stays an
+        expansion the guard can't resolve. A harmless value, a variable the text never sets ($HOME), a
+        quoted heredoc and the verbs as data pass."""
+        from ergon.gates import MAX_EXPANDED, expand_vars, human_cmd, shell_commands
+        verbs = ["approve", "reject", "close", "accept", "answer", "sync", "pin", "choose", "review -i"]
+        forms = ["V=\"{b}\"; ergon $V T-1", "V='{b}'; ergon ${{V}} T-1", "export V='{b}'; ergon $V T-1",
+                 "V='ergon {b} T-1'; $V", "E=ergon; $E {b} T-1", "P='ergon {b} T-1'; GIT_PAGER=$P git log",
+                 "P='ergon {b} T-1'; export GIT_EDITOR=\"$P\"; git commit", "V='{b} T-1'; ergon $V",
+                 "A=ergon B=\" {b}\"; C=$A$B; GIT_SSH_COMMAND=$C git fetch", "V='{b}'; bash -c \"ergon $V T-1\"",
+                 "V='{b}'; bash <<EOF\nergon $V T-1\nEOF", "V=x; V+=' {b}'; ergon ${{V#x}} T-1",
+                 "V='{b}'; (ergon $V T-1)", "V='{b}' && cd x && ergon $V T-1", "V='{b}'; echo $(ergon $V T-1)",
+                 "V='{b}'; python3 -m ergon $V T-1", "P='ergon {b} T-1'; git -c core.pager=\"$P\" log",
+                 "V='{b}'; sudo ergon \"$V\" T-1", "V=''; ergon $V {b} T-1", "V='ergon {b}'; bash -c \"$V T-1\"",
+                 "V='ergon {b}'; ssh host \"$V T-1\"", "V='{b} T-1'; git rebase --exec \"ergon $V\" main"]
+        for form in forms:
+            for verb in verbs:
+                cmd = form.format(b=verb)
+                self.assertTrue(human_cmd(cmd), cmd)
+        # a verb the guard can't resolve: set outside the text, by a loop, read, a substitution, `+=` onto an outside value
+        for cmd in ["ergon $X T-1", "ergon \"${X}\" T-1", "ergon $(cat verb) T-1", "ergon `cat verb` T-1",
+                    "for v in approve; do ergon $v T-1; done", "read V <f; ergon $V T-1", "V+=e; ergon $V T-1",
+                    "V=$(cat f); ergon $V T-1", "$E approve T-1", "\"$E\" review -i", "ergon ${X:-approve} T-1"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["V=status; git $V", "GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch", "V=board; ergon $V",
+                    "V=T-1; ergon show $V", "ID=T-1; ergon show $ID && ergon board", "P=cat; GIT_PAGER=$P git log",
+                    "V=approve; echo $V", "V=approve; grep \"ergon $V\" README.md", "V=approve; git commit -m \"$V it\"",
+                    "V=approve; cat <<'EOF' | sh\ngit log --grep $V\nEOF", "V=approve; cat <<EOF > notes\nergon $V\nEOF",
+                    "V=approve ergon show T-1", "ergon show $ID", "$EDITOR notes.md", "ergon review --tier $TIER",
+                    "V='ergon approve T-1'"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+        # expansions are resolved in text order, unsplit in an assignment, and bounded
+        self.assertEqual(expand_vars(shell_commands("V=a; W=${V}b; x $W $V")[0])[-1][0], ["x", "ab", "a"])
+        self.assertEqual(expand_vars(shell_commands("V='a b'; X=$V; x $X")[0])[1][0], ["X=a b"])
+        self.assertEqual(expand_vars(shell_commands("V+=b; x $V")[0])[-1][0], ["x", "${V}b"])
+        doubling = "V=xxxxxxxx; " + "V=$V$V; " * 40 + "ergon $V"
+        words = expand_vars(shell_commands(doubling)[0])[-1][0]
+        self.assertLessEqual(sum(map(len, words)), MAX_EXPANDED + 100)
+        self.assertTrue(human_cmd(doubling))  # what's past the bound stays an expansion
+        # end to end through the hook: the human-only refusal
+        for cmd in ["V=approve; ergon $V T-1", "P='ergon approve T-1'; GIT_PAGER=$P git log", "ergon $X T-1"]:
+            self.assertIn("human-only", self.guard("Bash", {"command": cmd}), cmd)
+        for cmd in ["V=status; git $V", "V=T-1; ergon show $V"]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+
     def test_guard_human_cmd_git_config_env_vars(self):
         """T-218: GIT_CONFIG_PARAMETERS and GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> set before a git call
         are config git reads; a human-only verb in a GIT_COMMAND_KEYS (or URL) value set there is a

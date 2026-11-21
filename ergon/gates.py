@@ -1571,6 +1571,77 @@ def env_commands(cmds):
     return out
 
 
+# A parameter expansion the guard resolves from a value assigned earlier in the same text: $NAME, ${NAME}.
+VAR_REF = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})")
+# How much text expand_vars substitutes for one command line (`V=x; V=$V$V; ...` doubles it each time).
+# Past it, what's left stays an expansion: the guard reads that as text it can't see.
+MAX_EXPANDED = 1 << 20
+
+
+def _resolvable(m, vals, budget):
+    """The value VAR_REF match m resolves to, charged to budget ([chars left]), or None: a name the
+    text didn't set, or a value past what's left of the budget."""
+    val = vals.get(m.group(1) or m.group(2))
+    if val is None or len(val) > budget[0]:
+        return None
+    budget[0] -= len(val)
+    return val
+
+
+def _expand_text(text, vals, budget):
+    """text with each VAR_REF to a name in vals replaced by its value, unsplit (an assignment's value,
+    a heredoc body the shell expands before the program reads it). Other expansions stay as they are."""
+    return VAR_REF.sub(lambda m: v if (v := _resolvable(m, vals, budget)) is not None else m.group(0), text)
+
+
+def _expand_word(word, vals, budget, split):
+    """The words one word becomes once each VAR_REF to a name in vals is replaced by its value: split
+    at blanks as an unquoted value is (`$V` with V='a b' is two words) if split, else one word as a
+    quoted one is. An assignment's value is never split (`GIT_PAGER=$P`); a word the split leaves
+    empty is dropped."""
+    if "$" not in word:
+        return [word]
+    if not split or ASSIGNMENT.match(word):
+        return [_expand_text(word, vals, budget)]
+    fields, cur, pos = [], "", 0
+    for m in VAR_REF.finditer(word):
+        val = _resolvable(m, vals, budget)
+        if val is None:
+            continue
+        pieces = re.split(r"[ \t\n]+", val)
+        cur += word[pos:m.start()] + pieces[0]
+        for piece in pieces[1:]:
+            fields.append(cur)
+            cur = piece
+        pos = m.end()
+    if pos == 0:
+        return [word]
+    fields.append(cur + word[pos:])
+    return [f for f in fields if f]
+
+
+def expand_vars(cmds, split=True):
+    """The commands of shell_commands with the variables assigned earlier in the same text resolved
+    (T-228): `V=x; prog $V` reads as `prog x`, and `P='prog x'; GIT_PAGER=$P git log` sets GIT_PAGER
+    to `prog x`. The lexer has dropped the quotes, so it can't tell `$V` from `"$V"`: split says how
+    to read each (_expand_word), and human_cmd reads the text both ways. Each NAME=value that sets
+    the shell's or a program's environment (_env_assignments) is recorded once its own command's
+    expansions are resolved, in text order. A `+=` onto a name the text didn't set keeps the outside
+    part as `${NAME}`, and a value holding an expansion the guard can't resolve keeps it, so what it
+    can't see still reads as an expansion. Where the shell doesn't keep an assignment (a subshell,
+    `X=1 cmd`) it's kept anyway: a value resolved where the shell has none can only add a refusal.
+    A variable the text never sets ($HOME) stays as it is, and so does everything past MAX_EXPANDED."""
+    vals, out, budget = {}, [], [MAX_EXPANDED]
+    for words, docs in cmds:
+        if vals:
+            words = [f for w in words for f in _expand_word(w, vals, budget, split)]
+            docs = [(_expand_text(d, vals, budget) if expands else d, expands) for d, expands in docs]
+        for name, append, val in _env_assignments(words):
+            vals[name] = (vals.get(name, "${" + name + "}") if append else "") + val
+        out.append((words, docs))
+    return out
+
+
 def human_cmd(cmd):
     """Whether a shell command runs a human-only ergon command: approve, reject, close, accept,
     answer, sync, pin, choose, or the interactive review. Only a real call counts: `ergon` (ergon.py, the package's
@@ -1581,11 +1652,20 @@ def human_cmd(cmd):
     commands git runs from its own arguments (git_commands: rebase --exec, submodule foreach, an
     alias or a command-valued config key it sets) are checked as commands, as are the ones it runs
     from the environment a command line sets for it (env_commands: GIT_PAGER=..., GIT_EDITOR=...,
-    GIT_CONFIG_PARAMETERS=..., GIT_CONFIG_KEY_<n>=... GIT_CONFIG_VALUE_<n>=...)."""
+    GIT_CONFIG_PARAMETERS=..., GIT_CONFIG_KEY_<n>=... GIT_CONFIG_VALUE_<n>=...). A variable assigned
+    earlier in the same text is read as its value (expand_vars: `V=approve; ergon $V`); an ergon
+    call whose verb is still an expansion (`ergon $X`, `ergon $(cat f)`), or a command whose program
+    is one ahead of a human-only verb (`$E approve`), runs a verb the guard can't see and counts."""
     try:
         cmds = shell_commands(cmd)[0]
     except (ValueError, RecursionError):
         return bool(HUMAN_CMD.search(cmd))
+    split, whole = expand_vars(cmds), expand_vars(cmds, split=False)  # `$V` and `"$V"`: either may be meant
+    return _runs_human(cmd, split) or (whole != split and _runs_human(cmd, whole))
+
+
+def _runs_human(cmd, cmds):
+    """human_cmd for cmd lexed (and its variables resolved) as cmds."""
     if any(human_cmd(t) for t in env_commands(cmds)):
         return True
     for words, docs in cmds:
@@ -1596,14 +1676,16 @@ def human_cmd(cmd):
             return True
         if any(human_cmd(t) for t in git_commands(words)):
             return True
+        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
         for k, w in enumerate(words):
-            if _program(w) not in ("ergon", "ergon.py") and not w.endswith("ergon/__main__.py"):
+            ergon = _program(w) in ("ergon", "ergon.py") or w.endswith("ergon/__main__.py")
+            if not ergon and not (k == head and _unseen(w)):
                 continue
             rest = words[k + 1:]
             at = next((m for m, a in enumerate(rest) if not a.startswith("-")), None)
             if at is None:
                 continue
-            if rest[at] in HUMAN_VERBS:
+            if rest[at] in HUMAN_VERBS or (ergon and _unseen(rest[at])):
                 return True
             if rest[at] == "review" and any(a == "-i" or (a.startswith("--i") and "--interactive".startswith(a))
                                             for a in rest[at + 1:]):
