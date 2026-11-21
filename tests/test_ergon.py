@@ -981,6 +981,67 @@ class TestBasics(Project):
         for cmd in ["GIT_EDITOR=vim git commit", "GIT_PAGER=cat git log", "EDITOR=\"$X\" git commit"]:
             self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
 
+    def test_guard_refuses_unseen_git_url_config(self):
+        """T-226: a remote's or submodule's URL key (GIT_URL_KEYS) runs an ext:: URL as a command, so
+        T-060's unseen-value checks cover it: set through --config-env, GIT_CONFIG_KEY_<n> /
+        GIT_CONFIG_VALUE_<n> (one half set elsewhere, or an expansion), `git -c` / `git config` with
+        an expansion, or an Edit of a config file, a URL the text doesn't show is refused and an ext::
+        URL running a human-only verb gets the human-only refusal. A URL the text shows that isn't
+        ext:: passes, including a --config-env variable set ahead of git in the same command and an
+        expansion after a literal `https://`, which can't make it ext::."""
+        from ergon.gates import config_key_runs, git_config_reason
+        for key in ["remote.origin.url", "Remote.X.PushURL", "submodule.s.url", "alias.x", "core.pager"]:
+            self.assertTrue(config_key_runs(key), key)
+        for key in ["user.name", "remote.origin.fetch", "url.https://x/.insteadOf"]:
+            self.assertFalse(config_key_runs(key), key)
+        ext = "ext::ergon {v} T-1"
+        unseen = ["git --config-env=remote.origin.url=V fetch origin", "git --config-env remote.o.pushurl=V push o",
+                  "git --config-env=submodule.s.url=V submodule update", "U=\"$X\" git --config-env=remote.o.url=U fetch o",
+                  "U=https://x/r; git --config-env=remote.o.url=U fetch o",  # set by another command: not read
+                  "U=ext:: U+=\"$X\" git --config-env=remote.o.url=U fetch o", "U+=x git --config-env=remote.o.url=U fetch o",
+                  "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0=\"$V\" git fetch origin",
+                  "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url git fetch origin",  # value set elsewhere
+                  "git -c remote.origin.url=\"$U\" fetch origin", "git config remote.origin.url \"$U\"",
+                  "git -c remote.o.url=\"e$X\" fetch o", "git -c remote.o.url=\"EXT::$X\" fetch o",
+                  "git -c remote.o.url=\"ext::ergon $X\" fetch o", "git config submodule.s.url \"`cat u`\""]
+        for cmd in unseen:
+            self.assertIn("ext:: URL", git_config_reason(cmd) or "", cmd)
+        for verb in ["approve", "reject", "close", "accept", "answer", "sync", "pin", "choose", "review -i"]:
+            for form in ["V='{u}' git --config-env=remote.origin.url=V fetch origin",
+                         "env V='{u}' git --config-env remote.o.pushurl=V push o",
+                         "export GIT_CONFIG_VALUE_3='{u}'"]:  # its key set by an earlier command
+                cmd = form.format(u=ext.format(v=verb))
+                self.assertTrue(git_config_reason(cmd), cmd)
+        shown = ["U=https://example.com/r.git git --config-env=remote.origin.url=U fetch origin",
+                 "U=https://example.com/r.git git --config-env remote.origin.pushurl=U push origin",
+                 "U=git@example.com:r.git U+=x git --config-env=submodule.s.url=U submodule update",
+                 "U='ext::git status' git --config-env=remote.origin.url=U fetch origin",
+                 "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0=https://x/r.git git fetch origin",
+                 "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.o.url GIT_CONFIG_VALUE_0=\"https://$HOST/r.git\" git fetch o",
+                 "export GIT_CONFIG_VALUE_3=https://x/r.git", "git -c remote.o.url=\"https://$TOKEN@x/r.git\" fetch o",
+                 "git config remote.origin.url \"ssh://$HOST/r.git\"", "git config remote.origin.url https://x/r.git",
+                 "git --config-env=user.name=N commit", "git config --get remote.origin.url", "git remote get-url origin"]
+        for cmd in shown:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+        # end to end through the hook, the three ways the bug was reported
+        refused = {"V='ext::ergon approve T-1' git --config-env=remote.origin.url=V fetch origin": "human-only",
+                   "git --config-env=remote.origin.url=V fetch origin": "--config-env",
+                   "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0=\"ext::ergon approve T-1\" "
+                   "git fetch origin": "human-only",
+                   "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0=\"$V\" git fetch origin":
+                   "ext:: URL"}
+        for cmd, why in refused.items():
+            self.assertIn(why, self.guard("Bash", {"command": cmd}) or "", cmd)
+        for cmd in shown[:2] + shown[4:6]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+        p = self.root / ".git" / "config"
+        for new in ["[remote \"x\"] url = ext::ergon approve T-1\n", "[remote \"x\"]\n\turl = ext::ergon approve T-1\n",
+                    "[submodule \"s\"]\n\turl = \"ext::ergon close T-1\"\n", "[remote \"x\"]\n\tpushurl = EXT::ergon accept T-1\n"]:
+            why = self.guard("Edit", {"file_path": str(p), "old_string": "[core]", "new_string": new + "[core]"})
+            self.assertIn("reads as a git config file", why or "", new)
+        self.assertIsNone(self.guard("Edit", {"file_path": str(p), "old_string": "[core]",
+                                              "new_string": "[remote \"x\"]\n\turl = https://example.com/r.git\n[core]"}))
+
     def test_stop_hook_blocks_on_lint_failure(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")

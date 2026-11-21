@@ -1379,6 +1379,13 @@ def ext_command(url):
     return shlex.join(args)
 
 
+def config_key_runs(key):
+    """Whether git can run a command from config key's value: a GIT_COMMAND_KEYS key (or the
+    insteadOf key of an ext:: base), or a URL key (GIT_URL_KEYS), whose value runs as a command when
+    it's an ext:: URL. A value that isn't one gives git_config_command None, so `!` can't probe it."""
+    return git_config_command(key, "!") is not None or bool(GIT_URL_KEYS.fullmatch(key.lower()))
+
+
 def git_config_command(key, val):
     """The command line git runs from config key = val, or None if it runs none: a `!` alias as shell
     text and any other as the git call it expands to, a credential helper as `git credential-<val>`
@@ -1434,22 +1441,23 @@ def _option_values(rest, longs, shorts, valued):
 
 def _git_calls(words):
     """Each git call among words, as (the settings its -c and --config-env options make, its
-    subcommand, the words after it). A setting is (key, value); --config-env's value is None, as
-    git reads it from the environment variable it names."""
+    subcommand, the words after it). A setting is (key, value, variable); --config-env's value is
+    None, as git reads it from the environment variable it names, and -c's variable is None."""
     for k, w in enumerate(words):
         prog, i, sets = _program(w), k + 1, []
         if prog == "git":
             while i < len(words) and words[i].startswith("-"):
                 a = words[i]
                 if a.startswith("--config-env="):
-                    sets.append((a[len("--config-env="):].partition("=")[0], None))
+                    key, _, var = a[len("--config-env="):].partition("=")
+                    sets.append((key, None, var))
                 elif a in GIT_OPT_ARG and i + 1 < len(words):
                     i += 1
                     key, eq, val = words[i].partition("=")
                     if a == "-c" and eq:
-                        sets.append((key, val))
+                        sets.append((key, val, None))
                     elif a == "--config-env":
-                        sets.append((key, None))
+                        sets.append((key, None, val))
                 i += 1
             sub, rest = (words[i], words[i + 1:]) if i < len(words) else ("", [])
         elif prog.startswith("git-"):  # a dashed form: $(git --exec-path)/git-filter-branch
@@ -1465,7 +1473,7 @@ def git_config_sets(words):
     adjacent pair, so every form of it) and `git clone -c/--config key=value`."""
     out = []
     for sets, sub, rest in _git_calls(words):
-        out += sets
+        out += [(key, val) for key, val, _ in sets]
         if sub == "config":
             out += [(a, rest[j + 1]) for j, a in enumerate(rest[:-1]) if "=" not in a]
         elif sub == "clone":
@@ -1625,7 +1633,23 @@ def _unseen(val):
     return "$" in val or "`" in val
 
 
+def _unseen_value(key, val):
+    """Whether a value for config key hides the command git may run from it (_unseen). For a URL key
+    (GIT_URL_KEYS) only an ext:: URL is a command, and git reads the transport from the URL's start:
+    a value whose text up to its first expansion can't begin `ext::` (`https://$HOST/r.git`) runs none."""
+    if not _unseen(val):
+        return False
+    if not GIT_URL_KEYS.fullmatch(key.lower()):
+        return True
+    head = re.split(r"[$`]", val, maxsplit=1)[0].lower()
+    return head.startswith("ext::") or "ext::".startswith(head)
+
+
 def unseen_config_msg(key, why):
+    if GIT_URL_KEYS.fullmatch(key.lower()):
+        return (f"git runs an ext:: URL set as `{key}` as a command, and the guard checks that command where it "
+                f"is set, but here it can't see the URL: {why}. So the setting is refused. Write the URL out in "
+                f"full (`git -c {key}=<url> ...` or `git config {key} <url>`), or ask the user")
     return (f"git runs the value of `{key}` as a command, and the guard checks that command where it is "
             f"defined, but here it can't see it: {why}. So the definition is refused. Write the value out "
             f"in full (`git -c {key}=<command> ...` or `git config {key} <command>`), or ask the user")
@@ -1655,12 +1679,25 @@ def git_config_reason(cmd):
                 if why := git_config_reason(t):
                     return why
         for key, val in git_config_sets(words):
-            if git_config_command(key, "!") is None:
-                continue
-            if val is None:
-                return unseen_config_msg(key, "`--config-env` has git read it from an environment variable")
-            if _unseen(val):
+            if val is not None and config_key_runs(key) and _unseen_value(key, val):
                 return unseen_config_msg(key, f"`{val}` holds a `$` or backtick expansion")
+        # --config-env's value is an environment variable's. A URL key's is read where this same simple
+        # command sets it ahead of git (`U=https://... git --config-env=remote.o.url=U fetch o`).
+        shown = {}  # each variable this command sets, to its value, or None where the text can't show it
+        for name, append, v in _env_assignments(words):
+            if append and shown.get(name) is None:  # `+=` onto a value set outside this command
+                shown[name] = None
+            else:
+                shown[name] = (shown[name] if append else "") + v
+        for sets, _, _ in _git_calls(words):
+            for key, val, var in sets:
+                if val is not None or not config_key_runs(key):
+                    continue
+                v = shown.get(var) if GIT_URL_KEYS.fullmatch(key.lower()) else None
+                if v is None or _unseen_value(key, v):
+                    return unseen_config_msg(key, "`--config-env` has git read it from an environment variable")
+                if (c := git_config_command(key, v)) is not None and human_cmd(c):
+                    return HUMAN_MSG
         for _, sub, rest in _git_calls(words):
             at = next((j for j, a in enumerate(rest) if a in ("--rename-section", "rename-section")), None)
             if sub != "config" or at is None:
@@ -1703,16 +1740,16 @@ def git_config_reason(cmd):
             if val is None or _unseen(val):
                 return unseen_config_msg(name, "the key comes from the environment or an expansion, so git may "
                                          f"run GIT_CONFIG_VALUE_{n}")
-            if git_config_command(val, "!") is not None and not any(
+            if config_key_runs(val) and not any(
                     nm.startswith("GIT_CONFIG_VALUE_") and m == n for nm, m, _ in env):
                 return unseen_config_msg(val, f"its value, GIT_CONFIG_VALUE_{n}, is set by another command")
         else:  # GIT_CONFIG_VALUE_<n>: read as its key, or as any command when the key isn't in the text
             key = keys.get(n)
-            if key is not None and git_config_command(key, "!") is None:
+            if key is not None and not config_key_runs(key):
                 continue
-            if val is None or _unseen(val):
+            if val is None or _unseen_value(key or "", val):
                 return unseen_config_msg(key or name, f"{name} comes from the environment or an expansion")
-            runs = [git_config_command(key, val)] if key else [val, val[1:], "git " + val]
+            runs = [git_config_command(key, val)] if key else [val, val[1:], "git " + val, ext_command(val)]
             if any(c and human_cmd(c) for c in runs):
                 return HUMAN_MSG
     return None
