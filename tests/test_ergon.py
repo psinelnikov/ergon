@@ -1174,6 +1174,60 @@ class TestBasics(Project):
         for cmd in ["GIT_EDITOR=vim git commit", "GIT_PAGER=cat git log", "EDITOR=\"$X\" git commit"]:
             self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
 
+    def test_guard_git_command_env_from_a_variable_the_text_sets(self):
+        """T-241: a git command variable set from a variable the same text sets is read as that value
+        where it's sure to be the one git gets: P set alone at the top level, not behind && / || or a
+        pipe, and nothing else that can set P (read, local, a subshell, `X=1 P=y cmd`, ${P:=...}, a
+        loop, eval / source / trap, a nameref or a name built at run time). The value it makes is
+        checked for a human-only verb. Anything less sure keeps T-223's "can't see" refusal."""
+        from ergon.gates import git_env_reason, shell_commands
+        top = []
+        shell_commands("a && b; c | d\ne || (f) &\ng &&\nh", top=top)
+        self.assertEqual([(w[0], before, after) for w, before, after in top],
+                         [("a", None, "&&"), ("b", "&&", ";"), ("c", ";", "|"), ("d", "|", "\n"), ("e", "\n", "||"),
+                          ("g", "||", "&&"), ("h", "&&", None)])
+        for cmd in ["P=cat; GIT_PAGER=$P git log", "P='less -R'; export GIT_EDITOR=$P; git commit",
+                    "P=cat\nGIT_PAGER=${P} git log", "P=cat && GIT_PAGER=$P git log", "P=less; P+=' -R'; GIT_PAGER=$P git log",
+                    "P=less Q=\"$P -R\"; GIT_PAGER=$Q git log", "P=cat; cd x && GIT_PAGER=$P git log | cat",
+                    "(cd x); P=cat; GIT_PAGER=$P git log", "P=cat; echo $(GIT_PAGER=$P git log)",
+                    "P='ssh -i ~/k'; GIT_SSH_COMMAND=$P git fetch", "P=vim; GIT_EDITOR=$P; export GIT_EDITOR; git commit"]:
+            self.assertIsNone(git_env_reason(cmd), cmd)
+        unseen = ["GIT_PAGER=$X git log", "GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch", "P=$X; GIT_PAGER=$P git log",
+                  "false && P=cat; GIT_PAGER=$P git log", "false || P=cat; GIT_PAGER=$P git log",
+                  "x &&\nP=cat; GIT_PAGER=$P git log", "x |\nP=cat; GIT_PAGER=$P git log", "P=cat & GIT_PAGER=$P git log",
+                  "P=cat | x; GIT_PAGER=$P git log", "(P=cat); GIT_PAGER=$P git log", "echo $(P=cat); GIT_PAGER=$P git log",
+                  "P=cat true; GIT_PAGER=$P git log", "P=cat GIT_PAGER=$P git log", "GIT_PAGER=$P git log; P=cat",
+                  "P+=cat; GIT_PAGER=$P git log", "x && Q=cat; P=$Q; GIT_PAGER=$P git log", "P=cat; GIT_PAGER=$P$X git log",
+                  "P=cat; read P <f; GIT_PAGER=$P git log", "P=cat; read $'\\x50' <f; GIT_PAGER=$P git log",
+                  "P=cat; builtin read P; GIT_PAGER=$P git log", "P=cat; printf -v Q x; GIT_PAGER=$P git log",
+                  "P=cat; eval \"$(cat f)\"; GIT_PAGER=$P git log", "P=cat; command eval x; GIT_PAGER=$P git log",
+                  "P=cat; . ./f; GIT_PAGER=$P git log", "trap 'x' DEBUG; P=cat; GIT_PAGER=$P git log",
+                  "P=cat; declare -n R=$Q; R=x; GIT_PAGER=$P git log", "P=cat; export $Q=x; GIT_PAGER=$P git log",
+                  "P=cat; set -A P x; GIT_PAGER=$P git log", "P=cat; $C P; GIT_PAGER=$P git log",
+                  "P=cat; local P=x; GIT_PAGER=$P git log", "P=cat; : ${P:=x}; GIT_PAGER=$P git log",
+                  "P=cat; : ${P::=x}; GIT_PAGER=$P git log", "P=cat; P[1]=x; GIT_PAGER=$P git log",
+                  "P=xcat; GIT_PAGER=$P[2,-1] git log", "P=xcat; GIT_PAGER=${P:1} git log", "P=cat; GIT_PAGER=$P:h git log",
+                  "P=cat; GIT_PAGER=$P{a,b} git log", "P=cat; export GIT_PAGER=erg{,$P}; git log",
+                  "P=cat; GIT_PAGER=${!Q} git log", "while x; do\nP=cat\ndone; GIT_PAGER=$P git log",
+                  "if x; then\nP=cat\nfi\nGIT_PAGER=$P git log", "f() { P=x; }; P=cat; f; GIT_PAGER=$P git log",
+                  "OLDPWD=cat; cd /x; GIT_PAGER=$OLDPWD git log", "MATCH=cat; [[ a =~ b ]]; GIT_PAGER=$MATCH git log",
+                  "P=`cat f`; GIT_PAGER=$P git log"]
+        for cmd in unseen:
+            self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        for verb in ["approve", "close", "review -i"]:
+            for form in ["P='ergon {b} T-1'; GIT_PAGER=$P git log", "P='ergon {b} T-1'; export GIT_EDITOR=$P; git commit",
+                         "GIT_PAGER=erg; P='on {b} T-1'; GIT_PAGER+=$P; git log",
+                         "A=erg B='on {b} T-1'; P=$A$B; GIT_SSH_COMMAND=${{P}} git fetch"]:
+                cmd = form.format(b=verb)
+                self.assertIn("human-only", git_env_reason(cmd) or "", cmd)
+        # end to end through the hook
+        self.assertIsNone(self.guard("Bash", {"command": "P=cat; GIT_PAGER=$P git log"}))
+        self.assertIsNone(self.guard("Bash", {"command": "P='less -R'; export GIT_EDITOR=$P; git commit"}))
+        self.assertIn("human-only", self.guard("Bash", {"command": "P='ergon approve T-1'; GIT_PAGER=$P git log"}) or "")
+        for cmd in ["GIT_PAGER=$X git log", "GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                    "false && P=cat; GIT_PAGER=$P git log"]:
+            self.assertIn("can't see", self.guard("Bash", {"command": cmd}) or "", cmd)
+
     def test_guard_refuses_unseen_git_url_config(self):
         """T-226: a remote's or submodule's URL key (GIT_URL_KEYS) runs an ext:: URL as a command, so
         T-060's unseen-value checks cover it: set through --config-env, GIT_CONFIG_KEY_<n> /

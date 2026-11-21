@@ -1129,14 +1129,17 @@ GIT_WRITE = re.compile(r"\bgit\b[^;&|]*\s(add|commit|checkout|switch|reset|resto
                        r"clean|update-ref|commit-tree|notes|gc|prune)\b")
 
 
-def shell_commands(s, i=0, close=None):
+def shell_commands(s, i=0, close=None, top=None):
     """Split shell text into simple commands, each (its words after quote removal, its heredoc
     bodies as (text, expands)). A command piped from one with heredocs shares them (`cat <<EOF | sh`
     runs the body). The commands inside $(...), `...` and (...) come out as commands of
     their own; a word holding a substitution keeps its source text. Returns (commands, the index
-    after `close`). Raises ValueError on text it can't split (an open quote, an unclosed paren)."""
+    after `close`). Raises ValueError on text it can't split (an open quote, an unclosed paren).
+    A list given as top gets (words, before, after) for each command at this level, not inside
+    $(...), `...` or (...): the operators around it (";", "\n", "&&", "||", "|", "&", "(", ")", None
+    at either end). An operator ahead of an empty command (`a &&` + newline) carries over to the next."""
     cmds, words, docs, word, pending, n = [], [], [], [], [], len(s)
-    inword = False
+    inword, before = False, None
 
     def end_word():
         nonlocal inword
@@ -1145,12 +1148,17 @@ def shell_commands(s, i=0, close=None):
         word.clear()
         inword = False
 
-    def end_cmd():  # a command with no words keeps its heredocs for the next (`cat <<EOF |` + newline)
-        nonlocal words, docs
+    def end_cmd(after=None):  # a command with no words keeps its heredocs for the next (`cat <<EOF |` + newline)
+        nonlocal words, docs, before
         end_word()
         if words:
             cmds.append((words, docs))
+            if top is not None:
+                top.append((words, before, after))
             words, docs = [], []
+            before = after
+        elif before not in ("&&", "||", "|", "&"):
+            before = after
 
     def sub(i):  # s[i:] starts with "$(": the commands up to its ")" are commands too
         found, j = shell_commands(s, i + 2, ")")
@@ -1251,27 +1259,27 @@ def shell_commands(s, i=0, close=None):
             end_word()
             i += 1
         elif c == "\n":
-            end_cmd()
+            end_cmd("\n")
             i = bodies(i + 1)
-        elif s.startswith("||", i):
-            end_cmd()
+        elif s.startswith("||", i) or s.startswith("&&", i):
+            end_cmd(s[i:i + 2])
             i += 2
         elif c == "|":  # a pipe: the heredocs read so far feed the next command's stdin too
             piped = docs
-            end_cmd()
+            end_cmd("|")
             docs = piped
             i += 2 if s.startswith("|&", i) else 1
         elif c in ";&":
-            end_cmd()
+            end_cmd(c)
             i += 1
         elif c == "(":
-            end_cmd()
+            end_cmd("(")
             found, i = shell_commands(s, i + 1, ")")
             cmds.extend(found)
         elif c == ")":
             if close != ")" or pending:
                 raise ValueError("unmatched )")
-            end_cmd()
+            end_cmd(")")
             return cmds, i + 1
         elif c in "<>":
             end_word()
@@ -1979,6 +1987,85 @@ GIT_ONLY_ENV_IN = re.compile(r"\b(?:" + "|".join(sorted(GIT_ONLY_ENV, key=len, r
 ENV_FROM_INPUT = {"read", "mapfile", "readarray"}
 
 
+# What git_env_reason may read a `$NAME` in a git command variable's value as (T-241). The bash and zsh
+# builtins and reserved words that can set a variable whose name the text needn't show (read, printf -v
+# into a name built at run time), run text the guard can't see in this shell (eval, source, trap),
+# or run a command twice or out of text order (loops, functions). One anywhere in the text means no
+# name is read as its value. builtin, command, exec, noglob, nocorrect, time and ! run the word after.
+SETS_UNSEEN = {".", "source", "eval", "trap", "alias", "unalias", "enable", "let", "read", "mapfile", "readarray",
+               "getopts", "wait", "unset", "pushd", "popd", "set", "shopt", "fc", "r", "bind", "complete",
+               "compgen", "compopt", "hash", "autoload", "functions", "unfunction", "emulate", "setopt", "unsetopt",
+               "zmodload", "vared", "zle", "getln", "pushln", "zparseopts", "zformat", "zstyle", "zregexparse",
+               "sysread", "sysopen", "zstat", "stat", "strftime", "zselect", "zsocket", "ztcp", "zpty", "zftp",
+               "zsystem", "zgetattr", "zlistattr", "pcre_compile", "pcre_match", "pcre_study", "sched", "bindkey",
+               "compadd", "compset", "compctl", "compcall", "comparguments", "compdescribe", "compvalues", "comptags",
+               "comptry", "compfiles", "compgroups", "compquote", "if", "then", "else", "elif", "fi", "case", "esac",
+               "for", "foreach", "select", "while", "until", "repeat", "do", "done", "end", "always", "coproc",
+               "function", "{", "}"}
+SHELL_RUNS_NEXT = {"builtin", "command", "exec", "noglob", "nocorrect", "time", "!", "-"}
+# The builtins that set the variables their arguments name: safe with literal names and no nameref (-n)
+# or tie (-T), since the name scan in _resolvable_names sees those.
+SHELL_DECLARES = SHELL_DECLARE | {"integer", "float", "private"}
+# Variables the shell sets itself, with no word naming them (cd sets PWD, `[[ =~ ]]` sets MATCH, zsh
+# ties path to PATH): never read as the value the text gave them. BASH_* and ZSH_* too.
+SHELL_SET_NAMES = {"PWD", "OLDPWD", "_", "REPLY", "reply", "OPTARG", "OPTIND", "MATCH", "MBEGIN", "MEND", "match",
+                   "mbegin", "mend", "PIPESTATUS", "pipestatus", "status", "RANDOM", "SRANDOM", "SECONDS", "LINENO",
+                   "EPOCHSECONDS", "EPOCHREALTIME", "BASHPID", "FUNCNAME", "HISTCMD", "COLUMNS", "LINES", "PPID",
+                   "UID", "EUID", "GID", "EGID", "USERNAME", "ERRNO", "TRY_BLOCK_ERROR", "DIRSTACK", "dirstack",
+                   "COMP_WORDS", "COMPREPLY", "IFS", "PATH", "path", "FPATH", "fpath", "CDPATH", "cdpath", "MANPATH",
+                   "manpath", "MAILPATH", "mailpath", "PSVAR", "psvar", "MODULE_PATH", "module_path", "HISTCHARS",
+                   "histchars", "argv", "ARGC", "TTYIDLE", "SHLVL"}
+IDENT = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _sets_unseen(words):
+    """Whether a simple command may set a shell variable the text doesn't name, or run code out of text
+    order (SETS_UNSEEN): its program, past assignments and the wrappers that run the next word, is one
+    of those, an expansion (`$cmd`), printf / print with -v, or a declare-like builtin with a nameref,
+    a tie, or a name built at run time."""
+    k = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+    start = k
+    while k < len(words) and (words[k] in SHELL_RUNS_NEXT or (k > start and words[k].startswith("-"))):
+        k += 1
+    if k == len(words):
+        return False
+    prog, args = words[k], words[k + 1:]
+    if prog in SETS_UNSEEN or _program(prog) in SETS_UNSEEN or _unseen(prog) or prog.startswith(("{", "}")):
+        return True
+    opts = "".join(a[1:] for a in args if a[:1] in "-+")
+    if prog in ("printf", "print"):
+        return "v" in opts
+    if prog in SHELL_DECLARES:
+        return "n" in opts or "T" in opts or any(
+            not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\+?=.*)?", a, re.S) for a in args if a[:1] not in "-+")
+    return False
+
+
+def _resolvable_names(cmds, top):
+    """The names whose `$NAME` / `${NAME}` git_env_reason reads as the value the text gave them, and the
+    commands (by id of their words) that give it: a NAME=value command alone, at the top level, not
+    behind && / || or a pipe and not piped or put in the background (`P=x; ...`, `P=x && ...`). Every
+    other word naming NAME (`read P`, `local P=x`, `X=1 P=y cmd`, `(P=y)`, `$P[1]`, `${P:-x}`, `${P=x}`)
+    means its value may not be the one the text shows, and so does a variable the shell sets itself
+    (SHELL_SET_NAMES). None at all where a command may set a variable the text doesn't name, or run
+    code out of text order (_sets_unseen), or a word holds an indirect expansion (`${!X}`, zsh `${(P)X}`)."""
+    sure = {id(w) for w, before, after in top if before in (None, ";", "\n")
+            and after in (None, ";", "\n", "&&", "||") and all(ASSIGNMENT.match(x) for x in w)}
+    names, others = set(), set()
+    for words, _ in cmds:
+        if _sets_unseen(words) or any("${!" in w or "${(" in w for w in words):
+            return set(), sure
+        for w in words:
+            for m in IDENT.finditer(w):
+                s, e, name = m.start(), m.end(), m.group(0)
+                if s == 0 and id(words) in sure and re.match(r"\+?=", w[e:]):
+                    names.add(name)
+                elif not ((w[s - 1:s] == "$" and w[e:e + 1] not in ("[", "{", ":", "("))
+                          or (w[s - 2:s] == "${" and w[e:e + 1] == "}")):
+                    others.add(name)
+    return {n for n in names - others if n not in SHELL_SET_NAMES and not n.startswith(("BASH", "ZSH"))}, sure
+
+
 def unseen_env_msg(name, why):
     return (f"git runs the value of {name} as a command, and the guard checks that command where {name} is set, "
             f"but here it can't see it: {why}. So it's refused. Write the value out in full (`{name}=<command> "
@@ -1992,14 +2079,21 @@ def git_env_reason(cmd):
     expansion, now or when git runs it through the shell, or a `+=` onto a value the text didn't set.
     Anywhere: exporting it with no value the text set earlier, `read` / `mapfile` / `printf -v` into
     it, a `for` / `select` loop over it, a nameref to it, or `${NAME:=value}` with an unseen value (a
-    value the text shows is checked by human_cmd). Strings run as code are checked too."""
+    value the text shows is checked by human_cmd). Strings run as code are checked too.
+    A `$P` / `${P}` in the value is read as the value the text gave P where that's sure to be the one
+    git gets (_resolvable_names: `P=cat; GIT_PAGER=$P git log`), and the value it makes, with what an
+    earlier `+=` joined to, is checked by human_cmd here (T-241)."""
+    top = []
     try:
-        cmds = shell_commands(cmd)[0]
+        cmds = shell_commands(cmd, top=top)[0]
     except (ValueError, RecursionError):
         if m := GIT_ONLY_ENV_IN.search(cmd):
             return unseen_env_msg(m.group(0), "the guard can't split this command")
         return None
     seen = set()  # the GIT_ONLY_ENV names the text has set to a value it shows
+    names, sure = _resolvable_names(cmds, top)
+    vals, budget = {}, [MAX_EXPANDED]  # names' values as the text gives them, in text order
+    full, through = {}, set()  # GIT_ONLY_ENV values with what `+=` joined; the ones read through a name
     for words, docs in cmds:
         # bash -c '...', a heredoc fed to sh. env's own words are read below.
         if any(CODE_RUNNER.fullmatch(_program(w)) and _program(w) != "env" for w in words):
@@ -2007,13 +2101,24 @@ def git_env_reason(cmd):
                 if t != cmd and (why := git_env_reason(t)):
                     return why
         for name, append, val in _env_assignments(words):
-            if name not in GIT_ONLY_ENV:
-                continue
-            if _unseen(val):
-                return unseen_env_msg(name, f"`{val}` holds a `$` or backtick expansion")
-            if append and name not in seen:
-                return unseen_env_msg(name, "`+=` adds to a value set outside this command")
-            seen.add(name)
+            if name in GIT_ONLY_ENV:
+                shown = val
+                if _unseen(val) and "{" not in re.sub(r"\$\{\w+\}", "", val):  # bash brace-expands export's words
+                    shown = _expand_text(val, vals, budget)
+                if _unseen(shown):
+                    return unseen_env_msg(name, f"`{val}` holds a `$` or backtick expansion")
+                if append and name not in seen:
+                    return unseen_env_msg(name, "`+=` adds to a value set outside this command")
+                seen.add(name)
+                full[name] = (full.get(name, "") if append else "") + shown
+                if shown != val:
+                    through.add(name)
+                elif not append:
+                    through.discard(name)
+                if name in through and human_cmd(full[name]):
+                    return HUMAN_MSG
+            if id(words) in sure and name in names:
+                vals[name] = (vals.get(name, "${" + name + "}") if append else "") + _expand_text(val, vals, budget)
         for w in _without_messages(words):
             for m in re.finditer(r"\$\{(\w+):?=([^}]*)(\}?)", w):
                 if m.group(1) not in GIT_ONLY_ENV:
