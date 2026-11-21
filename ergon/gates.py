@@ -1414,6 +1414,93 @@ def git_config_command(key, val):
     return val
 
 
+# Per git subcommand that takes a repository URL as an argument (T-236): the long options and short
+# letters that take the next word as their value when it isn't attached (from `git <sub> --help-all`
+# and the shell scripts' own parsers, git 2.54; an option whose value is optional never takes the
+# next word), the options whose value is itself a URL, and, per verb (None for a command with none),
+# which positional argument after it is the URL. git's builtins read options after positionals too.
+GIT_URL_ARGS = {
+    "clone": ({"--upload-pack", "--template", "--reference", "--reference-if-able", "--origin", "--branch",
+               "--revision", "--depth", "--shallow-since", "--shallow-exclude", "--separate-git-dir",
+               "--ref-format", "--config", "--server-option", "--filter", "--bundle-uri", "--jobs"},
+              "jobuc", set(), {None: 0}),
+    "fetch": ({"--upload-pack", "--jobs", "--depth", "--shallow-since", "--shallow-exclude", "--deepen",
+               "--submodule-prefix", "--recurse-submodules-default", "--refmap", "--server-option",
+               "--negotiation-tip", "--filter"}, "jo", set(), {None: 0}),
+    "pull": ({"--cleanup", "--strategy", "--strategy-option", "--upload-pack", "--depth", "--shallow-since",
+              "--shallow-exclude", "--deepen", "--refmap", "--server-option", "--negotiation-tip"},
+             "sXo", set(), {None: 0}),
+    "push": ({"--repo", "--receive-pack", "--exec", "--push-option"}, "o", {"--repo"}, {None: 0}),
+    "ls-remote": ({"--upload-pack", "--exec", "--sort", "--server-option"}, "o", set(), {None: 0}),
+    "archive": ({"--format", "--prefix", "--add-file", "--add-virtual-file", "--output", "--mtime", "--remote",
+                 "--exec"}, "o", {"--remote"}, {}),
+    "remote": ({"--track", "--master"}, "tm", set(), {"add": 1, "set-url": 1}),
+    "submodule": ({"--branch", "--reference", "--ref-format", "--name", "--depth"}, "b", set(),
+                  {"add": 0, "set-url": 1}),
+    "request-pull": (set(), "", set(), {None: 1}),  # runs `git ls-remote <url>`
+    "subtree": ({"--prefix", "--message", "--annotate", "--onto", "--branch"}, "Pmb", set(),
+                {"add": 0, "pull": 0, "push": 0}),  # each runs `git fetch` or `git push` on it
+}
+
+
+def _takes_next(a, longs, shorts):
+    """The steps past option word a to the next word to read, as git's option parser may take it: 2
+    when it takes the next word as its value, 1 when not, both when a is an abbreviation that may
+    name a valued option or a flag that starts the same way (git refuses an ambiguous one)."""
+    name, eq, _ = a.partition("=")
+    if a.startswith("--"):
+        if eq or a == "--" or not any(o.startswith(name) for o in longs):
+            return {1}
+        return {2} if name in longs else {1, 2}
+    for p, c in enumerate(a[1:], 2):  # -j4, -qj 4: a valued letter takes the rest of the cluster or the next word
+        if c in shorts:
+            return {1} if a[p:] else {2}
+    return {1}
+
+
+def git_url_args(sub, rest):
+    """The words of a git call (subcommand sub, the words after it) that git may read as a repository
+    URL: the clone / fetch / pull / push / ls-remote repository, `remote add` / `set-url`'s URL,
+    `submodule add` / `set-url`'s, request-pull's, `subtree add` / `pull` / `push`'s, any of `fetch
+    --multiple`'s, and push --repo's or archive --remote's value. Where an option may or may not take
+    the next word (_takes_next), both readings count, so a word that is the URL under either is here."""
+    if sub not in GIT_URL_ARGS:
+        return []
+    longs, shorts, url_opts, slots = GIT_URL_ARGS[sub]
+    multiple = sub == "fetch" and any(len(a) > 3 and "--multiple".startswith(a) for a in rest)
+    out = set()
+    for j, a in enumerate(rest):  # push --repo <url>, archive --remote=<url>, or an abbreviation
+        name, eq, val = a.partition("=")
+        if a.startswith("--") and len(name) > 2 and any(o.startswith(name) for o in url_opts):
+            if eq:
+                out.add(val)
+            elif j + 1 < len(rest):
+                out.add(rest[j + 1])
+    # (word index, positionals read since the verb, the verb or None, past `--`) for each reading
+    todo, done, verbed = [(0, 0, None, False)], set(), None not in slots
+    while todo:
+        state = todo.pop()
+        if state in done or state[0] >= len(rest):
+            continue
+        done.add(state)
+        i, n, verb, dashed = state
+        a = rest[i]
+        if not dashed and a == "--":
+            todo.append((i + 1, n, verb, True))
+        elif not dashed and a.startswith("-") and a != "-":
+            todo += [(i + s, n, verb, dashed) for s in _takes_next(a, longs, shorts)]
+        elif verbed and verb is None:
+            if a in slots:
+                todo.append((i + 1, 0, a, dashed))
+        else:
+            slot = slots[verb]
+            if n == slot or (multiple and n >= slot):
+                out.add(a)
+            if n < slot or multiple:  # past the slot, --multiple's count no longer matters
+                todo.append((i + 1, min(n + 1, slot + 1), verb, dashed))
+    return sorted(out)
+
+
 def _option_values(rest, longs, shorts, valued):
     """(kind, value) for each option of GIT_CMD_OPTS' kinds in rest, up to `--`: `--opt value`,
     `--opt=value`, or an abbreviation of it; `-x value`, `-xvalue`, or x late in a cluster."""
@@ -1736,10 +1823,21 @@ def _unseen_value(key, val):
     a value whose text up to its first expansion can't begin `ext::` (`https://$HOST/r.git`) runs none."""
     if not _unseen(val):
         return False
-    if not GIT_URL_KEYS.fullmatch(key.lower()):
-        return True
-    head = re.split(r"[$`]", val, maxsplit=1)[0].lower()
+    return not GIT_URL_KEYS.fullmatch(key.lower()) or _may_be_ext(val)
+
+
+def _may_be_ext(url):
+    """Whether an expansion in url may make it an ext:: URL: git reads the transport from the URL's
+    start, so one whose text up to its first expansion can't begin `ext::` (`https://$HOST/r.git`)
+    can't be one."""
+    head = re.split(r"[$`]", url, maxsplit=1)[0].lower()
     return head.startswith("ext::") or "ext::".startswith(head)
+
+
+def unseen_url_msg(sub, url):
+    return (f"git runs an ext:: URL given to `git {sub}` as a command, and the guard checks that command, but "
+            f"here it can't see the URL: `{url}` holds a `$` or backtick expansion. So it's refused. Write the "
+            f"URL or the remote's name out in full (`git {sub} https://...`, `git {sub} origin`), or ask the user")
 
 
 def unseen_config_msg(key, why):
@@ -1760,7 +1858,8 @@ def git_config_reason(cmd):
     """Why a shell command defines a git alias or GIT_COMMAND_KEYS key in a way human_cmd can't
     check, or None: with `git --config-env` (the value is in an environment variable), with a `$` or
     backtick in the value, by renaming a section into or out of one that holds such keys, or through
-    GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_<n> + GIT_CONFIG_VALUE_<n>. A value the text holds there
+    GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_<n> + GIT_CONFIG_VALUE_<n>; or gives git a repository URL
+    (git_url_args) that an expansion may make an ext:: URL, whose command git runs. A value the text holds there
     is read like `git -c`'s, a human-only verb in it refused; a key or value set by an earlier command
     can't be seen, so its other half is refused. Strings run as code are checked too."""
     try:
@@ -1801,6 +1900,10 @@ def git_config_reason(cmd):
                 if (c := git_config_command(key, v)) is not None and human_cmd(c):
                     return HUMAN_MSG
         for _, sub, rest in _git_calls(words):
+            # a repository argument (`git fetch "$U"`, `git clone "$U" d`, `git remote add o "$U"`): T-236
+            for url in git_url_args(sub, rest):
+                if _unseen(url) and _may_be_ext(url):
+                    return unseen_url_msg(sub, url)
             at = next((j for j, a in enumerate(rest) if a in ("--rename-section", "rename-section")), None)
             if sub != "config" or at is None:
                 continue

@@ -1202,6 +1202,50 @@ class TestBasics(Project):
         self.assertIsNone(self.guard("Edit", {"file_path": str(p), "old_string": "[core]",
                                               "new_string": "[remote \"x\"]\n\turl = https://example.com/r.git\n[core]"}))
 
+    def test_guard_refuses_unseen_git_url_arguments(self):
+        """T-236: git runs an ext:: URL given as clone's, fetch's, push's, ... repository argument
+        (T-215 checks one the text shows), so one an expansion may make ext:: is refused: in the
+        repository slot of each command that takes one, past options and their values, after `--`, as
+        push --repo's or archive --remote's value, behind sudo or in `bash -c`. An expansion elsewhere
+        (a refspec, a directory, an option's value, after a literal `https://`) and a remote's name pass."""
+        from ergon.gates import git_config_reason, git_url_args
+        self.assertEqual(git_url_args("fetch", ["-q", "--depth", "1", "o", "main"]), ["o"])
+        self.assertEqual(git_url_args("fetch", ["--repo", "o"]), ["o"])  # no fetch option starts --repo
+        self.assertEqual(git_url_args("fetch", ["--multiple", "a", "b"]), ["a", "b"])
+        self.assertEqual(git_url_args("clone", ["-qb", "x", "u", "d"]), ["u"])
+        self.assertEqual(git_url_args("clone", ["-bx", "u", "d"]), ["u"])
+        self.assertEqual(git_url_args("remote", ["-v", "add", "-t", "m", "o", "u"]), ["u"])
+        self.assertEqual(git_url_args("remote", ["rename", "a", "b"]), [])
+        self.assertEqual(git_url_args("fetch", ["--d", "o", "u"]), ["o", "u"])  # --depth or --dry-run: both
+        unseen = ["git fetch \"$U\"", "git clone \"$U\" d", "git remote add o \"$U\"",
+                  "git fetch -q --depth 1 \"$U\" main", "git fetch origin --depth=1 && git fetch \"${U}\"",
+                  "git clone --branch main -- \"$U\" d", "git clone -qb main \"$U\"", "git clone --depth \"$N\" \"$U\"",
+                  "git -C /tmp -c x.y=1 clone \"$U\"", "sudo git fetch \"$U\"", "bash -c 'git fetch \"$U\"'",
+                  "git pull \"$U\" main", "git pull --rebase -s ours \"$U\"", "git push \"$U\" HEAD",
+                  "git push --repo \"$U\"", "git push --repo=\"$U\" HEAD", "git ls-remote \"$U\"",
+                  "git ls-remote --sort version:refname \"$U\"", "git remote set-url o \"$U\"",
+                  "git remote set-url --push o \"$U\"", "git remote add -t main -m main o \"$U\"",
+                  "git submodule add \"$U\" sub", "git submodule add -b main --name s \"$U\" sub",
+                  "git submodule --quiet add -- \"$U\"", "git submodule set-url sub \"$U\"",
+                  "git archive --remote=\"$U\" HEAD", "git archive --remote \"$U\" HEAD",
+                  "git request-pull v1 \"$U\"", "git subtree add -P lib \"$U\" main", "git subtree pull --prefix=lib \"$U\" main",
+                  "git fetch --multiple origin \"$U\"", "git fetch $(cat url)", "git clone `cat url` d",
+                  "git fetch \"e$X\"", "git fetch \"EXT::$X\"", "git fetch \"ext::ergon $X\"", "/usr/bin/git fetch \"$U\""]
+        for cmd in unseen:
+            self.assertIn("ext:: URL", git_config_reason(cmd) or "", cmd)
+            self.assertTrue(self.guard("Bash", {"command": cmd}), cmd)  # `ext::ergon $X`: human_cmd's first
+        shown = ["git clone \"https://$HOST/r.git\"", "git fetch origin", "git clone \"https://$HOST/r.git\" \"$DIR\"",
+                 "git fetch origin \"$BRANCH\"", "git push origin \"$BRANCH\"", "git push -u origin \"HEAD:$B\"",
+                 "git pull origin \"$B\"", "git fetch --depth \"$N\" origin", "git clone -b \"$B\" https://x/r.git",
+                 "git clone \"git@$HOST:r.git\" d", "git ls-remote origin \"$REF\"", "git remote add \"$NAME\" https://x/r.git",
+                 "git remote rename o \"$NEW\"", "git remote remove \"$O\"", "git submodule add https://x/r.git \"$P\"",
+                 "git submodule update --init \"$P\"", "git archive --format=tar \"$REV\"", "git fetch --all",
+                 "git clone \"ssh://$HOST/r.git\"", "git log \"$U\"", "git checkout \"$U\"", "git request-pull \"$V\" origin",
+                 "echo \"git fetch $U\"", "git commit -m 'git fetch \"$U\"'"]
+        for cmd in shown:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+
     def test_stop_hook_blocks_on_lint_failure(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")
