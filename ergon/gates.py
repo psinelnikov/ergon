@@ -1869,7 +1869,10 @@ def git_config_reason(cmd):
     GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_<n> + GIT_CONFIG_VALUE_<n>; or gives git a repository URL
     (git_url_args) that an expansion may make an ext:: URL, whose command git runs. A value the text holds there
     is read like `git -c`'s, a human-only verb in it refused; a key or value set by an earlier command
-    can't be seen, so its other half is refused. Strings run as code are checked too."""
+    can't be seen, so its other half is refused. Strings run as code are checked too. So is a
+    variable set through a name the text doesn't show (indirect_set_msg, _dynamic_name), whatever it is."""
+    if why := indirect_set_msg(cmd):
+        return why
     try:
         cmds = shell_commands(cmd)[0]
     except (ValueError, RecursionError):
@@ -1887,6 +1890,8 @@ def git_config_reason(cmd):
                     continue
                 if why := git_config_reason(t):
                     return why
+        if how := _dynamic_name(words):
+            return DYNAMIC_NAME_MSG.format(how=how)
         for key, val in git_config_sets(words):
             if val is not None and config_key_runs(key) and _unseen_value(key, val):
                 return unseen_config_msg(key, f"`{val}` holds a `$` or backtick expansion")
@@ -2016,6 +2021,103 @@ SHELL_SET_NAMES = {"PWD", "OLDPWD", "_", "REPLY", "reply", "OPTARG", "OPTIND", "
                    "manpath", "MAILPATH", "mailpath", "PSVAR", "psvar", "MODULE_PATH", "module_path", "HISTCHARS",
                    "histchars", "argv", "ARGC", "TTYIDLE", "SHLVL"}
 IDENT = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*")
+# T-242: the builtins that set a variable an argument names, and how. A name built at run time
+# (`printf -v "$x"`, `read "$x"`, `export "$x=..."`, a function's `export "$1"`) may be any of git's
+# GIT_CONFIG_* or command variables, so git_config_reason and git_env_reason refuse it whatever it is.
+# read's and mapfile's options that take a value (in both bash and zsh: a bash-only one, like
+# `read -p prompt`, is a flag in zsh and the word after it a name), and zsh's builtins that set a
+# variable named by an argument, often an option's, where any expansion among the words counts.
+NAME_READS = {"read", "mapfile", "readarray"}
+NAME_READ_OPT_ARGS = {"read": "du", "mapfile": "dnOsuCc", "readarray": "dnOsuCc"}
+NAME_SETS_ANY = {"vared", "getln", "zparseopts", "zstyle", "zformat", "strftime", "zstat", "sysread", "zselect",
+                 "zregexparse", "pcre_match", "zgetattr", "zlistattr", "zsystem"}
+# The words ahead of a simple command's program that leave it the program: reserved words that start
+# a command, and the wrappers that run the next word as a builtin (SHELL_RUNS_NEXT).
+SHELL_LEADS = SHELL_RUNS_NEXT | {"{", "if", "then", "else", "elif", "while", "until", "do"}
+# `${!x:=v}` (bash 5) and zsh's `${(P)x::=v}` set the variable x names; a nested `${y}` may be the name.
+INDIRECT_SET = re.compile(r"\$\{(?:!|\([^)]*P[^)]*\))(?:[^{}:=]|\$\{[^{}]*\})*:{0,2}=")
+DYNAMIC_NAME_MSG = ("this command sets a shell variable whose name the guard can't see ({how}): it may be one of "
+                    "git's GIT_CONFIG_* or command variables (GIT_EDITOR, GIT_PAGER, ...), whose value git runs, "
+                    "so it's refused. Write the variable's name out in full, or ask the user")
+
+
+def indirect_set_msg(cmd):
+    """DYNAMIC_NAME_MSG if the text holds `${!x:=v}` (bash 5) or zsh's `${(P)x::=v}`, which set the
+    variable x names, or None. Read in the raw text: shell_commands splits zsh's `${(P)...}` at its
+    `(`, and a quoted or heredoc copy of one is rare enough to refuse along with it (T-242)."""
+    if m := INDIRECT_SET.search(cmd):
+        return DYNAMIC_NAME_MSG.format(how=f"`{m.group(0)}` sets the variable another one names")
+    return None
+
+
+def _dynamic_name(words):
+    """How a simple command sets a shell variable whose name the text doesn't show, or None: a name
+    with a `$` or backtick expansion given to printf / print -v, read, mapfile, getopts, a declare-like
+    builtin (`export "$x=v"`, `local "$1"`), a nameref whose target is such a name or is left for a later
+    assignment (`declare -n r=$x`, `local -n r`), or an expansion among a zsh setter's words (vared,
+    zparseopts, ...). A name the text shows is left to the callers' own checks. Its program is found
+    past assignments, reserved words (`if`, `{`, `do`), `function NAME` and wrappers (`builtin`,
+    `command`), so the body of a function that sets `"$1"` counts (T-242)."""
+    k, after_wrapper = 0, False
+    while k < len(words):
+        w = words[k]
+        if ASSIGNMENT.match(w) and not after_wrapper:
+            k += 1
+        elif w in SHELL_LEADS:
+            k, after_wrapper = k + 1, w in SHELL_RUNS_NEXT
+        elif w == "function":
+            k += 2  # `function f { ...`: f is its name
+        elif after_wrapper and w.startswith("-"):
+            k += 1  # `command -p read`
+        else:
+            break
+    if k >= len(words):
+        return None
+    prog, args = _program(words[k]), words[k + 1:]
+    if prog in NAME_SETS_ANY:
+        return next((f"`{prog}` sets a variable named by `{a}`" for a in args if _unseen(a)), None)
+    if prog in ("printf", "print"):
+        for j, a in enumerate(args):
+            if a == "--" or not a.startswith("-"):
+                return None
+            if m := re.fullmatch(r"-[A-Za-z]*v(.*)", a, re.S):
+                name = m.group(1) or (args[j + 1] if j + 1 < len(args) else "")
+                return f"`{prog} -v {name}`" if _unseen(name) else None
+        return None
+    if prog in NAME_READS:
+        names, takes, opts, j = [], NAME_READ_OPT_ARGS[prog], True, 0
+        while j < len(args):
+            a = args[j]
+            j += 1
+            if opts and a == "--":
+                opts = False
+            elif opts and a.startswith("-") and len(a) > 1:
+                # `-d delim`, `-d:`: the rest of the word, or the next word, is a value (read -a NAME's is a name)
+                at = next((i for i, c in enumerate(a[1:], 1) if c in takes), None)
+                j += at == len(a) - 1
+            else:
+                names.append(a.partition("?")[0] if prog == "read" else a)  # zsh `read 'name?prompt'`
+        return next((f"`{prog}` sets a variable named by `{a}`" for a in names if _unseen(a)), None)
+    if prog == "getopts":
+        name = args[1] if len(args) > 1 else ""
+        return f"`getopts` sets a variable named by `{name}`" if _unseen(name) else None
+    if prog in SHELL_DECLARES:
+        opts = "".join(a[1:] for a in args if a.startswith("-"))
+        # `declare -f "$fn"`, `export -f "$fn"`: functions, not variables (zsh's `typeset -F` is a float,
+        # a number git can't run as a command)
+        if "f" in opts or "F" in opts:
+            return None
+        for a in args:
+            if a.startswith(("-", "+")):
+                continue
+            name, eq, target = a.partition("=")
+            if "p" in opts and not eq:  # `declare -p "$x"` prints it
+                continue
+            if _unseen(name.removesuffix("+").partition("[")[0]):
+                return f"`{prog} {a}` names it with an expansion"
+            if prog in ("declare", "typeset", "local") and "n" in opts and (not eq or _unseen(target)):
+                return f"`{prog} -n {a}` makes a nameref whose target {'is' if eq else 'may be'} set at run time"
+    return None
 
 
 def _sets_unseen(words):
@@ -2082,7 +2184,15 @@ def git_env_reason(cmd):
     value the text shows is checked by human_cmd). Strings run as code are checked too.
     A `$P` / `${P}` in the value is read as the value the text gave P where that's sure to be the one
     git gets (_resolvable_names: `P=cat; GIT_PAGER=$P git log`), and the value it makes, with what an
-    earlier `+=` joined to, is checked by human_cmd here (T-241)."""
+    earlier `+=` joined to, is checked by human_cmd here (T-241).
+    Any variable set through a name the text doesn't show is refused, whatever it is (indirect_set_msg,
+    _dynamic_name: `printf -v "$x"`, a function's `export "$1"`), and so is one of these names handed
+    to a program where the text defines a function or alias (SHELL_REDEFINES), which may set it (T-242)."""
+    if why := indirect_set_msg(cmd):
+        return why
+    # zsh's `${(L)NAME:=value}`: shell_commands splits it at its `(`, so it's read in the raw text.
+    if m := re.search(r"\$\{\([^)]*\)(" + GIT_ONLY_ENV_IN.pattern + r"):{0,2}=", cmd):
+        return unseen_env_msg(m.group(1), f"`{m.group(0)}` sets it, behind zsh flags the guard doesn't read")
     top = []
     try:
         cmds = shell_commands(cmd, top=top)[0]
@@ -2091,6 +2201,7 @@ def git_env_reason(cmd):
             return unseen_env_msg(m.group(0), "the guard can't split this command")
         return None
     seen = set()  # the GIT_ONLY_ENV names the text has set to a value it shows
+    redefines = SHELL_REDEFINES.search(re.sub(r"[\\'\"]", "", cmd))  # as in git_config_reason
     names, sure = _resolvable_names(cmds, top)
     vals, budget = {}, [MAX_EXPANDED]  # names' values as the text gives them, in text order
     full, through = {}, set()  # GIT_ONLY_ENV values with what `+=` joined; the ones read through a name
@@ -2100,6 +2211,8 @@ def git_env_reason(cmd):
             for t in words + [d for d, _ in docs]:
                 if t != cmd and (why := git_env_reason(t)):
                     return why
+        if how := _dynamic_name(words):
+            return DYNAMIC_NAME_MSG.format(how=how)
         for name, append, val in _env_assignments(words):
             if name in GIT_ONLY_ENV:
                 shown = val
@@ -2120,7 +2233,7 @@ def git_env_reason(cmd):
             if id(words) in sure and name in names:
                 vals[name] = (vals.get(name, "${" + name + "}") if append else "") + _expand_text(val, vals, budget)
         for w in _without_messages(words):
-            for m in re.finditer(r"\$\{(\w+):?=([^}]*)(\}?)", w):
+            for m in re.finditer(r"\$\{(\w+):{0,2}=([^}]*)(\}?)", w):  # zsh's `::=` too
                 if m.group(1) not in GIT_ONLY_ENV:
                     continue
                 if _unseen(m.group(2)) or "{" in m.group(2) or not m.group(3):
@@ -2139,6 +2252,10 @@ def git_env_reason(cmd):
             if prog == "printf" and a.startswith("-v") and (a[2:] or (args[j + 1] if j + 1 < len(args) else "")) \
                     in GIT_ONLY_ENV:
                 return unseen_env_msg(a[2:] or args[j + 1], "`printf -v` sets it")
+            if redefines and prog not in SHELL_DECLARE and a.partition("=")[0].removesuffix("+") in GIT_ONLY_ENV:
+                # `alias git=export; git GIT_EDITOR=...`, `git() { read "$1"; }; git GIT_EDITOR` (T-242)
+                return unseen_env_msg(a.partition("=")[0].removesuffix("+"), "a function or alias this command "
+                                      f"defines may make `{prog}` set it")
             if a not in GIT_ONLY_ENV:
                 continue
             if prog in ENV_FROM_INPUT:

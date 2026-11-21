@@ -1228,6 +1228,58 @@ class TestBasics(Project):
                     "false && P=cat; GIT_PAGER=$P git log"]:
             self.assertIn("can't see", self.guard("Bash", {"command": cmd}) or "", cmd)
 
+    def test_guard_variable_set_through_a_name_built_at_run_time(self):
+        """T-242: a builtin handed a variable name the text doesn't show (`printf -v "$x"`, `read "$x"`,
+        `export "$x"`, `declare -n r=$x`, zsh `${(P)x::=...}`, bash `${!x:=...}`, a function's
+        `export "$1"`) may set any of git's GIT_CONFIG_* or command variables, so git_config_reason and
+        git_env_reason both refuse it, whatever the name turns out to be. A function or alias the text
+        defines may make a program set the git command variable it is handed (`alias git=export`).
+        Reading or exporting a variable the text names, and an expansion in a value, an option's value
+        (`read -u "$fd"`) or a subscript, pass."""
+        from ergon.gates import git_config_reason, git_env_reason
+        both = ["x=$(echo GIT_CONFIG_KEY | sed 's/$/_0/'); printf -v \"$x\" alias.y; GIT_CONFIG_COUNT=1 git y",
+                "printf -v \"$x\" %s alias.y", "printf -v$x alias.y", "print -v \"$x\" alias.y",
+                "read \"$x\" <<< alias.y", "read -r $x <f", "read -a \"$x\" <f", "read -p ok \"$x\"",
+                "read 'v?ok' \"$x\"", "builtin read \"$x\"", "command -p read \"$x\"", "if read \"$x\"; then :; fi",
+                "mapfile -t \"$x\" <f", "readarray \"$x\" <f", "getopts ab \"$n\" -a", "zparseopts -A \"$x\" a",
+                "export \"$x=alias.y\"", "export \"$x\"", "export $x", "export \"${x}_0=alias.y\"",
+                "export `echo GIT_EDITOR`=vim", "declare \"$x=alias.y\"", "local \"$1\"", "readonly $x=1",
+                "typeset -x \"$x\"=1", "declare -n r=$x; r=alias.y", "declare -n r=\"$x\"", "typeset -n r=${x}",
+                "declare -gn r=$1", "local -n r; r=GIT_EDITOR", ": ${(P)x::=alias.y}", "echo ${(P)x::=alias.y}",
+                ": ${(P)${x}:=alias.y}", ": ${!x:=vim}", ": ${!x=vim}", "cat <<EOF\n${(P)x::=vim}\nEOF",
+                "bash -c 'printf -v \"$1\" x' _ GIT_EDITOR",
+                # a function that sets the variable named by its argument, in place of a program or not
+                "f() { export \"$1\"; }; f GIT_EDITOR", "f() { export \"$1=vim\"; }; f GIT_EDITOR",
+                "f() { printf -v \"$1\" %s vim; }; f GIT_PAGER", "function f { read \"$1\"; }; f GIT_EDITOR",
+                "f() ( export \"$1\"=x ); f GIT_EDITOR", "git() { export \"$1=x\"; }; git GIT_EDITOR; command git commit",
+                "git() { local -n r=$1; r=x; }; git GIT_SSH_COMMAND", "grep() { read \"$1\"; }; grep GIT_CONFIG_KEY_0"]
+        for cmd in both:
+            for reason in (git_config_reason, git_env_reason):
+                self.assertIn("can't see", reason(cmd) or "", (reason.__name__, cmd))
+        # A program a function or alias in the text may replace, handed a git command variable by name.
+        for cmd in ["alias git=export\ngit GIT_EDITOR=x; git commit", "alias git='printf -v'\ngit GIT_PAGER x; git log",
+                    "git() { \"$@\"; }; git read GIT_EDITOR", "functions[git]=x; git GIT_EDITOR+=y",
+                    ": ${GIT_EDITOR::=$y}; git commit", ": ${(L)GIT_EDITOR::=vim}; git commit"]:
+            self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        for cmd in ["read -r line", "read line; echo $line", "read -d '' -r line", "read -u \"$fd\" line",
+                    "read -d\"$d\" line", "while IFS= read -r f; do echo \"$f\"; done <list",
+                    "mapfile -t lines < <(git ls-files)", "mapfile -u \"$fd\" -t lines", "export PATH=$PATH:/x",
+                    "export \"PATH=$HOME/bin:$PATH\"", "export FOO", "export FOO=$(pwd) BAR=\"$x\"", "export -n FOO",
+                    "local arr[$i]=x", "declare -A m; m[$k]=v", "printf -v out %s \"$x\"", "printf '%s\\n' \"$x\"",
+                    "printf -- \"-v $x\"", "print -r -- \"$x\"", "declare -n r=arr", "getopts ab opt \"$@\"",
+                    "f() { echo \"$1\"; }; f hi", "f() { local x=\"$1\"; echo $x; }; f hi", "stat \"$f\"",
+                    "echo ${!prefix*} ${!x} ${(P)x} ${(P)x:-a=b}", "echo ${x:=1} ${(L)x}", "echo \"export $x\"",
+                    "git commit -m \"$msg\"", ": ${GIT_EDITOR::=vim}; git commit", "f() { :; }; git log",
+                    "declare -f \"$fn\"", "export -f \"$fn\"", "declare -p \"$x\""]:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+            self.assertIsNone(git_env_reason(cmd), cmd)
+        # end to end through the hook
+        for cmd in ["x=$(cat f); printf -v \"$x\" alias.y","f() { export \"$1=vim\"; }; f GIT_EDITOR",
+                    "alias git=export\ngit GIT_EDITOR=x; git commit"]:
+            self.assertIn("can't see", self.guard("Bash", {"command": cmd}) or "", cmd)
+        for cmd in ["read -r line", "export \"PATH=$HOME/bin:$PATH\"", "printf -v out %s \"$x\""]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+
     def test_guard_refuses_unseen_git_url_config(self):
         """T-226: a remote's or submodule's URL key (GIT_URL_KEYS) runs an ext:: URL as a command, so
         T-060's unseen-value checks cover it: set through --config-env, GIT_CONFIG_KEY_<n> /
