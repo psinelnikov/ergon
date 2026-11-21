@@ -829,6 +829,39 @@ class TestBasics(Project):
         for bad in ["x = 1\n[", "[alias]\nx = \"open\n", "[alias x]\n", "[alias]\nx y\n", "[alias]\nx = \\q\n"]:
             self.assertIsNone(git_config_entries(bad), bad)
 
+    def test_guard_refuses_a_shell_write_to_a_bare_repositorys_config(self):
+        """T-239: `config` in a git directory not named .git (a bare repository, a --separate-git-dir
+        one; HEAD, objects and refs in it) is git config, so a shell write to it is refused, named by
+        path, from a `cd` into it, through a symlink, or in a command that makes the repository first.
+        A file named config elsewhere (~/.ssh/config, an ordinary directory's), config.yml and the git
+        directory's other files pass."""
+        root, home = self.root, self.root / "home"
+        (home / ".ssh").mkdir(parents=True)
+        (root / "plain").mkdir()
+        env = clean_env(HOME=str(home), CLAUDE_PROJECT_DIR=str(root))  # as Claude Code sets it for hooks
+        sh("git", "init", "-q", "--bare", "bare", cwd=root)
+        sh("git", "init", "-q", "--bare", "r.git", cwd=root)
+        sh("git", "init", "-q", "--separate-git-dir", str(root / "sep"), str(root / "wt"), cwd=root)
+        (root / "link").symlink_to(root / "bare" / "config")
+        printf = r"printf '[alias]\n\tx = !ergon approve T-1\n'"
+        alias = "[alias]\n\tx = !ergon approve T-1\n"
+        for f in [root / "bare" / "config", "bare/config", "./bare/../bare/config", "r.git/config",
+                  root / "sep" / "config", "sep/config.worktree", "bare/CONFIG", "link"]:
+            for cmd in [f"{printf} > {f}", f"{printf} >> {f}", f"{printf} | tee -a {f}", f"cp /tmp/evil {f}",
+                        f"sed -i '1i [alias]\\n\\tx = !ergon approve T-1' {f}", f"cat >> {f} <<'EOF'\n{alias}EOF",
+                        f"bash -c \"cp /tmp/evil {f}\""]:
+                self.assertIn("git reads config from", self.guard("Bash", {"command": cmd}, env=env) or "", cmd)
+        for cmd, cwd in [(f"cd bare && {printf} >> config", root), (f"cd {root}/bare; {printf} > config", home),
+                         (f"{printf} >> config", root / "bare"), (f"{printf} >> ../bare/config", root / "plain"),
+                         (f"git init -q --bare fresh && {printf} > fresh/config", root),
+                         (f"git clone -q --bare . copy.git && cd copy.git && {printf} >> config", root)]:
+            self.assertIn("git reads config from", self.guard("Bash", {"command": cmd}, env=env, cwd=cwd) or "", cmd)
+        for cmd in ["echo x > config.yml", "echo x > bare/config.yml", f"{printf} >> ~/.ssh/config",
+                    f"printf 'Host x\\n' >> {home}/.ssh/config", f"{printf} > plain/config", "echo x > bare/description",
+                    "cat bare/config", "git clone -q --bare . copy.git && echo x > config.yml"]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}, env=env), cmd)
+        self.assertIsNone(self.guard("Bash", {"command": "echo x > config"}, env=env, cwd=root / "plain"))
+
     def test_guard_refuses_git_config_from_a_file_the_agent_chose(self):
         """T-224: a file written by a plain shell write (not named as config, so the write passes) that
         holds an `[alias]` running a human-only verb, then made git's config by include.path /
@@ -842,15 +875,15 @@ class TestBasics(Project):
         root = self.root
         alias = "[alias]\n\tx = !ergon {v} T-1\n"
         printf = r"printf '[alias]\n\tx = !ergon approve T-1\n'"
-        # Step one, the write: these don't name a git config file, so the guard lets them through. A
-        # home's .gitconfig or an XDG git/config is named like one, so its write is refused already;
-        # the files are planted below to check the HOME / XDG_CONFIG_HOME step on its own.
+        # Step one, the write: this doesn't name a git config file, so the guard lets it through. A
+        # home's .gitconfig, an XDG git/config or a bare repository's config (T-239) is named like one,
+        # so its write is refused already; the files are planted below to check the HOME /
+        # XDG_CONFIG_HOME / --git-dir step on its own.
         (root / "h").mkdir()
         (root / "xdg" / "git").mkdir(parents=True)
         sh("git", "init", "-q", "--bare", "bare", cwd=root)
-        for f in ["evil.inc", "bare/config"]:
-            self.assertIsNone(self.guard("Bash", {"command": f"{printf} >> {f}"}), f)
-        for f in ["h/.gitconfig", "xdg/git/config"]:
+        self.assertIsNone(self.guard("Bash", {"command": f"{printf} >> evil.inc"}))
+        for f in ["h/.gitconfig", "xdg/git/config", "bare/config"]:
             self.assertIn("git reads config from", self.guard("Bash", {"command": f"{printf} > {f}"}), f)
         # Step two, making it git's config: refused, for every human-only verb.
         evil, home, xdg, bare = root / "evil.inc", root / "h", root / "xdg", root / "bare"

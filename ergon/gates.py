@@ -2173,6 +2173,46 @@ GIT_CONFIG_NAME = re.compile(r"(?:^|[/\s'\"=(:])(?:\.?gitconfig[\w.-]*|config\.w
 # A bare `config` counts where it names a file in a git directory: `cd .git && echo ... >> config`.
 GIT_DIR_CONFIG = re.compile(r"/\.git/(?:[^/]+/)*config(?:\.worktree)?$")
 CONFIG_WRITE = re.compile(r"\b(?:ln|dd|rsync)\s")
+# A git call that makes a repository (git init, git clone), so a `config` the same command writes may be
+# in a git directory that doesn't exist yet when the guard looks (T-239).
+GIT_MAKES_REPO = re.compile(r"\bgit\b[^;&|\n]*\s(?:init|clone)\b")
+
+
+def is_git_dir(d):
+    """Whether directory d is a git directory, as git's is_git_directory() tells one: HEAD in it, and
+    objects/ and refs/ in it or in the common directory its commondir file names (a linked worktree's).
+    A bare repository is one, whatever it's named."""
+    try:
+        if not os.path.isfile(os.path.join(d, "HEAD")):
+            return False
+        common = d
+        if os.path.isfile(os.path.join(d, "commondir")):
+            common = os.path.join(d, Path(d, "commondir").read_text(errors="replace").strip())
+        return all(os.path.isdir(os.path.join(common, s)) for s in ("objects", "refs"))
+    except (OSError, ValueError):
+        return False
+
+
+class GitDirConfig:
+    """Matches, like a compiled pattern's search(), an absolute path to the config or config.worktree of
+    any git directory (is_git_dir), so one not named .git too: a bare repository's, `git init
+    --separate-git-dir`'s. The path can be the file itself or a symlink to it. The name is compared ignoring case, as macOS's filesystem does.
+    With fresh, any file named config counts: the command also makes a repository (GIT_MAKES_REPO)
+    whose git directory the guard can't see yet. names_outside_data hands it each word joined to the
+    directories the shell may be in, so a relative word is matched from there, never from the guard's cwd."""
+
+    def __init__(self, fresh=False):
+        self.fresh = fresh
+
+    def search(self, path):
+        if not os.path.isabs(path) or "\0" in path:
+            return False
+        try:
+            paths = {os.path.normpath(path), os.path.realpath(path)}
+        except (OSError, ValueError):
+            return True  # a path the guard can't resolve is refused rather than let through
+        return any(os.path.basename(p).lower() in ("config", "config.worktree")
+                   and (self.fresh or is_git_dir(os.path.dirname(p))) for p in paths)
 
 
 def git_config_files(cwd):
@@ -2201,13 +2241,15 @@ def git_config_files(cwd):
 
 def config_write_reason(cmd, cwd):
     """Why a shell command must not run because it may write a file git reads config from: it holds a
-    shell write and names one (GIT_CONFIG_NAME, a `config` inside a .git directory, or a file git
-    reads or includes from cwd). What it writes can define an alias or command-valued key the guard
-    never sees, so `git config` (checked by human_cmd) or Edit (config_edit_reason) is the way."""
+    shell write and names one (GIT_CONFIG_NAME, a `config` inside a .git directory or in any other git
+    directory, such as a bare repository's (GitDirConfig, T-239), or a file git reads or includes from
+    cwd). What it writes can define an alias or command-valued key the guard never sees, so
+    `git config` (checked by human_cmd) or Edit (config_edit_reason) is the way."""
     hit = SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd) or CONFIG_WRITE.search(cmd)
     if not hit:
         return None
-    named = names_outside_data(cmd, GIT_CONFIG_NAME) or names_outside_data(cmd, GIT_DIR_CONFIG, cwd)
+    named = (names_outside_data(cmd, GIT_CONFIG_NAME) or names_outside_data(cmd, GIT_DIR_CONFIG, cwd)
+             or names_outside_data(cmd, GitDirConfig(fresh=bool(GIT_MAKES_REPO.search(cmd))), cwd))
     if not named:
         files = git_config_files(cwd)
         named = bool(files) and names_outside_data(
@@ -2215,7 +2257,8 @@ def config_write_reason(cmd, cwd):
     if not named:
         return None
     return (f"this command contains `{' '.join(hit.group(0).split())}` and names a file git reads config from "
-            f"(.git/config, config.worktree, ~/.gitconfig, git/config or one git includes): a shell write there "
+            f"(.git/config, config.worktree, a bare repository's config, ~/.gitconfig, git/config or one git "
+            f"includes): a shell write there "
             f"can define a git alias or command-valued key the guard can't see, so it's refused. Use "
             f"`git config <key> <value>`, which the guard checks, or Edit; or ask the user")
 
