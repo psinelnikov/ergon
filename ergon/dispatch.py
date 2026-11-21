@@ -4546,6 +4546,7 @@ def dispatch(args):
         if cap is not None:
             n = min(len(plan), args.max)
             vr = _config.VERIFY_ROUNDS
+            mr = _config.REMERGE_ROUNDS
             counted = set()
 
             def max_calls(t):
@@ -4564,15 +4565,21 @@ def dispatch(args):
                     if reviewed:
                         counted.add("review")
                     return (1 + 2 * rr if reviewed else 0) + (vr if verified else 0)
+                def remerged(reviewed):
+                    # a red merge pass runs fix_loop(first=...): verify fix rounds shared (counted above),
+                    # but review rounds restart at zero, so the review and its fix rounds may rerun per pass
+                    if reviewed and mr:
+                        counted.add("remerge")
+                    return mr * (1 + 2 * rr) if reviewed else 0
                 own = t["tier"] in _config.REVIEW
                 if cr:
                     counted.add("conflict")
-                calls = 1 + after(own) + cr * (1 + after(own))
+                calls = 1 + after(own) + cr * (1 + after(own)) + remerged(own)
                 if args.escalate and t["tier"] in _config.WORKER_TIERS[:-1]:
                     counted.add("escalate")  # after it the tier that finished is reviewed too
                     up = _config.WORKER_TIERS[_config.WORKER_TIERS.index(t["tier"]) + 1]
                     reviewed = own or up in _config.REVIEW
-                    calls = max(calls, 2 + after(reviewed) + cr * (1 + after(reviewed)))
+                    calls = max(calls, 2 + after(reviewed) + cr * (1 + after(reviewed)) + remerged(reviewed))
                 if args.until_done:
                     counted.add("until-done")
                 return calls + args.until_done
@@ -4601,6 +4608,9 @@ def dispatch(args):
                 ("verify", f"up to {vr} verify fix round{'s' if vr != 1 else ''} (a fix each) "
                            "(with or without a verify: a weakening veto or failed harden proof takes one too)"),
                 ("conflict", f"{crounds} (a worker each{again}) if the branch conflicts"),
+                ("remerge", f"up to {mr} merge pass{'es' if mr != 1 else ''} (the review"
+                            + (" and its fix rounds" if rr else "") + " each, if the merge goes red; "
+                            "a fix call that uses no round, an `outside:` answer or a prove waiver, is not counted)"),
                 ("until-done", f"up to {args.until_done} until-done rounds (a worker each) if it stops short"),
                 ("resolver", f"{resolvers} epic resolver call{'s' if resolvers != 1 else ''} "
                              "(one per epic whose last task lands, if its branch conflicts)"))

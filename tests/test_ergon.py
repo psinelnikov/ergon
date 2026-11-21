@@ -2249,6 +2249,8 @@ class TestReview(DispatchProject):
         return [json.loads(l) for l in self.seen.read_text().splitlines()] if self.seen.exists() else []
 
     def test_dry_run_estimate_counts_task_verify_and_a_reviewed_escalation(self):
+        toml = self.root / ".ergon.toml"
+        toml.write_text("remerge_rounds = 0\n" + toml.read_text())  # T-231 counts merge passes apart
         self.ergon("new", "task", "Verified", "--tier", "sonnet")
         self.ergon("new", "task", "Top", "--tier", "opus")
         f = self.task_file("T-001")
@@ -2410,6 +2412,8 @@ class TestReviewRounds(DispatchProject):
         return [r for r in history(self.root) if r["task"] == "T-001" and r["event"] == event]
 
     def test_dry_run_shows_fix_rounds_and_counts_them_in_the_estimate(self):
+        toml = self.root / ".ergon.toml"
+        toml.write_text("remerge_rounds = 0\n" + toml.read_text())  # T-231 counts merge passes apart
         self.ergon("new", "task", "Unreviewed", "--tier", "sonnet")
         stamp(self.task_file("T-002"))
         dry = self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout
@@ -2433,7 +2437,7 @@ class TestReviewRounds(DispatchProject):
         # T-111: after a conflict round resolve() runs fix_loop again on the merge, so the review and
         # its fix rounds (and verify fix rounds) may all run again. verify_rounds = 0 keeps only the review.
         toml = self.root / ".ergon.toml"
-        toml.write_text("verify_rounds = 0\nconflict_rounds = 1\n" + toml.read_text())
+        toml.write_text("remerge_rounds = 0\nverify_rounds = 0\nconflict_rounds = 1\n" + toml.read_text())
         est = lambda: float(re.search(r"estimated at most \$([\d.]+)",
                                       self.ergon("dispatch", "--dry-run", "--budget-total", "100",
                                                  "--budget", "1").stdout)[1])
@@ -2452,6 +2456,22 @@ class TestReviewRounds(DispatchProject):
         self.assertEqual(est(), 22.0)
         self.assertIn("(a worker each, then the verify fix rounds and the review and its fix rounds again)",
                       self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout)
+        self.assertEqual(self.calls(), [])
+
+    def test_dry_run_estimate_counts_the_review_that_reruns_after_a_remerge_pass(self):
+        # T-231: a red merge pass runs fix_loop(first=...): verify fix rounds are shared, but review
+        # rounds restart at zero, so each pass may rerun the review and its fix rounds.
+        toml = self.root / ".ergon.toml"
+        toml.write_text("verify_rounds = 0\nconflict_rounds = 0\nremerge_rounds = 2\n" + toml.read_text())
+        dry = lambda: self.ergon("dispatch", "--dry-run", "--budget-total", "100", "--budget", "1").stdout
+        est = lambda: float(re.search(r"estimated at most \$([\d.]+)", dry())[1])
+        # T-001 (haiku, reviewed): worker + review + 2 x (fix + review) = 6, plus 2 passes x 5 = 16.
+        self.assertEqual(est(), 16.0)
+        self.assertIn("up to 2 merge passes (the review and its fix rounds each, if the merge goes red; "
+                      "a fix call that uses no round, an `outside:` answer or a prove waiver, is not counted)", dry())
+        self.ergon("new", "task", "Unreviewed", "--tier", "sonnet")
+        stamp(self.task_file("T-002"))
+        self.assertEqual(est(), 17.0)  # T-002 (unreviewed) adds only its worker
         self.assertEqual(self.calls(), [])
 
     def test_fail_then_fix_then_pass_lands(self):
