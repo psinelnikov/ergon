@@ -37,7 +37,7 @@ label = "The task file itself"
 id = "approval.guard"
 concern = "approval"
 files = ["ergon/gates.py", "hooks/hooks.json"]
-fns = ["guard_reason", "hook", "shell_commands", "git_commands", "human_cmd", "names_outside_data", "state_git_reason", "git_config_reason", "config_edit_reason", "config_write_reason", "config_source_reason", "config_file_reason", "git_config_entries", "git_config_sets"]
+fns = ["guard_reason", "hook", "shell_commands", "git_commands", "human_cmd", "names_outside_data", "state_git_reason", "git_config_reason", "config_edit_reason", "config_write_reason", "config_source_reason", "config_file_reason", "git_config_entries", "git_config_sets", "git_url_args"]
 terms = ["guard", "heredoc", "alias", "human-only verb", "refuses", "read-only mode", "agent edits"]
 
 [[component]]
