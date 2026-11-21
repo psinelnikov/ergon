@@ -812,6 +812,102 @@ class TestBasics(Project):
         for bad in ["x = 1\n[", "[alias]\nx = \"open\n", "[alias x]\n", "[alias]\nx y\n", "[alias]\nx = \\q\n"]:
             self.assertIsNone(git_config_entries(bad), bad)
 
+    def test_guard_refuses_git_config_from_a_file_the_agent_chose(self):
+        """T-224: a file written by a plain shell write (not named as config, so the write passes) that
+        holds an `[alias]` running a human-only verb, then made git's config by include.path /
+        includeIf.*.path, GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM / GIT_CONFIG, HOME or XDG_CONFIG_HOME
+        set for a git call, or --git-dir (GIT_DIR, -C, cd) to another repository, is refused at the
+        include: the guard reads the file before git does. A file it can't read first (/dev/stdin, a
+        process substitution, a path behind an expansion, one the same command may write) is refused
+        too, and an include git stores to a file that's still empty is guarded at the later write.
+        Including a file that holds only [user], and HOME set for a program that isn't git, pass."""
+        from ergon.gates import config_source_reason, git_config_reason
+        root = self.root
+        alias = "[alias]\n\tx = !ergon {v} T-1\n"
+        printf = r"printf '[alias]\n\tx = !ergon approve T-1\n'"
+        # Step one, the write: these don't name a git config file, so the guard lets them through. A
+        # home's .gitconfig or an XDG git/config is named like one, so its write is refused already;
+        # the files are planted below to check the HOME / XDG_CONFIG_HOME step on its own.
+        (root / "h").mkdir()
+        (root / "xdg" / "git").mkdir(parents=True)
+        sh("git", "init", "-q", "--bare", "bare", cwd=root)
+        for f in ["evil.inc", "bare/config"]:
+            self.assertIsNone(self.guard("Bash", {"command": f"{printf} >> {f}"}), f)
+        for f in ["h/.gitconfig", "xdg/git/config"]:
+            self.assertIn("git reads config from", self.guard("Bash", {"command": f"{printf} > {f}"}), f)
+        # Step two, making it git's config: refused, for every human-only verb.
+        evil, home, xdg, bare = root / "evil.inc", root / "h", root / "xdg", root / "bare"
+        routes = [f"git config include.path {evil}", "git config include.path ../evil.inc",
+                  f"git config --add include.path {evil}", f"git -c include.path={evil} x",
+                  f"git config includeIf.gitdir:/elsewhere/.path {evil}", f"git -c includeIf.onbranch:main.path={evil} x",
+                  f"git clone -c include.path={evil} https://example.com/r.git d",
+                  f"GIT_CONFIG_GLOBAL={evil} git x", f"GIT_CONFIG_SYSTEM={evil} git x", f"GIT_CONFIG={evil} git config -l",
+                  f"export GIT_CONFIG_GLOBAL={evil}; git x", f"env GIT_CONFIG_GLOBAL={evil} git x",
+                  f"HOME={home} git x", f"export HOME={home} && git x", f"HOME=h git x", f"XDG_CONFIG_HOME={xdg} git x",
+                  f"GIT_CONFIG_PARAMETERS=\"'include.path'='{evil}'\" git x",
+                  f"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path GIT_CONFIG_VALUE_0={evil} git x",
+                  f"git --git-dir={bare} x", f"git --git-dir {bare} x", f"GIT_DIR={bare} git x",
+                  f"GIT_COMMON_DIR={bare} git x", f"git -C {bare} x", "git -C bare x", f"cd {bare} && git x",
+                  f"bash -c 'HOME={home} git x'"]
+        for v in ["approve", "reject", "close", "accept", "answer", "sync", "pin", "choose", "review -i"]:
+            for f in [evil, home / ".gitconfig", xdg / "git" / "config"]:
+                f.write_text(alias.format(v=v))
+            (bare / "config").write_text("[core]\n\tbare = true\n" + alias.format(v=v))
+            for cmd in routes:
+                why = git_config_reason(cmd) or config_source_reason(cmd, str(root))
+                self.assertIn("human-only", why or "", (v, cmd))
+        evil.write_text(alias.format(v="approve"))
+        self.assertIn(f"git would read config from {evil}", self.guard("Bash", {"command": routes[0]}))
+        self.assertIn("human-only", self.guard("Bash", {"command": f"HOME={home} git x"}))
+        self.assertIn("human-only", self.guard("Bash", {"command": f"git --git-dir={bare} x"}))
+        # Another repository's own .git/config is read like cwd's (guarded by name where it's written):
+        # a human's `$1` alias there passes, a human-only verb doesn't.
+        sh("git", "init", "-q", "other", cwd=root)
+        cfg = root / "other" / ".git" / "config"
+        cfg.write_text(cfg.read_text() + "[alias]\n\tlg = \"!f() { git log $1; }; f\"\n")
+        self.assertIsNone(config_source_reason("git -C other lg", str(root)))
+        self.assertIsNone(config_source_reason("git -C other diff > p.diff", str(root)))
+        cfg.write_text(cfg.read_text() + "\tx = !ergon approve T-1\n")
+        self.assertIn("human-only", config_source_reason("cd other && git x", str(root)) or "")
+        # An Edit that adds the include to a config file is read the same way.
+        why = self.guard("Edit", {"file_path": str(root / ".git" / "config"), "old_string": "[core]",
+                                  "new_string": f"[include]\n\tpath = {evil}\n[core]"})
+        self.assertIn("human-only", why or "")
+        # Nested: the file names another through an include whose condition doesn't hold now; it may later.
+        (root / "outer.inc").write_text('[includeIf "gitdir:/elsewhere/"]\n\tpath = evil.inc\n')
+        self.assertIn("evil.inc", config_source_reason(f"git config include.path {root / 'outer.inc'}", str(root)))
+        # A file the guard can't read first: stdin, a process substitution, a path behind an expansion,
+        # or one the same command can write before git reads it.
+        for cmd in ["GIT_CONFIG_GLOBAL=/dev/stdin git x <<< \"$C\"", f"GIT_CONFIG_GLOBAL=<(cat {evil}) git x",
+                    "git -c include.path=/dev/stdin x", "GIT_CONFIG_GLOBAL=\"$F\" git x", "HOME=$D git x",
+                    "git --git-dir=\"$G\" x", "git config include.path \"$F\"", "git --config-env=include.path=F x",
+                    f"{printf} > new.inc; GIT_CONFIG_GLOBAL=new.inc git x", f"cp /tmp/evil b2/config && git -C b2 x",
+                    f"git config include.path ../later.inc && {printf} > later.inc",
+                    "git config --rename-section stash include"]:
+            self.assertTrue(git_config_reason(cmd) or config_source_reason(cmd, str(root)), cmd)
+        # An include stored to a file that's still empty or missing passes, and the write that fills it
+        # later is refused, since git now reads config from it.
+        for name in ["empty.inc", "missing.inc"]:
+            if name == "empty.inc":
+                (root / name).write_text("")
+            self.assertIsNone(self.guard("Bash", {"command": f"git config include.path ../{name}"}), name)
+            sh("git", "config", "--add", "include.path", f"../{name}", cwd=root)
+            self.assertIn("git reads config from", self.guard("Bash", {"command": f"{printf} >> {name}"}), name)
+        # What passes: an include of a file holding only [user] (and a harmless alias), HOME for a program
+        # that isn't git, a home with no alias in it, /dev/null as the global config, and -C or cd within
+        # this repository.
+        (root / "user.inc").write_text("[user]\n\tname = Tester\n[alias]\n\tst = status\n")
+        (root / "plain").mkdir()
+        (root / "plain" / ".gitconfig").write_text("[user]\n\temail = t@example.com\n")
+        for cmd in [f"git config include.path {root / 'user.inc'}", "git config include.path ../user.inc",
+                    f"git -c include.path={root / 'user.inc'} st", "HOME=/tmp/x ls", "HOME=$D ls",
+                    f"HOME={root / 'plain'} git status", "GIT_CONFIG_GLOBAL=/dev/null git log > out.txt",
+                    "GIT_CONFIG_NOSYSTEM=1 git status", "git -C . log > out.txt", "git -C tasks status",
+                    "cd tasks && git status", f"git config include.path {root / 'nowhere.inc'}", "git log > out.txt",
+                    "git config --get include.path", "git config --unset include.path"]:
+            self.assertIsNone(git_config_reason(cmd) or config_source_reason(cmd, str(root)), cmd)
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+
     def test_guard_human_cmd_git_ext_urls_and_instaweb(self):
         """T-215: an ext:: URL is a command git runs (git-remote-ext(1): argv split at spaces, `% `
         a literal space), wherever git takes a URL: clone, fetch, push, ls-remote, remote add, a

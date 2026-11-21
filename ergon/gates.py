@@ -1379,11 +1379,17 @@ def ext_command(url):
     return shlex.join(args)
 
 
+# Config keys whose value names a file git reads as more config (git-config(1), INCLUDES), lowercased.
+INCLUDE_KEY = re.compile(r"include\.path|includeif\..+\.path", re.S)
+
+
 def config_key_runs(key):
     """Whether git can run a command from config key's value: a GIT_COMMAND_KEYS key (or the
     insteadOf key of an ext:: base), or a URL key (GIT_URL_KEYS), whose value runs as a command when
-    it's an ext:: URL. A value that isn't one gives git_config_command None, so `!` can't probe it."""
-    return git_config_command(key, "!") is not None or bool(GIT_URL_KEYS.fullmatch(key.lower()))
+    it's an ext:: URL. A value that isn't one gives git_config_command None, so `!` can't probe it.
+    An include key (INCLUDE_KEY) counts too: the file it names can define any of them (T-224)."""
+    k = key.lower()
+    return git_config_command(key, "!") is not None or bool(GIT_URL_KEYS.fullmatch(k) or INCLUDE_KEY.fullmatch(k))
 
 
 def git_config_command(key, val):
@@ -1608,10 +1614,11 @@ def human_cmd(cmd):
 HUMAN_MSG = ("approve / reject / close / accept / answer / sync / pin / choose / review -i are human-only; ask the "
              "user to run them in their own terminal")
 # The sections GIT_COMMAND_KEYS names keys in: `git config --rename-section user alias` turns keys the
-# guard never read as commands (user.name) into ones git runs.
+# guard never read as commands (user.name) into ones git runs. The include sections too: renaming one
+# into them makes git read a file the guard never checked as config.
 GIT_COMMAND_SECTIONS = {"alias", "core", "sequence", "pager", "interactive", "diff", "difftool", "mergetool", "merge",
                         "filter", "credential", "gpg", "remote", "uploadpack", "submodule", "tar", "trailer", "hook",
-                        "sendemail", "imap", "browser", "man", "guitool", "instaweb"}
+                        "sendemail", "imap", "browser", "man", "guitool", "instaweb", "include", "includeif"}
 # git's config from the environment: GIT_CONFIG_PARAMETERS ('key'='value' ...) and the GIT_CONFIG_COUNT
 # entries GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n>. Group 1 the name, 2 the <n>, 3 `=value` (or `+=...`).
 GIT_CONFIG_ENV = re.compile(r"(GIT_CONFIG_PARAMETERS|GIT_CONFIG_(?:KEY|VALUE)_([0-9]+))(\+?=.*)?", re.S)
@@ -1646,6 +1653,10 @@ def _unseen_value(key, val):
 
 
 def unseen_config_msg(key, why):
+    if INCLUDE_KEY.fullmatch(key.lower()):
+        return (f"git reads the file `{key}` names as more config, and the guard reads that file before git "
+                f"does, but here it can't see which file: {why}. So it's refused. Write the path out in full "
+                f"(`git -c {key}=<path> ...` or `git config {key} <path>`), or ask the user")
     if GIT_URL_KEYS.fullmatch(key.lower()):
         return (f"git runs an ext:: URL set as `{key}` as a command, and the guard checks that command where it "
                 f"is set, but here it can't see the URL: {why}. So the setting is refused. Write the URL out in "
@@ -1926,10 +1937,18 @@ def edit_result(path, tool, inp):
 def config_edit_reason(path, tool, inp):
     """Why an Edit or Write must not run: the file reads as git config afterwards and the edit adds
     an alias or command-valued entry. Any file counts, not only .git/config or ~/.gitconfig: one
-    include.path names is config too, and the guard can't tell which files git will include."""
+    include.path names is config too, and the guard can't tell which files git will include.
+    An include it adds is read like `git config include.path`'s (config_file_reason, T-224)."""
     if not path:
         return None
     before, after = edit_result(path, tool, inp)
+    old = git_config_entries(before) or []
+    for key, val in git_config_entries(after) or []:
+        if INCLUDE_KEY.fullmatch(key) and val and (key, val) not in old:
+            home = os.path.expanduser("~")
+            target = _include_target(val, os.path.dirname(os.path.abspath(path)), home)
+            if target and (why := config_file_reason(target, home)):
+                return why
     added = _command_entries(after)
     for e in _command_entries(before):
         if e in added:
@@ -1954,17 +1973,25 @@ CONFIG_WRITE = re.compile(r"\b(?:ln|dd|rsync)\s")
 
 def git_config_files(cwd):
     """The files git reads config from in cwd (`git config --list --show-origin --includes`): the
-    system, global and repository files and every file they include, each as git names it and resolved."""
+    system, global and repository files and every file they include, each as git names it and resolved.
+    A file an include names counts even while it's empty or missing, which git lists no entry from:
+    a shell write that fills it later defines config the guard never saw (T-224)."""
     try:
-        r = subprocess.run(["git", "config", "--list", "--show-origin", "--includes", "-z"], cwd=cwd,
-                           capture_output=True, text=True, timeout=10, errors="replace")
+        r = subprocess.run(["git", "--no-pager", "config", "--list", "--show-origin", "--includes", "-z"],
+                           cwd=cwd, capture_output=True, text=True, timeout=10, errors="replace",
+                           stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return set()
-    out = set()
-    for origin in r.stdout.split("\0")[::2]:
+    out, rec = set(), r.stdout.split("\0")
+    for origin, entry in zip(rec[::2], rec[1::2]):
+        key, _, val = entry.partition("\n")
+        files = []
         if origin.startswith("file:"):
-            f = os.path.join(cwd, os.path.expanduser(origin[5:]))
-            out |= {os.path.normpath(f), os.path.realpath(f)}
+            files.append(os.path.join(cwd, os.path.expanduser(origin[5:])))
+        if INCLUDE_KEY.fullmatch(key.lower()) and val:
+            base = os.path.dirname(files[0]) if files else None
+            files.append(_include_target(val, base, os.path.expanduser("~")))
+        out |= {g for f in files if f for g in (os.path.normpath(f), os.path.realpath(f))}
     return out
 
 
@@ -1987,6 +2014,283 @@ def config_write_reason(cmd, cwd):
             f"(.git/config, config.worktree, ~/.gitconfig, git/config or one git includes): a shell write there "
             f"can define a git alias or command-valued key the guard can't see, so it's refused. Use "
             f"`git config <key> <value>`, which the guard checks, or Edit; or ask the user")
+
+
+# Where a git call is told to read config from somewhere else (T-224): the environment variables that
+# choose its global, system or only config file, its home (~/.gitconfig, ~/.config/git/config) or
+# XDG_CONFIG_HOME (git/config under it), and its repository (whose config and config.worktree it reads).
+CONFIG_PATH_ENV = {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG", "HOME", "XDG_CONFIG_HOME", "GIT_DIR",
+                   "GIT_COMMON_DIR"}
+MAX_INCLUDE_DEPTH = 10  # git's own limit on nested includes
+MAX_CONFIG_BYTES = 1 << 20  # a config file the guard reads; a bigger one is refused rather than half-read
+
+
+def _include_target(val, base, home):
+    """The file an include.path / includeIf.*.path value names: `~/` from home, a relative path from
+    base (the directory of the file holding it; None from the command line, where git refuses one)."""
+    if val == "~" or val.startswith("~/"):
+        val = os.path.join(home, val[2:])
+    elif val.startswith("~"):
+        val = os.path.expanduser(val)
+    if not os.path.isabs(val):
+        if base is None:
+            return None
+        val = os.path.join(base, val)
+    return os.path.normpath(val)
+
+
+def _gitdir_files(g):
+    """The config files git reads from git directory g: its config and config.worktree, and those of
+    the common directory its commondir file names (a linked worktree's)."""
+    out = [os.path.join(g, "config"), os.path.join(g, "config.worktree")]
+    try:
+        common = Path(g, "commondir").read_text(errors="replace").strip()
+    except OSError:
+        return out
+    if common:
+        c = os.path.normpath(os.path.join(g, common))
+        out += [os.path.join(c, "config"), os.path.join(c, "config.worktree")]
+    return out
+
+
+def _repo_config_files(d):
+    """The repository config files git run in directory d reads: walking up from d to the first
+    directory holding a .git directory, a .git file (gitdir: <dir>), or a bare repository (HEAD,
+    objects and refs in the directory itself), that git directory's files (_gitdir_files)."""
+    d = os.path.abspath(d)
+    while True:
+        g, out = os.path.join(d, ".git"), []
+        if os.path.isdir(g):
+            out += _gitdir_files(g)
+        elif os.path.isfile(g):
+            try:
+                m = re.match(r"gitdir:\s*(.+)", Path(g).read_text(errors="replace").strip())
+            except OSError:
+                m = None
+            if m:
+                out += _gitdir_files(os.path.normpath(os.path.join(d, m.group(1))))
+        if os.path.isfile(os.path.join(d, "HEAD")) and all(os.path.isdir(os.path.join(d, s)) for s in ("objects", "refs")):
+            out += _gitdir_files(d)
+        parent = os.path.dirname(d)
+        if out or parent == d:
+            return out
+        d = parent
+
+
+def chosen_config_msg(path, key, why):
+    return (f"git would read config from {path}, and `{key}` there {why}: git runs that value as a command (a git "
+            f"alias or command-valued key), and the guard checks one where it's defined, which a file written "
+            f"by the shell isn't. So it's refused. Define it with `git config {key} <value>`, which the guard "
+            f"checks, or ask the user")
+
+
+def config_file_reason(path, home, skip=frozenset(), seen=None, depth=0, strict=True):
+    """Why git must not read config from file path, or None: an alias or command-valued entry in it, or
+    in a file it includes (any includeIf, followed as if its condition held), runs a human-only verb
+    or hides its command behind a `$` or backtick (the rule git_config_reason applies to `git config`).
+    So does a path that exists but isn't a regular file the guard can read now (/dev/stdin, a pipe,
+    /dev/fd/<n>), or one too big to read. A missing file holds nothing yet: a shell write that fills
+    it later is config_write_reason's. The files in skip (the ones git reads from the cwd anyway,
+    guarded where they're written) aren't read. strict=False skips the expansion rule, for another
+    repository's own config file, which is guarded by name where it's written like cwd's (whose
+    aliases aren't read at all): a human's `!f() { ...$1...; }; f` alias there isn't refused."""
+    seen = set() if seen is None else seen
+    if "\0" in path:  # realpath would raise, and a guard that crashes lets the command through
+        return f"git would read config from {path!r}, a path holding a NUL byte the guard can't read; it's refused"
+    real = os.path.realpath(path)
+    if real in seen or real in skip or depth > MAX_INCLUDE_DEPTH or not os.path.exists(real):
+        return None
+    seen.add(real)
+    if os.path.isdir(real) or real == os.devnull:
+        return None
+    if not os.path.isfile(real):
+        return (f"git would read config from {path}, which isn't a regular file the guard can read first (stdin, "
+                f"a pipe, a device), so it can't see whether that config defines a git alias or command-valued "
+                f"key; it's refused. Write the config to a file and point git at that, or ask the user")
+    try:
+        with open(real, "rb") as f:
+            data = f.read(MAX_CONFIG_BYTES + 1)
+    except OSError:
+        return None  # git can't read it either
+    if len(data) > MAX_CONFIG_BYTES:
+        return (f"git would read config from {path}, which is too big for the guard to read before git does, so "
+                f"it can't see whether it defines a git alias or command-valued key; it's refused. Ask the user")
+    entries = git_config_entries(data.decode(errors="replace")) or []
+    for key, val in entries:
+        c = git_config_command(key, val or "")
+        if c is None:
+            continue
+        if strict and _unseen_value(key, val or ""):
+            return chosen_config_msg(path, key, f"holds a `$` or backtick expansion (`{val}`), which hides the command")
+        if human_cmd(c):
+            return chosen_config_msg(path, key, "runs a human-only command (" + HUMAN_MSG.split(";")[0] + ")")
+    for key, val in entries:
+        if INCLUDE_KEY.fullmatch(key) and val:
+            target = _include_target(val, os.path.dirname(real), home)
+            if target and (why := config_file_reason(target, home, skip, seen, depth + 1, strict)):
+                return why
+    return None
+
+
+def _git_dir_opts(words, k):
+    """The -C directories and --git-dir of the git call at words[k], in order, as (option, value)."""
+    out, i = [], k + 1
+    while i < len(words) and words[i].startswith("-"):
+        a = words[i]
+        if a.startswith("--git-dir="):
+            out.append(("--git-dir", a[len("--git-dir="):]))
+        elif a in GIT_OPT_ARG and i + 1 < len(words):
+            i += 1
+            if a in ("-C", "--git-dir"):
+                out.append((a, words[i]))
+        i += 1
+    return out
+
+
+def _env_includes(env):
+    """The include values the GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_<n> + GIT_CONFIG_VALUE_<n> of env
+    set, as (key, value); a value None where the text doesn't show it."""
+    out = []
+    params = env.get("GIT_CONFIG_PARAMETERS", "")
+    if params:
+        try:
+            out += [(k, v) for k, _, v in (e.partition("=") for e in shlex.split(params))
+                    if INCLUDE_KEY.fullmatch(k.lower())]
+        except ValueError:
+            pass  # git_config_reason refuses a value it can't split
+    for name, key in env.items():
+        m = re.fullmatch(r"GIT_CONFIG_KEY_([0-9]+)", name)
+        if m and key and INCLUDE_KEY.fullmatch(key.lower()):
+            out.append((key, env.get(f"GIT_CONFIG_VALUE_{m.group(1)}")))
+    return out
+
+
+def unseen_source_msg(name, why):
+    return (f"{name} chooses where git reads config from, and the guard reads those files before git does, but "
+            f"here it can't see where: {why}. So it's refused. Write the path out in full, or ask the user")
+
+
+def config_source_reason(cmd, cwd, _base=None):
+    """Why a shell command must not run because a git call in it reads config from files the agent
+    picked, which a plain shell write (not named as config at the time) can have filled with an alias
+    or command-valued key, or None (T-224). The routes: GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM /
+    GIT_CONFIG, HOME or XDG_CONFIG_HOME set for the call (ahead of it, behind env, or exported earlier
+    in the text); --git-dir, GIT_DIR or GIT_COMMON_DIR; include.path / includeIf.*.path set by -c,
+    GIT_CONFIG_PARAMETERS, GIT_CONFIG_KEY_<n>, `git config` or `git clone -c`; and -C or an earlier
+    `cd` into another repository. Each file one brings in, and every file it includes, is read now by
+    config_file_reason, except those git reads from cwd anyway (git_config_files). Refused too: a path
+    the text doesn't show; and a route in a command that also holds a shell write, which could fill
+    the file after the guard read it and before git does. -C or cd into another repository whose config
+    file is named like one (.git/config, which config_write_reason guards by name) isn't refused for
+    a write in the same command, so `git -C ../other diff > p` passes. Strings run as code are checked
+    too. What other programs write (a script, a process left running) can't be seen: a speed bump."""
+    routes = re.compile(r"GIT_CONFIG(_GLOBAL|_SYSTEM)?=|GIT_(COMMON_)?DIR|--git-dir|include(if)?\.|"
+                        r"\b(HOME|XDG_CONFIG_HOME)=.*\bgit\b", re.I | re.S)
+    try:
+        if "\0" in cmd:  # a path holding one would crash os.path.realpath, and a crash lets the command through
+            raise ValueError("NUL")
+        cmds = shell_commands(cmd)[0]
+    except (ValueError, RecursionError):
+        if routes.search(cmd) or ("\0" in cmd and re.search(r"\bgit", cmd)):
+            return ("this command points git at config files it chose (GIT_CONFIG_*, GIT_DIR, --git-dir, HOME or "
+                    "an include) and the guard can't split it to read them, so it's refused")
+        return None
+    hit = SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd) or CONFIG_WRITE.search(cmd)
+    home = os.path.expanduser("~")
+    base = _base if _base is not None else {}  # lazily: the files git reads from cwd
+    env, run = {}, os.path.normpath(cwd)  # the variables later commands inherit; the shell's directory, None if unseen
+
+    def skip():
+        if "files" not in base:
+            base["files"] = {os.path.realpath(f) for f in git_config_files(cwd)}
+        return base["files"]
+
+    for words, docs in cmds:
+        if any(CODE_RUNNER.fullmatch(_program(w)) and _program(w) != "env" for w in words):
+            for t in words + [d for d, _ in docs]:
+                if t != cmd and (why := config_source_reason(t, run or cwd, base)):
+                    return why
+        local = dict(env)
+        for name, append, val in _env_assignments(words):
+            if name in CONFIG_PATH_ENV or name.startswith("GIT_CONFIG_"):
+                local[name] = (None if local.get(name, "") is None else local.get(name, "") + val) if append else val
+        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        if head == len(words) or _program(words[head]) in SHELL_DECLARE:
+            env = local
+        if head < len(words) and _program(words[head]) in ("cd", "pushd"):
+            target = next((w for w in words[head + 1:] if not w.startswith("-") or w == "-"), "~")
+            if run is None or _unseen(target) or target == "-" or target.startswith("+"):  # cd -, pushd +1
+                run = None
+            else:
+                run = os.path.normpath(os.path.join(run, os.path.expanduser(target)))
+        for k, w in enumerate(words):
+            if _program(w) != "git":
+                continue
+            explicit, implicit = [], []  # (what, file): chosen config files; another repository's
+            where, cenv = run, dict(local)
+            for opt, val in _git_dir_opts(words, k):
+                if _unseen(val) or (where is None and not os.path.isabs(os.path.expanduser(val))):
+                    return unseen_source_msg(f"git {opt}", f"`{val}` holds an expansion, or an earlier `cd` does")
+                if opt == "-C":
+                    where = os.path.normpath(os.path.join(where or "/", os.path.expanduser(val)))
+                else:
+                    cenv["GIT_DIR"] = val  # read from the directory the -C options end in
+            for name in sorted(CONFIG_PATH_ENV & cenv.keys()):
+                val = cenv[name]
+                if not val or _unseen(val):
+                    return unseen_source_msg(name, f"its value is empty or set by an expansion, a process substitution "
+                                                   f"or an earlier command (`{val or ''}`)")
+                val = os.path.expanduser(val)
+                if where is None and not os.path.isabs(val):
+                    return unseen_source_msg(name, "an earlier `cd` goes to a directory the text doesn't show")
+                p = os.path.normpath(os.path.join(where or "/", val))
+                if name == "HOME":
+                    explicit.append((name, os.path.join(p, ".gitconfig")))
+                    if "XDG_CONFIG_HOME" not in cenv:
+                        explicit.append((name, os.path.join(p, ".config", "git", "config")))
+                elif name == "XDG_CONFIG_HOME":
+                    explicit.append((name, os.path.join(p, "git", "config")))
+                elif name in ("GIT_DIR", "GIT_COMMON_DIR"):
+                    explicit += [(name, f) for f in _gitdir_files(p)]
+                else:
+                    explicit.append((name, p))
+            # include settings: -c (git takes an absolute or ~ path only), GIT_CONFIG_*; `git config` and
+            # `clone -c` store one, relative to the file it lands in, so a relative path is tried from each
+            # place that can be.
+            pairs = _env_includes(cenv) + [(key, val) for key, val in git_config_sets(words[k:])
+                                           if INCLUDE_KEY.fullmatch(key.lower())]
+            for key, val in pairs:
+                if not val or _unseen(val):
+                    return unseen_config_msg(key, "its value is empty, or comes from the environment or an expansion")
+                bases = {home}
+                if where:
+                    bases |= {where} | {os.path.dirname(f) for f in _repo_config_files(where)}
+                explicit += [(key, t) for b in sorted(bases) if (t := _include_target(val, b, home))]
+            moved = where is not None and os.path.realpath(where) != os.path.realpath(cwd)
+            if moved:
+                implicit = [("another repository", f) for f in _repo_config_files(where)]
+                # A directory the command may make a repository of first (it doesn't exist yet, or a git
+                # init / clone runs too), with a config it writes there: the guard has nothing to read now.
+                if hit and (not os.path.isdir(where) or any(sub in ("init", "clone") for words2, _ in cmds
+                                                            for _, sub, _ in _git_calls(words2))):
+                    implicit.append(("another repository", os.path.join(where, "config")))
+            if not explicit and not implicit:
+                continue
+            fresh = [(what, f) for what, f in explicit + implicit if os.path.realpath(f) not in skip()]
+            if hit:
+                late = [(what, f) for what, f in fresh if f != os.devnull
+                        and ((what, f) in explicit or not GIT_CONFIG_NAME.search(f))]
+                if late:
+                    what, f = late[0]
+                    return (f"this command points git at config it chose ({what}: {f}) and also contains "
+                            f"`{' '.join(hit.group(0).split())}`, which could write that file after the guard read "
+                            f"it and before git does, so it's refused. Run the write as its own command first, so "
+                            f"the guard can read the file before git does")
+            for what, f in fresh:
+                strict = (what, f) in explicit or not GIT_CONFIG_NAME.search(f)
+                if why := config_file_reason(f, home, skip(), strict=strict):
+                    return why
+    return None
 
 
 def frontmatter(text):
@@ -2425,6 +2729,9 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
         if why:
             return why
         why = git_env_reason(cmd)
+        if why:
+            return why
+        why = config_source_reason(cmd, cwd or str(_config.HOME))
         if why:
             return why
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
