@@ -862,6 +862,34 @@ class TestBasics(Project):
             self.assertIsNone(self.guard("Bash", {"command": cmd}, env=env), cmd)
         self.assertIsNone(self.guard("Bash", {"command": "echo x > config"}, env=env, cwd=root / "plain"))
 
+    def test_guard_refuses_a_shell_write_to_git_config_named_in_another_case(self):
+        """T-245: on a case-insensitive filesystem (macOS's) `.git/CONFIG`, `.Git/config` or
+        `~/.GITCONFIG` is the file git reads, so a shell write naming it in any case is refused, by
+        name, from a `cd`, or as a file git includes. A name that only looks like one (Config.yml,
+        GitConfig.java, a kin such as .GITCONFIG.local git doesn't include) passes."""
+        root, home = self.root, self.root / "home"
+        home.mkdir()
+        env = clean_env(HOME=str(home), CLAUDE_PROJECT_DIR=str(root))
+        probe = root / ".git" / "Config.Probe"
+        probe.write_text("")
+        if (root / ".git" / "config.probe").exists():  # the premise, where the filesystem ignores case
+            self.assertTrue(os.path.samefile(root / ".Git" / "CONFIG", root / ".git" / "config"))
+        probe.unlink()
+        printf = r"printf '[alias]\n\tx = !ergon approve T-1\n'"
+        for f in [".git/CONFIG", ".Git/config", ".GIT/Config.Worktree", "~/.GITCONFIG", "$HOME/.GitConfig",
+                  f"{home}/.gitConfig", "/etc/GitConfig", "~/.config/Git/Config", "\"$XDG_CONFIG_HOME/git/CONFIG\"",
+                  f"{root}/.GIT/config"]:
+            for cmd in [f"{printf} >> {f}", f"{printf} | tee -a {f}", f"cp /tmp/evil {f}"]:
+                self.assertIn("git reads config from", self.guard("Bash", {"command": cmd}, env=env) or "", cmd)
+        self.assertIn("git reads config from",
+                      self.guard("Bash", {"command": f"cd .GIT && {printf} >> CONFIG"}, env=env) or "")
+        sh("git", "config", "include.path", "../extra.inc", cwd=root)
+        (root / "extra.inc").write_text("[user]\n\tname = Tester\n")
+        self.assertIn("git reads config from", self.guard("Bash", {"command": f"{printf} >> EXTRA.INC"}, env=env) or "")
+        for cmd in ["echo x > Config.yml", "echo x > config.yml", "echo x > src/GitConfig.java",
+                    "echo x > ~/.GITCONFIG.local", "echo x > CONFIG", "echo x > docs/Config.md", "cat .git/CONFIG"]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}, env=env), cmd)
+
     def test_guard_refuses_git_config_from_a_file_the_agent_chose(self):
         """T-224: a file written by a plain shell write (not named as config, so the write passes) that
         holds an `[alias]` running a human-only verb, then made git's config by include.path /

@@ -2434,8 +2434,14 @@ def config_edit_reason(path, tool, inp):
 # `$(git rev-parse --git-dir)/config` or `$GIT_DIR/config`; as a word ends, or inside code.
 GIT_CONFIG_NAME = re.compile(r"(?:^|[/\s'\"=(:])(?:\.?gitconfig[\w.-]*|config\.worktree|\.git/(?:[^\s'\"]*/)?config)"
                              r"(?![\w./-])|(?:/git|\)|\$\{?\w+\}?)/config(?:\.worktree)?(?![\w./-])")
+# The same files named in any case (T-245): on a case-insensitive filesystem (macOS's, Windows's)
+# `.git/CONFIG`, `.Git/config` or `~/.GITCONFIG` is the file git reads. Only the exact names fold: a kin
+# such as `.gitconfig.local` is git's only when included, which config_write_reason's fallback matches in
+# any case too, so `GitConfig.java` or `Config.yml` still passes.
+GIT_CONFIG_NAME_ANY_CASE = re.compile(r"(?:^|[/\s'\"=(:])(?:\.?gitconfig|config\.worktree|\.git/(?:[^\s'\"]*/)?config)"
+                                      r"(?![\w./-])|(?:/git|\)|\$\{?\w+\}?)/config(?:\.worktree)?(?![\w./-])", re.I)
 # A bare `config` counts where it names a file in a git directory: `cd .git && echo ... >> config`.
-GIT_DIR_CONFIG = re.compile(r"/\.git/(?:[^/]+/)*config(?:\.worktree)?$")
+GIT_DIR_CONFIG = re.compile(r"/\.git/(?:[^/]+/)*config(?:\.worktree)?$", re.I)
 CONFIG_WRITE = re.compile(r"\b(?:ln|dd|rsync)\s")
 # A git call that makes a repository (git init, git clone), so a `config` the same command writes may be
 # in a git directory that doesn't exist yet when the guard looks (T-239).
@@ -2507,17 +2513,19 @@ def config_write_reason(cmd, cwd):
     """Why a shell command must not run because it may write a file git reads config from: it holds a
     shell write and names one (GIT_CONFIG_NAME, a `config` inside a .git directory or in any other git
     directory, such as a bare repository's (GitDirConfig, T-239), or a file git reads or includes from
-    cwd). What it writes can define an alias or command-valued key the guard never sees, so
+    cwd), its name in any case, as a case-insensitive filesystem reads it (T-245). What it writes can define an alias or command-valued key the guard never sees, so
     `git config` (checked by human_cmd) or Edit (config_edit_reason) is the way."""
     hit = SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd) or CONFIG_WRITE.search(cmd)
     if not hit:
         return None
-    named = (names_outside_data(cmd, GIT_CONFIG_NAME) or names_outside_data(cmd, GIT_DIR_CONFIG, cwd)
+    named = (names_outside_data(cmd, GIT_CONFIG_NAME) or names_outside_data(cmd, GIT_CONFIG_NAME_ANY_CASE)
+             or names_outside_data(cmd, GIT_DIR_CONFIG, cwd)
              or names_outside_data(cmd, GitDirConfig(fresh=bool(GIT_MAKES_REPO.search(cmd))), cwd))
     if not named:
+        # In any case, as a case-insensitive filesystem opens the file (T-245).
         files = git_config_files(cwd)
         named = bool(files) and names_outside_data(
-            cmd, re.compile("|".join(rf"^{re.escape(f)}$" for f in sorted(files))), cwd)
+            cmd, re.compile("|".join(rf"^{re.escape(f)}$" for f in sorted(files)), re.I), cwd)
     if not named:
         return None
     return (f"this command contains `{' '.join(hit.group(0).split())}` and names a file git reads config from "
