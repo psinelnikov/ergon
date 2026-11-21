@@ -759,6 +759,23 @@ class TestBasics(Project):
         self.assertIn("human-only", self.guard("Bash", {"command": bash[8].format(c="ergon approve T-1")}))
         self.assertIn("--config-env", self.guard("Bash", {"command": bash[0].format(c="ergon approve T-1")}))
         self.assertIsNone(self.guard("Bash", {"command": "git --config-env=user.name=N commit"}))
+        # T-233: a name handed to git, grep or rg is text to search for, not a variable they set; a
+        # setter builtin, a `${NAME:=value}` in their words, or a function or alias in their place sets it.
+        for cmd in ["git grep GIT_CONFIG_PARAMETERS", "git log -S GIT_CONFIG_KEY_0", "rg GIT_CONFIG_VALUE_0",
+                    "GIT_PAGER=cat git log -S GIT_CONFIG_KEY_0 -p", "git grep -n 'GIT_CONFIG_KEY_' -- ergon",
+                    "git grep GIT_CONFIG_KEY_0=alias.x", "echo \"${GIT_CONFIG_KEY_0:-}\" GIT_CONFIG_VALUE_0"]:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+        for cmd in ["read GIT_CONFIG_KEY_0", "export GIT_CONFIG_PARAMETERS", "printf -v GIT_CONFIG_VALUE_0 x",
+                    "git grep x; read GIT_CONFIG_KEY_0", "command git grep GIT_CONFIG_PARAMETERS",
+                    "git() { read \"$1\"; export \"$1\"; }; git GIT_CONFIG_PARAMETERS",
+                    "function grep { export \"$1\"; }; grep GIT_CONFIG_PARAMETERS",
+                    "'rg' () { export \"$1\"; }; rg GIT_CONFIG_PARAMETERS", "alias git=read\ngit GIT_CONFIG_KEY_0",
+                    "set -a; git grep \"${GIT_CONFIG_PARAMETERS:='alias.x=!ergon approve T-1'}\"; git x",
+                    "set -a; echo \"${GIT_CONFIG_PARAMETERS='alias.x=!ergon approve T-1'}\"; git x",
+                    "set -a; : ${GIT_CONFIG_PARAMETERS::=\"'alias.x=!ergon approve T-1'\"}; git x",
+                    "set -a; echo ${(L)GIT_CONFIG_PARAMETERS::=\"'alias.x=!ergon approve T-1'\"}; git x"]:
+            self.assertTrue(git_config_reason(cmd), cmd)
         self.assertTrue(all(k.partition(".")[0] in GIT_COMMAND_SECTIONS for k in
                             ["alias", "core", "pager", "diff", "difftool", "mergetool", "merge", "filter", "credential",
                              "gpg", "remote", "submodule", "sendemail", "imap", "hook"]))
@@ -811,6 +828,135 @@ class TestBasics(Project):
                          [("alias.x", "a ; b"), ("diff.My Tool.textconv", "f g"), ("diff.My Tool.flag", None)])
         for bad in ["x = 1\n[", "[alias]\nx = \"open\n", "[alias x]\n", "[alias]\nx y\n", "[alias]\nx = \\q\n"]:
             self.assertIsNone(git_config_entries(bad), bad)
+
+    def test_guard_refuses_a_shell_write_to_a_bare_repositorys_config(self):
+        """T-239: `config` in a git directory not named .git (a bare repository, a --separate-git-dir
+        one; HEAD, objects and refs in it) is git config, so a shell write to it is refused, named by
+        path, from a `cd` into it, through a symlink, or in a command that makes the repository first.
+        A file named config elsewhere (~/.ssh/config, an ordinary directory's), config.yml and the git
+        directory's other files pass."""
+        root, home = self.root, self.root / "home"
+        (home / ".ssh").mkdir(parents=True)
+        (root / "plain").mkdir()
+        env = clean_env(HOME=str(home), CLAUDE_PROJECT_DIR=str(root))  # as Claude Code sets it for hooks
+        sh("git", "init", "-q", "--bare", "bare", cwd=root)
+        sh("git", "init", "-q", "--bare", "r.git", cwd=root)
+        sh("git", "init", "-q", "--separate-git-dir", str(root / "sep"), str(root / "wt"), cwd=root)
+        (root / "link").symlink_to(root / "bare" / "config")
+        printf = r"printf '[alias]\n\tx = !ergon approve T-1\n'"
+        alias = "[alias]\n\tx = !ergon approve T-1\n"
+        for f in [root / "bare" / "config", "bare/config", "./bare/../bare/config", "r.git/config",
+                  root / "sep" / "config", "sep/config.worktree", "bare/CONFIG", "link"]:
+            for cmd in [f"{printf} > {f}", f"{printf} >> {f}", f"{printf} | tee -a {f}", f"cp /tmp/evil {f}",
+                        f"sed -i '1i [alias]\\n\\tx = !ergon approve T-1' {f}", f"cat >> {f} <<'EOF'\n{alias}EOF",
+                        f"bash -c \"cp /tmp/evil {f}\""]:
+                self.assertIn("git reads config from", self.guard("Bash", {"command": cmd}, env=env) or "", cmd)
+        for cmd, cwd in [(f"cd bare && {printf} >> config", root), (f"cd {root}/bare; {printf} > config", home),
+                         (f"{printf} >> config", root / "bare"), (f"{printf} >> ../bare/config", root / "plain"),
+                         (f"git init -q --bare fresh && {printf} > fresh/config", root),
+                         (f"git clone -q --bare . copy.git && cd copy.git && {printf} >> config", root)]:
+            self.assertIn("git reads config from", self.guard("Bash", {"command": cmd}, env=env, cwd=cwd) or "", cmd)
+        for cmd in ["echo x > config.yml", "echo x > bare/config.yml", f"{printf} >> ~/.ssh/config",
+                    f"printf 'Host x\\n' >> {home}/.ssh/config", f"{printf} > plain/config", "echo x > bare/description",
+                    "cat bare/config", "git clone -q --bare . copy.git && echo x > config.yml"]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}, env=env), cmd)
+        self.assertIsNone(self.guard("Bash", {"command": "echo x > config"}, env=env, cwd=root / "plain"))
+
+    def test_guard_refuses_git_config_from_a_file_the_agent_chose(self):
+        """T-224: a file written by a plain shell write (not named as config, so the write passes) that
+        holds an `[alias]` running a human-only verb, then made git's config by include.path /
+        includeIf.*.path, GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM / GIT_CONFIG, HOME or XDG_CONFIG_HOME
+        set for a git call, or --git-dir (GIT_DIR, -C, cd) to another repository, is refused at the
+        include: the guard reads the file before git does. A file it can't read first (/dev/stdin, a
+        process substitution, a path behind an expansion, one the same command may write) is refused
+        too, and an include git stores to a file that's still empty is guarded at the later write.
+        Including a file that holds only [user], and HOME set for a program that isn't git, pass."""
+        from ergon.gates import config_source_reason, git_config_reason
+        root = self.root
+        alias = "[alias]\n\tx = !ergon {v} T-1\n"
+        printf = r"printf '[alias]\n\tx = !ergon approve T-1\n'"
+        # Step one, the write: this doesn't name a git config file, so the guard lets it through. A
+        # home's .gitconfig, an XDG git/config or a bare repository's config (T-239) is named like one,
+        # so its write is refused already; the files are planted below to check the HOME /
+        # XDG_CONFIG_HOME / --git-dir step on its own.
+        (root / "h").mkdir()
+        (root / "xdg" / "git").mkdir(parents=True)
+        sh("git", "init", "-q", "--bare", "bare", cwd=root)
+        self.assertIsNone(self.guard("Bash", {"command": f"{printf} >> evil.inc"}))
+        for f in ["h/.gitconfig", "xdg/git/config", "bare/config"]:
+            self.assertIn("git reads config from", self.guard("Bash", {"command": f"{printf} > {f}"}), f)
+        # Step two, making it git's config: refused, for every human-only verb.
+        evil, home, xdg, bare = root / "evil.inc", root / "h", root / "xdg", root / "bare"
+        routes = [f"git config include.path {evil}", "git config include.path ../evil.inc",
+                  f"git config --add include.path {evil}", f"git -c include.path={evil} x",
+                  f"git config includeIf.gitdir:/elsewhere/.path {evil}", f"git -c includeIf.onbranch:main.path={evil} x",
+                  f"git clone -c include.path={evil} https://example.com/r.git d",
+                  f"GIT_CONFIG_GLOBAL={evil} git x", f"GIT_CONFIG_SYSTEM={evil} git x", f"GIT_CONFIG={evil} git config -l",
+                  f"export GIT_CONFIG_GLOBAL={evil}; git x", f"env GIT_CONFIG_GLOBAL={evil} git x",
+                  f"HOME={home} git x", f"export HOME={home} && git x", f"HOME=h git x", f"XDG_CONFIG_HOME={xdg} git x",
+                  f"GIT_CONFIG_PARAMETERS=\"'include.path'='{evil}'\" git x",
+                  f"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=include.path GIT_CONFIG_VALUE_0={evil} git x",
+                  f"git --git-dir={bare} x", f"git --git-dir {bare} x", f"GIT_DIR={bare} git x",
+                  f"GIT_COMMON_DIR={bare} git x", f"git -C {bare} x", "git -C bare x", f"cd {bare} && git x",
+                  f"bash -c 'HOME={home} git x'"]
+        for v in ["approve", "reject", "close", "accept", "answer", "sync", "pin", "choose", "review -i"]:
+            for f in [evil, home / ".gitconfig", xdg / "git" / "config"]:
+                f.write_text(alias.format(v=v))
+            (bare / "config").write_text("[core]\n\tbare = true\n" + alias.format(v=v))
+            for cmd in routes:
+                why = git_config_reason(cmd) or config_source_reason(cmd, str(root))
+                self.assertIn("human-only", why or "", (v, cmd))
+        evil.write_text(alias.format(v="approve"))
+        self.assertIn(f"git would read config from {evil}", self.guard("Bash", {"command": routes[0]}))
+        self.assertIn("human-only", self.guard("Bash", {"command": f"HOME={home} git x"}))
+        self.assertIn("human-only", self.guard("Bash", {"command": f"git --git-dir={bare} x"}))
+        # Another repository's own .git/config is read like cwd's (guarded by name where it's written):
+        # a human's `$1` alias there passes, a human-only verb doesn't.
+        sh("git", "init", "-q", "other", cwd=root)
+        cfg = root / "other" / ".git" / "config"
+        cfg.write_text(cfg.read_text() + "[alias]\n\tlg = \"!f() { git log $1; }; f\"\n")
+        self.assertIsNone(config_source_reason("git -C other lg", str(root)))
+        self.assertIsNone(config_source_reason("git -C other diff > p.diff", str(root)))
+        cfg.write_text(cfg.read_text() + "\tx = !ergon approve T-1\n")
+        self.assertIn("human-only", config_source_reason("cd other && git x", str(root)) or "")
+        # An Edit that adds the include to a config file is read the same way.
+        why = self.guard("Edit", {"file_path": str(root / ".git" / "config"), "old_string": "[core]",
+                                  "new_string": f"[include]\n\tpath = {evil}\n[core]"})
+        self.assertIn("human-only", why or "")
+        # Nested: the file names another through an include whose condition doesn't hold now; it may later.
+        (root / "outer.inc").write_text('[includeIf "gitdir:/elsewhere/"]\n\tpath = evil.inc\n')
+        self.assertIn("evil.inc", config_source_reason(f"git config include.path {root / 'outer.inc'}", str(root)))
+        # A file the guard can't read first: stdin, a process substitution, a path behind an expansion,
+        # or one the same command can write before git reads it.
+        for cmd in ["GIT_CONFIG_GLOBAL=/dev/stdin git x <<< \"$C\"", f"GIT_CONFIG_GLOBAL=<(cat {evil}) git x",
+                    "git -c include.path=/dev/stdin x", "GIT_CONFIG_GLOBAL=\"$F\" git x", "HOME=$D git x",
+                    "git --git-dir=\"$G\" x", "git config include.path \"$F\"", "git --config-env=include.path=F x",
+                    f"{printf} > new.inc; GIT_CONFIG_GLOBAL=new.inc git x", f"cp /tmp/evil b2/config && git -C b2 x",
+                    f"git config include.path ../later.inc && {printf} > later.inc",
+                    "git config --rename-section stash include"]:
+            self.assertTrue(git_config_reason(cmd) or config_source_reason(cmd, str(root)), cmd)
+        # An include stored to a file that's still empty or missing passes, and the write that fills it
+        # later is refused, since git now reads config from it.
+        for name in ["empty.inc", "missing.inc"]:
+            if name == "empty.inc":
+                (root / name).write_text("")
+            self.assertIsNone(self.guard("Bash", {"command": f"git config include.path ../{name}"}), name)
+            sh("git", "config", "--add", "include.path", f"../{name}", cwd=root)
+            self.assertIn("git reads config from", self.guard("Bash", {"command": f"{printf} >> {name}"}), name)
+        # What passes: an include of a file holding only [user] (and a harmless alias), HOME for a program
+        # that isn't git, a home with no alias in it, /dev/null as the global config, and -C or cd within
+        # this repository.
+        (root / "user.inc").write_text("[user]\n\tname = Tester\n[alias]\n\tst = status\n")
+        (root / "plain").mkdir()
+        (root / "plain" / ".gitconfig").write_text("[user]\n\temail = t@example.com\n")
+        for cmd in [f"git config include.path {root / 'user.inc'}", "git config include.path ../user.inc",
+                    f"git -c include.path={root / 'user.inc'} st", "HOME=/tmp/x ls", "HOME=$D ls",
+                    f"HOME={root / 'plain'} git status", "GIT_CONFIG_GLOBAL=/dev/null git log > out.txt",
+                    "GIT_CONFIG_NOSYSTEM=1 git status", "git -C . log > out.txt", "git -C tasks status",
+                    "cd tasks && git status", f"git config include.path {root / 'nowhere.inc'}", "git log > out.txt",
+                    "git config --get include.path", "git config --unset include.path"]:
+            self.assertIsNone(git_config_reason(cmd) or config_source_reason(cmd, str(root)), cmd)
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
 
     def test_guard_human_cmd_git_ext_urls_and_instaweb(self):
         """T-215: an ext:: URL is a command git runs (git-remote-ext(1): argv split at spaces, `% `
@@ -880,6 +1026,53 @@ class TestBasics(Project):
                     "grep 'PAGER=ergon close' x", "git log --grep 'EDITOR=ergon accept T-1'",
                     "X='ergon approve T-1' git log", "printf '%s\\n' \"GIT_PAGER=ergon approve\""]:
             self.assertFalse(human_cmd(cmd), cmd)
+
+    def test_guard_human_cmd_follows_shell_variables(self):
+        """T-228: a variable assigned earlier in the same text is read as its value, so a human-only verb
+        reached through one (as the verb, the program, a git command variable's value, a string run as
+        code, an expanding heredoc fed to a shell) is refused; so is an ergon call whose verb stays an
+        expansion the guard can't resolve. A harmless value, a variable the text never sets ($HOME), a
+        quoted heredoc and the verbs as data pass."""
+        from ergon.gates import MAX_EXPANDED, expand_vars, human_cmd, shell_commands
+        verbs = ["approve", "reject", "close", "accept", "answer", "sync", "pin", "choose", "review -i"]
+        forms = ["V=\"{b}\"; ergon $V T-1", "V='{b}'; ergon ${{V}} T-1", "export V='{b}'; ergon $V T-1",
+                 "V='ergon {b} T-1'; $V", "E=ergon; $E {b} T-1", "P='ergon {b} T-1'; GIT_PAGER=$P git log",
+                 "P='ergon {b} T-1'; export GIT_EDITOR=\"$P\"; git commit", "V='{b} T-1'; ergon $V",
+                 "A=ergon B=\" {b}\"; C=$A$B; GIT_SSH_COMMAND=$C git fetch", "V='{b}'; bash -c \"ergon $V T-1\"",
+                 "V='{b}'; bash <<EOF\nergon $V T-1\nEOF", "V=x; V+=' {b}'; ergon ${{V#x}} T-1",
+                 "V='{b}'; (ergon $V T-1)", "V='{b}' && cd x && ergon $V T-1", "V='{b}'; echo $(ergon $V T-1)",
+                 "V='{b}'; python3 -m ergon $V T-1", "P='ergon {b} T-1'; git -c core.pager=\"$P\" log",
+                 "V='{b}'; sudo ergon \"$V\" T-1", "V=''; ergon $V {b} T-1", "V='ergon {b}'; bash -c \"$V T-1\"",
+                 "V='ergon {b}'; ssh host \"$V T-1\"", "V='{b} T-1'; git rebase --exec \"ergon $V\" main"]
+        for form in forms:
+            for verb in verbs:
+                cmd = form.format(b=verb)
+                self.assertTrue(human_cmd(cmd), cmd)
+        # a verb the guard can't resolve: set outside the text, by a loop, read, a substitution, `+=` onto an outside value
+        for cmd in ["ergon $X T-1", "ergon \"${X}\" T-1", "ergon $(cat verb) T-1", "ergon `cat verb` T-1",
+                    "for v in approve; do ergon $v T-1; done", "read V <f; ergon $V T-1", "V+=e; ergon $V T-1",
+                    "V=$(cat f); ergon $V T-1", "$E approve T-1", "\"$E\" review -i", "ergon ${X:-approve} T-1"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["V=status; git $V", "GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch", "V=board; ergon $V",
+                    "V=T-1; ergon show $V", "ID=T-1; ergon show $ID && ergon board", "P=cat; GIT_PAGER=$P git log",
+                    "V=approve; echo $V", "V=approve; grep \"ergon $V\" README.md", "V=approve; git commit -m \"$V it\"",
+                    "V=approve; cat <<'EOF' | sh\ngit log --grep $V\nEOF", "V=approve; cat <<EOF > notes\nergon $V\nEOF",
+                    "V=approve ergon show T-1", "ergon show $ID", "$EDITOR notes.md", "ergon review --tier $TIER",
+                    "V='ergon approve T-1'"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+        # expansions are resolved in text order, unsplit in an assignment, and bounded
+        self.assertEqual(expand_vars(shell_commands("V=a; W=${V}b; x $W $V")[0])[-1][0], ["x", "ab", "a"])
+        self.assertEqual(expand_vars(shell_commands("V='a b'; X=$V; x $X")[0])[1][0], ["X=a b"])
+        self.assertEqual(expand_vars(shell_commands("V+=b; x $V")[0])[-1][0], ["x", "${V}b"])
+        doubling = "V=xxxxxxxx; " + "V=$V$V; " * 40 + "ergon $V"
+        words = expand_vars(shell_commands(doubling)[0])[-1][0]
+        self.assertLessEqual(sum(map(len, words)), MAX_EXPANDED + 100)
+        self.assertTrue(human_cmd(doubling))  # what's past the bound stays an expansion
+        # end to end through the hook: the human-only refusal
+        for cmd in ["V=approve; ergon $V T-1", "P='ergon approve T-1'; GIT_PAGER=$P git log", "ergon $X T-1"]:
+            self.assertIn("human-only", self.guard("Bash", {"command": cmd}), cmd)
+        for cmd in ["V=status; git $V", "V=T-1; ergon show $V"]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
 
     def test_guard_human_cmd_git_config_env_vars(self):
         """T-218: GIT_CONFIG_PARAMETERS and GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> set before a git call
@@ -981,6 +1174,112 @@ class TestBasics(Project):
         for cmd in ["GIT_EDITOR=vim git commit", "GIT_PAGER=cat git log", "EDITOR=\"$X\" git commit"]:
             self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
 
+    def test_guard_git_command_env_from_a_variable_the_text_sets(self):
+        """T-241: a git command variable set from a variable the same text sets is read as that value
+        where it's sure to be the one git gets: P set alone at the top level, not behind && / || or a
+        pipe, and nothing else that can set P (read, local, a subshell, `X=1 P=y cmd`, ${P:=...}, a
+        loop, eval / source / trap, a nameref or a name built at run time). The value it makes is
+        checked for a human-only verb. Anything less sure keeps T-223's "can't see" refusal."""
+        from ergon.gates import git_env_reason, shell_commands
+        top = []
+        shell_commands("a && b; c | d\ne || (f) &\ng &&\nh", top=top)
+        self.assertEqual([(w[0], before, after) for w, before, after in top],
+                         [("a", None, "&&"), ("b", "&&", ";"), ("c", ";", "|"), ("d", "|", "\n"), ("e", "\n", "||"),
+                          ("g", "||", "&&"), ("h", "&&", None)])
+        for cmd in ["P=cat; GIT_PAGER=$P git log", "P='less -R'; export GIT_EDITOR=$P; git commit",
+                    "P=cat\nGIT_PAGER=${P} git log", "P=cat && GIT_PAGER=$P git log", "P=less; P+=' -R'; GIT_PAGER=$P git log",
+                    "P=less Q=\"$P -R\"; GIT_PAGER=$Q git log", "P=cat; cd x && GIT_PAGER=$P git log | cat",
+                    "(cd x); P=cat; GIT_PAGER=$P git log", "P=cat; echo $(GIT_PAGER=$P git log)",
+                    "P='ssh -i ~/k'; GIT_SSH_COMMAND=$P git fetch", "P=vim; GIT_EDITOR=$P; export GIT_EDITOR; git commit"]:
+            self.assertIsNone(git_env_reason(cmd), cmd)
+        unseen = ["GIT_PAGER=$X git log", "GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch", "P=$X; GIT_PAGER=$P git log",
+                  "false && P=cat; GIT_PAGER=$P git log", "false || P=cat; GIT_PAGER=$P git log",
+                  "x &&\nP=cat; GIT_PAGER=$P git log", "x |\nP=cat; GIT_PAGER=$P git log", "P=cat & GIT_PAGER=$P git log",
+                  "P=cat | x; GIT_PAGER=$P git log", "(P=cat); GIT_PAGER=$P git log", "echo $(P=cat); GIT_PAGER=$P git log",
+                  "P=cat true; GIT_PAGER=$P git log", "P=cat GIT_PAGER=$P git log", "GIT_PAGER=$P git log; P=cat",
+                  "P+=cat; GIT_PAGER=$P git log", "x && Q=cat; P=$Q; GIT_PAGER=$P git log", "P=cat; GIT_PAGER=$P$X git log",
+                  "P=cat; read P <f; GIT_PAGER=$P git log", "P=cat; read $'\\x50' <f; GIT_PAGER=$P git log",
+                  "P=cat; builtin read P; GIT_PAGER=$P git log", "P=cat; printf -v Q x; GIT_PAGER=$P git log",
+                  "P=cat; eval \"$(cat f)\"; GIT_PAGER=$P git log", "P=cat; command eval x; GIT_PAGER=$P git log",
+                  "P=cat; . ./f; GIT_PAGER=$P git log", "trap 'x' DEBUG; P=cat; GIT_PAGER=$P git log",
+                  "P=cat; declare -n R=$Q; R=x; GIT_PAGER=$P git log", "P=cat; export $Q=x; GIT_PAGER=$P git log",
+                  "P=cat; set -A P x; GIT_PAGER=$P git log", "P=cat; $C P; GIT_PAGER=$P git log",
+                  "P=cat; local P=x; GIT_PAGER=$P git log", "P=cat; : ${P:=x}; GIT_PAGER=$P git log",
+                  "P=cat; : ${P::=x}; GIT_PAGER=$P git log", "P=cat; P[1]=x; GIT_PAGER=$P git log",
+                  "P=xcat; GIT_PAGER=$P[2,-1] git log", "P=xcat; GIT_PAGER=${P:1} git log", "P=cat; GIT_PAGER=$P:h git log",
+                  "P=cat; GIT_PAGER=$P{a,b} git log", "P=cat; export GIT_PAGER=erg{,$P}; git log",
+                  "P=cat; GIT_PAGER=${!Q} git log", "while x; do\nP=cat\ndone; GIT_PAGER=$P git log",
+                  "if x; then\nP=cat\nfi\nGIT_PAGER=$P git log", "f() { P=x; }; P=cat; f; GIT_PAGER=$P git log",
+                  "OLDPWD=cat; cd /x; GIT_PAGER=$OLDPWD git log", "MATCH=cat; [[ a =~ b ]]; GIT_PAGER=$MATCH git log",
+                  "P=`cat f`; GIT_PAGER=$P git log"]
+        for cmd in unseen:
+            self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        for verb in ["approve", "close", "review -i"]:
+            for form in ["P='ergon {b} T-1'; GIT_PAGER=$P git log", "P='ergon {b} T-1'; export GIT_EDITOR=$P; git commit",
+                         "GIT_PAGER=erg; P='on {b} T-1'; GIT_PAGER+=$P; git log",
+                         "A=erg B='on {b} T-1'; P=$A$B; GIT_SSH_COMMAND=${{P}} git fetch"]:
+                cmd = form.format(b=verb)
+                self.assertIn("human-only", git_env_reason(cmd) or "", cmd)
+        # end to end through the hook
+        self.assertIsNone(self.guard("Bash", {"command": "P=cat; GIT_PAGER=$P git log"}))
+        self.assertIsNone(self.guard("Bash", {"command": "P='less -R'; export GIT_EDITOR=$P; git commit"}))
+        self.assertIn("human-only", self.guard("Bash", {"command": "P='ergon approve T-1'; GIT_PAGER=$P git log"}) or "")
+        for cmd in ["GIT_PAGER=$X git log", "GIT_SSH_COMMAND=\"ssh -i $HOME/k\" git fetch",
+                    "false && P=cat; GIT_PAGER=$P git log"]:
+            self.assertIn("can't see", self.guard("Bash", {"command": cmd}) or "", cmd)
+
+    def test_guard_variable_set_through_a_name_built_at_run_time(self):
+        """T-242: a builtin handed a variable name the text doesn't show (`printf -v "$x"`, `read "$x"`,
+        `export "$x"`, `declare -n r=$x`, zsh `${(P)x::=...}`, bash `${!x:=...}`, a function's
+        `export "$1"`) may set any of git's GIT_CONFIG_* or command variables, so git_config_reason and
+        git_env_reason both refuse it, whatever the name turns out to be. A function or alias the text
+        defines may make a program set the git command variable it is handed (`alias git=export`).
+        Reading or exporting a variable the text names, and an expansion in a value, an option's value
+        (`read -u "$fd"`) or a subscript, pass."""
+        from ergon.gates import git_config_reason, git_env_reason
+        both = ["x=$(echo GIT_CONFIG_KEY | sed 's/$/_0/'); printf -v \"$x\" alias.y; GIT_CONFIG_COUNT=1 git y",
+                "printf -v \"$x\" %s alias.y", "printf -v$x alias.y", "print -v \"$x\" alias.y",
+                "read \"$x\" <<< alias.y", "read -r $x <f", "read -a \"$x\" <f", "read -p ok \"$x\"",
+                "read 'v?ok' \"$x\"", "builtin read \"$x\"", "command -p read \"$x\"", "if read \"$x\"; then :; fi",
+                "mapfile -t \"$x\" <f", "readarray \"$x\" <f", "getopts ab \"$n\" -a", "zparseopts -A \"$x\" a",
+                "export \"$x=alias.y\"", "export \"$x\"", "export $x", "export \"${x}_0=alias.y\"",
+                "export `echo GIT_EDITOR`=vim", "declare \"$x=alias.y\"", "local \"$1\"", "readonly $x=1",
+                "typeset -x \"$x\"=1", "declare -n r=$x; r=alias.y", "declare -n r=\"$x\"", "typeset -n r=${x}",
+                "declare -gn r=$1", "local -n r; r=GIT_EDITOR", ": ${(P)x::=alias.y}", "echo ${(P)x::=alias.y}",
+                ": ${(P)${x}:=alias.y}", ": ${!x:=vim}", ": ${!x=vim}", "cat <<EOF\n${(P)x::=vim}\nEOF",
+                "bash -c 'printf -v \"$1\" x' _ GIT_EDITOR",
+                # a function that sets the variable named by its argument, in place of a program or not
+                "f() { export \"$1\"; }; f GIT_EDITOR", "f() { export \"$1=vim\"; }; f GIT_EDITOR",
+                "f() { printf -v \"$1\" %s vim; }; f GIT_PAGER", "function f { read \"$1\"; }; f GIT_EDITOR",
+                "f() ( export \"$1\"=x ); f GIT_EDITOR", "git() { export \"$1=x\"; }; git GIT_EDITOR; command git commit",
+                "git() { local -n r=$1; r=x; }; git GIT_SSH_COMMAND", "grep() { read \"$1\"; }; grep GIT_CONFIG_KEY_0"]
+        for cmd in both:
+            for reason in (git_config_reason, git_env_reason):
+                self.assertIn("can't see", reason(cmd) or "", (reason.__name__, cmd))
+        # A program a function or alias in the text may replace, handed a git command variable by name.
+        for cmd in ["alias git=export\ngit GIT_EDITOR=x; git commit", "alias git='printf -v'\ngit GIT_PAGER x; git log",
+                    "git() { \"$@\"; }; git read GIT_EDITOR", "functions[git]=x; git GIT_EDITOR+=y",
+                    ": ${GIT_EDITOR::=$y}; git commit", ": ${(L)GIT_EDITOR::=vim}; git commit"]:
+            self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        for cmd in ["read -r line", "read line; echo $line", "read -d '' -r line", "read -u \"$fd\" line",
+                    "read -d\"$d\" line", "while IFS= read -r f; do echo \"$f\"; done <list",
+                    "mapfile -t lines < <(git ls-files)", "mapfile -u \"$fd\" -t lines", "export PATH=$PATH:/x",
+                    "export \"PATH=$HOME/bin:$PATH\"", "export FOO", "export FOO=$(pwd) BAR=\"$x\"", "export -n FOO",
+                    "local arr[$i]=x", "declare -A m; m[$k]=v", "printf -v out %s \"$x\"", "printf '%s\\n' \"$x\"",
+                    "printf -- \"-v $x\"", "print -r -- \"$x\"", "declare -n r=arr", "getopts ab opt \"$@\"",
+                    "f() { echo \"$1\"; }; f hi", "f() { local x=\"$1\"; echo $x; }; f hi", "stat \"$f\"",
+                    "echo ${!prefix*} ${!x} ${(P)x} ${(P)x:-a=b}", "echo ${x:=1} ${(L)x}", "echo \"export $x\"",
+                    "git commit -m \"$msg\"", ": ${GIT_EDITOR::=vim}; git commit", "f() { :; }; git log",
+                    "declare -f \"$fn\"", "export -f \"$fn\"", "declare -p \"$x\""]:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+            self.assertIsNone(git_env_reason(cmd), cmd)
+        # end to end through the hook
+        for cmd in ["x=$(cat f); printf -v \"$x\" alias.y","f() { export \"$1=vim\"; }; f GIT_EDITOR",
+                    "alias git=export\ngit GIT_EDITOR=x; git commit"]:
+            self.assertIn("can't see", self.guard("Bash", {"command": cmd}) or "", cmd)
+        for cmd in ["read -r line", "export \"PATH=$HOME/bin:$PATH\"", "printf -v out %s \"$x\""]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+
     def test_guard_refuses_unseen_git_url_config(self):
         """T-226: a remote's or submodule's URL key (GIT_URL_KEYS) runs an ext:: URL as a command, so
         T-060's unseen-value checks cover it: set through --config-env, GIT_CONFIG_KEY_<n> /
@@ -1071,6 +1370,50 @@ class TestBasics(Project):
                     (env + "GIT_CONFIG_VALUE_0=always git fetch o").format(k="protocol.file.allow")]
         for cmd in passing:
             self.assertIsNone(git_config_reason(cmd), cmd)
+
+    def test_guard_refuses_unseen_git_url_arguments(self):
+        """T-236: git runs an ext:: URL given as clone's, fetch's, push's, ... repository argument
+        (T-215 checks one the text shows), so one an expansion may make ext:: is refused: in the
+        repository slot of each command that takes one, past options and their values, after `--`, as
+        push --repo's or archive --remote's value, behind sudo or in `bash -c`. An expansion elsewhere
+        (a refspec, a directory, an option's value, after a literal `https://`) and a remote's name pass."""
+        from ergon.gates import git_config_reason, git_url_args
+        self.assertEqual(git_url_args("fetch", ["-q", "--depth", "1", "o", "main"]), ["o"])
+        self.assertEqual(git_url_args("fetch", ["--repo", "o"]), ["o"])  # no fetch option starts --repo
+        self.assertEqual(git_url_args("fetch", ["--multiple", "a", "b"]), ["a", "b"])
+        self.assertEqual(git_url_args("clone", ["-qb", "x", "u", "d"]), ["u"])
+        self.assertEqual(git_url_args("clone", ["-bx", "u", "d"]), ["u"])
+        self.assertEqual(git_url_args("remote", ["-v", "add", "-t", "m", "o", "u"]), ["u"])
+        self.assertEqual(git_url_args("remote", ["rename", "a", "b"]), [])
+        self.assertEqual(git_url_args("fetch", ["--d", "o", "u"]), ["o", "u"])  # --depth or --dry-run: both
+        unseen = ["git fetch \"$U\"", "git clone \"$U\" d", "git remote add o \"$U\"",
+                  "git fetch -q --depth 1 \"$U\" main", "git fetch origin --depth=1 && git fetch \"${U}\"",
+                  "git clone --branch main -- \"$U\" d", "git clone -qb main \"$U\"", "git clone --depth \"$N\" \"$U\"",
+                  "git -C /tmp -c x.y=1 clone \"$U\"", "sudo git fetch \"$U\"", "bash -c 'git fetch \"$U\"'",
+                  "git pull \"$U\" main", "git pull --rebase -s ours \"$U\"", "git push \"$U\" HEAD",
+                  "git push --repo \"$U\"", "git push --repo=\"$U\" HEAD", "git ls-remote \"$U\"",
+                  "git ls-remote --sort version:refname \"$U\"", "git remote set-url o \"$U\"",
+                  "git remote set-url --push o \"$U\"", "git remote add -t main -m main o \"$U\"",
+                  "git submodule add \"$U\" sub", "git submodule add -b main --name s \"$U\" sub",
+                  "git submodule --quiet add -- \"$U\"", "git submodule set-url sub \"$U\"",
+                  "git archive --remote=\"$U\" HEAD", "git archive --remote \"$U\" HEAD",
+                  "git request-pull v1 \"$U\"", "git subtree add -P lib \"$U\" main", "git subtree pull --prefix=lib \"$U\" main",
+                  "git fetch --multiple origin \"$U\"", "git fetch $(cat url)", "git clone `cat url` d",
+                  "git fetch \"e$X\"", "git fetch \"EXT::$X\"", "git fetch \"ext::ergon $X\"", "/usr/bin/git fetch \"$U\""]
+        for cmd in unseen:
+            self.assertIn("ext:: URL", git_config_reason(cmd) or "", cmd)
+            self.assertTrue(self.guard("Bash", {"command": cmd}), cmd)  # `ext::ergon $X`: human_cmd's first
+        shown = ["git clone \"https://$HOST/r.git\"", "git fetch origin", "git clone \"https://$HOST/r.git\" \"$DIR\"",
+                 "git fetch origin \"$BRANCH\"", "git push origin \"$BRANCH\"", "git push -u origin \"HEAD:$B\"",
+                 "git pull origin \"$B\"", "git fetch --depth \"$N\" origin", "git clone -b \"$B\" https://x/r.git",
+                 "git clone \"git@$HOST:r.git\" d", "git ls-remote origin \"$REF\"", "git remote add \"$NAME\" https://x/r.git",
+                 "git remote rename o \"$NEW\"", "git remote remove \"$O\"", "git submodule add https://x/r.git \"$P\"",
+                 "git submodule update --init \"$P\"", "git archive --format=tar \"$REV\"", "git fetch --all",
+                 "git clone \"ssh://$HOST/r.git\"", "git log \"$U\"", "git checkout \"$U\"", "git request-pull \"$V\" origin",
+                 "echo \"git fetch $U\"", "git commit -m 'git fetch \"$U\"'"]
+        for cmd in shown:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
 
     def test_stop_hook_blocks_on_lint_failure(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")

@@ -1129,14 +1129,17 @@ GIT_WRITE = re.compile(r"\bgit\b[^;&|]*\s(add|commit|checkout|switch|reset|resto
                        r"clean|update-ref|commit-tree|notes|gc|prune)\b")
 
 
-def shell_commands(s, i=0, close=None):
+def shell_commands(s, i=0, close=None, top=None):
     """Split shell text into simple commands, each (its words after quote removal, its heredoc
     bodies as (text, expands)). A command piped from one with heredocs shares them (`cat <<EOF | sh`
     runs the body). The commands inside $(...), `...` and (...) come out as commands of
     their own; a word holding a substitution keeps its source text. Returns (commands, the index
-    after `close`). Raises ValueError on text it can't split (an open quote, an unclosed paren)."""
+    after `close`). Raises ValueError on text it can't split (an open quote, an unclosed paren).
+    A list given as top gets (words, before, after) for each command at this level, not inside
+    $(...), `...` or (...): the operators around it (";", "\n", "&&", "||", "|", "&", "(", ")", None
+    at either end). An operator ahead of an empty command (`a &&` + newline) carries over to the next."""
     cmds, words, docs, word, pending, n = [], [], [], [], [], len(s)
-    inword = False
+    inword, before = False, None
 
     def end_word():
         nonlocal inword
@@ -1145,12 +1148,17 @@ def shell_commands(s, i=0, close=None):
         word.clear()
         inword = False
 
-    def end_cmd():  # a command with no words keeps its heredocs for the next (`cat <<EOF |` + newline)
-        nonlocal words, docs
+    def end_cmd(after=None):  # a command with no words keeps its heredocs for the next (`cat <<EOF |` + newline)
+        nonlocal words, docs, before
         end_word()
         if words:
             cmds.append((words, docs))
+            if top is not None:
+                top.append((words, before, after))
             words, docs = [], []
+            before = after
+        elif before not in ("&&", "||", "|", "&"):
+            before = after
 
     def sub(i):  # s[i:] starts with "$(": the commands up to its ")" are commands too
         found, j = shell_commands(s, i + 2, ")")
@@ -1251,27 +1259,27 @@ def shell_commands(s, i=0, close=None):
             end_word()
             i += 1
         elif c == "\n":
-            end_cmd()
+            end_cmd("\n")
             i = bodies(i + 1)
-        elif s.startswith("||", i):
-            end_cmd()
+        elif s.startswith("||", i) or s.startswith("&&", i):
+            end_cmd(s[i:i + 2])
             i += 2
         elif c == "|":  # a pipe: the heredocs read so far feed the next command's stdin too
             piped = docs
-            end_cmd()
+            end_cmd("|")
             docs = piped
             i += 2 if s.startswith("|&", i) else 1
         elif c in ";&":
-            end_cmd()
+            end_cmd(c)
             i += 1
         elif c == "(":
-            end_cmd()
+            end_cmd("(")
             found, i = shell_commands(s, i + 1, ")")
             cmds.extend(found)
         elif c == ")":
             if close != ")" or pending:
                 raise ValueError("unmatched )")
-            end_cmd()
+            end_cmd(")")
             return cmds, i + 1
         elif c in "<>":
             end_word()
@@ -1382,11 +1390,18 @@ def ext_command(url):
     return shlex.join(args)
 
 
+# Config keys whose value names a file git reads as more config (git-config(1), INCLUDES), lowercased.
+INCLUDE_KEY = re.compile(r"include\.path|includeif\..+\.path", re.S)
+
+
 def config_key_runs(key):
     """Whether git can run a command from config key's value: a GIT_COMMAND_KEYS key (or the
     insteadOf key of an ext:: base), or a URL key (GIT_URL_KEYS), whose value runs as a command when
-    it's an ext:: URL. A value that isn't one gives git_config_command None, so `!` can't probe it."""
-    return (git_config_command(key, "!") is not None or bool(GIT_URL_KEYS.fullmatch(key.lower()))
+    it's an ext:: URL. A value that isn't one gives git_config_command None, so `!` can't probe it.
+    An include key (INCLUDE_KEY) counts too: the file it names can define any of them (T-224). So does
+    a protocol allow key (GIT_PROTOCOL_KEY): `always` or `user` there re-enables ext::."""
+    k = key.lower()
+    return (git_config_command(key, "!") is not None or bool(GIT_URL_KEYS.fullmatch(k) or INCLUDE_KEY.fullmatch(k))
             or bool(GIT_PROTOCOL_KEY.fullmatch(key)))
 
 
@@ -1410,6 +1425,93 @@ def git_config_command(key, val):
     if k.startswith("submodule."):
         return val[1:] if val.startswith("!") else None
     return val
+
+
+# Per git subcommand that takes a repository URL as an argument (T-236): the long options and short
+# letters that take the next word as their value when it isn't attached (from `git <sub> --help-all`
+# and the shell scripts' own parsers, git 2.54; an option whose value is optional never takes the
+# next word), the options whose value is itself a URL, and, per verb (None for a command with none),
+# which positional argument after it is the URL. git's builtins read options after positionals too.
+GIT_URL_ARGS = {
+    "clone": ({"--upload-pack", "--template", "--reference", "--reference-if-able", "--origin", "--branch",
+               "--revision", "--depth", "--shallow-since", "--shallow-exclude", "--separate-git-dir",
+               "--ref-format", "--config", "--server-option", "--filter", "--bundle-uri", "--jobs"},
+              "jobuc", set(), {None: 0}),
+    "fetch": ({"--upload-pack", "--jobs", "--depth", "--shallow-since", "--shallow-exclude", "--deepen",
+               "--submodule-prefix", "--recurse-submodules-default", "--refmap", "--server-option",
+               "--negotiation-tip", "--filter"}, "jo", set(), {None: 0}),
+    "pull": ({"--cleanup", "--strategy", "--strategy-option", "--upload-pack", "--depth", "--shallow-since",
+              "--shallow-exclude", "--deepen", "--refmap", "--server-option", "--negotiation-tip"},
+             "sXo", set(), {None: 0}),
+    "push": ({"--repo", "--receive-pack", "--exec", "--push-option"}, "o", {"--repo"}, {None: 0}),
+    "ls-remote": ({"--upload-pack", "--exec", "--sort", "--server-option"}, "o", set(), {None: 0}),
+    "archive": ({"--format", "--prefix", "--add-file", "--add-virtual-file", "--output", "--mtime", "--remote",
+                 "--exec"}, "o", {"--remote"}, {}),
+    "remote": ({"--track", "--master"}, "tm", set(), {"add": 1, "set-url": 1}),
+    "submodule": ({"--branch", "--reference", "--ref-format", "--name", "--depth"}, "b", set(),
+                  {"add": 0, "set-url": 1}),
+    "request-pull": (set(), "", set(), {None: 1}),  # runs `git ls-remote <url>`
+    "subtree": ({"--prefix", "--message", "--annotate", "--onto", "--branch"}, "Pmb", set(),
+                {"add": 0, "pull": 0, "push": 0}),  # each runs `git fetch` or `git push` on it
+}
+
+
+def _takes_next(a, longs, shorts):
+    """The steps past option word a to the next word to read, as git's option parser may take it: 2
+    when it takes the next word as its value, 1 when not, both when a is an abbreviation that may
+    name a valued option or a flag that starts the same way (git refuses an ambiguous one)."""
+    name, eq, _ = a.partition("=")
+    if a.startswith("--"):
+        if eq or a == "--" or not any(o.startswith(name) for o in longs):
+            return {1}
+        return {2} if name in longs else {1, 2}
+    for p, c in enumerate(a[1:], 2):  # -j4, -qj 4: a valued letter takes the rest of the cluster or the next word
+        if c in shorts:
+            return {1} if a[p:] else {2}
+    return {1}
+
+
+def git_url_args(sub, rest):
+    """The words of a git call (subcommand sub, the words after it) that git may read as a repository
+    URL: the clone / fetch / pull / push / ls-remote repository, `remote add` / `set-url`'s URL,
+    `submodule add` / `set-url`'s, request-pull's, `subtree add` / `pull` / `push`'s, any of `fetch
+    --multiple`'s, and push --repo's or archive --remote's value. Where an option may or may not take
+    the next word (_takes_next), both readings count, so a word that is the URL under either is here."""
+    if sub not in GIT_URL_ARGS:
+        return []
+    longs, shorts, url_opts, slots = GIT_URL_ARGS[sub]
+    multiple = sub == "fetch" and any(len(a) > 3 and "--multiple".startswith(a) for a in rest)
+    out = set()
+    for j, a in enumerate(rest):  # push --repo <url>, archive --remote=<url>, or an abbreviation
+        name, eq, val = a.partition("=")
+        if a.startswith("--") and len(name) > 2 and any(o.startswith(name) for o in url_opts):
+            if eq:
+                out.add(val)
+            elif j + 1 < len(rest):
+                out.add(rest[j + 1])
+    # (word index, positionals read since the verb, the verb or None, past `--`) for each reading
+    todo, done, verbed = [(0, 0, None, False)], set(), None not in slots
+    while todo:
+        state = todo.pop()
+        if state in done or state[0] >= len(rest):
+            continue
+        done.add(state)
+        i, n, verb, dashed = state
+        a = rest[i]
+        if not dashed and a == "--":
+            todo.append((i + 1, n, verb, True))
+        elif not dashed and a.startswith("-") and a != "-":
+            todo += [(i + s, n, verb, dashed) for s in _takes_next(a, longs, shorts)]
+        elif verbed and verb is None:
+            if a in slots:
+                todo.append((i + 1, 0, a, dashed))
+        else:
+            slot = slots[verb]
+            if n == slot or (multiple and n >= slot):
+                out.add(a)
+            if n < slot or multiple:  # past the slot, --multiple's count no longer matters
+                todo.append((i + 1, min(n + 1, slot + 1), verb, dashed))
+    return sorted(out)
 
 
 def _option_values(rest, longs, shorts, valued):
@@ -1569,6 +1671,77 @@ def env_commands(cmds):
     return out
 
 
+# A parameter expansion the guard resolves from a value assigned earlier in the same text: $NAME, ${NAME}.
+VAR_REF = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})")
+# How much text expand_vars substitutes for one command line (`V=x; V=$V$V; ...` doubles it each time).
+# Past it, what's left stays an expansion: the guard reads that as text it can't see.
+MAX_EXPANDED = 1 << 20
+
+
+def _resolvable(m, vals, budget):
+    """The value VAR_REF match m resolves to, charged to budget ([chars left]), or None: a name the
+    text didn't set, or a value past what's left of the budget."""
+    val = vals.get(m.group(1) or m.group(2))
+    if val is None or len(val) > budget[0]:
+        return None
+    budget[0] -= len(val)
+    return val
+
+
+def _expand_text(text, vals, budget):
+    """text with each VAR_REF to a name in vals replaced by its value, unsplit (an assignment's value,
+    a heredoc body the shell expands before the program reads it). Other expansions stay as they are."""
+    return VAR_REF.sub(lambda m: v if (v := _resolvable(m, vals, budget)) is not None else m.group(0), text)
+
+
+def _expand_word(word, vals, budget, split):
+    """The words one word becomes once each VAR_REF to a name in vals is replaced by its value: split
+    at blanks as an unquoted value is (`$V` with V='a b' is two words) if split, else one word as a
+    quoted one is. An assignment's value is never split (`GIT_PAGER=$P`); a word the split leaves
+    empty is dropped."""
+    if "$" not in word:
+        return [word]
+    if not split or ASSIGNMENT.match(word):
+        return [_expand_text(word, vals, budget)]
+    fields, cur, pos = [], "", 0
+    for m in VAR_REF.finditer(word):
+        val = _resolvable(m, vals, budget)
+        if val is None:
+            continue
+        pieces = re.split(r"[ \t\n]+", val)
+        cur += word[pos:m.start()] + pieces[0]
+        for piece in pieces[1:]:
+            fields.append(cur)
+            cur = piece
+        pos = m.end()
+    if pos == 0:
+        return [word]
+    fields.append(cur + word[pos:])
+    return [f for f in fields if f]
+
+
+def expand_vars(cmds, split=True):
+    """The commands of shell_commands with the variables assigned earlier in the same text resolved
+    (T-228): `V=x; prog $V` reads as `prog x`, and `P='prog x'; GIT_PAGER=$P git log` sets GIT_PAGER
+    to `prog x`. The lexer has dropped the quotes, so it can't tell `$V` from `"$V"`: split says how
+    to read each (_expand_word), and human_cmd reads the text both ways. Each NAME=value that sets
+    the shell's or a program's environment (_env_assignments) is recorded once its own command's
+    expansions are resolved, in text order. A `+=` onto a name the text didn't set keeps the outside
+    part as `${NAME}`, and a value holding an expansion the guard can't resolve keeps it, so what it
+    can't see still reads as an expansion. Where the shell doesn't keep an assignment (a subshell,
+    `X=1 cmd`) it's kept anyway: a value resolved where the shell has none can only add a refusal.
+    A variable the text never sets ($HOME) stays as it is, and so does everything past MAX_EXPANDED."""
+    vals, out, budget = {}, [], [MAX_EXPANDED]
+    for words, docs in cmds:
+        if vals:
+            words = [f for w in words for f in _expand_word(w, vals, budget, split)]
+            docs = [(_expand_text(d, vals, budget) if expands else d, expands) for d, expands in docs]
+        for name, append, val in _env_assignments(words):
+            vals[name] = (vals.get(name, "${" + name + "}") if append else "") + val
+        out.append((words, docs))
+    return out
+
+
 def human_cmd(cmd):
     """Whether a shell command runs a human-only ergon command: approve, reject, close, accept,
     answer, sync, pin, choose, or the interactive review. Only a real call counts: `ergon` (ergon.py, the package's
@@ -1579,11 +1752,20 @@ def human_cmd(cmd):
     commands git runs from its own arguments (git_commands: rebase --exec, submodule foreach, an
     alias or a command-valued config key it sets) are checked as commands, as are the ones it runs
     from the environment a command line sets for it (env_commands: GIT_PAGER=..., GIT_EDITOR=...,
-    GIT_CONFIG_PARAMETERS=..., GIT_CONFIG_KEY_<n>=... GIT_CONFIG_VALUE_<n>=...)."""
+    GIT_CONFIG_PARAMETERS=..., GIT_CONFIG_KEY_<n>=... GIT_CONFIG_VALUE_<n>=...). A variable assigned
+    earlier in the same text is read as its value (expand_vars: `V=approve; ergon $V`); an ergon
+    call whose verb is still an expansion (`ergon $X`, `ergon $(cat f)`), or a command whose program
+    is one ahead of a human-only verb (`$E approve`), runs a verb the guard can't see and counts."""
     try:
         cmds = shell_commands(cmd)[0]
     except (ValueError, RecursionError):
         return bool(HUMAN_CMD.search(cmd))
+    split, whole = expand_vars(cmds), expand_vars(cmds, split=False)  # `$V` and `"$V"`: either may be meant
+    return _runs_human(cmd, split) or (whole != split and _runs_human(cmd, whole))
+
+
+def _runs_human(cmd, cmds):
+    """human_cmd for cmd lexed (and its variables resolved) as cmds."""
     if any(human_cmd(t) for t in env_commands(cmds)):
         return True
     for words, docs in cmds:
@@ -1594,14 +1776,16 @@ def human_cmd(cmd):
             return True
         if any(human_cmd(t) for t in git_commands(words)):
             return True
+        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
         for k, w in enumerate(words):
-            if _program(w) not in ("ergon", "ergon.py") and not w.endswith("ergon/__main__.py"):
+            ergon = _program(w) in ("ergon", "ergon.py") or w.endswith("ergon/__main__.py")
+            if not ergon and not (k == head and _unseen(w)):
                 continue
             rest = words[k + 1:]
             at = next((m for m, a in enumerate(rest) if not a.startswith("-")), None)
             if at is None:
                 continue
-            if rest[at] in HUMAN_VERBS:
+            if rest[at] in HUMAN_VERBS or (ergon and _unseen(rest[at])):
                 return True
             if rest[at] == "review" and any(a == "-i" or (a.startswith("--i") and "--interactive".startswith(a))
                                             for a in rest[at + 1:]):
@@ -1612,10 +1796,11 @@ def human_cmd(cmd):
 HUMAN_MSG = ("approve / reject / close / accept / answer / sync / pin / choose / review -i are human-only; ask the "
              "user to run them in their own terminal")
 # The sections GIT_COMMAND_KEYS names keys in: `git config --rename-section user alias` turns keys the
-# guard never read as commands (user.name) into ones git runs.
+# guard never read as commands (user.name) into ones git runs. The include sections too: renaming one
+# into them makes git read a file the guard never checked as config.
 GIT_COMMAND_SECTIONS = {"alias", "core", "sequence", "pager", "interactive", "diff", "difftool", "mergetool", "merge",
                         "filter", "credential", "gpg", "remote", "uploadpack", "submodule", "tar", "trailer", "hook",
-                        "sendemail", "imap", "browser", "man", "guitool", "instaweb"}
+                        "sendemail", "imap", "browser", "man", "guitool", "instaweb", "include", "includeif"}
 # git's config from the environment: GIT_CONFIG_PARAMETERS ('key'='value' ...) and the GIT_CONFIG_COUNT
 # entries GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n>. Group 1 the name, 2 the <n>, 3 `=value` (or `+=...`).
 GIT_CONFIG_ENV = re.compile(r"(GIT_CONFIG_PARAMETERS|GIT_CONFIG_(?:KEY|VALUE)_([0-9]+))(\+?=.*)?", re.S)
@@ -1623,8 +1808,16 @@ GIT_CONFIG_ENV = re.compile(r"(GIT_CONFIG_PARAMETERS|GIT_CONFIG_(?:KEY|VALUE)_([
 # `${!NAME}`, `${#NAME}`, `env -uNAME`, `env --unset=NAME`. A `${NAME:=value}` sets it.
 GIT_CONFIG_ENV_IN = re.compile(r"GIT_CONFIG_(?:PARAMETERS|KEY_|VALUE_)")
 GIT_CONFIG_ENV_READ = re.compile(r"(?:\$|\$\{[!#]?|-u|--unset=)$")
-# Programs whose arguments name an environment variable without setting it.
-ENV_READERS = {"printenv", "echo", "grep", "egrep", "fgrep", "rg", "unset"}
+# What after a name in `${NAME...}` sets it: `=`, `:=`, zsh's `::=` (the name ends at a non-word character).
+GIT_CONFIG_ENV_SETS = re.compile(r"\w*:{0,2}=")
+# Programs whose arguments name an environment variable without setting it: `git grep NAME`,
+# `git log -S NAME`, `rg NAME`. The shell still expands their words, so `${NAME:=value}` in one sets it.
+ENV_READERS = {"printenv", "echo", "grep", "egrep", "fgrep", "rg", "unset", "git"}
+# Text that may make a program's name run something else in this shell (a function, an alias, a
+# zsh functions[]/aliases[] entry, an autoloaded function, a loaded builtin), which can set the
+# variable it is handed. Where it shows, ENV_READERS' arguments are read like any program's.
+SHELL_REDEFINES = re.compile(r"\(\s*\)|\b(?:function|functions|alias|aliases|galiases|autoload|enable)"
+                             r"(?=[\s\[;&|)]|$)")  # `alias git=read`, `functions[git]=`, not `alias.x`
 DYNAMIC_ENV_MSG = ("this command sets a GIT_CONFIG_* variable whose name the guard can't read (an expansion in the "
                    "name, a nameref, `${NAME:=value}`): git can read an alias or command-valued key from it, so it's "
                    "refused. Write `git -c <key>=<value> ...` out in full, or ask the user")
@@ -1645,10 +1838,21 @@ def _unseen_value(key, val):
         return _unseen(val) or val.strip().lower() in ("always", "user")
     if not _unseen(val):
         return False
-    if not GIT_URL_KEYS.fullmatch(key.lower()):
-        return True
-    head = re.split(r"[$`]", val, maxsplit=1)[0].lower()
+    return not GIT_URL_KEYS.fullmatch(key.lower()) or _may_be_ext(val)
+
+
+def _may_be_ext(url):
+    """Whether an expansion in url may make it an ext:: URL: git reads the transport from the URL's
+    start, so one whose text up to its first expansion can't begin `ext::` (`https://$HOST/r.git`)
+    can't be one."""
+    head = re.split(r"[$`]", url, maxsplit=1)[0].lower()
     return head.startswith("ext::") or "ext::".startswith(head)
+
+
+def unseen_url_msg(sub, url):
+    return (f"git runs an ext:: URL given to `git {sub}` as a command, and the guard checks that command, but "
+            f"here it can't see the URL: `{url}` holds a `$` or backtick expansion. So it's refused. Write the "
+            f"URL or the remote's name out in full (`git {sub} https://...`, `git {sub} origin`), or ask the user")
 
 
 def unseen_config_msg(key, why):
@@ -1656,6 +1860,10 @@ def unseen_config_msg(key, why):
         return (f"`{key}` set to `always` or `user`, or to a value the guard can't see, re-enables git's ext:: "
                 f"transport, whose URL runs as a command: {why}. So the setting is refused. Leave it unset or "
                 f"set it to `never`, or ask the user")
+    if INCLUDE_KEY.fullmatch(key.lower()):
+        return (f"git reads the file `{key}` names as more config, and the guard reads that file before git "
+                f"does, but here it can't see which file: {why}. So it's refused. Write the path out in full "
+                f"(`git -c {key}=<path> ...` or `git config {key} <path>`), or ask the user")
     if GIT_URL_KEYS.fullmatch(key.lower()):
         return (f"git runs an ext:: URL set as `{key}` as a command, and the guard checks that command where it "
                 f"is set, but here it can't see the URL: {why}. So the setting is refused. Write the URL out in "
@@ -1669,9 +1877,13 @@ def git_config_reason(cmd):
     """Why a shell command defines a git alias or GIT_COMMAND_KEYS key in a way human_cmd can't
     check, or None: with `git --config-env` (the value is in an environment variable), with a `$` or
     backtick in the value, by renaming a section into or out of one that holds such keys, or through
-    GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_<n> + GIT_CONFIG_VALUE_<n>. A value the text holds there
+    GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_<n> + GIT_CONFIG_VALUE_<n>; or gives git a repository URL
+    (git_url_args) that an expansion may make an ext:: URL, whose command git runs. A value the text holds there
     is read like `git -c`'s, a human-only verb in it refused; a key or value set by an earlier command
-    can't be seen, so its other half is refused. Strings run as code are checked too."""
+    can't be seen, so its other half is refused. Strings run as code are checked too. So is a
+    variable set through a name the text doesn't show (indirect_set_msg, _dynamic_name), whatever it is."""
+    if why := indirect_set_msg(cmd):
+        return why
     try:
         cmds = shell_commands(cmd)[0]
     except (ValueError, RecursionError):
@@ -1680,6 +1892,7 @@ def git_config_reason(cmd):
                     "the guard can't split it to see what it defines, so it's refused")
         return None
     env = []  # (name, n, value or None) of each GIT_CONFIG_* any of its commands sets
+    redefines = SHELL_REDEFINES.search(re.sub(r"[\\'\"]", "", cmd))  # quotes can't hide `function`
     for words, docs in cmds:
         # bash -c '...', a heredoc fed to sh. env's own words are read below; so is a lone NAME=value.
         if any(CODE_RUNNER.fullmatch(_program(w)) and _program(w) != "env" for w in words):
@@ -1688,6 +1901,8 @@ def git_config_reason(cmd):
                     continue
                 if why := git_config_reason(t):
                     return why
+        if how := _dynamic_name(words):
+            return DYNAMIC_NAME_MSG.format(how=how)
         for key, val in git_config_sets(words):
             if val is not None and config_key_runs(key) and _unseen_value(key, val):
                 return unseen_config_msg(key, f"`{val}` holds a `$` or backtick expansion"
@@ -1710,6 +1925,10 @@ def git_config_reason(cmd):
                 if (c := git_config_command(key, v)) is not None and human_cmd(c):
                     return HUMAN_MSG
         for _, sub, rest in _git_calls(words):
+            # a repository argument (`git fetch "$U"`, `git clone "$U" d`, `git remote add o "$U"`): T-236
+            for url in git_url_args(sub, rest):
+                if _unseen(url) and _may_be_ext(url):
+                    return unseen_url_msg(sub, url)
             at = next((j for j, a in enumerate(rest) if a in ("--rename-section", "rename-section")), None)
             if sub != "config" or at is None:
                 continue
@@ -1719,12 +1938,16 @@ def git_config_reason(cmd):
                 return ("`git config --rename-section` into or out of a section that holds git aliases or "
                         "command-valued keys turns values the guard never read as commands into ones git "
                         "runs, so it's refused; ask the user")
-        if _program(words[0]) in ENV_READERS:
-            continue
         words = _without_messages(words)
+        # The program after any NAME=value words. An ENV_READERS one is handed the names after it as
+        # text (`git grep NAME`, `echo NAME=value`), unless the text may have made it a function.
+        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        reader = head < len(words) and _program(words[head]) in ENV_READERS and not redefines
         for k, w in enumerate(words):
             m = GIT_CONFIG_ENV.fullmatch(w)
             if m:
+                if reader and k > head:
+                    continue
                 if (m.group(3) or k > 0) and (k == 0 or words[k - 1] not in ("-u", "--unset")):
                     # NAME=value; or `read NAME`, `printf -v NAME`, `export NAME`, NAME+=...: a value the text doesn't hold
                     val = m.group(3)[1:] if m.group(3) and m.group(3).startswith("=") else None
@@ -1732,8 +1955,14 @@ def git_config_reason(cmd):
                 continue
             for h in GIT_CONFIG_ENV_IN.finditer(w):
                 # `GIT_CONFIG_KEY_$i=...`, `declare -n r=GIT_CONFIG_KEY_0`, `${GIT_CONFIG_KEY_0:=...}`
+                # (zsh: `${NAME::=...}`, `${(L)NAME:=...}`). A reader's word only sets it the last way.
+                sets = GIT_CONFIG_ENV_SETS.match(w, h.end())
+                if reader and k > head:
+                    if sets and "${" in w[:h.start()]:
+                        return DYNAMIC_ENV_MSG
+                    continue
                 read = GIT_CONFIG_ENV_READ.search(w[:h.start()])
-                if not read or (read.group(0).startswith("${") and re.match(r"\w*:?=", w[h.end():])):
+                if not read or (read.group(0).startswith("${") and sets):
                     return DYNAMIC_ENV_MSG
     keys = {n: v for name, n, v in env if name.startswith("GIT_CONFIG_KEY_")}
     for name, n, val in env:
@@ -1777,6 +2006,182 @@ GIT_ONLY_ENV_IN = re.compile(r"\b(?:" + "|".join(sorted(GIT_ONLY_ENV, key=len, r
 ENV_FROM_INPUT = {"read", "mapfile", "readarray"}
 
 
+# What git_env_reason may read a `$NAME` in a git command variable's value as (T-241). The bash and zsh
+# builtins and reserved words that can set a variable whose name the text needn't show (read, printf -v
+# into a name built at run time), run text the guard can't see in this shell (eval, source, trap),
+# or run a command twice or out of text order (loops, functions). One anywhere in the text means no
+# name is read as its value. builtin, command, exec, noglob, nocorrect, time and ! run the word after.
+SETS_UNSEEN = {".", "source", "eval", "trap", "alias", "unalias", "enable", "let", "read", "mapfile", "readarray",
+               "getopts", "wait", "unset", "pushd", "popd", "set", "shopt", "fc", "r", "bind", "complete",
+               "compgen", "compopt", "hash", "autoload", "functions", "unfunction", "emulate", "setopt", "unsetopt",
+               "zmodload", "vared", "zle", "getln", "pushln", "zparseopts", "zformat", "zstyle", "zregexparse",
+               "sysread", "sysopen", "zstat", "stat", "strftime", "zselect", "zsocket", "ztcp", "zpty", "zftp",
+               "zsystem", "zgetattr", "zlistattr", "pcre_compile", "pcre_match", "pcre_study", "sched", "bindkey",
+               "compadd", "compset", "compctl", "compcall", "comparguments", "compdescribe", "compvalues", "comptags",
+               "comptry", "compfiles", "compgroups", "compquote", "if", "then", "else", "elif", "fi", "case", "esac",
+               "for", "foreach", "select", "while", "until", "repeat", "do", "done", "end", "always", "coproc",
+               "function", "{", "}"}
+SHELL_RUNS_NEXT = {"builtin", "command", "exec", "noglob", "nocorrect", "time", "!", "-"}
+# The builtins that set the variables their arguments name: safe with literal names and no nameref (-n)
+# or tie (-T), since the name scan in _resolvable_names sees those.
+SHELL_DECLARES = SHELL_DECLARE | {"integer", "float", "private"}
+# Variables the shell sets itself, with no word naming them (cd sets PWD, `[[ =~ ]]` sets MATCH, zsh
+# ties path to PATH): never read as the value the text gave them. BASH_* and ZSH_* too.
+SHELL_SET_NAMES = {"PWD", "OLDPWD", "_", "REPLY", "reply", "OPTARG", "OPTIND", "MATCH", "MBEGIN", "MEND", "match",
+                   "mbegin", "mend", "PIPESTATUS", "pipestatus", "status", "RANDOM", "SRANDOM", "SECONDS", "LINENO",
+                   "EPOCHSECONDS", "EPOCHREALTIME", "BASHPID", "FUNCNAME", "HISTCMD", "COLUMNS", "LINES", "PPID",
+                   "UID", "EUID", "GID", "EGID", "USERNAME", "ERRNO", "TRY_BLOCK_ERROR", "DIRSTACK", "dirstack",
+                   "COMP_WORDS", "COMPREPLY", "IFS", "PATH", "path", "FPATH", "fpath", "CDPATH", "cdpath", "MANPATH",
+                   "manpath", "MAILPATH", "mailpath", "PSVAR", "psvar", "MODULE_PATH", "module_path", "HISTCHARS",
+                   "histchars", "argv", "ARGC", "TTYIDLE", "SHLVL"}
+IDENT = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*")
+# T-242: the builtins that set a variable an argument names, and how. A name built at run time
+# (`printf -v "$x"`, `read "$x"`, `export "$x=..."`, a function's `export "$1"`) may be any of git's
+# GIT_CONFIG_* or command variables, so git_config_reason and git_env_reason refuse it whatever it is.
+# read's and mapfile's options that take a value (in both bash and zsh: a bash-only one, like
+# `read -p prompt`, is a flag in zsh and the word after it a name), and zsh's builtins that set a
+# variable named by an argument, often an option's, where any expansion among the words counts.
+NAME_READS = {"read", "mapfile", "readarray"}
+NAME_READ_OPT_ARGS = {"read": "du", "mapfile": "dnOsuCc", "readarray": "dnOsuCc"}
+NAME_SETS_ANY = {"vared", "getln", "zparseopts", "zstyle", "zformat", "strftime", "zstat", "sysread", "zselect",
+                 "zregexparse", "pcre_match", "zgetattr", "zlistattr", "zsystem"}
+# The words ahead of a simple command's program that leave it the program: reserved words that start
+# a command, and the wrappers that run the next word as a builtin (SHELL_RUNS_NEXT).
+SHELL_LEADS = SHELL_RUNS_NEXT | {"{", "if", "then", "else", "elif", "while", "until", "do"}
+# `${!x:=v}` (bash 5) and zsh's `${(P)x::=v}` set the variable x names; a nested `${y}` may be the name.
+INDIRECT_SET = re.compile(r"\$\{(?:!|\([^)]*P[^)]*\))(?:[^{}:=]|\$\{[^{}]*\})*:{0,2}=")
+DYNAMIC_NAME_MSG = ("this command sets a shell variable whose name the guard can't see ({how}): it may be one of "
+                    "git's GIT_CONFIG_* or command variables (GIT_EDITOR, GIT_PAGER, ...), whose value git runs, "
+                    "so it's refused. Write the variable's name out in full, or ask the user")
+
+
+def indirect_set_msg(cmd):
+    """DYNAMIC_NAME_MSG if the text holds `${!x:=v}` (bash 5) or zsh's `${(P)x::=v}`, which set the
+    variable x names, or None. Read in the raw text: shell_commands splits zsh's `${(P)...}` at its
+    `(`, and a quoted or heredoc copy of one is rare enough to refuse along with it (T-242)."""
+    if m := INDIRECT_SET.search(cmd):
+        return DYNAMIC_NAME_MSG.format(how=f"`{m.group(0)}` sets the variable another one names")
+    return None
+
+
+def _dynamic_name(words):
+    """How a simple command sets a shell variable whose name the text doesn't show, or None: a name
+    with a `$` or backtick expansion given to printf / print -v, read, mapfile, getopts, a declare-like
+    builtin (`export "$x=v"`, `local "$1"`), a nameref whose target is such a name or is left for a later
+    assignment (`declare -n r=$x`, `local -n r`), or an expansion among a zsh setter's words (vared,
+    zparseopts, ...). A name the text shows is left to the callers' own checks. Its program is found
+    past assignments, reserved words (`if`, `{`, `do`), `function NAME` and wrappers (`builtin`,
+    `command`), so the body of a function that sets `"$1"` counts (T-242)."""
+    k, after_wrapper = 0, False
+    while k < len(words):
+        w = words[k]
+        if ASSIGNMENT.match(w) and not after_wrapper:
+            k += 1
+        elif w in SHELL_LEADS:
+            k, after_wrapper = k + 1, w in SHELL_RUNS_NEXT
+        elif w == "function":
+            k += 2  # `function f { ...`: f is its name
+        elif after_wrapper and w.startswith("-"):
+            k += 1  # `command -p read`
+        else:
+            break
+    if k >= len(words):
+        return None
+    prog, args = _program(words[k]), words[k + 1:]
+    if prog in NAME_SETS_ANY:
+        return next((f"`{prog}` sets a variable named by `{a}`" for a in args if _unseen(a)), None)
+    if prog in ("printf", "print"):
+        for j, a in enumerate(args):
+            if a == "--" or not a.startswith("-"):
+                return None
+            if m := re.fullmatch(r"-[A-Za-z]*v(.*)", a, re.S):
+                name = m.group(1) or (args[j + 1] if j + 1 < len(args) else "")
+                return f"`{prog} -v {name}`" if _unseen(name) else None
+        return None
+    if prog in NAME_READS:
+        names, takes, opts, j = [], NAME_READ_OPT_ARGS[prog], True, 0
+        while j < len(args):
+            a = args[j]
+            j += 1
+            if opts and a == "--":
+                opts = False
+            elif opts and a.startswith("-") and len(a) > 1:
+                # `-d delim`, `-d:`: the rest of the word, or the next word, is a value (read -a NAME's is a name)
+                at = next((i for i, c in enumerate(a[1:], 1) if c in takes), None)
+                j += at == len(a) - 1
+            else:
+                names.append(a.partition("?")[0] if prog == "read" else a)  # zsh `read 'name?prompt'`
+        return next((f"`{prog}` sets a variable named by `{a}`" for a in names if _unseen(a)), None)
+    if prog == "getopts":
+        name = args[1] if len(args) > 1 else ""
+        return f"`getopts` sets a variable named by `{name}`" if _unseen(name) else None
+    if prog in SHELL_DECLARES:
+        opts = "".join(a[1:] for a in args if a.startswith("-"))
+        # `declare -f "$fn"`, `export -f "$fn"`: functions, not variables (zsh's `typeset -F` is a float,
+        # a number git can't run as a command)
+        if "f" in opts or "F" in opts:
+            return None
+        for a in args:
+            if a.startswith(("-", "+")):
+                continue
+            name, eq, target = a.partition("=")
+            if "p" in opts and not eq:  # `declare -p "$x"` prints it
+                continue
+            if _unseen(name.removesuffix("+").partition("[")[0]):
+                return f"`{prog} {a}` names it with an expansion"
+            if prog in ("declare", "typeset", "local") and "n" in opts and (not eq or _unseen(target)):
+                return f"`{prog} -n {a}` makes a nameref whose target {'is' if eq else 'may be'} set at run time"
+    return None
+
+
+def _sets_unseen(words):
+    """Whether a simple command may set a shell variable the text doesn't name, or run code out of text
+    order (SETS_UNSEEN): its program, past assignments and the wrappers that run the next word, is one
+    of those, an expansion (`$cmd`), printf / print with -v, or a declare-like builtin with a nameref,
+    a tie, or a name built at run time."""
+    k = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+    start = k
+    while k < len(words) and (words[k] in SHELL_RUNS_NEXT or (k > start and words[k].startswith("-"))):
+        k += 1
+    if k == len(words):
+        return False
+    prog, args = words[k], words[k + 1:]
+    if prog in SETS_UNSEEN or _program(prog) in SETS_UNSEEN or _unseen(prog) or prog.startswith(("{", "}")):
+        return True
+    opts = "".join(a[1:] for a in args if a[:1] in "-+")
+    if prog in ("printf", "print"):
+        return "v" in opts
+    if prog in SHELL_DECLARES:
+        return "n" in opts or "T" in opts or any(
+            not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\+?=.*)?", a, re.S) for a in args if a[:1] not in "-+")
+    return False
+
+
+def _resolvable_names(cmds, top):
+    """The names whose `$NAME` / `${NAME}` git_env_reason reads as the value the text gave them, and the
+    commands (by id of their words) that give it: a NAME=value command alone, at the top level, not
+    behind && / || or a pipe and not piped or put in the background (`P=x; ...`, `P=x && ...`). Every
+    other word naming NAME (`read P`, `local P=x`, `X=1 P=y cmd`, `(P=y)`, `$P[1]`, `${P:-x}`, `${P=x}`)
+    means its value may not be the one the text shows, and so does a variable the shell sets itself
+    (SHELL_SET_NAMES). None at all where a command may set a variable the text doesn't name, or run
+    code out of text order (_sets_unseen), or a word holds an indirect expansion (`${!X}`, zsh `${(P)X}`)."""
+    sure = {id(w) for w, before, after in top if before in (None, ";", "\n")
+            and after in (None, ";", "\n", "&&", "||") and all(ASSIGNMENT.match(x) for x in w)}
+    names, others = set(), set()
+    for words, _ in cmds:
+        if _sets_unseen(words) or any("${!" in w or "${(" in w for w in words):
+            return set(), sure
+        for w in words:
+            for m in IDENT.finditer(w):
+                s, e, name = m.start(), m.end(), m.group(0)
+                if s == 0 and id(words) in sure and re.match(r"\+?=", w[e:]):
+                    names.add(name)
+                elif not ((w[s - 1:s] == "$" and w[e:e + 1] not in ("[", "{", ":", "("))
+                          or (w[s - 2:s] == "${" and w[e:e + 1] == "}")):
+                    others.add(name)
+    return {n for n in names - others if n not in SHELL_SET_NAMES and not n.startswith(("BASH", "ZSH"))}, sure
+
+
 def unseen_env_msg(name, why):
     return (f"git runs the value of {name} as a command, and the guard checks that command where {name} is set, "
             f"but here it can't see it: {why}. So it's refused. Write the value out in full (`{name}=<command> "
@@ -1790,30 +2195,59 @@ def git_env_reason(cmd):
     expansion, now or when git runs it through the shell, or a `+=` onto a value the text didn't set.
     Anywhere: exporting it with no value the text set earlier, `read` / `mapfile` / `printf -v` into
     it, a `for` / `select` loop over it, a nameref to it, or `${NAME:=value}` with an unseen value (a
-    value the text shows is checked by human_cmd). Strings run as code are checked too."""
+    value the text shows is checked by human_cmd). Strings run as code are checked too.
+    A `$P` / `${P}` in the value is read as the value the text gave P where that's sure to be the one
+    git gets (_resolvable_names: `P=cat; GIT_PAGER=$P git log`), and the value it makes, with what an
+    earlier `+=` joined to, is checked by human_cmd here (T-241).
+    Any variable set through a name the text doesn't show is refused, whatever it is (indirect_set_msg,
+    _dynamic_name: `printf -v "$x"`, a function's `export "$1"`), and so is one of these names handed
+    to a program where the text defines a function or alias (SHELL_REDEFINES), which may set it (T-242)."""
+    if why := indirect_set_msg(cmd):
+        return why
+    # zsh's `${(L)NAME:=value}`: shell_commands splits it at its `(`, so it's read in the raw text.
+    if m := re.search(r"\$\{\([^)]*\)(" + GIT_ONLY_ENV_IN.pattern + r"):{0,2}=", cmd):
+        return unseen_env_msg(m.group(1), f"`{m.group(0)}` sets it, behind zsh flags the guard doesn't read")
+    top = []
     try:
-        cmds = shell_commands(cmd)[0]
+        cmds = shell_commands(cmd, top=top)[0]
     except (ValueError, RecursionError):
         if m := GIT_ONLY_ENV_IN.search(cmd):
             return unseen_env_msg(m.group(0), "the guard can't split this command")
         return None
     seen = set()  # the GIT_ONLY_ENV names the text has set to a value it shows
+    redefines = SHELL_REDEFINES.search(re.sub(r"[\\'\"]", "", cmd))  # as in git_config_reason
+    names, sure = _resolvable_names(cmds, top)
+    vals, budget = {}, [MAX_EXPANDED]  # names' values as the text gives them, in text order
+    full, through = {}, set()  # GIT_ONLY_ENV values with what `+=` joined; the ones read through a name
     for words, docs in cmds:
         # bash -c '...', a heredoc fed to sh. env's own words are read below.
         if any(CODE_RUNNER.fullmatch(_program(w)) and _program(w) != "env" for w in words):
             for t in words + [d for d, _ in docs]:
                 if t != cmd and (why := git_env_reason(t)):
                     return why
+        if how := _dynamic_name(words):
+            return DYNAMIC_NAME_MSG.format(how=how)
         for name, append, val in _env_assignments(words):
-            if name not in GIT_ONLY_ENV:
-                continue
-            if _unseen(val):
-                return unseen_env_msg(name, f"`{val}` holds a `$` or backtick expansion")
-            if append and name not in seen:
-                return unseen_env_msg(name, "`+=` adds to a value set outside this command")
-            seen.add(name)
+            if name in GIT_ONLY_ENV:
+                shown = val
+                if _unseen(val) and "{" not in re.sub(r"\$\{\w+\}", "", val):  # bash brace-expands export's words
+                    shown = _expand_text(val, vals, budget)
+                if _unseen(shown):
+                    return unseen_env_msg(name, f"`{val}` holds a `$` or backtick expansion")
+                if append and name not in seen:
+                    return unseen_env_msg(name, "`+=` adds to a value set outside this command")
+                seen.add(name)
+                full[name] = (full.get(name, "") if append else "") + shown
+                if shown != val:
+                    through.add(name)
+                elif not append:
+                    through.discard(name)
+                if name in through and human_cmd(full[name]):
+                    return HUMAN_MSG
+            if id(words) in sure and name in names:
+                vals[name] = (vals.get(name, "${" + name + "}") if append else "") + _expand_text(val, vals, budget)
         for w in _without_messages(words):
-            for m in re.finditer(r"\$\{(\w+):?=([^}]*)(\}?)", w):
+            for m in re.finditer(r"\$\{(\w+):{0,2}=([^}]*)(\}?)", w):  # zsh's `::=` too
                 if m.group(1) not in GIT_ONLY_ENV:
                     continue
                 if _unseen(m.group(2)) or "{" in m.group(2) or not m.group(3):
@@ -1832,6 +2266,10 @@ def git_env_reason(cmd):
             if prog == "printf" and a.startswith("-v") and (a[2:] or (args[j + 1] if j + 1 < len(args) else "")) \
                     in GIT_ONLY_ENV:
                 return unseen_env_msg(a[2:] or args[j + 1], "`printf -v` sets it")
+            if redefines and prog not in SHELL_DECLARE and a.partition("=")[0].removesuffix("+") in GIT_ONLY_ENV:
+                # `alias git=export; git GIT_EDITOR=...`, `git() { read "$1"; }; git GIT_EDITOR` (T-242)
+                return unseen_env_msg(a.partition("=")[0].removesuffix("+"), "a function or alias this command "
+                                      f"defines may make `{prog}` set it")
             if a not in GIT_ONLY_ENV:
                 continue
             if prog in ENV_FROM_INPUT:
@@ -1939,10 +2377,18 @@ def edit_result(path, tool, inp):
 def config_edit_reason(path, tool, inp):
     """Why an Edit or Write must not run: the file reads as git config afterwards and the edit adds
     an alias or command-valued entry. Any file counts, not only .git/config or ~/.gitconfig: one
-    include.path names is config too, and the guard can't tell which files git will include."""
+    include.path names is config too, and the guard can't tell which files git will include.
+    An include it adds is read like `git config include.path`'s (config_file_reason, T-224)."""
     if not path:
         return None
     before, after = edit_result(path, tool, inp)
+    old = git_config_entries(before) or []
+    for key, val in git_config_entries(after) or []:
+        if INCLUDE_KEY.fullmatch(key) and val and (key, val) not in old:
+            home = os.path.expanduser("~")
+            target = _include_target(val, os.path.dirname(os.path.abspath(path)), home)
+            if target and (why := config_file_reason(target, home)):
+                return why
     added = _command_entries(after)
     for e in _command_entries(before):
         if e in added:
@@ -1963,33 +2409,83 @@ GIT_CONFIG_NAME = re.compile(r"(?:^|[/\s'\"=(:])(?:\.?gitconfig[\w.-]*|config\.w
 # A bare `config` counts where it names a file in a git directory: `cd .git && echo ... >> config`.
 GIT_DIR_CONFIG = re.compile(r"/\.git/(?:[^/]+/)*config(?:\.worktree)?$")
 CONFIG_WRITE = re.compile(r"\b(?:ln|dd|rsync)\s")
+# A git call that makes a repository (git init, git clone), so a `config` the same command writes may be
+# in a git directory that doesn't exist yet when the guard looks (T-239).
+GIT_MAKES_REPO = re.compile(r"\bgit\b[^;&|\n]*\s(?:init|clone)\b")
+
+
+def is_git_dir(d):
+    """Whether directory d is a git directory, as git's is_git_directory() tells one: HEAD in it, and
+    objects/ and refs/ in it or in the common directory its commondir file names (a linked worktree's).
+    A bare repository is one, whatever it's named."""
+    try:
+        if not os.path.isfile(os.path.join(d, "HEAD")):
+            return False
+        common = d
+        if os.path.isfile(os.path.join(d, "commondir")):
+            common = os.path.join(d, Path(d, "commondir").read_text(errors="replace").strip())
+        return all(os.path.isdir(os.path.join(common, s)) for s in ("objects", "refs"))
+    except (OSError, ValueError):
+        return False
+
+
+class GitDirConfig:
+    """Matches, like a compiled pattern's search(), an absolute path to the config or config.worktree of
+    any git directory (is_git_dir), so one not named .git too: a bare repository's, `git init
+    --separate-git-dir`'s. The path can be the file itself or a symlink to it. The name is compared ignoring case, as macOS's filesystem does.
+    With fresh, any file named config counts: the command also makes a repository (GIT_MAKES_REPO)
+    whose git directory the guard can't see yet. names_outside_data hands it each word joined to the
+    directories the shell may be in, so a relative word is matched from there, never from the guard's cwd."""
+
+    def __init__(self, fresh=False):
+        self.fresh = fresh
+
+    def search(self, path):
+        if not os.path.isabs(path) or "\0" in path:
+            return False
+        try:
+            paths = {os.path.normpath(path), os.path.realpath(path)}
+        except (OSError, ValueError):
+            return True  # a path the guard can't resolve is refused rather than let through
+        return any(os.path.basename(p).lower() in ("config", "config.worktree")
+                   and (self.fresh or is_git_dir(os.path.dirname(p))) for p in paths)
 
 
 def git_config_files(cwd):
     """The files git reads config from in cwd (`git config --list --show-origin --includes`): the
-    system, global and repository files and every file they include, each as git names it and resolved."""
+    system, global and repository files and every file they include, each as git names it and resolved.
+    A file an include names counts even while it's empty or missing, which git lists no entry from:
+    a shell write that fills it later defines config the guard never saw (T-224)."""
     try:
-        r = subprocess.run(["git", "config", "--list", "--show-origin", "--includes", "-z"], cwd=cwd,
-                           capture_output=True, text=True, timeout=10, errors="replace")
+        r = subprocess.run(["git", "--no-pager", "config", "--list", "--show-origin", "--includes", "-z"],
+                           cwd=cwd, capture_output=True, text=True, timeout=10, errors="replace",
+                           stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return set()
-    out = set()
-    for origin in r.stdout.split("\0")[::2]:
+    out, rec = set(), r.stdout.split("\0")
+    for origin, entry in zip(rec[::2], rec[1::2]):
+        key, _, val = entry.partition("\n")
+        files = []
         if origin.startswith("file:"):
-            f = os.path.join(cwd, os.path.expanduser(origin[5:]))
-            out |= {os.path.normpath(f), os.path.realpath(f)}
+            files.append(os.path.join(cwd, os.path.expanduser(origin[5:])))
+        if INCLUDE_KEY.fullmatch(key.lower()) and val:
+            base = os.path.dirname(files[0]) if files else None
+            files.append(_include_target(val, base, os.path.expanduser("~")))
+        out |= {g for f in files if f for g in (os.path.normpath(f), os.path.realpath(f))}
     return out
 
 
 def config_write_reason(cmd, cwd):
     """Why a shell command must not run because it may write a file git reads config from: it holds a
-    shell write and names one (GIT_CONFIG_NAME, a `config` inside a .git directory, or a file git
-    reads or includes from cwd). What it writes can define an alias or command-valued key the guard
-    never sees, so `git config` (checked by human_cmd) or Edit (config_edit_reason) is the way."""
+    shell write and names one (GIT_CONFIG_NAME, a `config` inside a .git directory or in any other git
+    directory, such as a bare repository's (GitDirConfig, T-239), or a file git reads or includes from
+    cwd). What it writes can define an alias or command-valued key the guard never sees, so
+    `git config` (checked by human_cmd) or Edit (config_edit_reason) is the way."""
     hit = SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd) or CONFIG_WRITE.search(cmd)
     if not hit:
         return None
-    named = names_outside_data(cmd, GIT_CONFIG_NAME) or names_outside_data(cmd, GIT_DIR_CONFIG, cwd)
+    named = (names_outside_data(cmd, GIT_CONFIG_NAME) or names_outside_data(cmd, GIT_DIR_CONFIG, cwd)
+             or names_outside_data(cmd, GitDirConfig(fresh=bool(GIT_MAKES_REPO.search(cmd))), cwd))
     if not named:
         files = git_config_files(cwd)
         named = bool(files) and names_outside_data(
@@ -1997,9 +2493,287 @@ def config_write_reason(cmd, cwd):
     if not named:
         return None
     return (f"this command contains `{' '.join(hit.group(0).split())}` and names a file git reads config from "
-            f"(.git/config, config.worktree, ~/.gitconfig, git/config or one git includes): a shell write there "
+            f"(.git/config, config.worktree, a bare repository's config, ~/.gitconfig, git/config or one git "
+            f"includes): a shell write there "
             f"can define a git alias or command-valued key the guard can't see, so it's refused. Use "
             f"`git config <key> <value>`, which the guard checks, or Edit; or ask the user")
+
+
+# Where a git call is told to read config from somewhere else (T-224): the environment variables that
+# choose its global, system or only config file, its home (~/.gitconfig, ~/.config/git/config) or
+# XDG_CONFIG_HOME (git/config under it), and its repository (whose config and config.worktree it reads).
+CONFIG_PATH_ENV = {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG", "HOME", "XDG_CONFIG_HOME", "GIT_DIR",
+                   "GIT_COMMON_DIR"}
+MAX_INCLUDE_DEPTH = 10  # git's own limit on nested includes
+MAX_CONFIG_BYTES = 1 << 20  # a config file the guard reads; a bigger one is refused rather than half-read
+
+
+def _include_target(val, base, home):
+    """The file an include.path / includeIf.*.path value names: `~/` from home, a relative path from
+    base (the directory of the file holding it; None from the command line, where git refuses one)."""
+    if val == "~" or val.startswith("~/"):
+        val = os.path.join(home, val[2:])
+    elif val.startswith("~"):
+        val = os.path.expanduser(val)
+    if not os.path.isabs(val):
+        if base is None:
+            return None
+        val = os.path.join(base, val)
+    return os.path.normpath(val)
+
+
+def _gitdir_files(g):
+    """The config files git reads from git directory g: its config and config.worktree, and those of
+    the common directory its commondir file names (a linked worktree's)."""
+    out = [os.path.join(g, "config"), os.path.join(g, "config.worktree")]
+    try:
+        common = Path(g, "commondir").read_text(errors="replace").strip()
+    except OSError:
+        return out
+    if common:
+        c = os.path.normpath(os.path.join(g, common))
+        out += [os.path.join(c, "config"), os.path.join(c, "config.worktree")]
+    return out
+
+
+def _repo_config_files(d):
+    """The repository config files git run in directory d reads: walking up from d to the first
+    directory holding a .git directory, a .git file (gitdir: <dir>), or a bare repository (HEAD,
+    objects and refs in the directory itself), that git directory's files (_gitdir_files)."""
+    d = os.path.abspath(d)
+    while True:
+        g, out = os.path.join(d, ".git"), []
+        if os.path.isdir(g):
+            out += _gitdir_files(g)
+        elif os.path.isfile(g):
+            try:
+                m = re.match(r"gitdir:\s*(.+)", Path(g).read_text(errors="replace").strip())
+            except OSError:
+                m = None
+            if m:
+                out += _gitdir_files(os.path.normpath(os.path.join(d, m.group(1))))
+        if os.path.isfile(os.path.join(d, "HEAD")) and all(os.path.isdir(os.path.join(d, s)) for s in ("objects", "refs")):
+            out += _gitdir_files(d)
+        parent = os.path.dirname(d)
+        if out or parent == d:
+            return out
+        d = parent
+
+
+def chosen_config_msg(path, key, why):
+    return (f"git would read config from {path}, and `{key}` there {why}: git runs that value as a command (a git "
+            f"alias or command-valued key), and the guard checks one where it's defined, which a file written "
+            f"by the shell isn't. So it's refused. Define it with `git config {key} <value>`, which the guard "
+            f"checks, or ask the user")
+
+
+def config_file_reason(path, home, skip=frozenset(), seen=None, depth=0, strict=True):
+    """Why git must not read config from file path, or None: an alias or command-valued entry in it, or
+    in a file it includes (any includeIf, followed as if its condition held), runs a human-only verb
+    or hides its command behind a `$` or backtick (the rule git_config_reason applies to `git config`).
+    So does a path that exists but isn't a regular file the guard can read now (/dev/stdin, a pipe,
+    /dev/fd/<n>), or one too big to read. A missing file holds nothing yet: a shell write that fills
+    it later is config_write_reason's. The files in skip (the ones git reads from the cwd anyway,
+    guarded where they're written) aren't read. strict=False skips the expansion rule, for another
+    repository's own config file, which is guarded by name where it's written like cwd's (whose
+    aliases aren't read at all): a human's `!f() { ...$1...; }; f` alias there isn't refused."""
+    seen = set() if seen is None else seen
+    if "\0" in path:  # realpath would raise, and a guard that crashes lets the command through
+        return f"git would read config from {path!r}, a path holding a NUL byte the guard can't read; it's refused"
+    real = os.path.realpath(path)
+    if real in seen or real in skip or depth > MAX_INCLUDE_DEPTH or not os.path.exists(real):
+        return None
+    seen.add(real)
+    if os.path.isdir(real) or real == os.devnull:
+        return None
+    if not os.path.isfile(real):
+        return (f"git would read config from {path}, which isn't a regular file the guard can read first (stdin, "
+                f"a pipe, a device), so it can't see whether that config defines a git alias or command-valued "
+                f"key; it's refused. Write the config to a file and point git at that, or ask the user")
+    try:
+        with open(real, "rb") as f:
+            data = f.read(MAX_CONFIG_BYTES + 1)
+    except OSError:
+        return None  # git can't read it either
+    if len(data) > MAX_CONFIG_BYTES:
+        return (f"git would read config from {path}, which is too big for the guard to read before git does, so "
+                f"it can't see whether it defines a git alias or command-valued key; it's refused. Ask the user")
+    entries = git_config_entries(data.decode(errors="replace")) or []
+    for key, val in entries:
+        c = git_config_command(key, val or "")
+        if c is None:
+            continue
+        if strict and _unseen_value(key, val or ""):
+            return chosen_config_msg(path, key, f"holds a `$` or backtick expansion (`{val}`), which hides the command")
+        if human_cmd(c):
+            return chosen_config_msg(path, key, "runs a human-only command (" + HUMAN_MSG.split(";")[0] + ")")
+    for key, val in entries:
+        if INCLUDE_KEY.fullmatch(key) and val:
+            target = _include_target(val, os.path.dirname(real), home)
+            if target and (why := config_file_reason(target, home, skip, seen, depth + 1, strict)):
+                return why
+    return None
+
+
+def _git_dir_opts(words, k):
+    """The -C directories and --git-dir of the git call at words[k], in order, as (option, value)."""
+    out, i = [], k + 1
+    while i < len(words) and words[i].startswith("-"):
+        a = words[i]
+        if a.startswith("--git-dir="):
+            out.append(("--git-dir", a[len("--git-dir="):]))
+        elif a in GIT_OPT_ARG and i + 1 < len(words):
+            i += 1
+            if a in ("-C", "--git-dir"):
+                out.append((a, words[i]))
+        i += 1
+    return out
+
+
+def _env_includes(env):
+    """The include values the GIT_CONFIG_PARAMETERS / GIT_CONFIG_KEY_<n> + GIT_CONFIG_VALUE_<n> of env
+    set, as (key, value); a value None where the text doesn't show it."""
+    out = []
+    params = env.get("GIT_CONFIG_PARAMETERS", "")
+    if params:
+        try:
+            out += [(k, v) for k, _, v in (e.partition("=") for e in shlex.split(params))
+                    if INCLUDE_KEY.fullmatch(k.lower())]
+        except ValueError:
+            pass  # git_config_reason refuses a value it can't split
+    for name, key in env.items():
+        m = re.fullmatch(r"GIT_CONFIG_KEY_([0-9]+)", name)
+        if m and key and INCLUDE_KEY.fullmatch(key.lower()):
+            out.append((key, env.get(f"GIT_CONFIG_VALUE_{m.group(1)}")))
+    return out
+
+
+def unseen_source_msg(name, why):
+    return (f"{name} chooses where git reads config from, and the guard reads those files before git does, but "
+            f"here it can't see where: {why}. So it's refused. Write the path out in full, or ask the user")
+
+
+def config_source_reason(cmd, cwd, _base=None):
+    """Why a shell command must not run because a git call in it reads config from files the agent
+    picked, which a plain shell write (not named as config at the time) can have filled with an alias
+    or command-valued key, or None (T-224). The routes: GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM /
+    GIT_CONFIG, HOME or XDG_CONFIG_HOME set for the call (ahead of it, behind env, or exported earlier
+    in the text); --git-dir, GIT_DIR or GIT_COMMON_DIR; include.path / includeIf.*.path set by -c,
+    GIT_CONFIG_PARAMETERS, GIT_CONFIG_KEY_<n>, `git config` or `git clone -c`; and -C or an earlier
+    `cd` into another repository. Each file one brings in, and every file it includes, is read now by
+    config_file_reason, except those git reads from cwd anyway (git_config_files). Refused too: a path
+    the text doesn't show; and a route in a command that also holds a shell write, which could fill
+    the file after the guard read it and before git does. -C or cd into another repository whose config
+    file is named like one (.git/config, which config_write_reason guards by name) isn't refused for
+    a write in the same command, so `git -C ../other diff > p` passes. Strings run as code are checked
+    too. What other programs write (a script, a process left running) can't be seen: a speed bump."""
+    routes = re.compile(r"GIT_CONFIG(_GLOBAL|_SYSTEM)?=|GIT_(COMMON_)?DIR|--git-dir|include(if)?\.|"
+                        r"\b(HOME|XDG_CONFIG_HOME)=.*\bgit\b", re.I | re.S)
+    try:
+        if "\0" in cmd:  # a path holding one would crash os.path.realpath, and a crash lets the command through
+            raise ValueError("NUL")
+        cmds = shell_commands(cmd)[0]
+    except (ValueError, RecursionError):
+        if routes.search(cmd) or ("\0" in cmd and re.search(r"\bgit", cmd)):
+            return ("this command points git at config files it chose (GIT_CONFIG_*, GIT_DIR, --git-dir, HOME or "
+                    "an include) and the guard can't split it to read them, so it's refused")
+        return None
+    hit = SHELL_WRITE.search(cmd) or TAR_WRITE.search(cmd) or CONFIG_WRITE.search(cmd)
+    home = os.path.expanduser("~")
+    base = _base if _base is not None else {}  # lazily: the files git reads from cwd
+    env, run = {}, os.path.normpath(cwd)  # the variables later commands inherit; the shell's directory, None if unseen
+
+    def skip():
+        if "files" not in base:
+            base["files"] = {os.path.realpath(f) for f in git_config_files(cwd)}
+        return base["files"]
+
+    for words, docs in cmds:
+        if any(CODE_RUNNER.fullmatch(_program(w)) and _program(w) != "env" for w in words):
+            for t in words + [d for d, _ in docs]:
+                if t != cmd and (why := config_source_reason(t, run or cwd, base)):
+                    return why
+        local = dict(env)
+        for name, append, val in _env_assignments(words):
+            if name in CONFIG_PATH_ENV or name.startswith("GIT_CONFIG_"):
+                local[name] = (None if local.get(name, "") is None else local.get(name, "") + val) if append else val
+        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        if head == len(words) or _program(words[head]) in SHELL_DECLARE:
+            env = local
+        if head < len(words) and _program(words[head]) in ("cd", "pushd"):
+            target = next((w for w in words[head + 1:] if not w.startswith("-") or w == "-"), "~")
+            if run is None or _unseen(target) or target == "-" or target.startswith("+"):  # cd -, pushd +1
+                run = None
+            else:
+                run = os.path.normpath(os.path.join(run, os.path.expanduser(target)))
+        for k, w in enumerate(words):
+            if _program(w) != "git":
+                continue
+            explicit, implicit = [], []  # (what, file): chosen config files; another repository's
+            where, cenv = run, dict(local)
+            for opt, val in _git_dir_opts(words, k):
+                if _unseen(val) or (where is None and not os.path.isabs(os.path.expanduser(val))):
+                    return unseen_source_msg(f"git {opt}", f"`{val}` holds an expansion, or an earlier `cd` does")
+                if opt == "-C":
+                    where = os.path.normpath(os.path.join(where or "/", os.path.expanduser(val)))
+                else:
+                    cenv["GIT_DIR"] = val  # read from the directory the -C options end in
+            for name in sorted(CONFIG_PATH_ENV & cenv.keys()):
+                val = cenv[name]
+                if not val or _unseen(val):
+                    return unseen_source_msg(name, f"its value is empty or set by an expansion, a process substitution "
+                                                   f"or an earlier command (`{val or ''}`)")
+                val = os.path.expanduser(val)
+                if where is None and not os.path.isabs(val):
+                    return unseen_source_msg(name, "an earlier `cd` goes to a directory the text doesn't show")
+                p = os.path.normpath(os.path.join(where or "/", val))
+                if name == "HOME":
+                    explicit.append((name, os.path.join(p, ".gitconfig")))
+                    if "XDG_CONFIG_HOME" not in cenv:
+                        explicit.append((name, os.path.join(p, ".config", "git", "config")))
+                elif name == "XDG_CONFIG_HOME":
+                    explicit.append((name, os.path.join(p, "git", "config")))
+                elif name in ("GIT_DIR", "GIT_COMMON_DIR"):
+                    explicit += [(name, f) for f in _gitdir_files(p)]
+                else:
+                    explicit.append((name, p))
+            # include settings: -c (git takes an absolute or ~ path only), GIT_CONFIG_*; `git config` and
+            # `clone -c` store one, relative to the file it lands in, so a relative path is tried from each
+            # place that can be.
+            pairs = _env_includes(cenv) + [(key, val) for key, val in git_config_sets(words[k:])
+                                           if INCLUDE_KEY.fullmatch(key.lower())]
+            for key, val in pairs:
+                if not val or _unseen(val):
+                    return unseen_config_msg(key, "its value is empty, or comes from the environment or an expansion")
+                bases = {home}
+                if where:
+                    bases |= {where} | {os.path.dirname(f) for f in _repo_config_files(where)}
+                explicit += [(key, t) for b in sorted(bases) if (t := _include_target(val, b, home))]
+            moved = where is not None and os.path.realpath(where) != os.path.realpath(cwd)
+            if moved:
+                implicit = [("another repository", f) for f in _repo_config_files(where)]
+                # A directory the command may make a repository of first (it doesn't exist yet, or a git
+                # init / clone runs too), with a config it writes there: the guard has nothing to read now.
+                if hit and (not os.path.isdir(where) or any(sub in ("init", "clone") for words2, _ in cmds
+                                                            for _, sub, _ in _git_calls(words2))):
+                    implicit.append(("another repository", os.path.join(where, "config")))
+            if not explicit and not implicit:
+                continue
+            fresh = [(what, f) for what, f in explicit + implicit if os.path.realpath(f) not in skip()]
+            if hit:
+                late = [(what, f) for what, f in fresh if f != os.devnull
+                        and ((what, f) in explicit or not GIT_CONFIG_NAME.search(f))]
+                if late:
+                    what, f = late[0]
+                    return (f"this command points git at config it chose ({what}: {f}) and also contains "
+                            f"`{' '.join(hit.group(0).split())}`, which could write that file after the guard read "
+                            f"it and before git does, so it's refused. Run the write as its own command first, so "
+                            f"the guard can read the file before git does")
+            for what, f in fresh:
+                strict = (what, f) in explicit or not GIT_CONFIG_NAME.search(f)
+                if why := config_file_reason(f, home, skip(), strict=strict):
+                    return why
+    return None
 
 
 def frontmatter(text):
@@ -2438,6 +3212,9 @@ def guard_reason(tool, inp, worker=False, cwd=None, read_only=False):
         if why:
             return why
         why = git_env_reason(cmd)
+        if why:
+            return why
+        why = config_source_reason(cmd, cwd or str(_config.HOME))
         if why:
             return why
         if re.search(r"\bunset\b[^;&|]*\b(CLAUDECODE|AI_AGENT)\b|\benv\b[^;&|]*-u\s*(CLAUDECODE|AI_AGENT)|"
