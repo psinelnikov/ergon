@@ -2272,7 +2272,7 @@ def git_env_reason(cmd):
                     return HUMAN_MSG
             if id(words) in sure and name in names:
                 vals[name] = (vals.get(name, "${" + name + "}") if append else "") + _expand_text(val, vals, budget)
-        for w in _without_messages(words):
+        for w in _without_messages(words, assigns=True):
             for m in re.finditer(r"\$\{(\w+):{0,2}=([^}]*)(\}?)", w):  # zsh's `::=` too
                 if m.group(1) not in GIT_ONLY_ENV:
                     continue
@@ -2906,13 +2906,14 @@ def _chdir_targets(words):
 _MSG_SHORT = re.compile(r"-[A-Za-z]*m$")
 
 
-def _without_messages(words):
+def _without_messages(words, assigns=False):
     """The words of a command minus the values of `git commit/tag/notes -m` and `--message[=]`, which are
-    text, not paths. A value with $(...) or backticks may run a command, so it stays."""
+    text, not paths. A value with $(...) or backticks may run a command, so it stays; with assigns, so does
+    one with a `${NAME:=...}` / `${NAME=...}`, which the shell expands in a double-quoted message (T-251)."""
     k = next((i for i, w in enumerate(words) if _program(w) == "git"), None)
     if k is None or not any(w in ("commit", "tag", "notes") for w in words[k + 1:]):
         return words
-    live = re.compile(r"\$\(|`")
+    live = re.compile(r"\$\(|`|\$\{\w+:{0,2}=" if assigns else r"\$\(|`")
     out, skip = [], False
     for w in words:
         if skip:

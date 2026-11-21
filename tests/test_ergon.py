@@ -1156,6 +1156,9 @@ class TestBasics(Project):
                 else:
                     self.assertIsNone(git_env_reason(cmd), cmd)
         self.assertIsNotNone(git_env_reason(": \"${GIT_PAGER:=ergon approve T-1}\"; git log"))
+        for cmd in ['git commit -m "${GIT_EDITOR::=$X}"', 'git commit -m "${GIT_EDITOR:=$X}"',
+                    'git tag -a v1 -m "${GIT_PAGER=$X}"', 'git commit --message="${GIT_EDITOR::=$X}"']:
+            self.assertIsNotNone(git_env_reason(cmd), cmd)  # T-251: the message expands the assignment
         for cmd in ["GIT_EDITOR=vim git commit", "GIT_PAGER=cat git log", "GIT_PAGER='less -R' git log",
                     "GIT_SSH_COMMAND='ssh -i ~/.ssh/k' git fetch", "GIT_EDITOR=vim; export GIT_EDITOR; git commit",
                     "export GIT_PAGER=cat GIT_PAGER", "GIT_PAGER=less; GIT_PAGER+=' -R'; git log",
