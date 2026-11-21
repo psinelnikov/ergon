@@ -1800,7 +1800,8 @@ HUMAN_MSG = ("approve / reject / close / accept / answer / sync / pin / choose /
 # into them makes git read a file the guard never checked as config.
 GIT_COMMAND_SECTIONS = {"alias", "core", "sequence", "pager", "interactive", "diff", "difftool", "mergetool", "merge",
                         "filter", "credential", "gpg", "remote", "uploadpack", "submodule", "tar", "trailer", "hook",
-                        "sendemail", "imap", "browser", "man", "guitool", "instaweb", "include", "includeif"}
+                        "sendemail", "imap", "browser", "man", "guitool", "instaweb", "include", "includeif",
+                        "protocol"}  # protocol: `[s] allow = always` renamed to `protocol.ext` enables ext:: (T-248)
 # git's config from the environment: GIT_CONFIG_PARAMETERS ('key'='value' ...) and the GIT_CONFIG_COUNT
 # entries GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n>. Group 1 the name, 2 the <n>, 3 `=value` (or `+=...`).
 GIT_CONFIG_ENV = re.compile(r"(GIT_CONFIG_PARAMETERS|GIT_CONFIG_(?:KEY|VALUE)_([0-9]+))(\+?=.*)?", re.S)
@@ -1873,6 +1874,28 @@ def unseen_config_msg(key, why):
             f"in full (`git -c {key}=<command> ...` or `git config {key} <command>`), or ask the user")
 
 
+def _allow_protocol_reason(words, vals):
+    """Why a simple command's GIT_ALLOW_PROTOCOL assignment must not run (T-248), or None: git reads the
+    variable as a `:` list of the protocols it allows, so `ext` in it (or a value the text doesn't hold)
+    turns the ext:: transport on. It counts where git inherits it: ahead of a git call, alone or
+    exported, or ahead of a shell that may run one; ahead of another program it's data. vals holds
+    the value set so far, for `+=`."""
+    head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+    prog = _program(words[head]) if head < len(words) else ""
+    inherits = (head == len(words) or prog in SHELL_DECLARE or (CODE_RUNNER.fullmatch(prog) is not None and prog != "env")
+                or any(True for _ in _git_calls(words)))
+    for name, append, val in _env_assignments(words):
+        if name != "GIT_ALLOW_PROTOCOL":
+            continue
+        cur = (vals.get(name, None) if append else "")
+        vals[name] = None if cur is None or _unseen(val) else cur + val
+        if inherits and (vals[name] is None or "ext" in vals[name].lower().split(":")):
+            return ("`GIT_ALLOW_PROTOCOL` listing `ext`, or a value the guard can't see, re-enables git's ext:: "
+                    "transport, whose URL runs as a command. So it's refused. List the protocols without `ext` "
+                    "(`GIT_ALLOW_PROTOCOL=file:https:ssh`), or ask the user")
+    return None
+
+
 def git_config_reason(cmd):
     """Why a shell command defines a git alias or GIT_COMMAND_KEYS key in a way human_cmd can't
     check, or None: with `git --config-env` (the value is in an environment variable), with a `$` or
@@ -1892,6 +1915,7 @@ def git_config_reason(cmd):
                     "the guard can't split it to see what it defines, so it's refused")
         return None
     env = []  # (name, n, value or None) of each GIT_CONFIG_* any of its commands sets
+    protocols = {}  # GIT_ALLOW_PROTOCOL as the text has set it so far (_allow_protocol_reason)
     redefines = SHELL_REDEFINES.search(re.sub(r"[\\'\"]", "", cmd))  # quotes can't hide `function`
     for words, docs in cmds:
         # bash -c '...', a heredoc fed to sh. env's own words are read below; so is a lone NAME=value.
@@ -1903,6 +1927,8 @@ def git_config_reason(cmd):
                     return why
         if how := _dynamic_name(words):
             return DYNAMIC_NAME_MSG.format(how=how)
+        if why := _allow_protocol_reason(words, protocols):
+            return why
         for key, val in git_config_sets(words):
             if val is not None and config_key_runs(key) and _unseen_value(key, val):
                 return unseen_config_msg(key, f"`{val}` holds a `$` or backtick expansion"
@@ -2355,7 +2381,9 @@ def git_config_entries(text):
 
 def _command_entries(text):
     """The git aliases and command-valued entries (git_config_command) of text read as git config."""
-    return [(k, v) for k, v in git_config_entries(text) or [] if git_config_command(k, v or "") is not None]
+    return [(k, v) for k, v in git_config_entries(text) or []
+            if git_config_command(k, v or "") is not None
+            or (GIT_PROTOCOL_KEY.fullmatch(k) and v is not None and _unseen_value(k, v))]
 
 
 def edit_result(path, tool, inp):

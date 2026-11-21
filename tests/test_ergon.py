@@ -1371,6 +1371,37 @@ class TestBasics(Project):
         for cmd in passing:
             self.assertIsNone(git_config_reason(cmd), cmd)
 
+    def test_protocol_env_edit_and_rename_routes(self):
+        """T-248: GIT_ALLOW_PROTOCOL naming ext, an Edit or Write adding protocol.ext.allow / protocol.allow
+        = always, and --rename-section into or out of protocol re-enable ext:: like T-232's sets."""
+        from ergon.gates import git_config_reason
+        refused = ["GIT_ALLOW_PROTOCOL=ext git fetch o", "GIT_ALLOW_PROTOCOL=ext:ssh git fetch o",
+                   "GIT_ALLOW_PROTOCOL=file:ext:ssh git fetch o", "GIT_ALLOW_PROTOCOL=$P git fetch o",
+                   "sudo GIT_ALLOW_PROTOCOL=ext git fetch o", "env GIT_ALLOW_PROTOCOL=ext git fetch o",
+                   "nice GIT_ALLOW_PROTOCOL=ext git fetch o", "export GIT_ALLOW_PROTOCOL=ext; git fetch o",
+                   "GIT_ALLOW_PROTOCOL=file; GIT_ALLOW_PROTOCOL+=:ext git fetch o",
+                   "git config --rename-section s protocol.ext", "git config --rename-section protocol.ext s",
+                   "git config --rename-section s protocol", "git config --rename-section protocol s"]
+        for cmd in refused:
+            self.assertTrue(git_config_reason(cmd), cmd)
+        for cmd in ["GIT_ALLOW_PROTOCOL=file:ssh git fetch o", "GIT_ALLOW_PROTOCOL=ext echo hi",
+                    "env GIT_ALLOW_PROTOCOL=ext ls", "echo GIT_ALLOW_PROTOCOL=ext",
+                    "export GIT_ALLOW_PROTOCOL=file:https"]:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+        p = Path(tempfile.mkdtemp()) / "cfg"
+        p.write_text("[core]\n\teditor = vi\n")
+        for header, name, val, ok in [('protocol "ext"', "allow", "always", False),
+                                      ('protocol "ext"', "allow", "user", False),
+                                      ("protocol", "allow", "always", False), ("protocol", "allow", "$V", False),
+                                      ('protocol "ext"', "allow", "never", True), ("protocol", "allow", "never", True),
+                                      ('protocol "file"', "allow", "always", True),
+                                      ('protocol "EXT"', "allow", "always", True)]:
+            add = f"[{header}]\n\t{name} = {val}\n"
+            for tool, inp in [("Write", {"content": "[core]\n\teditor = vi\n" + add}),
+                              ("Edit", {"old_string": "[core]", "new_string": add + "[core]"})]:
+                why = self.guard(tool, dict(inp, file_path=str(p)))
+                self.assertEqual(why is None, ok, (tool, header, val, why))
+
     def test_guard_refuses_unseen_git_url_arguments(self):
         """T-236: git runs an ext:: URL given as clone's, fetch's, push's, ... repository argument
         (T-215 checks one the text shows), so one an expansion may make ext:: is refused: in the
