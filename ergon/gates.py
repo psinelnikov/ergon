@@ -1351,6 +1351,9 @@ GIT_CMD_OPTS = {
 # an ext:: URL there is a command git runs (ext_command) on the next fetch or push.
 GIT_URL_KEYS = re.compile(r"remote\..+\.(url|pushurl)|submodule\..+\.url")
 GIT_INSTEADOF_KEY = re.compile(r"url\.(.+)\.(push)?insteadof", re.I | re.S)
+# protocol.allow and protocol.ext.allow (the `ext` subsection is case-sensitive): `always`, or `user`, re-enables
+# the ext:: transport, whose URL runs as a command, so a value other than `never` the text shows is refused.
+GIT_PROTOCOL_KEY = re.compile(r"(?i:protocol)\.(?:ext\.)?(?i:allow)")
 
 
 def ext_command(url):
@@ -1383,7 +1386,8 @@ def config_key_runs(key):
     """Whether git can run a command from config key's value: a GIT_COMMAND_KEYS key (or the
     insteadOf key of an ext:: base), or a URL key (GIT_URL_KEYS), whose value runs as a command when
     it's an ext:: URL. A value that isn't one gives git_config_command None, so `!` can't probe it."""
-    return git_config_command(key, "!") is not None or bool(GIT_URL_KEYS.fullmatch(key.lower()))
+    return (git_config_command(key, "!") is not None or bool(GIT_URL_KEYS.fullmatch(key.lower()))
+            or bool(GIT_PROTOCOL_KEY.fullmatch(key)))
 
 
 def git_config_command(key, val):
@@ -1637,6 +1641,8 @@ def _unseen_value(key, val):
     """Whether a value for config key hides the command git may run from it (_unseen). For a URL key
     (GIT_URL_KEYS) only an ext:: URL is a command, and git reads the transport from the URL's start:
     a value whose text up to its first expansion can't begin `ext::` (`https://$HOST/r.git`) runs none."""
+    if GIT_PROTOCOL_KEY.fullmatch(key):
+        return _unseen(val) or val.strip().lower() in ("always", "user")
     if not _unseen(val):
         return False
     if not GIT_URL_KEYS.fullmatch(key.lower()):
@@ -1646,6 +1652,10 @@ def _unseen_value(key, val):
 
 
 def unseen_config_msg(key, why):
+    if GIT_PROTOCOL_KEY.fullmatch(key):
+        return (f"`{key}` set to `always` or `user`, or to a value the guard can't see, re-enables git's ext:: "
+                f"transport, whose URL runs as a command: {why}. So the setting is refused. Leave it unset or "
+                f"set it to `never`, or ask the user")
     if GIT_URL_KEYS.fullmatch(key.lower()):
         return (f"git runs an ext:: URL set as `{key}` as a command, and the guard checks that command where it "
                 f"is set, but here it can't see the URL: {why}. So the setting is refused. Write the URL out in "
@@ -1680,7 +1690,8 @@ def git_config_reason(cmd):
                     return why
         for key, val in git_config_sets(words):
             if val is not None and config_key_runs(key) and _unseen_value(key, val):
-                return unseen_config_msg(key, f"`{val}` holds a `$` or backtick expansion")
+                return unseen_config_msg(key, f"`{val}` holds a `$` or backtick expansion"
+                                         if _unseen(val) else f"it is set to `{val}`")
         # --config-env's value is an environment variable's. A URL key's is read where this same simple
         # command sets it ahead of git (`U=https://... git --config-env=remote.o.url=U fetch o`).
         shown = {}  # each variable this command sets, to its value, or None where the text can't show it
@@ -1693,7 +1704,7 @@ def git_config_reason(cmd):
             for key, val, var in sets:
                 if val is not None or not config_key_runs(key):
                     continue
-                v = shown.get(var) if GIT_URL_KEYS.fullmatch(key.lower()) else None
+                v = shown.get(var) if GIT_URL_KEYS.fullmatch(key.lower()) or GIT_PROTOCOL_KEY.fullmatch(key) else None
                 if v is None or _unseen_value(key, v):
                     return unseen_config_msg(key, "`--config-env` has git read it from an environment variable")
                 if (c := git_config_command(key, v)) is not None and human_cmd(c):
@@ -1734,6 +1745,8 @@ def git_config_reason(cmd):
             except ValueError:
                 return unseen_config_msg(name, "the guard can't split its value")
             for key, v in entries:
+                if GIT_PROTOCOL_KEY.fullmatch(key) and _unseen_value(key, v):
+                    return unseen_config_msg(key, f"{name} sets it to `{v}`")
                 if (c := git_config_command(key, v)) is not None and human_cmd(c):
                     return HUMAN_MSG
         elif name.startswith("GIT_CONFIG_KEY_"):

@@ -1042,6 +1042,36 @@ class TestBasics(Project):
         self.assertIsNone(self.guard("Edit", {"file_path": str(p), "old_string": "[core]",
                                               "new_string": "[remote \"x\"]\n\turl = https://example.com/r.git\n[core]"}))
 
+    def test_protocol_allow_keys_cannot_reenable_ext(self):
+        """T-232: protocol.allow / protocol.ext.allow set to always, user or a value the text doesn't
+        hold re-enables ext::, so git_config_reason refuses it by every route; `never` and the allow
+        keys of other transports pass."""
+        from ergon.gates import config_key_runs, git_config_reason
+        for key in ["protocol.allow", "protocol.ext.allow", "Protocol.ext.ALLOW"]:
+            self.assertTrue(config_key_runs(key), key)
+        for key in ["protocol.EXT.allow", "protocol.file.allow", "protocol.version"]:
+            self.assertFalse(config_key_runs(key), key)
+        env = "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0={k} "
+        refused = []
+        for key in ["protocol.ext.allow", "protocol.allow"]:
+            for v in ["always", "user", "$V", "`cat v`"]:
+                refused += [f"git -c {key}='{v}' fetch o", f"git config {key} '{v}'",
+                            f"git clone -c {key}='{v}' u d", f"git --config-env={key}=V fetch o",
+                            "GIT_CONFIG_PARAMETERS=\"'%s'='%s'\" git fetch o" % (key, v),
+                            (env + "GIT_CONFIG_VALUE_0='{v}' git fetch o").format(k=key, v=v)]
+            refused += [(env + "git fetch o").format(k=key), f"V=always git --config-env={key}=V fetch o"]
+        for cmd in refused:
+            self.assertTrue(git_config_reason(cmd), cmd)
+        passing = []
+        for key in ["protocol.ext.allow", "protocol.allow", "protocol.EXT.allow", "protocol.file.allow",
+                    "protocol.https.allow"]:
+            passing += [f"git -c {key}=never fetch o", f"git config {key} never"]
+        passing += ["git -c protocol.file.allow=always clone u d", "git -c protocol.EXT.allow=always fetch o",
+                    "V=never git --config-env=protocol.ext.allow=V fetch o",
+                    (env + "GIT_CONFIG_VALUE_0=always git fetch o").format(k="protocol.file.allow")]
+        for cmd in passing:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+
     def test_stop_hook_blocks_on_lint_failure(self):
         self.ergon("new", "task", "Fix it", "--tier", "haiku")
         f = self.task_file("T-001")
