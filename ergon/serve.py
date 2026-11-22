@@ -850,6 +850,13 @@ def task_page(tid, nonce):
          f'<span class=tier>{esc(t.get("tier"))}</span> <span class=tier>{esc(_tasks.category(t))}</span>'
          + (f' · <span class=park>{esc(park_mark(t))}</span>' if park_mark(t) else "") + '</p>']
 
+    if _tasks.is_asking(t):
+        b.append("<h2>Open questions</h2>")
+        for n, (q, o) in enumerate(_dispatch.asked(t)[0], 1):
+            b.append(f"<p>Q{n} {esc(q)}</p>")
+            if o:
+                b.append("<ul class=options>" + "".join(f"<li>{esc(x)}</li>" for x in o) + "</ul>")
+
     fus = _tasks.follow_ups(t, tasks, open_only=False)
     if fus:
         b.append(f'<h2>Follow-ups</h2><p>{esc(_tasks.status_text(t, tasks))}</p><ul class=tasks>')

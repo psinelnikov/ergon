@@ -187,6 +187,20 @@ class TestServe(ServeFixture):
         self.assertEqual(doing["last"], "dispatched")
         self.assertAlmostEqual(doing["since_ts"], S.parse_at("2026-11-16T13:12:00+00:00"))
 
+    def test_questions_in_lens_order_on_review_and_task_page(self):
+        # T-258: the open questions list lens options in lens order, none recommended, on /review and /t/T-NNN.
+        f = self.task_file("T-003")
+        f.write_text(re.sub(r"^status: \w+$", "status: blocked\nasking: sess-1", f.read_text(), flags=re.M).rstrip()
+                     + "\n- 2026-11-08 dispatch: asking: 1 question(s) below\n"
+                     "- 2026-11-08 question: Which store? [options: risk: a journal \u2014 gives up speed | "
+                     "minimal: a flat file \u2014 gives up queries]\n")
+        for path in ("/", "/t/T-003"):
+            page = self.req("GET", path)[2]
+            self.assertLess(page.index("minimal: a flat file"), page.index("risk: a journal"), path)
+            self.assertNotIn("recommended", page, path)
+        self.assertIn("Open questions", self.req("GET", "/t/T-003")[2])
+        self.assertNotIn("Open questions", self.req("GET", "/t/T-001")[2])
+
     def test_task_page(self):
         code, _, page = self.req("GET", "/t/T-001")
         self.assertEqual(code, 200)

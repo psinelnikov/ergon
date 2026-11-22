@@ -355,8 +355,21 @@ def parse_questions(text):
         elif m[1] == "FOUND":
             last = None
         elif last is not None and not last[1]:
-            last[1].extend(o.strip(" *`") for o in val.split("|") if o.strip(" *`"))
+            last[1].extend(o.strip(" *`") for o in re.split(r"\s+\|\s+", val) if o.strip(" *`"))
+            last[1][:] = sort_options(last[1])
     return out
+
+
+def option_lens(o):
+    """The lens an option `<lens>: <approach> — gives up <cost>` opens with (lower case), or None."""
+    m = re.match(r"^\s*([A-Za-z][\w-]*)\s*:", o)
+    return m[1].lower() if m and m[1].lower() in _tasks.LENSES else None
+
+
+def sort_options(opts):
+    """opts in lens order (minimal, durable, operator, risk, defer); an option with no known lens
+    keeps its place after the lensed ones. No option is marked or ranked above another."""
+    return sorted(opts, key=lambda o: _tasks.LENSES.index(option_lens(o)) if option_lens(o) else len(_tasks.LENSES))
 
 
 def note_line(text):
@@ -379,7 +392,7 @@ def asked(t):
     for b in bullets[start + 1:]:
         m = re.match(r"^\S+ question: (.*?)(?: \[options: (.*)\])?$", b)
         if m:
-            qs.append((m[1], [o.strip() for o in (m[2] or "").split(" | ") if o.strip()]))
+            qs.append((m[1], sort_options([o.strip() for o in (m[2] or "").split(" | ") if o.strip()])))
         m = re.match(r"^\S+ answer by .*?: (.*)$", b)
         if m:
             ans = m[1]

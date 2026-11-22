@@ -920,7 +920,7 @@ def show_questions(t):
     for n, (q, opts) in enumerate(_dispatch.asked(t)[0], 1):
         print(f"\nQ{n}  {q}")
         for i, o in enumerate(opts, 1):
-            print(f"    {i}. {o}" + ("  (recommended)" if i == 1 else ""))
+            print(f"    {o}" if _dispatch.option_lens(o) else f"    {i}. {o}")
     print("\n" + RE_PLAN.format(id=t["id"]))
 
 
@@ -948,9 +948,12 @@ def answer_task(t, text=""):
     if not text:
         qs, parts = _dispatch.asked(t)[0], []
         for n, (q, opts) in enumerate(qs or [("(no question recorded)", [])], 1):
-            got = ask(f"\nQ{n} answer" + (f" (1-{len(opts)}, or your own words)" if opts else "") + ": ")
-            if got.isdigit() and opts and 1 <= int(got) <= len(opts):
+            got = ask(f"\nQ{n} answer" + (" (a lens name or number to pick, or your own words)" if opts else "") + ": ")
+            by_lens = {_dispatch.option_lens(o): o for o in opts if _dispatch.option_lens(o)}
+            if got.isdigit() and opts and 1 <= int(got) <= len(opts) and not _dispatch.option_lens(opts[int(got) - 1]):
                 got = opts[int(got) - 1]
+            elif got.lower() in by_lens:
+                got = by_lens[got.lower()]
             if not got:
                 raise SystemExit("no answer given; nothing written")
             parts.append(got)

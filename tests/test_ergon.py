@@ -7882,7 +7882,8 @@ class TestAsking(DispatchProject):
         # A human answers interactively: an option by number, then free text, then confirms.
         r = self.answer(inp="1\nkeep it for now\ny\n")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("1. sqlite  (recommended)", r.stdout)
+        self.assertIn("1. sqlite", r.stdout)
+        self.assertNotIn("recommended", r.stdout)
         self.assertIn("it's a re-plan: don't answer", r.stdout)
         text = self.text()
         self.assertEqual(self.status("T-001"), "ready")
@@ -7936,7 +7937,8 @@ class TestAsking(DispatchProject):
 
         r = review_i(inp="s\na\n1\nkeep it\nn\n")  # proposed first, then asking; declining writes nothing
         self.assertLess(r.stdout.index("T-002"), r.stdout.index("[2/2]  T-001  Store it  (asking)"))
-        self.assertIn("1. sqlite  (recommended)", r.stdout)
+        self.assertIn("1. sqlite", r.stdout)
+        self.assertNotIn("recommended", r.stdout)
         self.assertIn("it's a re-plan: don't answer", r.stdout)
         self.assertIn("aborted", r.stdout)
         self.assertIn("answered 0  skipped 2", r.stdout)
@@ -7987,6 +7989,29 @@ class TestAsking(DispatchProject):
         self.assertIn("aborted", self.answer("use json", inp="n\n").stderr)
         self.assertIn("no answer given", self.answer(inp="\n").stderr)
         self.assertEqual(self.text(), before)
+
+    def test_lens_options_show_in_lens_order_and_take_a_lens_pick(self):
+        # T-258: `risk, minimal` is shown `minimal, risk` everywhere, none recommended, and a lens is a pick.
+        self.env["FAKE_ASK"] = ("QUESTION: How should it store?\nOPTIONS: risk: a journal \u2014 gives up speed | "
+                                "minimal: a flat file \u2014 gives up queries")
+        self.asks()
+        self.assertIn("[options: minimal: a flat file \u2014 gives up queries | risk: a journal \u2014 gives up speed]",
+                      self.text())
+        review = self.ergon("review").stdout
+        self.assertLess(review.index("minimal: a flat file"), review.index("risk: a journal"))
+        self.assertNotIn("recommended", review)
+        r = self.answer(inp="minimal\ny\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertLess(r.stdout.index("minimal: a flat file"), r.stdout.index("risk: a journal"))
+        self.assertNotIn("recommended", r.stdout)
+        self.assertIn("answer by Tester: minimal: a flat file \u2014 gives up queries", self.text())
+
+    def test_old_options_note_still_answers_by_number(self):
+        self.asks()  # sqlite | json, no lens
+        self.assertIn("[options: sqlite | json]", self.text())
+        r = self.answer(inp="2\nno\ny\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("answer by Tester: Q1: json. Q2: no.", self.text())
 
     def test_asking_without_a_question_blocks(self):
         self.env["FAKE_ASK"] = "OPTIONS: a | b"

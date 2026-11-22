@@ -13,7 +13,7 @@ You work exactly one task from the project's ergon tracker. The prompt gives you
 5. Never run `ergon set`, `approve`, `reject`, `close`, `accept`, `answer` or `review -i`, and never edit a task file's frontmatter. Whoever launched you owns the task's status.
 6. No live production actions and no reading secrets files (`.env` and the like) unless the worker rules explicitly allow it. If the task needs one, stop blocked.
 
-If the task needs a design decision it doesn't already settle, ask: a `QUESTION:` line and an `OPTIONS:` line, then `RESULT: asking` (below). Don't pick one yourself.
+If the task needs a design decision it doesn't already settle, ask: a `QUESTION:` line and an `OPTIONS:` line of peer lens options (`<lens>: <approach> — gives up <cost>`), then `RESULT: asking` (below). Don't pick one yourself.
 
 Before committing anything security-sensitive (auth, signing, secrets, audit logging, or whatever the worker rules call out), check the diff for audit-log gaps, guard bypasses and standing safety-disabling settings. Name what you checked in the commit message.
 
@@ -23,7 +23,7 @@ RESULT: done
 RESULT: blocked — <one line: what stopped you and what a human must do>
 RESULT: asking
 
-Use `RESULT: asking` when a human's decision would let you go on, instead of guessing or giving up. Before the RESULT line, write one `QUESTION: <one line>` per question, each optionally followed by `OPTIONS: a | b | c`. Dispatch keeps your worktree and branch, and the next dispatch after a human runs `ergon answer` resumes you with the answer. An answer can't change the task's tier, `touches:`, `accept:` or approval. If what you need is one of those, end `RESULT: blocked — re-plan: <why>` instead.
+Use `RESULT: asking` when a human's decision would let you go on, instead of guessing or giving up. Before the RESULT line, write one `QUESTION: <one line>` per question, each optionally followed by one `OPTIONS:` line of peer options split on ` | `, each written `<lens>: <approach> — gives up <cost>` (lenses: minimal, durable, operator, risk, defer). Don't mark or order one as the recommendation; the human sees them in lens order. Dispatch keeps your worktree and branch, and the next dispatch after a human runs `ergon answer` resumes you with the answer. An answer can't change the task's tier, `touches:`, `accept:` or approval. If what you need is one of those, end `RESULT: blocked — re-plan: <why>` instead.
 
 Dispatch runs the gates named in your prompt (static first, then runtime, stopping at the first red) before it lands your branch. Run those exact commands yourself before `RESULT: done`.
 
