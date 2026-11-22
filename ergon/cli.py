@@ -64,11 +64,15 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                The task goes back to ready, and the next dispatch resumes the
                                worker's session with the answer (a fresh one if its cache is gone).
                                Never changes approved:, tier, touches: or accept:
-  ergon choose ID N | --own "<text>"
-                               HUMAN ONLY, real terminal. Pick one of a proposed task's ## Options
-                               (no N offers them): writes `Chosen: N by <name> <date>` as the
-                               section's first line and a `chosen` history row. `approve` refuses a
-                               task with options and no choice; `check` fails one past proposed.
+  ergon choose ID LENS [LENS ...] | N | --own "<text>"
+                               HUMAN ONLY, real terminal. Pick a proposed task's ## Options (none
+                               given offers them): on lens options, one lens or several to combine
+                               them (`ergon choose T-1 operator minimal` writes `Chosen: minimal +
+                               operator by <name> <date>`; the worker builds what they share and
+                               takes each one's distinct part); on a numbered list, one number
+                               (`Chosen: N by …`). Written as the section's first line, with a
+                               `chosen` history row. `approve` refuses a task with options and no
+                               choice; `check` fails one past proposed.
                                Never changes approved:, tier, touches: or accept:
   ergon close ID [ID ...] --as done|dropped --reason R
                                HUMAN ONLY. An approved task whose work landed elsewhere, or that
@@ -473,7 +477,11 @@ def main():
     an.add_argument("text", nargs="*", help="the answer; leave it out to pick from the options")
     ch = sub.add_parser("choose", help="HUMAN ONLY: pick one of a proposed task's options (approve waits on it)")
     ch.add_argument("id")
-    ch.add_argument("n", nargs="?", metavar="N", help="the option's number; leave it and --own out to pick")
+    ch.add_argument("picks", nargs="*", metavar="LENS|N",
+                    help="lens options: one or more lens names (minimal, durable, operator, risk, defer); several "
+                         "combine them into `Chosen: <lens> + <lens>`, and the worker builds what they share and "
+                         "takes each one's distinct part. A numbered list: exactly one number. Leave it and --own "
+                         "out to pick")
     ch.add_argument("--own", metavar="TEXT", help="your own approach instead of a listed one")
     r = sub.add_parser("reject")
     r.add_argument("ids", nargs="+")

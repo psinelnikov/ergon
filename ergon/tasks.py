@@ -284,10 +284,15 @@ def brief_digest(t):
 #
 # A section with a `Crux:` line or a `- <word>: …` bullet is lens format; any other is the old
 # numbered list, read and checked as before. `options(t)` gives a lens section's options in LENSES
-# order whatever order they were written in, so `Chosen: <N>` counts in that order.
+# order whatever order they were written in, so an old `Chosen: <N>` counts in that order.
+#
+# A lens section is chosen by lens name (T-253): `Chosen: <lens>[ + <lens> ...] by <name> <date>`,
+# one option or a combination of several, written in LENSES order. A combination tells the worker
+# to build what the named options share and take each one's distinct part.
 
 OPTION_ITEM = re.compile(r"^\s*(\d+)[.)]\s+(.*?)\s*$")
-CHOSEN = re.compile(r"^Chosen:\s+(\d+|own)\s+by\s+(.+?)\s+(\d{4}-\d\d-\d\d)(?:\s+—\s+(.*?))?\s*$")
+CHOSEN = re.compile(r"^Chosen:\s+(\d+|own|[A-Za-z][\w-]*(?:\s*\+\s*[A-Za-z][\w-]*)*)\s+by\s+(.+?)\s+"
+                    r"(\d{4}-\d\d-\d\d)(?:\s+—\s+(.*?))?\s*$")
 RECOMMENDED = re.compile(r"\s*\((?:recommended)\)\s*$", re.I)
 LENSES = ("minimal", "durable", "operator", "risk", "defer")
 LENS_FIELDS = (("optimizes", "Optimizes for"), ("gives_up", "Gives up"), ("regret", "Regret if"))
@@ -435,14 +440,23 @@ def chosen_lines(text):
     return [l.strip() for l in sections(_body_of(text), "options").split("\n") if l.strip().startswith("Chosen:")]
 
 
+def is_lens_choice(chosen):
+    """Does this chosen dict (from options()) name lenses, `Chosen: <lens>[ + <lens> ...]`?"""
+    return bool(chosen) and isinstance(chosen.get("option"), str) and chosen["option"] != "own"
+
+
 def options(t):
     """(options, chosen) of t's `## Options` section. options: an Options list. For a numbered
     section, the list's texts in order (a trailing `(recommended)` taken off), and .crux None. For
     a lens-format one, a LensOption per option in LENSES order whatever order they were written in
     (unknown lenses last, as written), and .crux the `Crux:` text. chosen: the first `Chosen:` line
-    as {"option": N (an int) or "own", "text": the chosen option's text or the human's own, "by",
-    "date", "line"}, or None when there is none. A Chosen: line that doesn't read gives
-    {"option": None, "line"}. ([], None) when t has no section."""
+    as {"option", "lenses", "text", "by", "date", "line"}, or None when there is none. option is
+    N (an int), "own", or the named lenses joined by ` + ` as written (`minimal + operator`);
+    lenses the lenses it names, lower-cased, as written ([] for own or a number on a numbered
+    section, the option's lens for an old number on a lens section); text the chosen option's text,
+    the options' texts joined by ` + ` for lenses, or the human's own ('' when a number or lens names
+    no option, or a lens repeats). A Chosen: line that doesn't read gives {"option": None, "line"}.
+    ([], None) when t has no section."""
     text = sections(t.get("_body") or "", "options")
     opts, chosen = Options(), None
     for l in text.split("\n"):
@@ -451,10 +465,15 @@ def options(t):
             if chosen is None:
                 m = CHOSEN.match(s)
                 if not m:
-                    chosen = {"option": None, "text": "", "by": "", "date": "", "line": s}
-                else:
+                    chosen = {"option": None, "lenses": [], "text": "", "by": "", "date": "", "line": s}
+                elif m[1].isdigit() or m[1] == "own":
                     num = int(m[1]) if m[1].isdigit() else "own"
-                    chosen = {"option": num, "text": m[4] or "", "by": m[2], "date": m[3], "line": s}
+                    chosen = {"option": num, "lenses": [], "text": (m[4] or "") if num == "own" else "",
+                              "by": m[2], "date": m[3], "line": s}
+                else:
+                    lenses = [x.strip().lower() for x in m[1].split("+")]
+                    chosen = {"option": " + ".join(lenses), "lenses": lenses, "text": "", "by": m[2],
+                              "date": m[3], "line": s}
             continue
         m = OPTION_ITEM.match(l)
         if m and m[2]:
@@ -466,6 +485,11 @@ def options(t):
     if chosen and isinstance(chosen["option"], int):
         n = chosen["option"]
         chosen["text"] = opts[n - 1] if 1 <= n <= len(opts) else ""
+        if chosen["text"] and opts.crux is not None:
+            chosen["lenses"] = [opts[n - 1].lens]
+    elif is_lens_choice(chosen) and not lens_choice_problems(opts, chosen["lenses"]):
+        by_lens = {o.lens: o for o in opts}
+        chosen["text"] = " + ".join(by_lens[x] for x in chosen["lenses"])
     return opts, chosen
 
 
@@ -490,12 +514,38 @@ def options_problems(t):
         out.append("## Options has more than one `Chosen:` line")
     if chosen and chosen["option"] is None:
         out.append(f"## Options has a `Chosen:` line that doesn't read: {chosen['line']!r} (expected "
-                   f"`Chosen: <N> by <name> <YYYY-MM-DD>` or `Chosen: own by <name> <YYYY-MM-DD> — <text>`)")
+                   f"`Chosen: <lens>[ + <lens> ...] by <name> <YYYY-MM-DD>`, `Chosen: <N> by <name> <YYYY-MM-DD>` "
+                   f"or `Chosen: own by <name> <YYYY-MM-DD> — <text>`)")
+    elif is_lens_choice(chosen):
+        out += [f"## Options has `Chosen: {chosen['option']}`: {why}" for why in lens_choice_problems(opts, chosen["lenses"])]
     elif chosen and chosen["option"] == "own" and not chosen["text"]:
         out.append("## Options has `Chosen: own` without its text (`… — <text>`)")
     elif chosen and isinstance(chosen["option"], int) and not 1 <= chosen["option"] <= len(opts):
         out.append(f"## Options has `Chosen: {chosen['option']}`, but the list has {len(opts)} option(s)")
     return out
+
+
+def lens_choice_problems(opts, lenses):
+    """Why naming these lenses doesn't choose from opts (an Options list), one line each, or []: a
+    numbered section (it is chosen by number), no lens, a lens the section has no option for, or
+    one named twice."""
+    if opts.crux is None:
+        return ["the section is a numbered list, chosen by its number, not by lens"]
+    if not lenses:
+        return ["it names no lens"]
+    have = [o.lens for o in opts]
+    out = [f"the section has no {x} option (its lenses: {', '.join(have)})" for x in dict.fromkeys(lenses)
+           if x not in have]
+    out += [f"it names the {x} lens more than once" for x in dict.fromkeys(lenses) if lenses.count(x) > 1]
+    return out
+
+
+def choose_hint(t, opts=None):
+    """The `ergon choose` command a human runs to choose for t: by lens on a lens section, by
+    number on a numbered one."""
+    opts = options(t)[0] if opts is None else opts
+    what = "<lens> [<lens> ...]" if opts.crux is not None else "<N>"
+    return f"ergon choose {t['id']} {what}"
 
 
 def choice_problem(t):
@@ -504,18 +554,27 @@ def choice_problem(t):
     section is approved as before."""
     if is_epic(t) or not has_options(t):
         return None
-    chosen = options(t)[1]
+    opts, chosen = options(t)
     if chosen is None:
         return (f"{t['id']} has options and no choice: a human picks one first with "
-                f"`ergon choose {t['id']} <N>` (or `--own \"<text>\"`), in their own terminal")
+                f"`{choose_hint(t, opts)}` (or `--own \"<text>\"`), in their own terminal")
     if chosen["option"] is None or not chosen["text"]:
         return (f"{t['id']}'s `Chosen:` line doesn't name one of its options (`ergon check` says why): a human "
-                f"chooses again with `ergon choose {t['id']} <N>`, in their own terminal")
+                f"chooses again with `{choose_hint(t, opts)}`, in their own terminal")
     return None
 
 
+def lens_order(lenses):
+    """lenses lower-cased in LENSES order (unknown ones last, as given)."""
+    lenses = [str(x).strip().lower() for x in lenses]
+    return sorted(lenses, key=lambda x: LENSES.index(x) if x in LENSES else len(LENSES))
+
+
 def chosen_line(option, by, date, text=""):
-    """The `Chosen:` line `ergon choose` writes: option is a number or "own" (with its text)."""
+    """The `Chosen:` line `ergon choose` writes: option is a number, "own" (with its text), or a
+    list of lenses, written in LENSES order joined by ` + `."""
+    if isinstance(option, (list, tuple)):
+        option = " + ".join(lens_order(option))
     return f"Chosen: {option} by {by} {date}" + (f" — {text}" if option == "own" else "")
 
 
@@ -551,8 +610,9 @@ def print_options(t, indent="  "):
     if opts.crux is not None:
         print(f"{indent}Crux: {opts.crux}")
     for n, o in enumerate(opts, 1):
-        marks = [m for m, on in (("recommended", n == 1 and opts.crux is None),
-                                 ("chosen", bool(chosen) and chosen["option"] == n)) if on]
+        picked = bool(chosen) and bool(chosen["text"]) and (
+            o.lens in chosen["lenses"] if isinstance(o, LensOption) else chosen["option"] == n)
+        marks = [m for m, on in (("recommended", n == 1 and opts.crux is None), ("chosen", picked)) if on]
         print(f"{indent}{n}. {o}" + (f"  ({', '.join(marks)})" if marks else ""))
         if isinstance(o, LensOption):
             for key, label in LENS_FIELDS:
@@ -566,7 +626,12 @@ def choice_text(t):
     chosen = options(t)[1]
     if not chosen or chosen["option"] is None:
         return None
-    what = f"own: {chosen['text']}" if chosen["option"] == "own" else f"{chosen['option']}. {chosen['text']}"
+    if chosen["option"] == "own":
+        what = f"own: {chosen['text']}"
+    elif is_lens_choice(chosen):
+        what = chosen["text"] or f"{chosen['option']} (names no option)"
+    else:
+        what = f"{chosen['option']}. {chosen['text']}"
     return f"{what}  (by {chosen['by']} {chosen['date']})"
 
 
@@ -969,7 +1034,8 @@ def review(args):
         for t in choosing:
             print(line(t, tasks))
             print_options(t, indent="         ")
-        print('\nfrom your own terminal:  ergon choose <ID> <N>   or   ergon choose <ID> --own "<text>"')
+        print('\nfrom your own terminal:  ergon choose <ID> <lens> [<lens> ...] (lens options; several combine them)'
+              '\n                     or  ergon choose <ID> <N> (a numbered list)   or   ergon choose <ID> --own "<text>"')
     asking = sorted((t for t in tasks.values() if is_asking(t)), key=lambda t: t["id"])
     if asking:
         print(f"\nAWAITING ANSWER ({len(asking)}): a worker asked, its branch is kept")
@@ -1029,7 +1095,7 @@ def show(args):
         print(f"CATEGORY  {category(t)}" + ("" if t.get("category") else " (not set: reads as feature)"))
         if has_options(t):
             print("OPTIONS  " + (f"chosen {choice_text(t)}" if choice_text(t) else
-                                 f"no choice yet: `ergon choose {t['id']} <N>` (a human, in their own terminal)"))
+                                 f"no choice yet: `{choose_hint(t)}` (a human, in their own terminal)"))
             print_options(t)
         print(f"PRIORITY  cod={t.get('cod', '')}  cod_why={t.get('cod_why', '')}  graded={t.get('graded', '')}"
               f"  unblocks={_pri.unblocks(t, tasks)}  p={_pri.score(t, tasks):.1f}")
@@ -1615,7 +1681,7 @@ def lint(warns=None):
             errs += [f"{where}: {why}" for why in options_problems(t)]
             if t.get("status") in NEEDS_APPROVAL and has_options(t) and options(t)[1] is None:
                 errs.append(f"{where}: {t['status']}, but its ## Options has no `Chosen:` line: a human chooses "
-                            f"(`ergon choose {t['id']} <N>`) before a task is approved, so edit it back to proposed "
+                            f"(`{choose_hint(t)}`) before a task is approved, so edit it back to proposed "
                             f"(status and approved:), choose, and approve it again")
         if t.get("epic") and t["epic"] not in epics:
             errs.append(f"{where}: epic {t['epic']} doesn't exist")

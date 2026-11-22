@@ -404,7 +404,9 @@ class TestServe(ServeFixture):
             self.assertNotIn("recommended", sec)
             self.assertIn("ergon choose T-004 1</code>", page)
             self.assertIn("ergon choose T-004 2</code>", page)
-        self.ergon("choose", "T-004", "1", inp="y\n", env=dict(self.env, ERGON_ASK_STDIN="1"))
+        # an old `Chosen: 1` line (T-253's `ergon choose` takes lens names on a lens section; T-254 marks those)
+        f = self.task_file("T-004")
+        f.write_text(f.read_text().replace("\n## Options\n", "\n## Options\nChosen: 1 by Tester 2026-11-22\n"))
         _, _, page = self.req("GET", "/t/T-004")
         li = page.split('<li class="option chosen">')[1].split("</li>")[0]
         self.assertIn("minimal: fields inside each &lt;li&gt;", li)  # 1 counts in lens order

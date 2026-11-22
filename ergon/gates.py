@@ -980,24 +980,29 @@ CHOICE_STEERS = ("A choice steers only: it never changes tier, touches:, accept:
 
 
 def choose(args):
-    """HUMAN ONLY: pick one of a proposed task's options (`ergon choose ID N`), or say how it is
-    built in your own words (`--own "<text>"`). With neither, offers the options to pick from."""
+    """HUMAN ONLY: pick a proposed task's option: one or more lenses on a lens section
+    (`ergon choose ID minimal operator`, several combine them), one number on a numbered one
+    (`ergon choose ID N`), or say how it is built in your own words (`--own "<text>"`). With none,
+    offers the options to pick from."""
     if in_agent_shell():
         raise SystemExit("refused: running inside an agent shell. A human chooses from their own terminal.")
     t = _tasks.load(_config.ITEMS).get(args.id)
     if not t:
         raise SystemExit(f"no such task: {args.id}")
-    if args.n is not None and args.own is not None:
-        raise SystemExit("give an option's number or --own \"<text>\", not both")
-    choose_task(t, args.n, args.own)
+    if args.picks and args.own is not None:
+        raise SystemExit("give the option's lens(es) or number, or --own \"<text>\", not both")
+    choose_task(t, args.picks, args.own)
 
 
-def choose_task(t, n=None, own=None):
+def choose_task(t, picks=None, own=None):
     """HUMAN ONLY, the one path for `ergon choose` and `c` in the interactive review: check that t
-    is proposed and has a well-formed `## Options` section, take the choice (a number, or the
-    human's own text; with neither, ask), print it and confirm; then write or replace the
-    section's `Chosen:` line and record a `chosen` row. Never touches tier, touches:, accept: or
-    approved:. Raises SystemExit, writing nothing, if any of that fails or isn't confirmed."""
+    is proposed and has a well-formed `## Options` section, take the choice (one or more lens names
+    on a lens section, exactly one number on a numbered one, or the human's own text; with none,
+    ask), print it and confirm; then write or replace the section's `Chosen:` line (lenses in LENSES
+    order, joined by ` + `) and record a `chosen` row (`option` and `text`, plus `options`, the
+    lenses, for a lens choice). Never touches tier, touches:, accept: or approved:. Raises
+    SystemExit, writing nothing, if any of that fails or isn't confirmed."""
+    picks = [str(x).strip() for x in ([picks] if isinstance(picks, (str, int)) else picks or []) if str(x).strip()]
     tid = t["id"]
     if t["status"] != "proposed":
         raise SystemExit(f"{tid} is {t['status']}: a choice is made on a proposed task only, before it is "
@@ -1007,27 +1012,49 @@ def choose_task(t, n=None, own=None):
     opts, chosen = _tasks.options(t)
     if len(opts) < 2:
         raise SystemExit(f"{tid}: {_tasks.options_problems(t)[0]}; fix the section first")
+    by_lens = {o.lens: o for o in opts} if opts.crux is not None else {}
     print(f"{tid}  {t['title']}\n\nOPTIONS")
     _tasks.print_options(t)
     if chosen:
         print(f"\n(replaces the current choice: {chosen['line']})")
-    if n is None and own is None:
-        got = ask(f"\nchoice (1-{len(opts)}, or your own words): ").strip()
+    if not picks and own is None:
+        got = ask(f"\nchoice ({', '.join(by_lens)}: one lens, or several to combine them; or your own words): "
+                  if by_lens else f"\nchoice (1-{len(opts)}, or your own words): ").strip()
         if not got:
             raise SystemExit("no choice given; nothing written")
-        if got.isdigit():
-            n = got
+        words = [w for w in re.split(r"[\s,+]+", got) if w]
+        if got.isdigit() or (by_lens and all(w.lower() in _tasks.LENSES for w in words)):
+            picks = words  # a number or lens names, checked below like the command line's
         else:
             own = got
+    lenses = None
     if own is not None:
         text = _dispatch.note_line(_dispatch.md_trim(own))
         if not text:
             raise SystemExit("--own needs the text of your choice")
         option, what = "own", f"your own: {text}"
+    elif by_lens:
+        if any(p.isdigit() for p in picks):
+            raise SystemExit(f"{tid}: its options are lens options, chosen by name, not number: name one or "
+                             f"more of {', '.join(by_lens)} (several combine them), or --own \"<text>\"")
+        named = [p.lower() for p in picks]
+        why = _tasks.lens_choice_problems(opts, named)
+        if why:
+            raise SystemExit(f"{tid}: {'; '.join(why)}. Name one or more of {', '.join(by_lens)}, "
+                             f"or --own \"<text>\"")
+        lenses = _tasks.lens_order(named)
+        option, text = " + ".join(lenses), " + ".join(by_lens[x] for x in lenses)
+        what = option + "".join(f"\n  {by_lens[x]}" for x in lenses)
+        if len(lenses) > 1:
+            what += ("\n(a combination: the worker builds what these options share and takes each one's "
+                     "distinct part)")
     else:
-        if not str(n).isdigit() or not 1 <= int(n) <= len(opts):
-            raise SystemExit(f"{tid}: pick an option from 1 to {len(opts)}, or --own \"<text>\"")
-        option, text = int(n), opts[int(n) - 1]
+        if any(not p.isdigit() for p in picks):
+            raise SystemExit(f"{tid}: its options are a numbered list, chosen by number, not lens: pick one "
+                             f"from 1 to {len(opts)}, or --own \"<text>\"")
+        if len(picks) != 1 or not 1 <= int(picks[0]) <= len(opts):
+            raise SystemExit(f"{tid}: pick one option from 1 to {len(opts)}, or --own \"<text>\"")
+        option, text = int(picks[0]), opts[int(picks[0]) - 1]
         what = f"{option}. {text}"
     print(f"\nchoice: {what}\n\n{CHOICE_STEERS}")
     if not human_gate(f"Choose this for {tid} as {approver()}?"):
@@ -1036,11 +1063,14 @@ def choose_task(t, n=None, own=None):
         t = _tasks.load(_config.ITEMS).get(tid)
         if not t or t["status"] != "proposed" or not _tasks.has_options(t):
             raise SystemExit(f"{tid} is now {t['status'] if t else 'gone'}; nothing written")
-        t["_body"] = _tasks.set_chosen(t["_body"], _tasks.chosen_line(option, approver(), _tasks.today(),
-                                                                      text))
+        if lenses and _tasks.lens_choice_problems(_tasks.options(t)[0], lenses):
+            raise SystemExit(f"{tid}'s options changed meanwhile; nothing written")
+        t["_body"] = _tasks.set_chosen(t["_body"], _tasks.chosen_line(lenses or option, approver(),
+                                                                      _tasks.today(), text))
         _tasks.dump(t, _tasks.TASK_KEYS)
-        _history.record("chosen", t, by=approver(), option=option, text=text)
-    print(f"{tid}: chose {what}. Approve it from your own terminal: ergon approve {tid}")
+        _history.record("chosen", t, by=approver(), option=option, text=text,
+                        **({"options": lenses} if lenses else {}))
+    print(f"{tid}: chose {option if lenses else what}. Approve it from your own terminal: ergon approve {tid}")
 
 
 def pin(args):
