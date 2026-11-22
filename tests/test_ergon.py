@@ -8824,13 +8824,27 @@ class TestLearn(Project):
                          ["T-001", "T-002", "T-003", "T-004"])  # nothing new filed
         self.ergon("check")
 
-    def test_class_options_become_the_options_section_and_approval_waits_on_a_choice(self):
-        opts = ["a ruff rule E722", "  an AST test   that flags bare except ", "a grep in the static gate"]
-        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=opts + ["x"] * 3)))
+    LENS_OPTS = [
+        {"lens": "defer", "approach": "leave it to review for now", "optimizes_for": "no new code to maintain",
+         "gives_up": "the check never runs automatically", "regret_if": "the mistake lands again next week"},
+        {"lens": "minimal", "approach": "a ruff rule E722 in the static gate", "optimizes_for": "one line of config",
+         "gives_up": "only catches the bare form of the mistake", "regret_if": "the swallowing takes another shape"},
+        {"lens": "durable", "approach": "an AST test that flags every handler that drops its error",
+         "optimizes_for": "catches the whole class", "gives_up": "a test file to maintain",
+         "regret_if": "the codebase stops using exceptions"},
+    ]
+    CRUX = "how much of the class the check has to catch"
+
+    def test_lens_options_become_the_options_section_and_approval_waits_on_a_choice(self):
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, crux=self.CRUX,
+                                                            options=self.LENS_OPTS)))
         from ergon.tasks import options
         t = self.fields("T-004")
-        self.assertEqual(options(t), (opts[:1] + ["an AST test that flags bare except", opts[2]] + ["x"], None))
+        opts, chosen = options(t)
+        self.assertEqual([o.lens for o in opts], ["minimal", "durable", "defer"])  # LENSES order
+        self.assertEqual(opts.crux, self.CRUX)
         self.assertNotIn("No options were offered", t["_body"])
+        self.ergon("check")
         r = self.ergon("approve", "T-004", inp="y\n", check=False, env=self.human())
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("has options and no choice", r.stderr)
@@ -8839,11 +8853,27 @@ class TestLearn(Project):
         r = self.ergon("approve", "T-004", inp="y\n", check=False, env=self.human())
         self.assertEqual(r.returncode, 0, r.stderr)
 
-    def test_class_options_are_capped_at_four_and_a_class_with_fewer_than_two_gets_a_note(self):
-        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=["1", "2", "3", "4", "5", " "])))
-        self.assertEqual(len(__import__("ergon").tasks.options(self.fields("T-004"))[0]), 4)
-        for extra in ({}, {"options": []}, {"options": ["only one"]}, {"options": "nope"}):
-            with self.subTest(extra=extra):
+    def test_prompt_asks_for_a_crux_and_lens_options_with_no_ranking(self):
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C)))
+        [prompt] = self.prompts()
+        head = prompt.lower()
+        self.assertNotIn("best first", head)
+        self.assertNotIn("recommend", head)
+        for word in ('"crux"', "optimizes_for", "gives_up", "regret_if", "minimal, durable, operator, risk, defer"):
+            self.assertIn(word, prompt)
+
+    def test_a_bad_option_set_files_no_options_and_a_note_says_why(self):
+        rec = [dict(o) for o in self.LENS_OPTS]
+        rec[0]["approach"] = "the recommended way"
+        rep = [dict(o) for o in self.LENS_OPTS]
+        rep[1]["lens"] = "defer"
+        cases = [("recommend", dict(crux=self.CRUX, options=rec)),
+                 ("more than once", dict(crux=self.CRUX, options=rep)),
+                 ("no `Crux:`", dict(options=self.LENS_OPTS)),
+                 ("1 option(s)", {"crux": self.CRUX, "options": self.LENS_OPTS[:1]}),
+                 ("No options were offered", {}), ("No options were offered", {"options": "nope"})]
+        for why, extra in cases:
+            with self.subTest(why=why, extra=list(extra)):
                 for f in (self.root / "tasks").rglob("T-004-*.md"):
                     f.unlink()
                 for r in (self.runs / "learn").glob("*.json"):
@@ -8852,20 +8882,27 @@ class TestLearn(Project):
                 t = self.fields("T-004")
                 self.assertNotIn("## Options", t["_body"])
                 self.assertIn("No options were offered", t["_body"])
+                self.assertIn(why, t["_body"].partition("## Notes")[2])
                 self.ergon("approve", "T-004", inp="y\n", env=self.human())
 
+    def test_options_are_capped_at_four(self):
+        many = self.LENS_OPTS + [dict(self.LENS_OPTS[0], lens=l) for l in ("operator", "risk")]
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, crux=self.CRUX, options=many)))
+        self.assertEqual(len(__import__("ergon").tasks.options(self.fields("T-004"))[0]), 4)
+
     def test_a_class_joining_an_open_task_leaves_its_options_alone(self):
-        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=["one", "two"])))
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, crux=self.CRUX,
+                                                            options=self.LENS_OPTS)))
         self.ergon("choose", "T-004", "1", inp="y\n", env=self.human())
         before = self.task_file("T-004").read_text()
         self.incident(self.D, "runtime", "test_parse fails: ValueError swallowed")
-        self.ergon("learn", env=self.reply(self.bare_except(self.D, task="T-004", options=["three", "four"])))
+        self.ergon("learn", env=self.reply(self.bare_except(self.D, task="T-004", crux="c", options=self.LENS_OPTS[:2])))
         after = self.task_file("T-004").read_text()
         self.assertEqual(after.partition("## Options\n")[2].partition("\n## ")[0],
                          before.partition("## Options\n")[2].partition("\n## ")[0])
         self.assertIn("Chosen: 1 by", after)
-        self.assertIn("  - three", after.partition("## Notes")[2])
-        self.assertNotIn("3. three", after)
+        self.assertIn("  - defer: leave it to review for now", after.partition("## Notes")[2])
+        self.assertIn("  - minimal: a ruff rule E722", after.partition("## Notes")[2])
 
     def test_malformed_reply_files_nothing_and_warns(self):
         before = {p.name: p.read_text() for p in (self.root / "tasks").rglob("T-*.md")}
