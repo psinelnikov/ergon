@@ -1314,6 +1314,70 @@ class TestBasics(Project):
         for cmd in ["read -r line", "export \"PATH=$HOME/bin:$PATH\"", "printf -v out %s \"$x\""]:
             self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
 
+    def test_guard_git_command_env_set_behind_reserved_words_and_wrappers(self):
+        """T-249: a literal-name setter (export, declare, read, printf -v, a bare NAME=value, a nameref,
+        a for loop) behind a reserved word that starts a command (`{`, `if`, `then`, `else`, `do`,
+        `while`, `until`, `!`), `function NAME`, or a wrapper that runs the next word (`builtin`,
+        `command`, `exec`) is read as that setter: env_commands / human_cmd check the value it gives a
+        git command variable, and git_env_reason refuses one it can't see. The same words given to
+        echo or after git stay data, and a value the text shows that runs no human-only verb passes."""
+        from ergon.gates import env_commands, git_env_reason, human_cmd, shell_commands
+        leads = ["{ {s}; }", "if {s}; then :; fi", "if true; then {s}; fi", "if x; then :; else {s}; fi",
+                 "while {s}; do :; done", "until {s}; do :; done", "while x; do {s}; done", "! {s}",
+                 "builtin {s}", "command {s}", "command -p {s}", "exec {s}", "exec -a n {s}", "builtin command {s}",
+                 "if ! {s}; then :; fi", "{ { {s}; }; }", "function f { {s}; }; f", "time {s}"]
+
+        def at(lead, s):
+            return lead.replace("{s}", s)
+        for lead in leads:
+            for verb in ["approve", "close", "review -i"]:
+                for s in [f"export GIT_EDITOR='ergon {verb} T-1'", f"declare -x GIT_PAGER='ergon {verb} T-1'",
+                          f"typeset -x GIT_SSH_COMMAND='ergon {verb} T-1'"]:
+                    cmd = at(lead, s) + "; git commit"
+                    self.assertTrue(human_cmd(cmd), cmd)
+                    self.assertTrue(any(human_cmd(t) for t in env_commands(shell_commands(cmd)[0])), cmd)
+            for s in ["export GIT_EDITOR=$x", "export GIT_EDITOR=\"$(cat f)\"", "declare -x GIT_PAGER=`cat f`",
+                      "export GIT_EDITOR", "declare -x GIT_PAGER", "export GIT_EDITOR+=x", "read GIT_EDITOR",
+                      "read -r GIT_PAGER", "mapfile GIT_EDITOR", "printf -v GIT_EDITOR %s x", "printf -vGIT_PAGER x",
+                      "declare -n r=GIT_EDITOR", "local -n r=GIT_PAGER"]:
+                cmd = at(lead, s) + "; git commit"
+                self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        # a bare assignment behind a reserved word (a wrapper would run it as a program's name)
+        for lead in ["{ {s}; }", "if true; then {s}; fi", "while x; do {s}; done", "! {s}", "time {s}"]:
+            cmd = at(lead, "GIT_EDITOR='ergon approve T-1'") + "; git commit"
+            self.assertTrue(human_cmd(cmd), cmd)
+            self.assertIn("can't see", git_env_reason(at(lead, "GIT_EDITOR=$x") + "; git commit") or "", lead)
+        for cmd in ["{ for GIT_EDITOR in a b; do git commit; done; }", "if true; then for GIT_PAGER in a; do :; done; fi"]:
+            self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        # a program that is still an expansion, behind a reserved word or a wrapper, ahead of a human-only verb
+        for cmd in ["{ $E approve T-1; }", "builtin $E approve T-1", "if $E close T-1; then :; fi", "! $E answer T-1",
+                    # bash and zsh run `E=echo` as a program's name after command / builtin / exec / noglob: E stays unset
+                    "command E=echo; $E approve T-1", "builtin E=echo; $E approve T-1", "noglob E=echo; $E approve T-1"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        self.assertFalse(human_cmd("{ E=echo; }; $E approve T-1"))  # braces set E in this shell
+        # what those words leave alone: values the text shows, data, and other names (a function the
+        # text defines may make echo set what it's handed, T-242, so it's left out here)
+        for lead in [x for x in leads if not x.startswith("function")]:
+            for s in ["export GIT_EDITOR=vim", "export GIT_PAGER='less -R'", "declare -x GIT_PAGER=cat",
+                      "echo GIT_EDITOR=$x", "echo export GIT_EDITOR", "read -r line", "printf -v out %s x",
+                      "export PATH=$PATH:/x", "export FOO", "git commit -m GIT_EDITOR=$x"]:
+                cmd = at(lead, s) + "; git log"
+                self.assertIsNone(git_env_reason(cmd), cmd)
+                self.assertFalse(human_cmd(cmd), cmd)
+            cmd = at(lead, "export X='ergon approve T-1'") + "; git log"
+            self.assertFalse(human_cmd(cmd), cmd)  # not a variable git runs
+        # end to end through the hook
+        for cmd in ["{ export GIT_EDITOR='ergon approve T-1'; }; git commit",
+                    "builtin export GIT_PAGER='ergon close T-1'; git log",
+                    "if true; then export GIT_EDITOR='ergon answer T-1'; fi; git commit"]:
+            self.assertIn("human-only", self.guard("Bash", {"command": cmd}) or "", cmd)
+        for cmd in ["builtin export GIT_EDITOR=$x; git commit", "if read GIT_EDITOR; then git commit; fi",
+                    "{ printf -v GIT_PAGER %s x; }; git log", "command export GIT_EDITOR; git commit"]:
+            self.assertIn("can't see", self.guard("Bash", {"command": cmd}) or "", cmd)
+        for cmd in ["{ export GIT_PAGER=cat; }; git log", "if true; then export GIT_EDITOR=vim; fi; git commit",
+                    "builtin echo GIT_EDITOR=$x"]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+
     def test_guard_refuses_unseen_git_url_config(self):
         """T-226: a remote's or submodule's URL key (GIT_URL_KEYS) runs an ext:: URL as a command, so
         T-060's unseen-value checks cover it: set through --config-env, GIT_CONFIG_KEY_<n> /

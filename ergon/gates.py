@@ -1728,9 +1728,10 @@ def _env_assignments(words):
     """(name, "+" or "", value) of each NAME=value or NAME+=value among a simple command's words that
     sets the environment of what it runs or of later commands: ahead of its program (or alone),
     as an argument of export / declare, or ahead of a git call behind a wrapper (sudo, env, nice).
-    Anywhere else (after git, as echo's argument) it's data."""
+    Anywhere else (after git, as echo's argument) it's data. The program is found past reserved
+    words and wrappers (_command_head: `{ export X=v; }`, `builtin export X=v`), T-249."""
     git_at = next((k for k, w in enumerate(words) if _program(w) == "git" or _program(w).startswith("git-")), -1)
-    head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+    head = _command_head(words)
     declares = head < len(words) and _program(words[head]) in SHELL_DECLARE
     for k, w in enumerate(words):
         m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)", w, re.S)
@@ -1864,7 +1865,7 @@ def _runs_human(cmd, cmds):
             return True
         if any(human_cmd(t) for t in git_commands(words)):
             return True
-        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        head = _command_head(words)  # `{ $E approve; }`, `builtin $E approve` (T-249)
         for k, w in enumerate(words):
             ergon = _program(w) in ("ergon", "ergon.py") or w.endswith("ergon/__main__.py")
             if not ergon and not (k == head and _unseen(w)):
@@ -2178,6 +2179,30 @@ def indirect_set_msg(cmd):
     return None
 
 
+def _command_head(words):
+    """The index of a simple command's program among its words, or len(words) if it has none: past
+    NAME=value words, the reserved words that start a command (`{`, `if`, `then`, `do`, `!`, ...),
+    `function NAME`, and the wrappers that run the next word (`builtin`, `command`, `exec`) with their
+    options (`command -p`, `exec -a NAME`). So `{ export X=v; }`, `if read X` and `builtin printf -v X`
+    are export, read and printf (T-249). After `builtin`, `command`, `exec`, `noglob` or zsh's `-`,
+    bash and zsh run a NAME=value word as the program's name (`command X=1 cmd` sets no X), so it is
+    the program there; after `time`, `!` and zsh's `nocorrect` it is an assignment."""
+    k, wrapper = 0, None
+    while k < len(words):
+        w = words[k]
+        if ASSIGNMENT.match(w) and wrapper in (None, "time", "!", "nocorrect"):
+            k += 1
+        elif w in SHELL_LEADS:
+            k, wrapper = k + 1, (w if w in SHELL_RUNS_NEXT else None)
+        elif w == "function":
+            k += 2  # `function f { ...`: f is its name
+        elif wrapper and w.startswith("-") and w != "-":
+            k += 1 + (wrapper == "exec" and w == "-a")  # `command -p read`, `exec -a name prog`
+        else:
+            break
+    return min(k, len(words))
+
+
 def _dynamic_name(words):
     """How a simple command sets a shell variable whose name the text doesn't show, or None: a name
     with a `$` or backtick expansion given to printf / print -v, read, mapfile, getopts, a declare-like
@@ -2186,19 +2211,7 @@ def _dynamic_name(words):
     zparseopts, ...). A name the text shows is left to the callers' own checks. Its program is found
     past assignments, reserved words (`if`, `{`, `do`), `function NAME` and wrappers (`builtin`,
     `command`), so the body of a function that sets `"$1"` counts (T-242)."""
-    k, after_wrapper = 0, False
-    while k < len(words):
-        w = words[k]
-        if ASSIGNMENT.match(w) and not after_wrapper:
-            k += 1
-        elif w in SHELL_LEADS:
-            k, after_wrapper = k + 1, w in SHELL_RUNS_NEXT
-        elif w == "function":
-            k += 2  # `function f { ...`: f is its name
-        elif after_wrapper and w.startswith("-"):
-            k += 1  # `command -p read`
-        else:
-            break
+    k = _command_head(words)
     if k >= len(words):
         return None
     prog, args = _program(words[k]), words[k + 1:]
@@ -2369,7 +2382,7 @@ def git_env_reason(cmd):
                 if human_cmd(m.group(2)):
                     return HUMAN_MSG
                 seen.add(m.group(1))
-        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        head = _command_head(words)  # `{ export ...`, `if read ...`, `builtin printf -v ...` (T-249)
         if head == len(words):
             continue
         prog, args = _program(words[head]), words[head + 1:]
