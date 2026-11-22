@@ -19,10 +19,12 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                opens the epic and leaves its tasks proposed / edit / skip)
   ergon show ID
   ergon new task "Title" --tier sonnet [--epic E-001] [--touches a,b] [--source LOG.md:42]
-                      [--category C] [--option "<approach>" --option "<approach>" ...]
-                               --option (2 to 4, the recommended one first) writes an ## Options
-                               section a human picks from with `ergon choose`. In an agent shell a
-                               feature (category feature or empty) is refused without 2 of them
+                      [--category C] [--crux "<text>"] [--option "<lens>: <approach> | <optimizes for> | <gives up> | <regret if>" ...]
+                               --crux and 2 to 4 --options (one per lens: minimal, durable, operator,
+                               risk, defer) write an ## Options section a human picks from with
+                               `ergon choose`. In an agent shell a feature (category feature or empty)
+                               is refused without a crux and well-formed options; elsewhere plain
+                               --option text writes a numbered list
   ergon new epic "Title"
   ergon import gh#123 [--tier T] [--epic E] [--touches a,b]
                                a GitHub issue (or gh:OWNER/REPO#123) as a proposed task, via the
@@ -434,10 +436,12 @@ def main():
     nw.add_argument("--epic")
     nw.add_argument("--touches")
     nw.add_argument("--source")
+    nw.add_argument("--crux", metavar="TEXT", help="task: one line saying what the choice between the options turns on")
     nw.add_argument("--option", action="append", metavar="TEXT",
-                    help="task: one approach to choose from; give it 2 to 4 times, the recommended one first. Writes an "
-                         "## Options section a human picks from with `ergon choose`. In an agent shell a feature "
-                         "(category feature or empty) needs at least 2")
+                    help="task: one approach to choose from, \"<lens>: <approach> | <optimizes for> | <gives up> | "
+                         "<regret if>\"; give it 2 to 4 times, one per lens (minimal, durable, operator, risk, defer). "
+                         "Writes an ## Options section a human picks from with `ergon choose`. In an agent shell a "
+                         "feature (category feature or empty) needs --crux and well-formed options")
     im = sub.add_parser("import", help="a GitHub issue as a proposed task: gh#123 or gh:OWNER/REPO#123")
     im.add_argument("ref", metavar="gh#N")
     im.add_argument("--tier", help="default: human, until someone sizes it")

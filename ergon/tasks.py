@@ -1068,6 +1068,17 @@ EPIC_BODY = """
 """
 
 
+def _parse_lens_flag(text):
+    """One `--option "<lens>: <approach> | <optimizes for> | <gives up> | <regret if>"` as a mapping of
+    LensOption fields. A text with no `<word>:` prefix gets an empty lens; missing fields stay empty."""
+    parts = [x.strip() for x in text.split(" | ")]
+    parts += [""] * (4 - len(parts))
+    m = re.match(r"^([A-Za-z][\w-]*)\s*:\s*(.*)$", parts[0])
+    lens, approach = (m[1], m[2]) if m else ("", parts[0])
+    return {"lens": lens, "approach": approach, "optimizes": parts[1], "gives_up": parts[2],
+            "regret": " | ".join(p for p in parts[3:] if p)}
+
+
 def new(args):
     if args.kind == "task":
         if args.tier not in TIERS:
@@ -1075,14 +1086,25 @@ def new(args):
         if args.category and args.category not in CATEGORIES:
             raise SystemExit(f"--category must be one of {CATEGORIES}")
         opts = [o for o in (" ".join(str(x).split()) for x in getattr(args, "option", None) or []) if o]
-        if len(opts) == 1:
-            raise SystemExit("--option: give at least 2 (the recommended one first), or none: a choice of one "
-                             "isn't a choice")
-        if _gates.in_agent_shell() and category({"category": args.category}) == "feature" and len(opts) < 2:
-            raise SystemExit("refused: in an agent shell a feature (--category feature, or none) needs 2 to 4 "
-                             "--option \"<approach>\", the recommended one first, so the human chooses how it is "
-                             "built before approving it. If it isn't new behaviour a user would notice, give "
-                             "--category bugfix, refactor or chore")
+        crux = " ".join(str(getattr(args, "crux", None) or "").split())
+        agent_feature = _gates.in_agent_shell() and category({"category": args.category}) == "feature"
+        entries = [_parse_lens_flag(o) for o in opts]
+        lens_mode = bool(crux) or any(e["lens"] in LENSES for e in entries) or (agent_feature and bool(opts))
+        if agent_feature and not lens_mode:
+            raise SystemExit(
+                "refused: in an agent shell a feature (--category feature, or none) needs --crux \"<what the choice "
+                "turns on>\" and 2 to 4 --option \"<lens>: <approach> | <optimizes for> | <gives up> | <regret if>\", "
+                f"one per lens ({', '.join(LENSES)}), so the human chooses how it is built before approving it. "
+                "If it isn't new behaviour a user would notice, give --category bugfix, refactor or chore")
+        if lens_mode:
+            problems = lens_problems(crux, entries)
+            if problems:
+                raise SystemExit("refused: the options are malformed:\n  " + "\n  ".join(problems))
+            section = lens_section(crux, entries)
+        elif len(opts) == 1:
+            raise SystemExit("--option: give at least 2, or none: a choice of one isn't a choice")
+        else:
+            section = "\n## Options\n" + "".join(f"{n}. {o}\n" for n, o in enumerate(opts, 1)) if opts else ""
         epics = load(_config.EPICS)
         if args.epic and args.epic not in epics:
             raise SystemExit(f"no such epic: {args.epic}")
@@ -1092,7 +1114,7 @@ def new(args):
                 "epic": args.epic or "", "depends": [], "touches": args.touches.split(",") if args.touches else [],
                 "source": args.source or "", "created": today(), "approved": "", "tier_why": "",
                 "_path": home / f"{tid}-{slug(args.title)}.md",
-                "_body": TASK_BODY.replace("\n## Notes", options_section(opts) + "\n## Notes") if opts else TASK_BODY}
+                "_body": TASK_BODY.replace("\n## Notes", section + "\n## Notes") if section else TASK_BODY}
         dump(meta, TASK_KEYS)
         _history.record("created", meta, tier=args.tier, title=args.title, source=args.source or None, by="new")
     else:

@@ -8913,10 +8913,10 @@ class TestOptions(Project):
     def options_text(self, tid):
         return self.task_file(tid).read_text().partition("## Options\n")[2].partition("\n## ")[0]
 
-    def test_new_writes_options_in_order_first_recommended(self):
+    def test_new_writes_plain_options_numbered_unmarked(self):
         self.new_feature("an in-memory LRU", "a redis cache", "  no   cache ")
         self.assertEqual(self.options_text("T-001"),
-                         "1. an in-memory LRU (recommended)\n2. a redis cache\n3. no cache\n")
+                         "1. an in-memory LRU\n2. a redis cache\n3. no cache\n")
         t = ergon.tasks.parse(self.task_file("T-001"))
         self.assertEqual(ergon.tasks.options(t), (["an in-memory LRU", "a redis cache", "no cache"], None))
         body = t["_body"]
@@ -9070,18 +9070,42 @@ class TestOptions(Project):
             self.assertIn("human-only", self.guard("Bash", {"command": cmd}), cmd)
         self.assertIsNone(self.guard("Bash", {"command": 'git commit -m "ergon choose T-001 1"'}))
 
+    LENS_A = "minimal: keep one in-memory map | speed of change | no sharing between runs | runs grow large"
+    LENS_B = "durable: store it in sqlite on disk | survives restarts | a schema to migrate | the data stays small"
+
+    def refused(self, *flags):
+        r = self.ergon("new", "task", "Feature", "--tier", "sonnet", *flags, check=False, env=self.agent())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        return r.stderr
+
+    def test_new_task_in_agent_shell_refuses_malformed_lens_options(self):
+        a, b = self.LENS_A, self.LENS_B
+        c = ("--crux", "what it turns on")
+        self.assertIn("no `Crux:`", self.refused("--option", a, "--option", b))
+        self.assertIn("recommendation wording", self.refused(*c, "--option", a.replace("one", "the best one"), "--option", b))
+        self.assertIn("minimal lens more than once", self.refused(*c, "--option", a, "--option", a))
+        self.assertIn("no Regret if", self.refused(*c, "--option", "minimal: keep one in-memory map | speed | no sharing",
+                                                   "--option", b))
+        self.assertIn("under half the median", self.refused(*c, "--option", "minimal: x | y | z | w", "--option", b,
+                                                            "--option", b.replace("durable", "risk")))
+
     def test_new_task_in_agent_shell_needs_options_for_a_feature(self):
         agent = self.agent()
         r = self.ergon("new", "task", "Feature", "--tier", "sonnet", check=False, env=agent)
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("needs 2 to 4", r.stderr)
-        self.assertIn("chooses how it is built", r.stderr)
+        self.assertIn("needs --crux", r.stderr)
+        self.assertNotIn("recommend", r.stderr)
         r = self.ergon("new", "task", "Feature", "--tier", "sonnet", "--category", "feature", "--option", "a",
                        check=False, env=agent)
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
-        self.ergon("new", "task", "Feature", "--tier", "sonnet", "--option", "a", "--option", "b", env=agent)
-        self.assertEqual(self.options_text("T-001"), "1. a (recommended)\n2. b\n")
+        self.ergon("new", "task", "Feature", "--tier", "sonnet", "--crux", "speed or simplicity",
+                   "--option", self.LENS_B, "--option", self.LENS_A, env=agent)
+        text = self.options_text("T-001")
+        self.assertTrue(text.startswith("Crux: speed or simplicity\n- minimal: "), text)
+        self.assertLess(text.index("- minimal:"), text.index("- durable:"))
+        self.assertNotIn("recommended", text)
         self.ergon("new", "task", "Fix", "--tier", "haiku", "--category", "bugfix", env=agent)
         self.assertNotIn("## Options", self.task_file("T-002").read_text())
         self.ergon("new", "task", "Human's feature", "--tier", "sonnet")  # outside an agent shell: optional
