@@ -603,22 +603,51 @@ def options_section(opts):
                                       for n, o in enumerate(opts, 1))
 
 
-def print_options(t, indent="  "):
-    """Print t's options, the chosen one marked, and in a numbered section the recommended one. A
-    lens-format section prints its crux first and each option's fields under it, none recommended."""
+def option_lines(t, indent="  "):
+    """The lines that show t's options, none recommended, every chosen option marked. A lens-format
+    section gives its crux, then each lens with its fields in LENSES order; a numbered one its list."""
     opts, chosen = options(t)
+    out = []
     if opts.crux is not None:
-        print(f"{indent}Crux: {opts.crux}")
+        out.append(f"{indent}Crux: {opts.crux}")
     for n, o in enumerate(opts, 1):
         picked = bool(chosen) and bool(chosen["text"]) and (
             o.lens in chosen["lenses"] if isinstance(o, LensOption) else chosen["option"] == n)
-        marks = [m for m, on in (("recommended", n == 1 and opts.crux is None), ("chosen", picked)) if on]
-        print(f"{indent}{n}. {o}" + (f"  ({', '.join(marks)})" if marks else ""))
+        out.append(f"{indent}{n}. {o}" + ("  (chosen)" if picked else ""))
         if isinstance(o, LensOption):
-            for key, label in LENS_FIELDS:
-                print(f"{indent}   {label}: {getattr(o, key)}")
+            out += [f"{indent}   {label}: {getattr(o, key)}" for key, label in LENS_FIELDS]
     if chosen and chosen["option"] == "own":
-        print(f"{indent}own. {chosen['text']}  (chosen)")
+        out.append(f"{indent}own. {chosen['text']}  (chosen)")
+    return out
+
+
+def print_options(t, indent="  "):
+    """Print t's options as option_lines gives them."""
+    for l in option_lines(t, indent):
+        print(l)
+
+
+def rendered_text(t):
+    """t's task file text with its `## Options` section's body replaced by the rendered options (the
+    `Chosen:` line kept), so neither the written order nor a `(recommended)` shows."""
+    text = t["_path"].read_text()
+    if not has_options(t):
+        return text
+    chosen = next(iter(chosen_lines(text)), None)
+    out, on, done = [], False, False
+    for l in text.split("\n"):
+        m = HEADING.match(l)
+        if m:
+            on = m.group(1).strip().lower() == "options"
+            if on:
+                out.append(l)
+                if not done:
+                    done = True
+                    out += ([chosen] if chosen else []) + option_lines(t, "") + [""]
+                continue
+        if not on:
+            out.append(l)
+    return "\n".join(out)
 
 
 def choice_text(t):
@@ -1088,7 +1117,7 @@ def show(args):
     item = tasks.get(args.id) or epics.get(args.id)
     if not item:
         raise SystemExit(f"no such id: {args.id}")
-    print(item["_path"].read_text())
+    print(rendered_text(item) if item["id"] in tasks else item["_path"].read_text())
     if args.id in tasks:
         from . import priority as _pri
         t = tasks[args.id]
@@ -1096,7 +1125,6 @@ def show(args):
         if has_options(t):
             print("OPTIONS  " + (f"chosen {choice_text(t)}" if choice_text(t) else
                                  f"no choice yet: `{choose_hint(t)}` (a human, in their own terminal)"))
-            print_options(t)
         print(f"PRIORITY  cod={t.get('cod', '')}  cod_why={t.get('cod_why', '')}  graded={t.get('graded', '')}"
               f"  unblocks={_pri.unblocks(t, tasks)}  p={_pri.score(t, tasks):.1f}")
         fus = follow_ups(t, tasks, open_only=False)

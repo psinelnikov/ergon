@@ -9017,7 +9017,8 @@ class TestOptions(Project):
         f = self.task_file("T-001")
         out = self.ergon("show", "T-001").stdout
         self.assertIn("OPTIONS  no choice yet: `ergon choose T-001 <N>`", out)
-        self.assertIn("  1. an in-memory LRU  (recommended)", out)
+        self.assertIn("1. an in-memory LRU", out)
+        self.assertNotIn("recommended", out)  # T-254: the file's `(recommended)` is not shown
         review = self.ergon("review").stdout
         self.assertIn("AWAITING A CHOICE (1)", review)
         self.assertIn("         2. a redis cache", review)
@@ -9258,6 +9259,24 @@ class TestLensOptions(Project):
         out = self.ergon("show", "T-001").stdout
         self.assertIn("Crux: whether lookups", out)
         self.assertIn("   Gives up: one cache shared", out)
+        self.assertNotIn("recommended", out)
+
+    def test_show_prints_the_rendered_section_in_lens_order_marking_a_combination(self):
+        # T-254: the file's written order (defer first) and any `(recommended)` never show; each chosen lens is marked
+        self.task("Chosen: minimal + durable by Pavel 2026-11-22\n" + self.LENS.replace("durable: a redis", "durable: a <b>redis"))
+        out = self.ergon("show", "T-001").stdout
+        sec = out.split("## Options")[1].split("## Notes")[0]
+        self.assertLess(sec.index("minimal:"), sec.index("durable:"))
+        self.assertLess(sec.index("durable:"), sec.index("defer:"))
+        self.assertIn("Chosen: minimal + durable by Pavel 2026-11-22", sec)
+        self.assertEqual(out.count("(chosen)"), 2)
+        self.assertNotIn("recommended", out)
+        self.assertNotIn("(chosen)", [l for l in sec.splitlines() if "defer:" in l][0])
+
+    def test_show_hides_an_old_recommended_mark(self):
+        self.task("1. an LRU (recommended)\n2. a redis cache\n")
+        out = self.ergon("show", "T-001").stdout
+        self.assertIn("1. an LRU", out)
         self.assertNotIn("recommended", out)
 
     def test_numbered_section_reads_as_before(self):

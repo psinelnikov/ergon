@@ -603,7 +603,7 @@ def review_interactive(args):
         while t["status"] == "proposed":
             epic = epics.get(t.get("epic"))
             print(f"\n{'=' * 78}\n[{i}/{len(queue)}]  {epic['id'] + '  ' + epic['title'] if epic else '(no epic)'}\n")
-            print(t["_path"].read_text().rstrip())
+            print(_tasks.rendered_text(t).rstrip())
             waits = [d for d in t.get("depends") or [] if tasks.get(d, {}).get("status") != "done"]
             if waits:
                 print(f"\n(waits on {', '.join(waits)})")
