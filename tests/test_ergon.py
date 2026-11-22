@@ -5582,8 +5582,15 @@ Sign each export.
 ## Done when
 - exports verify
 ## Options
-1. Sign with the account key (recommended)
-2. Sign with a per-export key
+Crux: where the signing key lives
+- durable: sign with a per-export key
+  Optimizes for: blast radius per key
+  Gives up: more keys to store
+  Regret if: key storage turns out costly
+- minimal: sign with the account key
+  Optimizes for: the fewest moving parts
+  Gives up: one key signs everything
+  Regret if: the account key leaks
 END TASK
 
 TASK: Rotate the signing key
@@ -5641,6 +5648,19 @@ depends:
 half
 
 RESULT: done
+"""
+
+
+LENS_OPTIONS = """## Options
+Crux: how much to build now
+- minimal: do the smallest change that works
+  Optimizes for: speed of landing
+  Gives up: reuse later
+  Regret if: a second caller shows up
+- durable: build a shared helper for every caller
+  Optimizes for: reuse by later work
+  Gives up: a bigger diff to review
+  Regret if: nothing else ever calls it
 """
 
 
@@ -5719,7 +5739,10 @@ class TestBreakdown(DispatchProject):
         self.assertNotIn("## Options", text)
         text = self.task_file("T-003").read_text()
         self.assertEqual(self.field("T-003", "category"), "feature")
-        self.assertIn("## Options\n1. Sign with the account key (recommended)\n2. Sign with a per-export key\n\n## Notes", text)
+        self.assertIn("## Options\nCrux: where the signing key lives\n- minimal: sign with the account key\n"
+                      "  Optimizes for: the fewest moving parts\n", text)  # LENSES order, not the order written
+        self.assertLess(text.index("- minimal:"), text.index("- durable:"))
+        self.assertNotIn("(recommended)", text)
         # the rest are refused with a warning, never repaired
         self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 3)
         self.assertIn("warning: breakdown E-001 block 4 refused (Rotate the signing key): touches "
@@ -5760,38 +5783,44 @@ class TestBreakdown(DispatchProject):
         self.assertIn("two `## What` sections", got[3][2])
         self.assertEqual(got[0][1]["title"], "T")
 
-    def test_feature_blocks_need_two_to_four_options_and_a_known_category(self):
+    def test_feature_blocks_need_a_valid_lens_section_and_a_known_category(self):
         from ergon import dispatch as D
         head = "TASK: T\ntier: haiku\ntier_why: w\n%stouches:\ndepends:\n## What\nx\n## Done when\n- y\n"
-        opts = lambda n: "## Options\n" + "".join(f"{i}. approach {i}\n" for i in range(1, n + 1))
-        replies = [head % "category: feature\n" + opts(2), head % "category: feature\n" + opts(1),
-                   head % "" + opts(5), head % "category: chore\n", head % "category: chore\n" + opts(1),
-                   head % "category: bugfix\n" + "## Options\nsome prose\n", head % "category: epic\n" + opts(2),
-                   head % "category: feature\n" + opts(2) + "Chosen: 1 by me 2026-01-01\n"]
+        good = LENS_OPTIONS
+        swap = lambda a, b: good.replace(a, b)
+        short_lens = lambda: good[:good.index("- durable")] + "- durable: x\n  Optimizes for: a\n  Gives up: b\n  Regret if: c\n"
+        replies = [head % "category: feature\n" + good,
+                   head % "category: feature\n" + swap("how much", "we recommend how much"),
+                   head % "category: feature\n" + swap("- durable:", "- minimal:"),
+                   head % "category: feature\n" + swap("  Gives up: reuse later\n", ""),
+                   head % "category: feature\n" + short_lens(),
+                   head % "category: feature\n" + swap("Crux: how much to build now\n", ""),
+                   head % "category: feature\n" + "## Options\n1. a\n2. b\n",
+                   head % "category: feature\n",
+                   head % "category: chore\n",
+                   head % "category: bugfix\n" + "## Options\nsome prose\n",
+                   head % "category: epic\n" + good,
+                   head % "category: feature\n" + good + "Chosen: 1 by me 2026-01-01\n"]
         got = D.parse_blocks("".join(r + "END TASK\n" for r in replies))
-        why = []
-        for n, f, w in got:
-            why.append(w or D.check_block(n, f, {}, {}, set()))
+        why = [w or D.check_block(n, f, {}, {}, set()) for n, f, w in got]
         self.assertIsNone(why[0])
-        self.assertEqual(got[0][1]["options"], "1. approach 1\n2. approach 2")
-        self.assertIn("a feature block needs 2 to 4 options under `## Options`, has 1", why[1])
-        self.assertIn("a feature block needs 2 to 4 options", why[2])  # no category reads as feature
-        self.assertIsNone(why[3])
-        self.assertIn("a block with options needs 2 to 4", why[4])
-        self.assertIn("isn't a numbered option", why[5])
-        self.assertIn("category 'epic' not in", why[6])
-        self.assertIn("`Chosen:` line", why[7])
+        for i, word in ((1, "recommendation wording"), (2, "more than once"), (3, "has no Gives up"),
+                        (4, "under half the median"), (5, "no `Crux:` line"), (6, "old numbered list"),
+                        (7, "a feature block needs 2 to 4 options"), (9, "not in lens format"),
+                        (10, "category 'epic' not in"), (11, "`Chosen:` line")):
+            self.assertIn(word, why[i] or "", i)
+        self.assertIsNone(why[8])  # a chore may leave it out
 
     def test_breakdown_refuses_a_one_option_feature_and_files_the_rest(self):
         self.new_epic()
         approve_epic(self)
         blk = "TASK: %s\ntier: haiku\ntier_why: w\ncategory: %s\ntouches:\ndepends:\n## What\nx\n## Done when\n- y\n%sEND TASK\n"
-        self.env["FAKE_BREAKDOWN"] = (blk % ("Two", "feature", "## Options\n1. a\n2. b\n") + blk % ("One", "feature", "## Options\n1. a\n")
+        self.env["FAKE_BREAKDOWN"] = (blk % ("Two", "feature", LENS_OPTIONS) + blk % ("One", "feature", "## Options\n1. a\n")
                                       + blk % ("Plain", "chore", "") + blk % ("Odd", "wish", "") + "RESULT: done\n")
         out = self.ergon("breakdown", "E-001").stdout
-        self.assertIn("block 2 refused (One): a feature block needs 2 to 4 options under `## Options`, has 1", out)
+        self.assertIn("block 2 refused (One): `## Options` is not in lens format", out)
         self.assertIn("block 4 refused (Odd): category 'wish' not in", out)
-        self.assertIn("## Options\n1. a (recommended)\n2. b\n", self.task_file("T-001").read_text())
+        self.assertIn("## Options\nCrux: how much to build now\n- minimal:", self.task_file("T-001").read_text())
         self.assertNotIn("## Options", self.task_file("T-002").read_text())
         self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 2)
         self.ergon("check")

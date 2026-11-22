@@ -3098,15 +3098,28 @@ depends: <comma-separated numbers of earlier blocks in this reply, or existing T
 ## Done when
 <outcomes a reviewer can check>
 ## Options
-1. <the recommended approach, one line>
-2. <an alternative approach, one line>
+Crux: <one line: what the choice turns on; it names no option>
+- minimal: <the smallest change that meets the goal, one line>
+  Optimizes for: <what it makes best>
+  Gives up: <what it costs>
+  Regret if: <what would make a human wish for another lens>
+- durable: <approach>
+  Optimizes for: <…>
+  Gives up: <…>
+  Regret if: <…>
+- operator: <approach, same three fields>
+- risk: <approach, same three fields>
+- defer: <what happens if nothing is built now, same three fields>
 END TASK
 
-`## Options` lists 2 to 4 alternative approaches, the one you recommend first, one line each, and every
+`## Options` is a `Crux:` line and 2 to 4 lens options (`- <lens>: <approach>`, each with `Optimizes for:`,
+`Gives up:` and `Regret if:` lines), at most one per lens, written in the order minimal, durable, operator,
+risk, defer. The lenses are peers: the crux names no option, no option is marked or ranked, and a block
+that favours one option in its wording is refused. No option may be under half the median option's length. Every
 option stays within the epic's Goal and Constraints. A feature block needs it; a bugfix, refactor or
-chore block may leave it out. Blocks are numbered 1, 2, 3, … in the order you write them, and `depends` may name only an earlier
+chore block may leave it out. An old numbered list is refused. Blocks are numbered 1, 2, 3, … in the order you write them, and `depends` may name only an earlier
 block. Each block is checked as `ergon check` would check it. A block with an unknown field, a tier
-below a `[[protect]]` minimum for a path it touches, an unknown category, a feature with fewer than 2 or more than 4 options, an empty What or
+below a `[[protect]]` minimum for a path it touches, an unknown category, a feature with no options or an `## Options` section that breaks the lens rules, an empty What or
 Done when, or a missing END TASK line is refused and never repaired. So is a block that depends on a refused one. At most
 {max} blocks are filed.
 """
@@ -3271,15 +3284,21 @@ def check_block(n, f, tasks, ids, refused):
     if cat not in _tasks.CATEGORIES:
         return f"category {f['category']!r} not in {_tasks.CATEGORIES}"
     f["_category"] = cat
-    opts = [m[2] for l in f.get("options", "").split("\n") if (m := _tasks.OPTION_ITEM.match(l)) and m[2]]
-    if any(l.strip().startswith("Chosen:") for l in f.get("options", "").split("\n")):
+    text = f.get("options", "")
+    if any(l.strip().startswith("Chosen:") for l in text.split("\n")):
         return "`## Options` has a `Chosen:` line (a human chooses)"
-    if f.get("options") and len(opts) != len([l for l in f["options"].split("\n") if l.strip()]):
-        return "`## Options` holds a line that isn't a numbered option (`1. …`)"
-    if (cat == "feature" or opts) and not BLOCK_OPTIONS[0] <= len(opts) <= BLOCK_OPTIONS[1]:
-        return (f"{'a feature block' if cat == 'feature' else 'a block with options'} needs "
-                f"{BLOCK_OPTIONS[0]} to {BLOCK_OPTIONS[1]} options under `## Options`, has {len(opts)}")
-    f["_options"] = [_tasks.RECOMMENDED.sub("", o) for o in opts]
+    f["_lens"] = None
+    if text:
+        if not _tasks.is_lens_section(text):
+            return ("`## Options` is not in lens format (a `Crux:` line, then `- <lens>: <approach>` bullets "
+                    "with their fields); an old numbered list is refused")
+        crux, entries = _tasks.parse_lens(text)
+        problems = _tasks.lens_problems(crux, entries)
+        if problems:
+            return f"`## Options`: {problems[0]}"
+        f["_lens"] = (crux, entries)
+    elif cat == "feature":
+        return (f"a feature block needs {BLOCK_OPTIONS[0]} to {BLOCK_OPTIONS[1]} options under `## Options`, has 0")
     touches = split_list(f["touches"])
     if any(re.search(r"[\[\]#]", x) for x in touches):
         return f"a touches: entry holds `[`, `]` or `#`: {f['touches']}"
@@ -3422,7 +3441,7 @@ def file_blocks(e, blocks, info):
             continue
         tid = _tasks.next_id(_config.ITEMS, "T")
         body = (f"\n## What\n{f['what']}\n\n## Done when\n{f['done when']}\n"
-                + (_tasks.options_section(f["_options"]) if f["_options"] else "") + "\n## Notes\n"
+                + (_tasks.lens_section(*f["_lens"]) if f["_lens"] else "") + "\n## Notes\n"
                 + (f"{f['notes']}\n" if f.get("notes") else ""))
         source = BREAKDOWN_SOURCE.format(eid=e["id"])
         meta = {"id": tid, "title": title, "tier": f["tier"], "category": f["_category"], "status": "proposed", "epic": e["id"],
