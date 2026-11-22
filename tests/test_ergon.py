@@ -30,7 +30,8 @@ holds $FAKE_CONTEXT tokens (default 1000). With $FAKE_ASK set, a worker whose pr
 answer yet commits, then ends with $FAKE_ASK (QUESTION lines) and RESULT: asking. Called
 without --agent it is dispatch's 5-hour-window probe: it counts itself in $FAKE_PROBES and, with
 $FAKE_FIVE_HOUR set (|-separated utilizations, the nth probe the nth, the last repeating), streams
-a rate_limit_event; without it, no window, as on an API key. A worker writes its task ID over
+a rate_limit_event; without it, no window, as on an API key. With $FAKE_PROBE_LIMIT the probe
+itself ends the way a still-limited login does ($FAKE_LIMIT_TEXT). A worker writes its task ID over
 $FAKE_SHARED (and $FAKE_PUB_SHARED in the companion) too, so two tasks conflict, and sleeps
 $FAKE_SLEEP_<TIER> first. Handed a conflict round, it merges each base named and keeps both sides
 of each conflicted file, then ends $FAKE_CONFLICT_RESULT (default RESULT: done), and so does an
@@ -63,6 +64,8 @@ if "--agent" not in sys.argv:
     if os.environ.get("FAKE_PROBES"):
         n = len(open(os.environ["FAKE_PROBES"]).read()) if os.path.exists(os.environ["FAKE_PROBES"]) else 0
         open(os.environ["FAKE_PROBES"], "a").write("p")
+    if os.environ.get("FAKE_PROBE_LIMIT"):
+        limit_stop()
     seq = [x for x in os.environ.get("FAKE_FIVE_HOUR", "").split("|") if x]
     if seq:
         u, resets = float(seq[min(n, len(seq) - 1)]), int(os.environ.get("FAKE_RESETS_" + str(n), "1794935400"))
@@ -4748,7 +4751,8 @@ class TestConflictRounds(DispatchProject):
                 at = int(time.time() + 3600)
                 # an old transcript (age 4000) makes the restart a fresh worker
                 self.env.update(FAKE_STOPS="ok|ok|limit|ok", FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"),
-                                FAKE_LIMIT_TEXT=f"Claude AI usage limit reached|{at}", FAKE_TRANSCRIPT_AGE=age)
+                                FAKE_LIMIT_TEXT=f"Claude AI usage limit reached|{at}", FAKE_TRANSCRIPT_AGE=age,
+                                FAKE_PROBE_LIMIT="1")
                 out = self.ergon("dispatch", "--max", "6", "--jobs", "2").stdout
                 self.assertEqual(self.status("T-002"), "blocked", out)
                 self.assertRegex(self.task_file("T-002").read_text(), r"(?m)^limited: \S+ conflict 1$")
@@ -7441,7 +7445,8 @@ class TestUsageLimit(DispatchProject):
         home.mkdir()
         self.seen = Path(self.tmp.name) / "seen.jsonl"
         self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0",
-                        FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"))
+                        FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"),
+                        FAKE_PROBE_LIMIT="1")  # the limit is real in this class: the probe reports it too
         self.env.pop("CLAUDE_CONFIG_DIR", None)
         self.ergon("new", "task", "Job", "--tier", "sonnet", "--touches", "a.py")
         stamp(self.task_file("T-001"))
@@ -7496,9 +7501,11 @@ class TestUsageLimit(DispatchProject):
         self.assertIn(f"limited until {self.clock(at)}", self.ergon("board").stdout)
         self.ergon("check")
 
-        # Before the reset a scan skips it, and says until when.
+        # Before the reset a scan re-checks the limit with a probe (T-266): it still reports the
+        # limit, so the task waits — the run launches nothing and names the probe's reset.
         out = self.ergon("dispatch", "--max", "6").stdout
-        self.assertIn(f"skipped  T-001  limited until {self.clock(at)}", out)
+        self.assertIn(f"probe: still limited until {self.clock(at)}", out)
+        self.assertIn(f"paused by the 5-hour limit until {self.clock(at)}: T-001", out)
         self.assertIn(f"limited until {self.clock(at)}", self.ergon("dispatch", "--dry-run").stdout)
         self.assertEqual(self.status("T-001"), "blocked")
         self.assertEqual(len(self.calls()), 1)
@@ -7518,6 +7525,46 @@ class TestUsageLimit(DispatchProject):
         self.assertEqual([(r["after"], r["session"]) for r in self.rows("resumed")], [("limit", "s-1")])
         self.assertEqual([r.get("after") for r in self.rows("worker_end")], [None, "limit"])
         self.ergon("check")
+
+    def test_a_scan_rechecks_the_limit_and_resumes_early(self):
+        """T-266: a `limited:` mark's recorded reset can be stale — the login changed or the limit
+        lifted early — so while anything waits on it a scan probes the limit and resumes the parked
+        step when this login isn't limited."""
+        at = self.limit_at(3600)
+        self.env.update(FAKE_STOPS="limit|ok", FAKE_PROBES=str(Path(self.tmp.name) / "probes"))
+        out = self.ergon("dispatch", "--max", "6").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertTrue(self.mark())
+
+        # the account was switched: the next scan's probe answers, so the mark's wait is stale
+        self.env.pop("FAKE_PROBE_LIMIT")
+        out = self.ergon("dispatch", "--max", "6").stdout
+        self.assertIn("probe: this login isn't limited; resuming parked work", out)
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIsNone(self.mark())
+        calls = self.calls()
+        self.assertEqual([(c["agent"], c["resume"]) for c in calls], [("SONNET", None), ("SONNET", "s-1")])
+        self.assertIn("The usage limit stopped your work on T-001 during its run", calls[1]["prompt"])
+        self.assertEqual([(r["after"], r["step"]) for r in self.rows("dispatched") if r.get("after")],
+                         [("limit", "worker")])
+        self.assertEqual([(r["after"], r["session"]) for r in self.rows("resumed")], [("limit", "s-1")])
+        self.ergon("check")
+
+    def test_probes_off_keeps_the_plain_wait(self):
+        """T-266: `limit_probe = false` leaves no way to re-check, so the wait is the mark's."""
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text("limit_probe = false\n" + cfg.read_text())
+        self.env.pop("FAKE_PROBE_LIMIT", None)
+        probes = Path(self.tmp.name) / "probes"
+        self.env["FAKE_PROBES"] = str(probes)
+        at = self.limit_at(3600)
+        self.env["FAKE_STOPS"] = "limit|ok"
+        self.ergon("dispatch", "--max", "6")
+        self.assertEqual(self.status("T-001"), "blocked")
+        out = self.ergon("dispatch", "--max", "6").stdout
+        self.assertIn(f"skipped  T-001  limited until {self.clock(at)}", out)
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertFalse(probes.exists())
 
     def test_no_reset_in_the_message_waits_half_an_hour(self):
         self.env.update(FAKE_STOPS="limit", FAKE_LIMIT_TEXT="You've hit your limit")
