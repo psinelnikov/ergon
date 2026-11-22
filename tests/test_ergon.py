@@ -1731,16 +1731,34 @@ class TestEpicApproval(Project):
         """T-175: `r` on a brief in the interactive walk drops it, as `ergon reject E-NNN` does."""
         self.ergon("new", "epic", "Unwanted")
         self.ergon("new", "task", "Part one", "--tier", "haiku", "--epic", "E-001")
-        r = self.ergon("review", "-i", "--epic", "E-001", inp="r\nnot now\nq\n", check=False,
+        r = self.ergon("review", "-i", "--epic", "E-001", inp="r\n\nr\nnot now\nq\n", check=False,
                        env=clean_env(ERGON_ASK_STDIN="1"))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("[a]pprove  [r]eject  [e]dit", r.stdout)
+        self.assertIn("give a reason", r.stdout)  # an empty reason doesn't drop
         text = self.epic_file().read_text()
         self.assertIn("\nstatus: dropped\n", text)
         self.assertRegex(text, r"Rejected \d{4}-\d\d-\d\d: not now")
         self.assertEqual(self.status("T-001"), "proposed")
         rows = [e for e in history(self.root) if e["event"] == "rejected" and e.get("epic") == "E-001"]
         self.assertEqual((rows[0]["from"], rows[0]["to"], rows[0]["reason"]), ("proposed", "dropped", "not now"))
+
+    def test_interactive_walk_reject_needs_a_reason(self):
+        """`r` on a task in the interactive walk drops it only once a reason is given."""
+        self.ergon("new", "task", "Maybe", "--tier", "haiku")
+        review_i = lambda inp: self.ergon("review", "-i", inp=inp, check=False,
+                                          env=clean_env(ERGON_ASK_STDIN="1"))
+        r = review_i("r\n\ns\n")  # an empty reason doesn't drop: back to the choices, then skip
+        self.assertIn("give a reason", r.stdout)
+        self.assertEqual(self.status("T-001"), "proposed")
+        self.assertNotIn("Rejected", self.task_file("T-001").read_text())
+        r = review_i("r\nnot worth it\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("dropped 1", r.stdout)
+        self.assertEqual(self.status("T-001"), "dropped")
+        self.assertRegex(self.task_file("T-001").read_text(), r"Rejected \d{4}-\d\d-\d\d: not worth it")
+        rows = [e for e in history(self.root) if e["event"] == "rejected"]
+        self.assertEqual((rows[0]["task"], rows[0]["reason"]), ("T-001", "not worth it"))
 
     def test_reject_drops_a_proposed_epic_brief(self):
         """T-126: rejecting a proposed epic's ID drops its brief alone, as approving one approves
@@ -1752,10 +1770,14 @@ class TestEpicApproval(Project):
         self.ergon("new", "task", "Part one", "--tier", "haiku", "--category", "chore", "--epic", "E-001", env=agent)
         self.ergon("new", "task", "Part two", "--tier", "haiku", "--category", "chore", "--epic", "E-001", env=agent)
         stamp(self.task_file("T-001"))  # a human approved this task, but not its epic's brief
-        r = self.ergon("reject", "E-001", check=False, env=agent, inp="y\n")
+        r = self.ergon("reject", "E-001", "--reason", "x", check=False, env=agent, inp="y\n")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("refused", r.stderr)
-        r = self.ergon("reject", "E-001", check=False, env=human, inp="n\n")  # the prompt comes first
+        r = self.ergon("reject", "E-001", check=False, env=human, inp="n\n")  # missing --reason fails before the prompt
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--reason", r.stderr)
+        r = self.ergon("reject", "E-001", "--reason", "x", check=False, env=human, inp="n\n")
+        self.assertIn("aborted", r.stderr)
         self.assertIn("aborted", r.stderr)
         self.assertIn("\nstatus: proposed\n", self.epic_file().read_text())
 
@@ -1786,7 +1808,7 @@ class TestEpicApproval(Project):
         self.assertNotIn("EPICS AWAITING APPROVAL", self.ergon("review").stdout)
 
         # naming the dropped epic again drops its proposed tasks, and leaves the epic as it is
-        r = self.ergon("reject", "E-001", env=human, inp="y\n")
+        r = self.ergon("reject", "E-001", "--reason", "x", env=human, inp="y\n")
         self.assertNotIn("epic brief", r.stdout)
         self.assertIn("dropped 1", r.stdout)
         self.assertEqual(self.status("T-002"), "dropped")
@@ -1797,18 +1819,18 @@ class TestEpicApproval(Project):
         self.ergon("new", "epic", "Wanted")
         self.ergon("new", "task", "Keep", "--tier", "haiku", "--epic", "E-002")
         approve_epic(self, "E-002")
-        r = self.ergon("reject", "E-002", env=human, inp="y\n")
+        r = self.ergon("reject", "E-002", "--reason", "x", env=human, inp="y\n")
         self.assertNotIn("epic brief", r.stdout)
         self.assertIn("dropped 1", r.stdout)
         self.assertEqual(self.status("T-003"), "dropped")
         self.assertIn("\nstatus: open\n", self.epic_file("E-002").read_text())
-        r = self.ergon("reject", "E-002", check=False, env=human, inp="y\n")
+        r = self.ergon("reject", "E-002", "--reason", "x", check=False, env=human, inp="y\n")
         self.assertIn("nothing in `proposed` or `review`", r.stderr)
 
         # a proposed brief and a proposed task named together: the prompt names both
         self.ergon("new", "epic", "Also unwanted")
         self.ergon("new", "task", "Loose", "--tier", "sonnet")
-        r = self.ergon("reject", "E-003", "T-004", env=human, inp="y\n")
+        r = self.ergon("reject", "E-003", "T-004", "--reason", "x", env=human, inp="y\n")
         self.assertIn("Drop 1 epic brief(s) and drop 1 proposed?", r.stdout)
         self.assertIn("dropped 1 epic brief(s), dropped 1", r.stdout)
         self.assertIn("\nstatus: dropped\n", self.epic_file("E-003").read_text())
@@ -5375,7 +5397,10 @@ class TestAccept(DispatchProject):
 
         code, out = self.human("reject", "T-001")
         self.assertNotEqual(code, 0)
-        self.assertIn("needs --reason", out)
+        self.assertIn("--reason", out)  # argparse: --reason is required
+        code, out = self.human("reject", "T-001", "--reason", "  ")
+        self.assertNotEqual(code, 0)
+        self.assertIn("needs a --reason", out)
         code, out = self.human("reject", "T-001", "--reason", "no test for the 404 path")
         self.assertEqual(code, 0, out)
         self.assertEqual(self.status("T-001"), "ready")

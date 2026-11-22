@@ -47,8 +47,8 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                proposed, or in shared mode open with no signed approval that
                                verifies (an old epic with no approved: stamp counts as approved
                                in local mode only); otherwise it approves its proposed tasks
-  ergon reject ID [--reason R] HUMAN ONLY. proposed -> dropped; review -> ready (needs --reason,
-                               which the next worker is shown; branch and worktree are kept).
+  ergon reject ID --reason R   HUMAN ONLY. proposed -> dropped; review -> ready (the reason is
+                               what the next worker is shown; branch and worktree are kept).
                                An epic ID drops its brief when it's proposed (its tasks stay
                                proposed, never offered; naming the epic again drops them);
                                otherwise it drops its proposed tasks
@@ -473,7 +473,8 @@ def main():
     ch.add_argument("--own", metavar="TEXT", help="your own approach instead of a listed one")
     r = sub.add_parser("reject")
     r.add_argument("ids", nargs="+")
-    r.add_argument("--reason")
+    r.add_argument("--reason", required=True,
+                   help="why it's dropped; on a send-back from review, what the next worker must fix")
     c = sub.add_parser("close")
     c.add_argument("ids", nargs="+")
     c.add_argument("--as", dest="as_", required=True, choices=["done", "dropped"])

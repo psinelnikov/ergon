@@ -478,17 +478,19 @@ def review_brief(e, at, tasks, apr, tally):
             except SystemExit as err:
                 print(err)
                 continue
-            reason = ask("reason (optional): ")
+            reason = ask("reason: ")
+            if not reason:
+                print("give a reason: a dropped brief keeps why it was dropped")
+                continue
             e["status"] = "dropped"
-            if reason:
-                e["_body"] = e["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {reason}\n"
+            e["_body"] = e["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {reason}\n"
             with _gitops.state_lock():
                 if sign:
                     _shared.commit_pending()  # hand edits go in a commit of their own
                 _tasks.dump(e, _tasks.EPIC_KEYS)
                 if sign:
                     _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {e['id']}"], [e["_path"]])
-            _history.record("rejected", e, by=approver(), reason=reason or None, **{"from": "proposed", "to": "dropped"})
+            _history.record("rejected", e, by=approver(), reason=reason, **{"from": "proposed", "to": "dropped"})
             tally["dropped"] += 1
             return True
         if choice == "a":
@@ -647,17 +649,19 @@ def review_interactive(args):
                 except SystemExit as err:
                     print(err)
                     continue
-                reason = ask("reason (optional): ")
+                reason = ask("reason: ")
+                if not reason:
+                    print("give a reason: a dropped task keeps why it was dropped")
+                    continue
                 t["status"] = "dropped"
-                if reason:
-                    t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {reason}\n"
+                t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {reason}\n"
                 with _gitops.state_lock():
                     if sign:
                         _shared.commit_pending()  # hand edits go in a commit of their own
                     _tasks.dump(t, _tasks.TASK_KEYS)
                     if sign:
                         _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {t['id']}"], [t["_path"]])
-                _history.record("rejected", t, by=approver(), reason=reason or None, **{"from": "proposed", "to": "dropped"})
+                _history.record("rejected", t, by=approver(), reason=reason, **{"from": "proposed", "to": "dropped"})
                 tally["dropped"] += 1
                 break
             if choice == "t":
@@ -688,10 +692,11 @@ def review_interactive(args):
 def reject(args):
     """HUMAN ONLY. A proposed task is dropped. A task in `review` goes back to `ready` with the
     reason in its Notes; its branch and worktree stay, so the next dispatch picks up from them
-    and its worker is told why. An epic ID whose brief is proposed drops the brief alone, as
-    approving it approves the brief alone: its proposed tasks stay proposed, and aren't offered
-    or started while the epic is dropped (`_tasks.epic_problem`); naming the epic again drops
-    them. On any other epic, its ID names its proposed tasks."""
+    and its worker is told why. --reason is required on both: a drop keeps why it was dropped,
+    and a send-back is what the next worker is told to fix. An epic ID whose brief is proposed
+    drops the brief alone, as approving it approves the brief alone: its proposed tasks stay
+    proposed, and aren't offered or started while the epic is dropped (`_tasks.epic_problem`);
+    naming the epic again drops them. On any other epic, its ID names its proposed tasks."""
     if _config.SHARED:  # act on the latest state, and publish the result
         sync_for_count(args.ids, what="rejection")
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
@@ -710,8 +715,10 @@ def reject(args):
         if not briefs and not todo and not back:
             raise SystemExit(said)
         print(said)
-    if back and not args.reason:
-        raise SystemExit("rejecting work in `review` needs --reason: it's what the next worker is told to fix")
+    args.reason = args.reason.strip()
+    if not args.reason:
+        raise SystemExit("rejecting needs a --reason: a drop keeps why it was dropped, and a send-back "
+                         "is what the next worker is told to fix")
     sign = signing()
     named_ids = {t["id"] for t in todo}
     for e in briefs:
@@ -739,8 +746,7 @@ def reject(args):
             _shared.commit_pending()  # hand edits go in a commit of their own, not the signed one
         for t in briefs + todo:
             t["status"] = "dropped"
-            if args.reason:
-                t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {args.reason}\n"
+            t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {args.reason}\n"
             _tasks.dump(t, _tasks.EPIC_KEYS if _tasks.is_epic(t) else _tasks.TASK_KEYS)
         for t in back:
             t["status"] = "ready"
@@ -1073,6 +1079,9 @@ def close(args):
         todo.append(t)
     if not todo:
         raise SystemExit("nothing to close")
+    args.reason = args.reason.strip()
+    if not args.reason:
+        raise SystemExit("closing needs a --reason: the evidence a closed task keeps")
     sign = signing()
     for t in todo:
         print(_tasks.line(t, tasks))

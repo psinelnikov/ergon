@@ -466,7 +466,7 @@ class TestLocalOnly(unittest.TestCase):
         run("new", "task", "Two", "--tier", "haiku", "--epic", "E-001")
         run("set", "T-001", "title=Renamed")
         run("approve", "T-001", inp="y\n")
-        run("reject", "T-002", inp="y\n")
+        run("reject", "T-002", "--reason", "x", inp="y\n")
         run("tidy")
         run("set", "T-001", "status=doing")
         run("check")
@@ -769,7 +769,7 @@ class TestDispatchClaims(Shared):
         self.start()
         self.ergon(self.a, "new", "task", "Two", "--tier", "haiku")
         self.ergon(self.a, "sync")
-        self.ergon(self.a, "reject", "T-002", inp="y\n", env=self.env_a)
+        self.ergon(self.a, "reject", "T-002", "--reason", "x", inp="y\n", env=self.env_a)
         self.assertEqual(self.remote_status("T-002"), "dropped")
         self.ergon(self.a, "approve", "T-001", inp="y\n")
         self.ergon(self.a, "close", "T-001", "--as", "done", "--reason", "x", inp="y\n", env=self.env_a)
@@ -802,9 +802,9 @@ class TestDispatchClaims(Shared):
         self.ergon(self.a, "sync")
         self.ergon(self.b, "sync")
         # B drops it before A (not yet synced) tries to
-        self.ergon(self.b, "reject", "T-002", inp="y\n", env=self.env_b)
+        self.ergon(self.b, "reject", "T-002", "--reason", "x", inp="y\n", env=self.env_b)
         self.assertEqual(self.remote_status("T-002"), "dropped")
-        r = self.ergon(self.a, "reject", "T-002", check=False, inp="y\n", env=self.env_a)
+        r = self.ergon(self.a, "reject", "T-002", "--reason", "x", check=False, inp="y\n", env=self.env_a)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("nothing in `proposed` or `review`", r.stderr + r.stdout)
         self.assertEqual(self.status(self.a, "T-002"), "dropped")
@@ -825,7 +825,7 @@ class TestDispatchClaims(Shared):
         self.ergon(self.a, "new", "task", "Three", "--tier", "haiku")
         self.ergon(self.a, "approve", "T-003", inp="y\n")
         shutil.move(str(self.remote), str(self.remote) + ".gone")
-        for args in (("accept", "T-001"), ("reject", "T-002"),
+        for args in (("accept", "T-001"), ("reject", "T-002", "--reason", "x"),
                      ("close", "T-003", "--as", "dropped", "--reason", "x")):
             r = self.ergon(self.a, *args, inp="y\n", env=self.env_a)
             self.assertIn("run `ergon sync` to publish", r.stdout, args)
@@ -1274,7 +1274,7 @@ class TestSignedApprovals(Shared):
         self.ergon(self.a, "close", "T-001", "--as", "dropped", "--reason", "moot", inp="y\n")
         self.assertIn("\n\nErgon-Close: T-001 dropped\n", self.head(self.a))
         self.assertTrue(self.signed(self.a))
-        self.ergon(self.a, "reject", "T-002", inp="y\n")
+        self.ergon(self.a, "reject", "T-002", "--reason", "x", inp="y\n")
         self.assertIn("\n\nErgon-Reject: T-002\n", self.head(self.a))
         self.assertTrue(self.signed(self.a))
 
@@ -1283,7 +1283,7 @@ class TestSignedApprovals(Shared):
         self.ergon(self.a, "new", "epic", "Widgets")
         self.ergon(self.a, "sync")
         self.ergon(self.b, "sync")
-        self.ergon(self.a, "reject", "E-001", inp="y\n")
+        self.ergon(self.a, "reject", "E-001", "--reason", "x", inp="y\n")
         self.assertIn("\n\nErgon-Reject: E-001\n", self.head(self.a))
         self.assertTrue(self.signed(self.a))
         remote_head = sh("git", "cat-file", "commit", "ergon-state", cwd=self.remote).stdout
