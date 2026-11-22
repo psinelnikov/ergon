@@ -356,29 +356,42 @@ def counts(tasks):
 
 
 def options_html(t):
-    """A task's `## Options` as a numbered list: the first marked recommended, a chosen one marked
-    with who and when, and `ergon choose` commands to copy while nothing is chosen. '' without
-    options. Read-only: the page takes no input."""
+    """A task's `## Options` as a numbered list, none recommended: every chosen option marked with
+    who and when, a lens-format section showing its crux and each option's fields in LENSES order,
+    and commands to copy (one per lens, a combination, `--own`) while nothing is chosen.
+    '' without options. Read-only: the page takes no input."""
     if not _tasks.has_options(t):
         return ""
     opts, chosen = _tasks.options(t)
     tid = str(t["id"])
-    o = ["<h3>Options</h3><ol class=options>"]
+    o = ["<h3>Options</h3>"]
+    if opts.crux is not None:
+        o.append(f"<p class=crux>Crux: {esc(opts.crux)}</p>")
+    o.append("<ol class=options>")
     for n, text in enumerate(opts, 1):
-        is_chosen = bool(chosen) and chosen["option"] == n
+        is_chosen = bool(chosen) and bool(chosen["text"]) and (
+            text.lens in chosen["lenses"] if isinstance(text, _tasks.LensOption) else chosen["option"] == n)
         o.append(f'<li class="option{" chosen" if is_chosen else ""}">{esc(text)}'
-                 + (' <span class=tier>recommended</span>' if n == 1 else "")
                  + (f' <span class="tier chosen-mark">chosen by {esc(chosen["by"])} {esc(chosen["date"])}</span>'
-                    if is_chosen else "") + "</li>")
+                    if is_chosen else ""))
+        if isinstance(text, _tasks.LensOption):
+            o.append("<ul class=fields>" + "".join(f"<li>{label}: {esc(getattr(text, key))}</li>"
+                                                  for key, label in _tasks.LENS_FIELDS) + "</ul>")
+        o.append("</li>")
     o.append("</ol>")
     if chosen and chosen["option"] == "own":
         o.append(f'<p class="option chosen">own: {esc(chosen["text"])} '
                  f'<span class="tier chosen-mark">chosen by {esc(chosen["by"])} {esc(chosen["date"])}</span></p>')
     if chosen is None and t["status"] == "proposed" and TASK_ID.fullmatch(tid):
         o.append("<p class=muted>This page chooses nothing. From your own terminal:</p>")
-        for n in range(1, len(opts) + 1):
-            o.append(f"<code class=cmd>{esc('ergon choose ' + tid + ' ' + str(n))}</code>")
-        o.append(f"<code class=cmd>{esc('ergon choose ' + tid + ' --own \"<your words>\"')}</code>")
+        if opts.crux is not None:
+            cmds = [f"ergon choose {tid} {x.lens}" for x in opts]
+            if len(opts) > 1:
+                cmds.append(f"ergon choose {tid} {opts[0].lens} {opts[1].lens}")
+        else:
+            cmds = [f"ergon choose {tid} {n}" for n in range(1, len(opts) + 1)]
+        cmds.append(f'ergon choose {tid} --own "<your words>"')
+        o += [f"<code class=cmd>{esc(c)}</code>" for c in cmds]
     return "".join(o)
 
 
@@ -842,6 +855,13 @@ def task_page(tid, nonce):
          f'<span class=tier>{esc(t.get("tier"))}</span> <span class=tier>{esc(_tasks.category(t))}</span>'
          + (f' · <span class=park>{esc(park_mark(t))}</span>' if park_mark(t) else "") + '</p>']
 
+    if _tasks.is_asking(t):
+        b.append("<h2>Open questions</h2>")
+        for n, (q, o) in enumerate(_dispatch.asked(t)[0], 1):
+            b.append(f"<p>Q{n} {esc(q)}</p>")
+            if o:
+                b.append("<ul class=options>" + "".join(f"<li>{esc(x)}</li>" for x in o) + "</ul>")
+
     fus = _tasks.follow_ups(t, tasks, open_only=False)
     if fus:
         b.append(f'<h2>Follow-ups</h2><p>{esc(_tasks.status_text(t, tasks))}</p><ul class=tasks>')
@@ -882,7 +902,7 @@ def task_page(tid, nonce):
     b.append("</tbody></table></div>")
 
     # the brief
-    b.append(f'<h2>Brief</h2><div class=brief>{markdown(t["_body"], tasks)}</div>')
+    b.append(f'<h2>Brief</h2><div class=brief>{markdown(no_options(t["_body"]), tasks)}</div>')
     b.append(options_html(t))
 
     # totals
@@ -968,6 +988,11 @@ def section(body, name):
     """The text under a `## name` heading of a brief, up to the next `##` heading; None if absent."""
     m = re.search(rf"^##[ \t]+{re.escape(name)}[ \t]*$(.*?)(?=^##[ \t]|\Z)", body, re.M | re.S | re.I)
     return m[1].strip("\n") if m else None
+
+
+def no_options(body):
+    """body without its `## Options` sections: options_html shows them, in lens order and unmarked."""
+    return re.sub(r"^##[ \t]+Options[ \t]*$.*?(?=^##[ \t]|\Z)", "", body or "", flags=re.M | re.S | re.I)
 
 
 def blank(text):
@@ -1200,7 +1225,7 @@ def review_card(t, tasks, found):
     dep_html = ", ".join(f'{link_ids(esc(d), tasks)} <span class=muted>({esc(tasks.get(d, {}).get("status", "missing"))})</span>'
                          for d in deps) or '<span class=muted>none</span>'
     touches = ", ".join(f"<code>{esc(p)}</code>" for p in t.get("touches") or []) or '<span class=muted>none</span>'
-    body = t.get("_body") or ""
+    body = no_options(t.get("_body") or "")
     what, done = section(body, "What"), section(body, "Done when")
     if what is None and done is None:
         brief = markdown(body, tasks)

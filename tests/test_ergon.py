@@ -2597,26 +2597,49 @@ class TestDispatch(DispatchProject):
         self.env.update(FAKE_FOUND=found, FAKE_FOUND_SEP="~")
         return self.ergon("dispatch", *args).stdout
 
-    def test_found_feature_options_become_an_options_section(self):
-        self.found_run("Cache it \u2014 slow\nCATEGORY: feature\nOPTIONS: an LRU | `a redis cache` | | c | d | e")
+    LENS_FOUND = ("Cache it \u2014 slow\nCATEGORY: feature\nCRUX: how much to keep in memory\n"
+                  "OPTION: defer: keep reading from disk \u2014 optimizes for zero new code \u2014 gives up lookup speed \u2014 regret if load grows\n"
+                  "OPTION: minimal: an LRU of 1000 entries \u2014 optimizes for a small change \u2014 gives up shared state \u2014 regret if we need many workers\n"
+                  "OPTION: durable: a redis cache layer \u2014 optimizes for sharing across hosts \u2014 gives up simplicity \u2014 regret if redis goes away\n")
+
+    def test_found_feature_lens_options_become_an_options_section(self):
+        self.found_run(self.LENS_FOUND)
         text = self.task_file("T-002").read_text()
         self.assertEqual(self.status("T-002"), "proposed")
-        self.assertIn("## Options\n1. an LRU (recommended)\n2. a redis cache\n3. c\n4. d\n\n## Notes", text)
+        sec = text.partition("## Options\n")[2].partition("\n## ")[0]
+        self.assertTrue(sec.startswith("Crux: how much to keep in memory\n- minimal: an LRU"), sec)
+        self.assertLess(sec.index("- minimal"), sec.index("- durable"))
+        self.assertLess(sec.index("- durable"), sec.index("- defer"))
+        self.assertIn("  Regret if: load grows", sec)
         self.assertNotIn("no options given", text)
         self.ergon("check")
-        r = self.ergon("approve", "T-002", inp="y\n", check=False, env=dict(self.env, ERGON_ASK_STDIN="1"))
-        self.assertNotEqual(r.returncode, 0)
-        self.assertEqual(self.status("T-002"), "proposed")
-        self.ergon("choose", "T-002", "1", inp="y\n", env=dict(self.env, ERGON_ASK_STDIN="1"))
-        self.assertIn("Chosen:", self.task_file("T-002").read_text())
 
-    def test_found_two_options(self):
+    def test_found_feature_malformed_lens_options_are_named(self):
+        bad = self.LENS_FOUND.replace("OPTION: defer:", "OPTION: risk:").replace("gives up lookup speed", "gives up").replace(
+            "a small change", "the best small change")
+        self.found_run(bad)
+        text = self.task_file("T-002").read_text()
+        self.assertEqual(self.status("T-002"), "proposed")
+        self.assertNotIn("## Options", text)
+        for w in ("no `defer` option", "recommendation wording", "has no Gives up"):
+            self.assertIn(w, text)
+        self.assertIn("options from T-001 not filed", text)
+
+    def test_found_feature_without_crux_or_repeating_a_lens(self):
+        self.found_run(self.LENS_FOUND.replace("CRUX: how much to keep in memory\n", "").replace("OPTION: durable:", "OPTION: minimal:"))
+        text = self.task_file("T-002").read_text()
+        self.assertNotIn("## Options", text)
+        self.assertIn("no `Crux:` line", text)
+        self.assertIn("minimal lens more than once", text)
+
+    def test_found_old_options_line_files_no_options(self):
         self.found_run("Cache it \u2014 slow\nOPTIONS: a | b")
-        self.assertEqual(self.task_file("T-002").read_text().partition("## Options\n")[2].partition("\n## ")[0],
-                         "1. a (recommended)\n2. b\n")
+        text = self.task_file("T-002").read_text()
+        self.assertNotIn("## Options", text)
+        self.assertIn("no options given by T-001", text)
 
     def test_found_feature_without_options_gets_a_note(self):
-        self.found_run("Cache it \u2014 slow\nOPTIONS: only one~Other \u2014 x")
+        self.found_run("Cache it \u2014 slow~Other \u2014 x")
         for tid in ("T-002", "T-003"):
             text = self.task_file(tid).read_text()
             self.assertNotIn("## Options", text)
@@ -2625,7 +2648,7 @@ class TestDispatch(DispatchProject):
             self.assertEqual(self.status(tid), "proposed")
 
     def test_found_bugfix_options_are_ignored(self):
-        self.found_run("Fix X \u2014 y breaks\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix\nOPTIONS: a | b", "--ids", "T-001")
+        self.found_run("Fix X \u2014 y breaks\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix\nCRUX: c\nOPTION: defer: a \u2014 optimizes for x \u2014 gives up y \u2014 regret if z", "--ids", "T-001")
         text = self.task_file("T-002").read_text()
         self.assertEqual(self.status("T-002"), "ready")
         self.assertNotIn("## Options", text)
@@ -2635,7 +2658,7 @@ class TestDispatch(DispatchProject):
         from ergon.dispatch import parse_questions, parse_found
         text = "QUESTION: q\nFOUND: f \u2014 why\nOPTIONS: x | y\n"
         self.assertEqual(parse_questions(text), [("q", [])])
-        self.assertEqual(parse_found(text)[0][2]["options"], ["x", "y"])
+        self.assertNotIn("options", parse_found(text)[0][2])
         text = "FOUND: f \u2014 why\nTIER: haiku \u2014 s\nQUESTION: q\nOPTIONS: a | b\n"
         self.assertEqual(parse_questions(text), [("q", ["a", "b"])])
 
@@ -5592,8 +5615,15 @@ Sign each export.
 ## Done when
 - exports verify
 ## Options
-1. Sign with the account key (recommended)
-2. Sign with a per-export key
+Crux: where the signing key lives
+- durable: sign with a per-export key
+  Optimizes for: blast radius per key
+  Gives up: more keys to store
+  Regret if: key storage turns out costly
+- minimal: sign with the account key
+  Optimizes for: the fewest moving parts
+  Gives up: one key signs everything
+  Regret if: the account key leaks
 END TASK
 
 TASK: Rotate the signing key
@@ -5651,6 +5681,19 @@ depends:
 half
 
 RESULT: done
+"""
+
+
+LENS_OPTIONS = """## Options
+Crux: how much to build now
+- minimal: do the smallest change that works
+  Optimizes for: speed of landing
+  Gives up: reuse later
+  Regret if: a second caller shows up
+- durable: build a shared helper for every caller
+  Optimizes for: reuse by later work
+  Gives up: a bigger diff to review
+  Regret if: nothing else ever calls it
 """
 
 
@@ -5729,7 +5772,10 @@ class TestBreakdown(DispatchProject):
         self.assertNotIn("## Options", text)
         text = self.task_file("T-003").read_text()
         self.assertEqual(self.field("T-003", "category"), "feature")
-        self.assertIn("## Options\n1. Sign with the account key (recommended)\n2. Sign with a per-export key\n\n## Notes", text)
+        self.assertIn("## Options\nCrux: where the signing key lives\n- minimal: sign with the account key\n"
+                      "  Optimizes for: the fewest moving parts\n", text)  # LENSES order, not the order written
+        self.assertLess(text.index("- minimal:"), text.index("- durable:"))
+        self.assertNotIn("(recommended)", text)
         # the rest are refused with a warning, never repaired
         self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 3)
         self.assertIn("warning: breakdown E-001 block 4 refused (Rotate the signing key): touches "
@@ -5770,38 +5816,44 @@ class TestBreakdown(DispatchProject):
         self.assertIn("two `## What` sections", got[3][2])
         self.assertEqual(got[0][1]["title"], "T")
 
-    def test_feature_blocks_need_two_to_four_options_and_a_known_category(self):
+    def test_feature_blocks_need_a_valid_lens_section_and_a_known_category(self):
         from ergon import dispatch as D
         head = "TASK: T\ntier: haiku\ntier_why: w\n%stouches:\ndepends:\n## What\nx\n## Done when\n- y\n"
-        opts = lambda n: "## Options\n" + "".join(f"{i}. approach {i}\n" for i in range(1, n + 1))
-        replies = [head % "category: feature\n" + opts(2), head % "category: feature\n" + opts(1),
-                   head % "" + opts(5), head % "category: chore\n", head % "category: chore\n" + opts(1),
-                   head % "category: bugfix\n" + "## Options\nsome prose\n", head % "category: epic\n" + opts(2),
-                   head % "category: feature\n" + opts(2) + "Chosen: 1 by me 2026-01-01\n"]
+        good = LENS_OPTIONS
+        swap = lambda a, b: good.replace(a, b)
+        short_lens = lambda: good[:good.index("- durable")] + "- durable: x\n  Optimizes for: a\n  Gives up: b\n  Regret if: c\n"
+        replies = [head % "category: feature\n" + good,
+                   head % "category: feature\n" + swap("how much", "we recommend how much"),
+                   head % "category: feature\n" + swap("- durable:", "- minimal:"),
+                   head % "category: feature\n" + swap("  Gives up: reuse later\n", ""),
+                   head % "category: feature\n" + short_lens(),
+                   head % "category: feature\n" + swap("Crux: how much to build now\n", ""),
+                   head % "category: feature\n" + "## Options\n1. a\n2. b\n",
+                   head % "category: feature\n",
+                   head % "category: chore\n",
+                   head % "category: bugfix\n" + "## Options\nsome prose\n",
+                   head % "category: epic\n" + good,
+                   head % "category: feature\n" + good + "Chosen: 1 by me 2026-01-01\n"]
         got = D.parse_blocks("".join(r + "END TASK\n" for r in replies))
-        why = []
-        for n, f, w in got:
-            why.append(w or D.check_block(n, f, {}, {}, set()))
+        why = [w or D.check_block(n, f, {}, {}, set()) for n, f, w in got]
         self.assertIsNone(why[0])
-        self.assertEqual(got[0][1]["options"], "1. approach 1\n2. approach 2")
-        self.assertIn("a feature block needs 2 to 4 options under `## Options`, has 1", why[1])
-        self.assertIn("a feature block needs 2 to 4 options", why[2])  # no category reads as feature
-        self.assertIsNone(why[3])
-        self.assertIn("a block with options needs 2 to 4", why[4])
-        self.assertIn("isn't a numbered option", why[5])
-        self.assertIn("category 'epic' not in", why[6])
-        self.assertIn("`Chosen:` line", why[7])
+        for i, word in ((1, "recommendation wording"), (2, "more than once"), (3, "has no Gives up"),
+                        (4, "under half the median"), (5, "no `Crux:` line"), (6, "old numbered list"),
+                        (7, "a feature block needs 2 to 4 options"), (9, "not in lens format"),
+                        (10, "category 'epic' not in"), (11, "`Chosen:` line")):
+            self.assertIn(word, why[i] or "", i)
+        self.assertIsNone(why[8])  # a chore may leave it out
 
     def test_breakdown_refuses_a_one_option_feature_and_files_the_rest(self):
         self.new_epic()
         approve_epic(self)
         blk = "TASK: %s\ntier: haiku\ntier_why: w\ncategory: %s\ntouches:\ndepends:\n## What\nx\n## Done when\n- y\n%sEND TASK\n"
-        self.env["FAKE_BREAKDOWN"] = (blk % ("Two", "feature", "## Options\n1. a\n2. b\n") + blk % ("One", "feature", "## Options\n1. a\n")
+        self.env["FAKE_BREAKDOWN"] = (blk % ("Two", "feature", LENS_OPTIONS) + blk % ("One", "feature", "## Options\n1. a\n")
                                       + blk % ("Plain", "chore", "") + blk % ("Odd", "wish", "") + "RESULT: done\n")
         out = self.ergon("breakdown", "E-001").stdout
-        self.assertIn("block 2 refused (One): a feature block needs 2 to 4 options under `## Options`, has 1", out)
+        self.assertIn("block 2 refused (One): `## Options` is not in lens format", out)
         self.assertIn("block 4 refused (Odd): category 'wish' not in", out)
-        self.assertIn("## Options\n1. a (recommended)\n2. b\n", self.task_file("T-001").read_text())
+        self.assertIn("## Options\nCrux: how much to build now\n- minimal:", self.task_file("T-001").read_text())
         self.assertNotIn("## Options", self.task_file("T-002").read_text())
         self.assertEqual(len(list((self.root / "tasks").rglob("T-*.md"))), 2)
         self.ergon("check")
@@ -8092,7 +8144,8 @@ class TestAsking(DispatchProject):
         # A human answers interactively: an option by number, then free text, then confirms.
         r = self.answer(inp="1\nkeep it for now\ny\n")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("1. sqlite  (recommended)", r.stdout)
+        self.assertIn("1. sqlite", r.stdout)
+        self.assertNotIn("recommended", r.stdout)
         self.assertIn("it's a re-plan: don't answer", r.stdout)
         text = self.text()
         self.assertEqual(self.status("T-001"), "ready")
@@ -8146,7 +8199,8 @@ class TestAsking(DispatchProject):
 
         r = review_i(inp="s\na\n1\nkeep it\nn\n")  # proposed first, then asking; declining writes nothing
         self.assertLess(r.stdout.index("T-002"), r.stdout.index("[2/2]  T-001  Store it  (asking)"))
-        self.assertIn("1. sqlite  (recommended)", r.stdout)
+        self.assertIn("1. sqlite", r.stdout)
+        self.assertNotIn("recommended", r.stdout)
         self.assertIn("it's a re-plan: don't answer", r.stdout)
         self.assertIn("aborted", r.stdout)
         self.assertIn("answered 0  skipped 2", r.stdout)
@@ -8197,6 +8251,29 @@ class TestAsking(DispatchProject):
         self.assertIn("aborted", self.answer("use json", inp="n\n").stderr)
         self.assertIn("no answer given", self.answer(inp="\n").stderr)
         self.assertEqual(self.text(), before)
+
+    def test_lens_options_show_in_lens_order_and_take_a_lens_pick(self):
+        # T-258: `risk, minimal` is shown `minimal, risk` everywhere, none recommended, and a lens is a pick.
+        self.env["FAKE_ASK"] = ("QUESTION: How should it store?\nOPTIONS: risk: a journal \u2014 gives up speed | "
+                                "minimal: a flat file \u2014 gives up queries")
+        self.asks()
+        self.assertIn("[options: minimal: a flat file \u2014 gives up queries | risk: a journal \u2014 gives up speed]",
+                      self.text())
+        review = self.ergon("review").stdout
+        self.assertLess(review.index("minimal: a flat file"), review.index("risk: a journal"))
+        self.assertNotIn("recommended", review)
+        r = self.answer(inp="minimal\ny\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertLess(r.stdout.index("minimal: a flat file"), r.stdout.index("risk: a journal"))
+        self.assertNotIn("recommended", r.stdout)
+        self.assertIn("answer by Tester: minimal: a flat file \u2014 gives up queries", self.text())
+
+    def test_old_options_note_still_answers_by_number(self):
+        self.asks()  # sqlite | json, no lens
+        self.assertIn("[options: sqlite | json]", self.text())
+        r = self.answer(inp="2\nno\ny\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("answer by Tester: Q1: json. Q2: no.", self.text())
 
     def test_asking_without_a_question_blocks(self):
         self.env["FAKE_ASK"] = "OPTIONS: a | b"
@@ -9009,26 +9086,56 @@ class TestLearn(Project):
                          ["T-001", "T-002", "T-003", "T-004"])  # nothing new filed
         self.ergon("check")
 
-    def test_class_options_become_the_options_section_and_approval_waits_on_a_choice(self):
-        opts = ["a ruff rule E722", "  an AST test   that flags bare except ", "a grep in the static gate"]
-        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=opts + ["x"] * 3)))
+    LENS_OPTS = [
+        {"lens": "defer", "approach": "leave it to review for now", "optimizes_for": "no new code to maintain",
+         "gives_up": "the check never runs automatically", "regret_if": "the mistake lands again next week"},
+        {"lens": "minimal", "approach": "a ruff rule E722 in the static gate", "optimizes_for": "one line of config",
+         "gives_up": "only catches the bare form of the mistake", "regret_if": "the swallowing takes another shape"},
+        {"lens": "durable", "approach": "an AST test that flags every handler that drops its error",
+         "optimizes_for": "catches the whole class", "gives_up": "a test file to maintain",
+         "regret_if": "the codebase stops using exceptions"},
+    ]
+    CRUX = "how much of the class the check has to catch"
+
+    def test_lens_options_become_the_options_section_and_approval_waits_on_a_choice(self):
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, crux=self.CRUX,
+                                                            options=self.LENS_OPTS)))
         from ergon.tasks import options
         t = self.fields("T-004")
-        self.assertEqual(options(t), (opts[:1] + ["an AST test that flags bare except", opts[2]] + ["x"], None))
+        opts, chosen = options(t)
+        self.assertEqual([o.lens for o in opts], ["minimal", "durable", "defer"])  # LENSES order
+        self.assertEqual(opts.crux, self.CRUX)
         self.assertNotIn("No options were offered", t["_body"])
+        self.ergon("check")
         r = self.ergon("approve", "T-004", inp="y\n", check=False, env=self.human())
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("has options and no choice", r.stderr)
-        r = self.ergon("choose", "T-004", "2", inp="y\n", check=False, env=self.human())
+        r = self.ergon("choose", "T-004", "durable", inp="y\n", check=False, env=self.human())
         self.assertEqual(r.returncode, 0, r.stderr)
         r = self.ergon("approve", "T-004", inp="y\n", check=False, env=self.human())
         self.assertEqual(r.returncode, 0, r.stderr)
 
-    def test_class_options_are_capped_at_four_and_a_class_with_fewer_than_two_gets_a_note(self):
-        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=["1", "2", "3", "4", "5", " "])))
-        self.assertEqual(len(__import__("ergon").tasks.options(self.fields("T-004"))[0]), 4)
-        for extra in ({}, {"options": []}, {"options": ["only one"]}, {"options": "nope"}):
-            with self.subTest(extra=extra):
+    def test_prompt_asks_for_a_crux_and_lens_options_with_no_ranking(self):
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C)))
+        [prompt] = self.prompts()
+        head = prompt.lower()
+        self.assertNotIn("best first", head)
+        self.assertNotIn("recommend", head)
+        for word in ('"crux"', "optimizes_for", "gives_up", "regret_if", "minimal, durable, operator, risk, defer"):
+            self.assertIn(word, prompt)
+
+    def test_a_bad_option_set_files_no_options_and_a_note_says_why(self):
+        rec = [dict(o) for o in self.LENS_OPTS]
+        rec[0]["approach"] = "the recommended way"
+        rep = [dict(o) for o in self.LENS_OPTS]
+        rep[1]["lens"] = "defer"
+        cases = [("recommend", dict(crux=self.CRUX, options=rec)),
+                 ("more than once", dict(crux=self.CRUX, options=rep)),
+                 ("no `Crux:`", dict(options=self.LENS_OPTS)),
+                 ("1 option(s)", {"crux": self.CRUX, "options": self.LENS_OPTS[:1]}),
+                 ("No options were offered", {}), ("No options were offered", {"options": "nope"})]
+        for why, extra in cases:
+            with self.subTest(why=why, extra=list(extra)):
                 for f in (self.root / "tasks").rglob("T-004-*.md"):
                     f.unlink()
                 for r in (self.runs / "learn").glob("*.json"):
@@ -9037,20 +9144,27 @@ class TestLearn(Project):
                 t = self.fields("T-004")
                 self.assertNotIn("## Options", t["_body"])
                 self.assertIn("No options were offered", t["_body"])
+                self.assertIn(why, t["_body"].partition("## Notes")[2])
                 self.ergon("approve", "T-004", inp="y\n", env=self.human())
 
+    def test_options_are_capped_at_four(self):
+        many = self.LENS_OPTS + [dict(self.LENS_OPTS[0], lens=l) for l in ("operator", "risk")]
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, crux=self.CRUX, options=many)))
+        self.assertEqual(len(__import__("ergon").tasks.options(self.fields("T-004"))[0]), 4)
+
     def test_a_class_joining_an_open_task_leaves_its_options_alone(self):
-        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, options=["one", "two"])))
-        self.ergon("choose", "T-004", "1", inp="y\n", env=self.human())
+        self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, crux=self.CRUX,
+                                                            options=self.LENS_OPTS)))
+        self.ergon("choose", "T-004", "minimal", inp="y\n", env=self.human())
         before = self.task_file("T-004").read_text()
         self.incident(self.D, "runtime", "test_parse fails: ValueError swallowed")
-        self.ergon("learn", env=self.reply(self.bare_except(self.D, task="T-004", options=["three", "four"])))
+        self.ergon("learn", env=self.reply(self.bare_except(self.D, task="T-004", crux="c", options=self.LENS_OPTS[:2])))
         after = self.task_file("T-004").read_text()
         self.assertEqual(after.partition("## Options\n")[2].partition("\n## ")[0],
                          before.partition("## Options\n")[2].partition("\n## ")[0])
-        self.assertIn("Chosen: 1 by", after)
-        self.assertIn("  - three", after.partition("## Notes")[2])
-        self.assertNotIn("3. three", after)
+        self.assertIn("Chosen: minimal by", after)
+        self.assertIn("  - defer: leave it to review for now", after.partition("## Notes")[2])
+        self.assertIn("  - minimal: a ruff rule E722", after.partition("## Notes")[2])
 
     def test_malformed_reply_files_nothing_and_warns(self):
         before = {p.name: p.read_text() for p in (self.root / "tasks").rglob("T-*.md")}
@@ -9146,10 +9260,10 @@ class TestOptions(Project):
     def options_text(self, tid):
         return self.task_file(tid).read_text().partition("## Options\n")[2].partition("\n## ")[0]
 
-    def test_new_writes_options_in_order_first_recommended(self):
+    def test_new_writes_plain_options_numbered_unmarked(self):
         self.new_feature("an in-memory LRU", "a redis cache", "  no   cache ")
         self.assertEqual(self.options_text("T-001"),
-                         "1. an in-memory LRU (recommended)\n2. a redis cache\n3. no cache\n")
+                         "1. an in-memory LRU\n2. a redis cache\n3. no cache\n")
         t = ergon.tasks.parse(self.task_file("T-001"))
         self.assertEqual(ergon.tasks.options(t), (["an in-memory LRU", "a redis cache", "no cache"], None))
         body = t["_body"]
@@ -9160,12 +9274,35 @@ class TestOptions(Project):
         self.assertIn("at least 2", r.stderr)
         self.assertEqual(len(list((self.root / "tasks").rglob("T-002-*.md"))), 0)
 
+    def test_no_prompt_help_or_surface_marks_a_recommended_option(self):
+        """T-260: options are peers; nothing the agents read or a human sees says "recommend"."""
+        import ergon.dispatch, ergon.learn
+        self.assertNotIn("recommend", ergon.dispatch.BREAKDOWN_PROMPT.lower())
+        self.assertNotIn("recommend", ergon.learn.PROMPT.lower())
+        for f in sorted((ERGON.parent / "agents").glob("task-*.md")):
+            self.assertNotIn("recommend", f.read_text().lower(), f.name)
+        for args in (["-h"], ["new", "-h"], ["choose", "-h"]):
+            r = self.ergon(*args, check=False)
+            self.assertNotIn("recommend", (r.stdout + r.stderr).lower(), args)
+        # an old task with a `(recommended)` mark shows none on show, review or /t/T-NNN
+        self.new_feature("an in-memory LRU", "a redis cache")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("1. an in-memory LRU", "1. an in-memory LRU (recommended)"))
+        self.assertIn("(recommended)", f.read_text())
+        self.assertNotIn("recommended", self.ergon("show", "T-001").stdout)
+        self.assertNotIn("recommended", self.ergon("review").stdout)
+        code = ("import ergon.config as c, ergon.serve as s; c.configure(); print(s.task_page('T-001', 'n'))")
+        r = sh(sys.executable, "-c", code, cwd=self.root, env={**self.env, "PYTHONPATH": str(ERGON.parent)})
+        self.assertIn("an in-memory LRU", r.stdout)
+        self.assertNotIn("recommended", r.stdout)
+
     def test_choose_writes_chosen_line_and_row_then_approve(self):
         self.new_feature("an in-memory LRU", "a redis cache")
         f = self.task_file("T-001")
         out = self.ergon("show", "T-001").stdout
         self.assertIn("OPTIONS  no choice yet: `ergon choose T-001 <N>`", out)
-        self.assertIn("  1. an in-memory LRU  (recommended)", out)
+        self.assertIn("1. an in-memory LRU", out)
+        self.assertNotIn("recommended", out)  # T-254: the file's `(recommended)` is not shown
         review = self.ergon("review").stdout
         self.assertIn("AWAITING A CHOICE (1)", review)
         self.assertIn("         2. a redis cache", review)
@@ -9303,18 +9440,42 @@ class TestOptions(Project):
             self.assertIn("human-only", self.guard("Bash", {"command": cmd}), cmd)
         self.assertIsNone(self.guard("Bash", {"command": 'git commit -m "ergon choose T-001 1"'}))
 
+    LENS_A = "minimal: keep one in-memory map | speed of change | no sharing between runs | runs grow large"
+    LENS_B = "durable: store it in sqlite on disk | survives restarts | a schema to migrate | the data stays small"
+
+    def refused(self, *flags):
+        r = self.ergon("new", "task", "Feature", "--tier", "sonnet", *flags, check=False, env=self.agent())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        return r.stderr
+
+    def test_new_task_in_agent_shell_refuses_malformed_lens_options(self):
+        a, b = self.LENS_A, self.LENS_B
+        c = ("--crux", "what it turns on")
+        self.assertIn("no `Crux:`", self.refused("--option", a, "--option", b))
+        self.assertIn("recommendation wording", self.refused(*c, "--option", a.replace("one", "the best one"), "--option", b))
+        self.assertIn("minimal lens more than once", self.refused(*c, "--option", a, "--option", a))
+        self.assertIn("no Regret if", self.refused(*c, "--option", "minimal: keep one in-memory map | speed | no sharing",
+                                                   "--option", b))
+        self.assertIn("under half the median", self.refused(*c, "--option", "minimal: x | y | z | w", "--option", b,
+                                                            "--option", b.replace("durable", "risk")))
+
     def test_new_task_in_agent_shell_needs_options_for_a_feature(self):
         agent = self.agent()
         r = self.ergon("new", "task", "Feature", "--tier", "sonnet", check=False, env=agent)
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("needs 2 to 4", r.stderr)
-        self.assertIn("chooses how it is built", r.stderr)
+        self.assertIn("needs --crux", r.stderr)
+        self.assertNotIn("recommend", r.stderr)
         r = self.ergon("new", "task", "Feature", "--tier", "sonnet", "--category", "feature", "--option", "a",
                        check=False, env=agent)
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
-        self.ergon("new", "task", "Feature", "--tier", "sonnet", "--option", "a", "--option", "b", env=agent)
-        self.assertEqual(self.options_text("T-001"), "1. a (recommended)\n2. b\n")
+        self.ergon("new", "task", "Feature", "--tier", "sonnet", "--crux", "speed or simplicity",
+                   "--option", self.LENS_B, "--option", self.LENS_A, env=agent)
+        text = self.options_text("T-001")
+        self.assertTrue(text.startswith("Crux: speed or simplicity\n- minimal: "), text)
+        self.assertLess(text.index("- minimal:"), text.index("- durable:"))
+        self.assertNotIn("recommended", text)
         self.ergon("new", "task", "Fix", "--tier", "haiku", "--category", "bugfix", env=agent)
         self.assertNotIn("## Options", self.task_file("T-002").read_text())
         self.ergon("new", "task", "Human's feature", "--tier", "sonnet")  # outside an agent shell: optional
@@ -9331,6 +9492,332 @@ class TestOptions(Project):
         self.assertIn(f"Chosen: 2 by Tester {self.TODAY}", self.options_text("T-001"))
         self.assertEqual(self.status("T-001"), "ready")
         self.assertEqual([x["option"] for x in history(self.root) if x["event"] == "chosen"], [2])
+
+
+class TestLensOptions(Project):
+    """E-009 / T-252: the lens format of ## Options (a Crux, one option per lens, none recommended)."""
+    LENS = textwrap.dedent("""\
+        Crux: whether lookups must be fast now or can wait
+        - defer: build nothing now and look again when the table passes a million rows
+          Optimizes for: no work today and nothing new to run
+          Gives up: faster lookups for the people using it now
+          Regret if: the slow page drives users away before we look again
+        - minimal: an in-memory LRU inside each worker process, sized by config
+          Optimizes for: the least code and no new service to operate
+          Gives up: one cache shared across all of the workers
+          Regret if: we scale out to many workers and the hit rate collapses
+        - durable: a redis cache that every worker shares, with a TTL per key
+          Optimizes for: one warm cache that survives restarts and deploys
+          Gives up: simplicity, since redis is one more service to run
+          Regret if: the load never grows and redis sits there idle
+        """)
+
+    def task(self, section, tid="T-001"):
+        if not self.task_file_exists(tid):
+            self.ergon("new", "task", "Cache it", "--tier", "sonnet")
+        f = self.task_file(tid)
+        text = f.read_text()
+        head, _, rest = text.partition("## Notes")
+        f.write_text(head.split("\n## Options\n")[0].rstrip("\n") + "\n\n## Options\n" + section + "\n## Notes" + rest)
+        return f
+
+    def task_file_exists(self, tid):
+        return bool(list((self.root / "tasks").rglob(f"{tid}-*.md")))
+
+    def check(self):
+        return self.ergon("check", check=False).stdout
+
+    def test_options_come_back_in_lens_order_with_the_crux(self):
+        f = self.task(self.LENS)
+        opts, chosen = ergon.tasks.options(ergon.tasks.parse(f))
+        self.assertIsNone(chosen)
+        self.assertEqual([o.lens for o in opts], ["minimal", "durable", "defer"])
+        self.assertEqual(opts.crux, "whether lookups must be fast now or can wait")
+        self.assertEqual(opts[0], "minimal: an in-memory LRU inside each worker process, sized by config")
+        self.assertEqual(opts[2].fields(), {
+            "lens": "defer", "approach": "build nothing now and look again when the table passes a million rows",
+            "optimizes": "no work today and nothing new to run",
+            "gives_up": "faster lookups for the people using it now",
+            "regret": "the slow page drives users away before we look again"})
+        self.assertNotIn("T-001", self.check())  # a well-formed section passes
+        out = self.ergon("show", "T-001").stdout
+        self.assertIn("Crux: whether lookups", out)
+        self.assertIn("   Gives up: one cache shared", out)
+        self.assertNotIn("recommended", out)
+
+    def test_show_prints_the_rendered_section_in_lens_order_marking_a_combination(self):
+        # T-254: the file's written order (defer first) and any `(recommended)` never show; each chosen lens is marked
+        self.task("Chosen: minimal + durable by Pavel 2026-11-22\n" + self.LENS.replace("durable: a redis", "durable: a <b>redis"))
+        out = self.ergon("show", "T-001").stdout
+        sec = out.split("## Options")[1].split("## Notes")[0]
+        self.assertLess(sec.index("minimal:"), sec.index("durable:"))
+        self.assertLess(sec.index("durable:"), sec.index("defer:"))
+        self.assertIn("Chosen: minimal + durable by Pavel 2026-11-22", sec)
+        self.assertEqual(out.count("(chosen)"), 2)
+        self.assertNotIn("recommended", out)
+        self.assertNotIn("(chosen)", [l for l in sec.splitlines() if "defer:" in l][0])
+
+    def test_show_hides_an_old_recommended_mark(self):
+        self.task("1. an LRU (recommended)\n2. a redis cache\n")
+        out = self.ergon("show", "T-001").stdout
+        self.assertIn("1. an LRU", out)
+        self.assertNotIn("recommended", out)
+
+    def test_numbered_section_reads_as_before(self):
+        f = self.task("1. an LRU (recommended)\n2. a redis cache\n3. nothing\n4. a file cache\n")
+        opts, _ = ergon.tasks.options(ergon.tasks.parse(f))
+        self.assertEqual(opts, ["an LRU", "a redis cache", "nothing", "a file cache"])
+        self.assertIsNone(opts.crux)
+        self.assertNotIn("T-001", self.check())
+
+    def test_check_reports_each_lens_problem(self):
+        lens = self.LENS
+        cases = {
+            "the minimal option uses recommendation wording (recommended)": lens.replace("sized by config", "sized by config (recommended)"),
+            "the crux uses recommendation wording (best)": lens.replace("whether lookups", "the BEST way: whether lookups"),
+            "the durable lens more than once": lens + "- durable: a second durable option, written out at the same length\n"
+                                                      "  Optimizes for: x\n  Gives up: y\n  Regret if: z\n",
+            "unknown lens 'fancy'": lens.replace("- durable:", "- fancy:"),
+            "the minimal option has no Gives up": lens.replace("  Gives up: one cache shared across all of the workers\n", ""),
+            "the durable option has no Regret if": lens.replace("Regret if: the load never grows and redis sits there idle",
+                                                                "Regret if:"),
+            "the minimal option is under half the median": lens.replace(
+                "- minimal: an in-memory LRU inside each worker process, sized by config\n"
+                "  Optimizes for: the least code and no new service to operate\n"
+                "  Gives up: one cache shared across all of the workers\n"
+                "  Regret if: we scale out to many workers and the hit rate collapses",
+                "- minimal: LRU\n  Optimizes for: code\n  Gives up: sharing\n  Regret if: scale"),
+            "no `Crux:` line, or an empty one": lens.replace("Crux: whether lookups must be fast now or can wait\n", ""),
+            "no `Crux:` line, or an empty one ": lens.replace("Crux: whether lookups must be fast now or can wait", "Crux:"),
+            "1 option(s); it needs 2 to 4": lens.split("- minimal:")[0],
+        }
+        for want, section in cases.items():
+            with self.subTest(want):
+                self.task(section)
+                out = self.check()
+                self.assertIn("T-001: ## Options: " + want.strip(), out)
+
+    def test_lens_problems_and_lens_section_round_trip(self):
+        _, entries = ergon.tasks.parse_lens(self.LENS)
+        crux = "whether lookups must be fast now or can wait"
+        self.assertEqual(ergon.tasks.lens_problems(crux, entries, require_defer=True), [])
+        without = [e for e in entries if e.lens != "defer"]
+        self.assertEqual(ergon.tasks.lens_problems(crux, without, require_defer=True), [
+            "no `defer` option (what happens if nothing is built now)"])
+        self.assertEqual(ergon.tasks.lens_problems(crux, without), [])
+        five = entries + [dict(e.fields(), lens=lens) for e, lens in zip(entries, ("operator", "risk"))]
+        self.assertIn("5 option(s); it needs 2 to 4, one per lens", ergon.tasks.lens_problems(crux, five))
+        # whole words only: `recommendation` and `bestow` are not recommendation wording
+        fine = [dict(e.fields(), approach=e.approach + " to bestow a recommendation") for e in entries]
+        self.assertEqual(ergon.tasks.lens_problems(crux, fine), [])
+        for word in ("recommend", "Preferred", "best", "(recommended)"):
+            marked = [dict(entries[0].fields(), regret=entries[0].regret + " " + word)] + entries[1:]
+            self.assertEqual(len(ergon.tasks.lens_problems(crux, marked)), 1, word)
+        section = ergon.tasks.lens_section(crux, entries)
+        self.assertTrue(section.startswith("\n## Options\nCrux: whether lookups"))
+        self.assertLess(section.index("- minimal:"), section.index("- durable:"))
+        self.assertLess(section.index("- durable:"), section.index("- defer:"))
+        self.assertNotRegex(section.lower(), r"recommend|preferred|\bbest\b")
+        t = {"id": "T-009", "_body": "## What\nx\n" + section}
+        opts, _ = ergon.tasks.options(t)
+        self.assertEqual(ergon.tasks.options_problems(t), [])
+        self.assertEqual(ergon.tasks.lens_problems(opts.crux, opts, require_defer=True), [])
+        self.assertEqual([o.fields() for o in opts], [e.fields() for e in sorted(entries, key=ergon.tasks._lens_rank)])
+
+    def test_chosen_counts_in_lens_order(self):
+        f = self.task("Chosen: 3 by Tester 2026-11-22\n" + self.LENS)
+        _, chosen = ergon.tasks.options(ergon.tasks.parse(f))
+        self.assertEqual(chosen["text"], "defer: build nothing now and look again when the table passes a million rows")
+
+    def test_brief_digest_of_an_old_format_task_is_unchanged(self):
+        """Pinned to hashes taken before the lens format was added (T-252)."""
+        body = ("\n## What\nCache the lookups.\n\n## Done when\nLookups hit the cache.\n\n## Options\n%s"
+                "1. an in-memory LRU (recommended)\n2. a redis cache\n3. no cache\n\n## Notes\nscratch\n")
+        want = {"": "ef204420065830a5785df78989d1ca20fa498801d4f069c598cbc30294d89592",
+                "Chosen: 2 by Pavel Sinelnikov 2026-11-20\n":
+                    "0e2747d37bda0f28144057c2917d48bfc54b8d170e362276705e871b694c462a",
+                "Chosen: own by Pavel Sinelnikov 2026-11-20 — a file cache, keyed by path\n":
+                    "3c4a77648052e4cbbf29e3dfe0b4aca6d30cc90435711a119e2122de06bfe9cb"}
+        for chosen, digest in want.items():
+            t = {"id": "T-042", "title": "Cache it", "tier": "sonnet", "touches": ["ergon/tasks.py"], "_body": body % chosen}
+            self.assertEqual(ergon.tasks.brief_digest(t), digest, chosen)
+
+
+class TestLensChoose(Project):
+    """E-009 / T-253: `ergon choose T-NNN <lens> [<lens> ...]` records one lens option or a combination."""
+    TODAY = time.strftime("%Y-%m-%d")
+    human, agent, choose, approve, options_text = (TestOptions.human, TestOptions.agent, TestOptions.choose,
+                                                   TestOptions.approve, TestOptions.options_text)
+    OPERATOR = textwrap.dedent("""\
+        - operator: a cache behind a flag with a hit-rate line in the status output
+          Optimizes for: an operator who can see the cache working and turn it off
+          Gives up: a little code for the flag and the counter in the output
+          Regret if: nobody ever reads the status output and the flag stays on
+        """)
+    NUMBERED = "1. an LRU\n2. a redis cache\n"
+
+    def lens_task(self, section=None, tid="T-001", flags=()):
+        if not list((self.root / "tasks").rglob(f"{tid}-*.md")):
+            self.ergon("new", "task", "Cache it", "--tier", "sonnet", *flags)
+        f = self.task_file(tid)
+        head, _, rest = f.read_text().partition("## Notes")
+        section = TestLensOptions.LENS + self.OPERATOR if section is None else section
+        f.write_text(head.split("\n## Options\n")[0].rstrip("\n") + "\n\n## Options\n" + section + "\n## Notes" + rest)
+        return f
+
+    def rows(self):
+        return [x for x in history(self.root) if x["event"] == "chosen"]
+
+    def test_choose_writes_a_combination_in_lens_order_and_a_row(self):
+        f = self.lens_task(flags=("--touches", "ergon/a.py,ergon/b.py"))
+        f.write_text(f.read_text().replace("tier: sonnet\n", "tier: sonnet\naccept: yes\n"))
+        fields = lambda: {k: ergon.tasks.parse(f).get(k) for k in ("tier", "touches", "accept", "approved", "status")}
+        before = fields()
+        self.assertIn("`ergon choose T-001 <lens> [<lens> ...]`", self.ergon("show", "T-001").stdout)
+        r = self.choose("T-001", "operator", "minimal")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("choice: minimal + operator\n  minimal: an in-memory LRU", r.stdout)
+        self.assertIn("a combination: the worker builds what these options share", r.stdout)
+        self.assertIn("A choice steers only", r.stdout)
+        self.assertEqual(self.options_text("T-001").splitlines()[0], f"Chosen: minimal + operator by Tester {self.TODAY}")
+        self.assertEqual(fields(), before)  # never tier, touches:, accept: or approved:
+        t = ergon.tasks.parse(f)
+        _, chosen = ergon.tasks.options(t)
+        self.assertEqual((chosen["option"], chosen["lenses"]), ("minimal + operator", ["minimal", "operator"]))
+        text = ("minimal: an in-memory LRU inside each worker process, sized by config + "
+                "operator: a cache behind a flag with a hit-rate line in the status output")
+        self.assertEqual(chosen["text"], text)
+        self.assertEqual([(x["option"], x["text"], x["options"]) for x in self.rows()],
+                         [("minimal + operator", text, ["minimal", "operator"])])
+        self.assertEqual(ergon.tasks.options_problems(t), [])
+        self.assertIsNone(ergon.tasks.choice_problem(t))
+        out = self.ergon("show", "T-001").stdout
+        self.assertIn("1. minimal: an in-memory LRU inside each worker process, sized by config  (chosen)", out)
+        self.assertIn("4. defer: build nothing now", out)
+        self.assertNotIn("4. defer: build nothing now and look again when the table passes a million rows  (chosen)", out)
+
+        # one lens: the row has options too, and it replaces the combination
+        r = self.choose("T-001", "Durable")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = self.options_text("T-001").splitlines()
+        self.assertEqual(lines[0], f"Chosen: durable by Tester {self.TODAY}")
+        self.assertEqual(sum(l.startswith("Chosen:") for l in lines), 1)
+        self.assertEqual(self.rows()[-1]["options"], ["durable"])
+        self.assertEqual(self.rows()[-1]["option"], "durable")
+        # --own on a lens section: as before, no options
+        self.assertEqual(self.choose("T-001", "--own", "a file cache").returncode, 0)
+        self.assertNotIn("options", self.rows()[-1])
+        self.assertEqual(fields(), before)
+
+        self.assertEqual(self.choose("T-001", "minimal", "defer").returncode, 0)
+        r = self.approve("T-001")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("chosen minimal: an in-memory LRU", r.stdout)
+        after = fields()
+        self.assertEqual({k: after[k] for k in ("tier", "touches", "accept")},
+                         {k: before[k] for k in ("tier", "touches", "accept")})
+        self.ergon("check")
+
+    def test_choose_refusals(self):
+        f = self.lens_task()
+        self.lens_task(self.NUMBERED, tid="T-002")
+        text = {tid: self.task_file(tid).read_text() for tid in ("T-001", "T-002")}
+        cases = [
+            (("T-001", "minimal"), self.agent(), "agent shell"),
+            (("T-001", "fancy"), None, "the section has no fancy option (its lenses: minimal, durable, operator, defer)"),
+            (("T-001", "risk"), None, "the section has no risk option"),
+            (("T-001", "minimal", "operator", "Minimal"), None, "it names the minimal lens more than once"),
+            (("T-001", "2"), None, "its options are lens options, chosen by name, not number"),
+            (("T-001", "minimal", "2"), None, "chosen by name, not number"),
+            (("T-001", "minimal", "--own", "mine"), None, "not both"),
+            (("T-002", "minimal"), None, "its options are a numbered list, chosen by number, not lens"),
+            (("T-002", "1", "2"), None, "pick one option from 1 to 2"),
+        ]
+        for args, env, want in cases:
+            with self.subTest(args):
+                r = self.choose(*args, env=env)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(want, r.stderr)
+        self.assertEqual({tid: self.task_file(tid).read_text() for tid in ("T-001", "T-002")}, text)
+        self.assertEqual(self.rows(), [])
+        # a task that isn't proposed
+        self.assertEqual(self.choose("T-001", "minimal").returncode, 0)
+        self.assertEqual(self.approve("T-001").returncode, 0)
+        r = self.choose("T-001", "durable")
+        self.assertIn("is ready: a choice is made on a proposed task only", r.stderr)
+        self.assertIn("Chosen: minimal by", self.options_text("T-001"))
+        self.assertEqual([x["option"] for x in self.rows()], ["minimal"])
+
+    def test_old_lines_still_read_and_pass_approve_and_bad_lens_lines_do_not(self):
+        lens = TestLensOptions.LENS + self.OPERATOR
+        ok = {
+            "Chosen: 2 by Pavel Sinelnikov 2026-11-20\n" + lens: (2, ["durable"], "durable: a redis cache"),
+            "Chosen: own by Pavel Sinelnikov 2026-11-20 — a file cache\n" + lens: ("own", [], "a file cache"),
+            "Chosen: 2 by Pavel Sinelnikov 2026-11-20\n" + self.NUMBERED: (2, [], "a redis cache"),
+            "Chosen: own by Pavel Sinelnikov 2026-11-20 — a file cache\n" + self.NUMBERED: ("own", [], "a file cache"),
+            "Chosen: operator + minimal by P S 2026-11-20\n" + lens: ("operator + minimal", ["operator", "minimal"], "operator: "),
+        }
+        for section, (option, lenses, text) in ok.items():
+            with self.subTest(section.splitlines()[0]):
+                t = {"id": "T-009", "_body": "## What\nx\n\n## Options\n" + section}
+                _, chosen = ergon.tasks.options(t)
+                self.assertEqual((chosen["option"], chosen["lenses"]), (option, lenses))
+                self.assertTrue(chosen["text"].startswith(text), chosen["text"])
+                self.assertEqual(ergon.tasks.options_problems(t), [])
+                self.assertIsNone(ergon.tasks.choice_problem(t))
+        bad = {
+            "Chosen: risk by P S 2026-11-20\n" + lens: "has `Chosen: risk`: the section has no risk option",
+            "Chosen: minimal + Minimal by P S 2026-11-20\n" + lens: "it names the minimal lens more than once",
+            "Chosen: minimal by P S 2026-11-20\n" + self.NUMBERED: "the section is a numbered list, chosen by its number",
+        }
+        for section, want in bad.items():
+            with self.subTest(section.splitlines()[0]):
+                t = {"id": "T-009", "_body": "## What\nx\n\n## Options\n" + section}
+                self.assertTrue(any(want in p for p in ergon.tasks.options_problems(t)), ergon.tasks.options_problems(t))
+                self.assertIn("doesn't name one of its options", ergon.tasks.choice_problem(t))
+        # chosen_line writes lenses in lens order
+        self.assertEqual(ergon.tasks.chosen_line(["operator", "minimal"], "A B", "2026-11-22"),
+                         "Chosen: minimal + operator by A B 2026-11-22")
+        self.assertEqual(ergon.tasks.chosen_line(2, "A B", "2026-11-22"), "Chosen: 2 by A B 2026-11-22")
+        # check names the problem on a task file
+        self.lens_task("Chosen: risk by Tester 2026-11-20\n" + lens)
+        self.assertIn("T-001: ## Options has `Chosen: risk`: the section has no risk option",
+                      self.ergon("check", check=False).stdout)
+
+    def test_guard_refuses_agent_edits_of_a_combination_line(self):
+        f = self.lens_task()
+        p = str(f)
+        combo = "Chosen: minimal + operator by Me 2026-01-01\n"
+        self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": "## Options\n",
+                                                          "new_string": "## Options\n" + combo}))
+        self.assertEqual(self.choose("T-001", "minimal", "operator").returncode, 0)
+        line = f"Chosen: minimal + operator by Tester {self.TODAY}"
+        for new in (line.replace("operator", "durable"), line.replace(" + operator", ""),
+                    line.replace("minimal + operator", "minimal + durable + operator")):
+            self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": line, "new_string": new}), new)
+        self.assertIsNone(self.guard("Edit", {"file_path": p, "old_string": "## What\n", "new_string": "## What\nmore\n"}))
+        self.assertIn("human-only", self.guard("Bash", {"command": "ergon choose T-001 operator minimal"}))
+
+    def test_prompt_and_review_interactive_take_lens_names(self):
+        self.lens_task()
+        r = self.choose("T-001", inp="operator, minimal\ny\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("choice (minimal, durable, operator, defer: one lens, or several to combine them", r.stdout)
+        self.assertEqual(self.options_text("T-001").splitlines()[0], f"Chosen: minimal + operator by Tester {self.TODAY}")
+        r = self.choose("T-001", inp="2\n")
+        self.assertIn("chosen by name, not number", r.stderr)
+        self.lens_task(tid="T-002")
+        # T-001 (chosen) approves; T-002: c, two lens names, confirm, approve
+        r = self.ergon("review", "-i", inp="a\nc\ndurable defer\ny\na\n", env=self.human(), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"Chosen: durable + defer by Tester {self.TODAY}", self.options_text("T-002"))
+        self.assertEqual(self.rows()[-1]["options"], ["durable", "defer"])
+
+    def test_help_describes_combinations(self):
+        h = self.ergon("choose", "-h").stdout
+        self.assertIn("LENS|N", h)
+        self.assertIn("combine", h)
+        self.assertIn("Chosen: minimal +", self.ergon("-h").stdout)
 
 
 if __name__ == "__main__":

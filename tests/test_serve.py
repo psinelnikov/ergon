@@ -187,6 +187,20 @@ class TestServe(ServeFixture):
         self.assertEqual(doing["last"], "dispatched")
         self.assertAlmostEqual(doing["since_ts"], S.parse_at("2026-11-16T13:12:00+00:00"))
 
+    def test_questions_in_lens_order_on_review_and_task_page(self):
+        # T-258: the open questions list lens options in lens order, none recommended, on /review and /t/T-NNN.
+        f = self.task_file("T-003")
+        f.write_text(re.sub(r"^status: \w+$", "status: blocked\nasking: sess-1", f.read_text(), flags=re.M).rstrip()
+                     + "\n- 2026-11-08 dispatch: asking: 1 question(s) below\n"
+                     "- 2026-11-08 question: Which store? [options: risk: a journal \u2014 gives up speed | "
+                     "minimal: a flat file \u2014 gives up queries]\n")
+        for path in ("/", "/t/T-003"):
+            page = self.req("GET", path)[2]
+            self.assertLess(page.index("minimal: a flat file"), page.index("risk: a journal"), path)
+            self.assertNotIn("recommended", page, path)
+        self.assertIn("Open questions", self.req("GET", "/t/T-003")[2])
+        self.assertNotIn("Open questions", self.req("GET", "/t/T-001")[2])
+
     def test_task_page(self):
         code, _, page = self.req("GET", "/t/T-001")
         self.assertEqual(code, 200)
@@ -364,6 +378,48 @@ class TestServe(ServeFixture):
         f.write_text(f.read_text().rstrip("\n") + "\n\n## Options\n"
                      + "".join(f"{n}. {o}" + (" (recommended)" if n == 1 else "") + "\n" for n, o in enumerate(opts, 1)))
 
+    def add_lens_options(self, tid, crux, *opts):
+        f = self.task_file(tid)
+        f.write_text(f.read_text().rstrip("\n") + f"\n\n## Options\nCrux: {crux}\n" + "".join(
+            f"- {lens}: {approach}\n  Optimizes for: {o}\n  Gives up: {g}\n  Regret if: {r}\n"
+            for lens, approach, o, g, r in opts))
+
+    def test_lens_options_shown_with_no_recommended_mark(self):
+        """T-262: a lens-format ## Options shows its crux and each option's fields in lens order on
+        /review and /t/T-NNN, nothing marked recommended, and the choose commands count in that order."""
+        self.add_lens_options("T-004", "whether the page stays one <ol>",
+                              ("risk", "a second list for fields", "a flat section",
+                               "a nested list", "fields read as options too"),
+                              ("minimal", "fields inside each <li>", "one list, few rules",
+                               "a deeper <li>", "an option field hides"))
+        for path in ("/review", "/t/T-004"):
+            _, _, page = self.req("GET", path)
+            self.assertIn("<p class=crux>Crux: whether the page stays one &lt;ol&gt;</p>", page)
+            sec = page.split('<ol class=options>')[1].split("</ol>")[0]
+            self.assertLess(sec.index("minimal: fields inside each &lt;li&gt;"),
+                            sec.index("risk: a second list for fields"))  # LENSES order, not written order
+            self.assertIn("Optimizes for: one list, few rules", sec)
+            self.assertIn("Gives up: a deeper &lt;li&gt;", sec)
+            self.assertIn("Regret if: an option field hides", sec)
+            self.assertNotIn("recommended", sec)
+            self.assertIn("ergon choose T-004 minimal</code>", page)
+            self.assertIn("ergon choose T-004 risk</code>", page)
+            self.assertIn("ergon choose T-004 minimal risk</code>", page)
+            self.assertIn("ergon choose T-004 --own", page)
+        # a combination marks both lenses, its text escaped
+        f = self.task_file("T-004")
+        f.write_text(f.read_text().replace("\n## Options\n", "\n## Options\nChosen: minimal + risk by Tester 2026-11-22\n"))
+        _, _, page = self.req("GET", "/t/T-004")
+        self.assertEqual(page.count('<li class="option chosen">'), 2)
+        self.assertNotIn("ergon choose T-004", page)
+        # an old `Chosen: 1` line (T-253's `ergon choose` takes lens names on a lens section; T-254 marks those)
+        f = self.task_file("T-004")
+        f.write_text(f.read_text().replace("\n## Options\n", "\n## Options\nChosen: 1 by Tester 2026-11-22\n"))
+        _, _, page = self.req("GET", "/t/T-004")
+        li = page.split('<li class="option chosen">')[1].split("</li>")[0]
+        self.assertIn("minimal: fields inside each &lt;li&gt;", li)  # 1 counts in lens order
+        self.assertIn("chosen by", li)
+
     def test_options_shown_with_choose_commands(self):
         """T-194: /review and /t/T-NNN list a task's options, the recommended one marked, one `ergon choose`
         command each plus --own; after a choice, the chosen mark shows and the commands are gone."""
@@ -374,7 +430,7 @@ class TestServe(ServeFixture):
             self.assertIn("plain &lt;script&gt;alert(1)&lt;/script&gt; approach", sec)
             self.assertIn("second approach", sec)
             self.assertNotIn("<script>alert(1)", page)
-            self.assertEqual(sec.count("recommended"), 1)
+            self.assertNotIn("recommended", page)
             self.assertIn("ergon choose T-004 1</code>", page)
             self.assertIn("ergon choose T-004 2</code>", page)
             self.assertIn("ergon choose T-004 --own", page)

@@ -45,10 +45,12 @@ from . import tasks as _tasks
 FOUND_CLAUSE = (
     "`FOUND: <title> — <why>` followed right after by `DONE WHEN: …` (required: at least one line per FOUND, "
     "what makes the follow-up finished; several lines are fine) and these optional lines: `TOUCHES: a, b`, "
-    "`TIER: haiku|sonnet|opus|human — <why>`, `OPTIONS: a | b | c`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour "
+    "`TIER: haiku|sonnet|opus|human — <why>`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour "
     "a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same "
-    "behaviour, better code; chore: docs, help text, tests, config, tooling); a feature needs an `OPTIONS:` line "
-    "with 2 to 4 approaches to take, the recommended one first, which a human chooses from before approving it). "
+    "behaviour, better code; chore: docs, help text, tests, config, tooling); a feature needs a `CRUX: <what the "
+    "choice turns on>` line and 2 to 4 peer lines `OPTION: <lens>: <approach> — optimizes for … — gives up … — "
+    "regret if …`, one per lens (minimal, durable, operator, risk, defer), one of them `defer` (what happens if "
+    "nothing is built now), none of them marked as better than the rest; a human chooses from them before approving it). "
     "If you find nothing to file, write no `FOUND:` line at all (never `FOUND: none`)")
 
 WORKER_PROMPT = """You are dispatched on {id}.
@@ -321,7 +323,7 @@ def release_breakdown(eid, mine, push=False):
 
 # ---------- questions ----------
 # A worker that needs a decision ends with `QUESTION: <text>` lines (each optionally followed by
-# `OPTIONS: a | b | c`, recommended first) and `RESULT: asking`. Dispatch parks the task: status
+# `OPTIONS: a | b | c`) and `RESULT: asking`. Dispatch parks the task: status
 # blocked, frontmatter `asking: <session>`, the questions as `question:` bullets in Notes, the
 # worktree and branch kept. Only a human's `ergon answer` moves it on: it writes the answer to
 # Notes, swaps `asking:` for `answered: <session>` and sets the task ready. The next dispatch
@@ -354,8 +356,21 @@ def parse_questions(text):
         elif m[1] == "FOUND":
             last = None
         elif last is not None and not last[1]:
-            last[1].extend(o.strip(" *`") for o in val.split("|") if o.strip(" *`"))
+            last[1].extend(o.strip(" *`") for o in re.split(r"\s+\|\s+", val) if o.strip(" *`"))
+            last[1][:] = sort_options(last[1])
     return out
+
+
+def option_lens(o):
+    """The lens an option `<lens>: <approach> — gives up <cost>` opens with (lower case), or None."""
+    m = re.match(r"^\s*([A-Za-z][\w-]*)\s*:", o)
+    return m[1].lower() if m and m[1].lower() in _tasks.LENSES else None
+
+
+def sort_options(opts):
+    """opts in lens order (minimal, durable, operator, risk, defer); an option with no known lens
+    keeps its place after the lensed ones. No option is marked or ranked above another."""
+    return sorted(opts, key=lambda o: _tasks.LENSES.index(option_lens(o)) if option_lens(o) else len(_tasks.LENSES))
 
 
 def note_line(text):
@@ -378,7 +393,7 @@ def asked(t):
     for b in bullets[start + 1:]:
         m = re.match(r"^\S+ question: (.*?)(?: \[options: (.*)\])?$", b)
         if m:
-            qs.append((m[1], [o.strip() for o in (m[2] or "").split(" | ") if o.strip()]))
+            qs.append((m[1], sort_options([o.strip() for o in (m[2] or "").split(" | ") if o.strip()])))
         m = re.match(r"^\S+ answer by .*?: (.*)$", b)
         if m:
             ans = m[1]
@@ -896,11 +911,35 @@ FOUND_CATEGORIES = ("feature", "bugfix", "refactor", "chore")  # tasks.CATEGORIE
 NO_FOUND = {"none", "nothing", "n/a", "no", "-"}  # a FOUND title that says there is nothing to file
 
 
+_LENS_LABELS = (("optimizes for", "optimizes"), ("gives up", "gives_up"), ("regret if", "regret"))
+
+
+def parse_lens_option(val):
+    """The fields() dict of one `<lens>: <approach> — optimizes for … — gives up … — regret if …`
+    value. Parts are matched by their label, in any order; a part with no label continues the text
+    before it. A value with no `<lens>:` gets an empty lens (lens_problems names it)."""
+    parts = re.split(r"\s+[—–]\s+", val)
+    lens, colon, approach = parts[0].partition(":")
+    if not colon:
+        lens, approach = "", parts[0]
+    out = {"lens": lens.strip(), "approach": approach.strip(), "optimizes": "", "gives_up": "", "regret": ""}
+    key = "approach"
+    for part in parts[1:]:
+        for label, k in _LENS_LABELS:
+            lm = re.match(rf"{label}\b\s*:?\s*(.*)$", part, re.I)
+            if lm:
+                key, part = k, lm[1]
+                break
+        out[key] = (out[key] + " " + part).strip()
+    return out
+
+
 def parse_found(text):
     """[(title, why, extra)] from a worker's FOUND: lines. TOUCHES (once), DONE WHEN (repeatable)
-    and TIER, CATEGORY and OPTIONS (`a | b | c`, at most 4) lines (once each) directly after a FOUND
-    line fill `extra`: touches, done, tier, tier_why, category, options. A line md_trim would empty is ignored, and so is a tier or category
-    that isn't one."""
+    and TIER, CATEGORY and CRUX lines (once each) and OPTION lines (`<lens>: <approach> — optimizes for … —
+    gives up … — regret if …`, repeatable) directly after a FOUND line fill `extra`: touches, done, tier,
+    tier_why, category, crux, lens (a list of LensOption fields() dicts). An old `OPTIONS:` line is read
+    and dropped. A line md_trim would empty is ignored, and so is a tier or category that isn't one."""
     out, cur, bullets = [], None, False
     for line in text.splitlines():
         if bullets and cur is not None:  # `DONE WHEN:` with nothing after it: its `- item` lines are the items
@@ -918,7 +957,7 @@ def parse_found(text):
                 cur = {}
                 out.append((md_trim(m[1]), md_trim(m[2]), cur))
             continue
-        m = re.match(r"^\W*(TOUCHES|DONE WHEN|TIER|CATEGORY|OPTIONS):\s*(.*?)\s*$", line)
+        m = re.match(r"^\W*(TOUCHES|DONE WHEN|TIER|CATEGORY|OPTIONS|CRUX|OPTION):\s*(.*?)\s*$", line)
         if not m:
             if line.strip():
                 cur = None
@@ -933,9 +972,10 @@ def parse_found(text):
         elif m[1] == "TOUCHES":
             if "touches" not in cur:
                 cur["touches"] = [x for x in (md_trim(x) for x in val.split(",")) if x]
-        elif m[1] == "OPTIONS":
-            if "options" not in cur:
-                cur["options"] = [x for x in (md_trim(x) for x in val.split("|")) if x][:4]
+        elif m[1] == "CRUX":
+            cur.setdefault("crux", val)
+        elif m[1] == "OPTION":
+            cur.setdefault("lens", []).append(parse_lens_option(val))
         elif m[1] == "CATEGORY":
             if "category" not in cur and val.lower() in FOUND_CATEGORIES:
                 cur["category"] = val.lower()
@@ -1025,10 +1065,13 @@ def file_found(t, found, epics, vouch=True):
             body = body.replace("## Done when\n", "## Done when\n" + "".join(f"- {d}\n" for d in extra["done"]), 1)
         else:
             body = body.rstrip("\n") + "\n" + NO_DONE_WHEN_NOTE.format(id=tid) + "\n"
-        opts = extra.get("options") or []
         feature = (extra.get("category") or "feature") == "feature"
-        if feature and len(opts) >= 2:
-            body = body.replace("\n## Notes", _tasks.options_section(opts) + "\n## Notes", 1)
+        lens = extra.get("lens") or []
+        problems = []
+        if feature and (lens or extra.get("crux")):
+            problems = _tasks.lens_problems(extra.get("crux"), lens, require_defer=True)
+            if not problems:
+                body = body.replace("\n## Notes", _tasks.lens_section(extra["crux"], lens) + "\n## Notes", 1)
         sized = extra.get("tier")
         meta = {"id": tid, "title": title, "tier": sized or t["tier"],
                 "category": extra.get("category") or "", "status": "proposed",
@@ -1042,7 +1085,11 @@ def file_found(t, found, epics, vouch=True):
             meta["status"], meta["approved"] = "ready", auto[0]
             if not sized:  # nobody approves it, so nobody sizes it then
                 meta["tier_why"] = f"tier of the task that found it ({t['id']})"
-        if feature and len(opts) < 2:
+        if feature and problems:
+            meta["_body"] = meta["_body"].rstrip("\n") + (
+                f"\noptions from {t['id']} not filed: " + "; ".join(problems)
+                + ". Choose an approach before approving, or add one with ergon choose --own\n")
+        elif feature and not lens:
             meta["_body"] = meta["_body"].rstrip("\n") + (
                 f"\nno options given by {t['id']}: choose an approach before approving, "
                 "or add one with ergon choose --own\n")
@@ -1974,7 +2021,9 @@ def found_lines(found):
         out.append(f"- {title}" + (f" — {why}" if why else "")
                    + f"\n  category: {extra.get('category') or '(none: reads as feature)'}; "
                    + f"tier: {extra.get('tier') or FINDERS}; touches: {touches}\n"
-                   + (f"  options: {' | '.join(extra['options'])}\n" if extra.get("options") else ""))
+                   + (f"  crux: {extra['crux']}\n" if extra.get("crux") else "")
+                   + "".join(f"  option: {e['lens']}: {e['approach']} — optimizes for {e['optimizes']} — "
+                             f"gives up {e['gives_up']} — regret if {e['regret']}\n" for e in extra.get("lens") or []))
     return REVIEW_FOUND.format(lines="".join(out))
 
 
@@ -3102,15 +3151,28 @@ depends: <comma-separated numbers of earlier blocks in this reply, or existing T
 ## Done when
 <outcomes a reviewer can check>
 ## Options
-1. <the recommended approach, one line>
-2. <an alternative approach, one line>
+Crux: <one line: what the choice turns on; it names no option>
+- minimal: <the smallest change that meets the goal, one line>
+  Optimizes for: <what it makes best>
+  Gives up: <what it costs>
+  Regret if: <what would make a human wish for another lens>
+- durable: <approach>
+  Optimizes for: <…>
+  Gives up: <…>
+  Regret if: <…>
+- operator: <approach, same three fields>
+- risk: <approach, same three fields>
+- defer: <what happens if nothing is built now, same three fields>
 END TASK
 
-`## Options` lists 2 to 4 alternative approaches, the one you recommend first, one line each, and every
+`## Options` is a `Crux:` line and 2 to 4 lens options (`- <lens>: <approach>`, each with `Optimizes for:`,
+`Gives up:` and `Regret if:` lines), at most one per lens, written in the order minimal, durable, operator,
+risk, defer. The lenses are peers: the crux names no option, no option is marked or ranked, and a block
+that favours one option in its wording is refused. No option may be under half the median option's length. Every
 option stays within the epic's Goal and Constraints. A feature block needs it; a bugfix, refactor or
-chore block may leave it out. Blocks are numbered 1, 2, 3, … in the order you write them, and `depends` may name only an earlier
+chore block may leave it out. An old numbered list is refused. Blocks are numbered 1, 2, 3, … in the order you write them, and `depends` may name only an earlier
 block. Each block is checked as `ergon check` would check it. A block with an unknown field, a tier
-below a `[[protect]]` minimum for a path it touches, an unknown category, a feature with fewer than 2 or more than 4 options, an empty What or
+below a `[[protect]]` minimum for a path it touches, an unknown category, a feature with no options or an `## Options` section that breaks the lens rules, an empty What or
 Done when, or a missing END TASK line is refused and never repaired. So is a block that depends on a refused one. At most
 {max} blocks are filed.
 """
@@ -3275,15 +3337,21 @@ def check_block(n, f, tasks, ids, refused):
     if cat not in _tasks.CATEGORIES:
         return f"category {f['category']!r} not in {_tasks.CATEGORIES}"
     f["_category"] = cat
-    opts = [m[2] for l in f.get("options", "").split("\n") if (m := _tasks.OPTION_ITEM.match(l)) and m[2]]
-    if any(l.strip().startswith("Chosen:") for l in f.get("options", "").split("\n")):
+    text = f.get("options", "")
+    if any(l.strip().startswith("Chosen:") for l in text.split("\n")):
         return "`## Options` has a `Chosen:` line (a human chooses)"
-    if f.get("options") and len(opts) != len([l for l in f["options"].split("\n") if l.strip()]):
-        return "`## Options` holds a line that isn't a numbered option (`1. …`)"
-    if (cat == "feature" or opts) and not BLOCK_OPTIONS[0] <= len(opts) <= BLOCK_OPTIONS[1]:
-        return (f"{'a feature block' if cat == 'feature' else 'a block with options'} needs "
-                f"{BLOCK_OPTIONS[0]} to {BLOCK_OPTIONS[1]} options under `## Options`, has {len(opts)}")
-    f["_options"] = [_tasks.RECOMMENDED.sub("", o) for o in opts]
+    f["_lens"] = None
+    if text:
+        if not _tasks.is_lens_section(text):
+            return ("`## Options` is not in lens format (a `Crux:` line, then `- <lens>: <approach>` bullets "
+                    "with their fields); an old numbered list is refused")
+        crux, entries = _tasks.parse_lens(text)
+        problems = _tasks.lens_problems(crux, entries)
+        if problems:
+            return f"`## Options`: {problems[0]}"
+        f["_lens"] = (crux, entries)
+    elif cat == "feature":
+        return (f"a feature block needs {BLOCK_OPTIONS[0]} to {BLOCK_OPTIONS[1]} options under `## Options`, has 0")
     touches = split_list(f["touches"])
     if any(re.search(r"[\[\]#]", x) for x in touches):
         return f"a touches: entry holds `[`, `]` or `#`: {f['touches']}"
@@ -3426,7 +3494,7 @@ def file_blocks(e, blocks, info):
             continue
         tid = _tasks.next_id(_config.ITEMS, "T")
         body = (f"\n## What\n{f['what']}\n\n## Done when\n{f['done when']}\n"
-                + (_tasks.options_section(f["_options"]) if f["_options"] else "") + "\n## Notes\n"
+                + (_tasks.lens_section(*f["_lens"]) if f["_lens"] else "") + "\n## Notes\n"
                 + (f"{f['notes']}\n" if f.get("notes") else ""))
         source = BREAKDOWN_SOURCE.format(eid=e["id"])
         meta = {"id": tid, "title": title, "tier": f["tier"], "category": f["_category"], "status": "proposed", "epic": e["id"],

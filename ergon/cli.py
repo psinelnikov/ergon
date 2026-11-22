@@ -19,10 +19,12 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                opens the epic and leaves its tasks proposed / edit / skip)
   ergon show ID
   ergon new task "Title" --tier sonnet [--epic E-001] [--touches a,b] [--source LOG.md:42]
-                      [--category C] [--option "<approach>" --option "<approach>" ...]
-                               --option (2 to 4, the recommended one first) writes an ## Options
-                               section a human picks from with `ergon choose`. In an agent shell a
-                               feature (category feature or empty) is refused without 2 of them
+                      [--category C] [--crux "<text>"] [--option "<lens>: <approach> | <optimizes for> | <gives up> | <regret if>" ...]
+                               --crux and 2 to 4 --options (one per lens: minimal, durable, operator,
+                               risk, defer) write an ## Options section a human picks from with
+                               `ergon choose`. In an agent shell a feature (category feature or empty)
+                               is refused without a crux and well-formed options; elsewhere plain
+                               --option text writes a numbered list
   ergon new epic "Title"
   ergon import gh#123 [--tier T] [--epic E] [--touches a,b]
                                a GitHub issue (or gh:OWNER/REPO#123) as a proposed task, via the
@@ -62,11 +64,15 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                The task goes back to ready, and the next dispatch resumes the
                                worker's session with the answer (a fresh one if its cache is gone).
                                Never changes approved:, tier, touches: or accept:
-  ergon choose ID N | --own "<text>"
-                               HUMAN ONLY, real terminal. Pick one of a proposed task's ## Options
-                               (no N offers them): writes `Chosen: N by <name> <date>` as the
-                               section's first line and a `chosen` history row. `approve` refuses a
-                               task with options and no choice; `check` fails one past proposed.
+  ergon choose ID LENS [LENS ...] | N | --own "<text>"
+                               HUMAN ONLY, real terminal. Pick a proposed task's ## Options (none
+                               given offers them): on lens options, one lens or several to combine
+                               them (`ergon choose T-1 operator minimal` writes `Chosen: minimal +
+                               operator by <name> <date>`; the worker builds what they share and
+                               takes each one's distinct part); on a numbered list, one number
+                               (`Chosen: N by …`). Written as the section's first line, with a
+                               `chosen` history row. `approve` refuses a task with options and no
+                               choice; `check` fails one past proposed.
                                Never changes approved:, tier, touches: or accept:
   ergon close ID [ID ...] --as done|dropped --reason R
                                HUMAN ONLY. An approved task whose work landed elsewhere, or that
@@ -434,10 +440,12 @@ def main():
     nw.add_argument("--epic")
     nw.add_argument("--touches")
     nw.add_argument("--source")
+    nw.add_argument("--crux", metavar="TEXT", help="task: one line saying what the choice between the options turns on")
     nw.add_argument("--option", action="append", metavar="TEXT",
-                    help="task: one approach to choose from; give it 2 to 4 times, the recommended one first. Writes an "
-                         "## Options section a human picks from with `ergon choose`. In an agent shell a feature "
-                         "(category feature or empty) needs at least 2")
+                    help="task: one approach to choose from, \"<lens>: <approach> | <optimizes for> | <gives up> | "
+                         "<regret if>\"; give it 2 to 4 times, one per lens (minimal, durable, operator, risk, defer). "
+                         "Writes an ## Options section a human picks from with `ergon choose`. In an agent shell a "
+                         "feature (category feature or empty) needs --crux and well-formed options")
     im = sub.add_parser("import", help="a GitHub issue as a proposed task: gh#123 or gh:OWNER/REPO#123")
     im.add_argument("ref", metavar="gh#N")
     im.add_argument("--tier", help="default: human, until someone sizes it")
@@ -469,7 +477,11 @@ def main():
     an.add_argument("text", nargs="*", help="the answer; leave it out to pick from the options")
     ch = sub.add_parser("choose", help="HUMAN ONLY: pick one of a proposed task's options (approve waits on it)")
     ch.add_argument("id")
-    ch.add_argument("n", nargs="?", metavar="N", help="the option's number; leave it and --own out to pick")
+    ch.add_argument("picks", nargs="*", metavar="LENS|N",
+                    help="lens options: one or more lens names (minimal, durable, operator, risk, defer); several "
+                         "combine them into `Chosen: <lens> + <lens>`, and the worker builds what they share and "
+                         "takes each one's distinct part. A numbered list: exactly one number. Leave it and --own "
+                         "out to pick")
     ch.add_argument("--own", metavar="TEXT", help="your own approach instead of a listed one")
     r = sub.add_parser("reject")
     r.add_argument("ids", nargs="+")
