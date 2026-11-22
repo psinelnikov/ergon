@@ -3,6 +3,7 @@ import argparse
 import datetime
 import fcntl
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -179,8 +180,13 @@ def merge_into(base, branch, msg, no_ff=False, repo=None):
 
 
 def epic_complete(eid, tasks):
+    """Is every task of epic eid done or dropped? With [signing] (T-229), a done or dropped one
+    whose human decision doesn't verify (written by hand) doesn't count, so the epic stays open."""
     kids = [t for t in tasks.values() if t.get("epic") == eid]
-    return bool(kids) and all(t["status"] in ("done", "dropped") for t in kids)
+    if not kids or not all(t["status"] in ("done", "dropped") for t in kids):
+        return False
+    apr = approvals() if _config.SIGNING else None
+    return not (apr and any(apr.decision_problem(t) for t in kids))
 
 
 def open_epic(e):
@@ -648,6 +654,16 @@ class Approvals:
         return out
 
     def problem(self, t):
+        """Why t mustn't be offered, started or cited: its approval doesn't verify, or (with
+        [signing] in local mode) a human decision on it was written by hand. None if neither."""
+        return self.approval_problem(t) or self.decision_problem(t)
+
+    def decision_problem(self, t):
+        """Why a human decision t's file shows doesn't verify, or None. Only [signing] in local
+        mode signs decisions (LocalApprovals); shared mode's signed commits record them."""
+        return None
+
+    def approval_problem(self, t):
         """Why t's approval doesn't verify, or None if it does."""
         if self.error:
             return self.error
@@ -673,7 +689,7 @@ class Approvals:
     def stamp(self, t):
         """The approved: stamp t's verified approval makes (each approver's name, the date of the
         latest), or None if it doesn't verify."""
-        if self.problem(t):
+        if self.approval_problem(t):
             return None
         who = self.signers(t)
         names = " and ".join(n for _, n, _ in who)
@@ -742,6 +758,22 @@ def approvals():
 SIGN_NAMESPACE = "ergon"  # ssh-keygen -Y's namespace, so an approval's signature is no commit's
 APPROVAL_FILE = re.compile(r"^[\w.-]+\.txt$")
 
+# T-229: the other human decisions, signed the same way. `accept`, `reject`, `close`, `answer` and
+# `pin` each sign one message into <state>/approvals/: an `at <UTC time>` line, then a line
+# `<verb> <ID> sha256:<digest>` per task it decides. The digest (decision_digest) covers what the
+# decision did, as the task file shows it afterwards, so it is recomputed from the file:
+#   accept, close, and reject of a proposed task: the status it ended in and the brief digest;
+#   reject of a task in review: the Note sending it back (`review: rejected by …`);
+#   answer: the session it answers and the answer, as dispatch reads them back;
+#   pin: first, last or clear, and the message's signed time (the newest signed pin counts).
+# LocalApprovals.decision_problem says which of a task's decisions doesn't verify.
+DECISION_VALUE = re.compile(r"^(accept|reject|close|answer|pin)\s+([TE]-\d{3,})\s+sha256:([0-9a-f]{64})$")
+AT_LINE = re.compile(r"^at\s+(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)$")
+PINS = ("first", "last", "clear")
+SIGNED_STAMP = re.compile(r"\ssha256:[0-9a-f]{8}\s*$")  # a stamp a signed approval wrote
+SENT_BACK = re.compile(r"\breview: rejected by ")  # reject's Note on a task it sends back to ready
+HELD_MARK = "waits for a human: `ergon accept "  # dispatch's Note on a task it holds at review
+
 
 def approvals_dir():
     return _config.STATE / "approvals"
@@ -750,6 +782,50 @@ def approvals_dir():
 def approval_message(pairs):
     """What an approval signs: one `<ID> sha256:<digest>` line per (ID, digest)."""
     return "".join(f"{tid} sha256:{digest}\n" for tid, digest in pairs)
+
+
+def decision_digest(verb, tid, **fields):
+    """sha256 (hex) of one human decision: its verb, the task, and what it did (`fields`)."""
+    doc = {"verb": verb, "id": tid, **fields}
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def ended_digest(verb, t):
+    """accept, close, or reject of a proposed task: t ended in the status its file says, with its
+    brief as it is now (after the command appended its reason)."""
+    return decision_digest(verb, t["id"], status=str(t.get("status") or ""), brief=_tasks.brief_digest(t))
+
+
+def last_note(t):
+    """The last bullet under t's ## Notes, or ''."""
+    _, _, notes = (t.get("_body") or "").partition("## Notes")
+    bullets = [l[2:].strip() for l in notes.splitlines() if l.startswith("- ")]
+    return bullets[-1] if bullets else ""
+
+
+def sent_back_digest(t):
+    """reject of a task in review: the Note that sends it back to ready, which its next worker is told."""
+    return decision_digest("reject", t["id"], status="ready", note=last_note(t))
+
+
+def answer_digest(t):
+    """answer: the session t's `answered:` resumes and the answer dispatch reads back from Notes."""
+    from . import dispatch as _dispatch  # imports this module
+    return decision_digest("answer", t["id"], session=str(t.get("answered") or ""), answer=_dispatch.asked(t)[1] or "")
+
+
+def pin_digest(tid, where, at):
+    """pin: first, last or clear, at the message's signed time."""
+    return decision_digest("pin", tid, pin=where, at=at)
+
+
+def signing_since():
+    """The day [signing] was first committed to the trunk's config (YYYY-MM-DD), or today if it
+    isn't committed yet. A task filed since then is held to signed decisions from the start."""
+    r = subprocess.run(["git", "-C", str(_config.HOME), "log", "--format=%cs", "-G", r"^\[signing\]",
+                        f"refs/heads/{_config.MAIN}", "--", _config.CONFIG_FILE], capture_output=True, text=True)
+    days = r.stdout.split() if r.returncode == 0 else []
+    return days[-1] if days else _tasks.today()
 
 
 def verify_signature(keygen, allowed, message, sig):
@@ -771,15 +847,18 @@ def verify_signature(keygen, allowed, message, sig):
 
 
 class LocalApprovals(Approvals):
-    """[signing]: what the signed approvals in <state>/approvals/ approve, verified against the
-    approvers file on the committed trunk. A file is verified the first time a task or epic it
-    names is asked about, so `check` and `next` verify only what they look at."""
+    """[signing]: what the signed approvals and decisions in <state>/approvals/ approve and decide,
+    verified against the approvers file on the committed trunk. A file is verified the first time
+    a task or epic it names is asked about, so `check` and `next` verify only what they look at.
+    With `error` (no ssh-keygen, no approvers file) nothing verifies."""
 
-    def __init__(self, keygen, text):
-        super().__init__()
+    def __init__(self, keygen, text, error=None):
+        super().__init__(error=error)
         self.keygen, self.text = keygen, text
         self.loaded, self.verdicts = set(), {}
         self.files = {}  # ID: [(file name, message, digest)], newest first
+        self.decisions = {}  # (verb, ID): [(file name, message, digest, signed time)], newest file first
+        self.since = None  # signing_since(), read once if needed
         try:
             names = sorted((p.name for p in approvals_dir().iterdir() if APPROVAL_FILE.match(p.name)), reverse=True)
         except OSError:
@@ -789,11 +868,15 @@ class LocalApprovals(Approvals):
                 msg = (approvals_dir() / name).read_bytes()
             except OSError:
                 continue
-            for line in msg.decode("utf-8", "replace").splitlines():
-                m = APPROVE_VALUE.match(line.strip())
+            lines = [l.strip() for l in msg.decode("utf-8", "replace").splitlines()]
+            at = next((m[1] for l in lines if (m := AT_LINE.match(l))), None)
+            for line in lines:
+                m = APPROVE_VALUE.match(line)
                 if m:
                     self.seen.add(m[1])
                     self.files.setdefault(m[1], []).append((name, msg, m[2]))
+                elif m := DECISION_VALUE.match(line):
+                    self.decisions.setdefault((m[1], m[2]), []).append((name, msg, m[3], at))
 
     def load(self, tid):
         if tid in self.loaded:
@@ -806,6 +889,8 @@ class LocalApprovals(Approvals):
 
     def verdict(self, name, msg):
         """(principal, principal, date) if the file's signature verifies, else None."""
+        if self.error:
+            return None
         if name not in self.verdicts:
             who, sig = None, approvals_dir() / (name + ".sig")
             if sig.is_file():
@@ -818,31 +903,122 @@ class LocalApprovals(Approvals):
             self.verdicts[name] = who
         return self.verdicts[name]
 
+    def decided(self, tid, digests):
+        """Does a signed decision verify for tid? digests: {verb: the digest it must carry}.
+        'ok' if one does; 'changed' if a verified one carries another digest (the file changed
+        since); 'unlisted' if lines name it but none verifies; 'none' if no line names it."""
+        recs = [(v, r) for v in digests for r in self.decisions.get((v, tid), [])]
+        good = [(v, r) for v, r in recs if self.verdict(r[0], r[1])]
+        if any(r[2] == digests[v] for v, r in good):
+            return "ok"
+        return "changed" if good else "unlisted" if recs else "none"
+
+    def signed_pin(self, tid):
+        """first, last or clear, as the newest verified pin decision of tid (by its signed time)
+        set it; None if no pin of it verifies."""
+        best = None
+        for name, msg, digest, at in self.decisions.get(("pin", tid), []):
+            if not at or not self.verdict(name, msg):
+                continue
+            where = next((w for w in PINS if pin_digest(tid, w, at) == digest), None)
+            if where and (best is None or at > best[0]):
+                best = (at, where)
+        return best[1] if best else None
+
+    def signed_era(self, t):
+        """Is done or dropped t held to a signed decision? Yes if it was approved under signing (a
+        stamp naming a digest, or a verified line naming it) or filed since [signing] was
+        committed. A task that ended before has no signature behind its end, and needs none."""
+        if SIGNED_STAMP.search(str(t.get("approved") or "")):
+            return True
+        if self.since is None:
+            self.since = signing_since()
+        if str(t.get("created") or "") >= self.since:
+            return True
+        tid = t["id"]
+        recs = [(n, m) for n, m, _ in self.files.get(tid, [])]
+        recs += [(r[0], r[1]) for (_, i), rs in self.decisions.items() if i == tid for r in rs]
+        return any(self.verdict(n, m) for n, m in recs)
+
+    def decision_problem(self, t):
+        """Why a human decision t's file shows doesn't verify (written by hand, or the file
+        changed after it), or None. Checked: a done task that needed acceptance (accept or close),
+        a dropped one (reject or close), an `answered:` mark (answer), a ready task sent back
+        from review (reject) or moved out of it by hand, and `pin:` (pin). Epics aren't checked."""
+        if _tasks.is_epic(t):
+            return None
+        tid, status = t["id"], t.get("status")
+        how = {"changed": "the task changed after the signed decision",
+               "unlisted": f"not signed by a key in {approvers_path()} on {where()}",
+               "none": "written by hand"}
+        if status in ("done", "dropped"):
+            verbs = ("reject", "close") if status == "dropped" else ("accept", "close") if _tasks.needs_accept(t) else ()
+            if not verbs or not self.signed_era(t):
+                return None
+            effect = (f"so it doesn't count as {status}: its epic doesn't finish"
+                      + (" and the tasks that depend on it wait" if status == "done" else ""))
+            if self.error:
+                return f"{status}, but its decision can't be verified: {self.error}; {effect}"
+            got = self.decided(tid, {v: ended_digest(v, t) for v in verbs})
+            if got == "ok":
+                return None
+            return (f"{status} without a signed `ergon {verbs[0]}` or `ergon close` ({how[got]}), {effect}; "
+                    f"a human confirms it with `ergon close {tid} --as {status} --reason R`")
+        if status not in GATED or self.error:  # an approval that can't verify says why already
+            return None
+        if t.get("answered"):
+            got = self.decided(tid, {"answer": answer_digest(t)})
+            if got != "ok":
+                return (f"answered: without a signed `ergon answer` ({how[got]}); a human puts it back "
+                        f"(status: blocked, asking: <session> for answered:) and runs `ergon answer {tid}`, "
+                        f"or closes it")
+        if status in ("ready", "doing"):
+            note = last_note(t)
+            if SENT_BACK.search(note):
+                got = self.decided(tid, {"reject": sent_back_digest(t)})
+                if got != "ok":
+                    return (f"sent back from review without a signed `ergon reject` ({how[got]}); a human "
+                            f"sets it back to review and rejects it with `ergon reject {tid} --reason R`, or "
+                            f"closes it")
+            elif HELD_MARK in note:
+                return (f"moved out of review by hand: its last Note is dispatch's hold for `ergon accept`; "
+                        f"a human sets it back to review and runs `ergon accept {tid}` or `ergon reject {tid} "
+                        f"--reason R`, or closes it")
+        pin = str(t.get("pin") or "").strip()
+        pin = pin if pin in ("first", "last") else "clear"
+        signed = self.signed_pin(tid) or "clear"
+        if pin != signed:
+            if pin != "clear":
+                return (f"pin: {pin} without a signed `ergon pin` (written by hand, or before [signing]); a "
+                        f"human runs `ergon pin {tid} {pin}` or `ergon pin {tid} clear`")
+            return (f"its signed pin ({signed}) was removed by hand; a human runs `ergon pin {tid} clear` "
+                    f"or pins it again")
+        return None
+
 
 def local_approvals():
     """[signing]: approvals verified against the approvers file on the committed trunk."""
     keygen = ssh_keygen()
     if not keygen:
-        return Approvals(error="no ssh-keygen on PATH, so no approval signature can be verified")
+        return LocalApprovals(None, None, error="no ssh-keygen on PATH, so no approval signature can be verified")
     text = approvers_text()
     if text is None:
-        return Approvals(error=f"no approvers file {approvers_path()} committed on {where()}, so no "
-                               f"approval can be verified")
+        return LocalApprovals(None, None, error=f"no approvers file {approvers_path()} committed on {where()}, "
+                                                f"so no approval can be verified")
     return LocalApprovals(keygen, text)
 
 
-def sign_approvals(pairs):
-    """[signing]: sign one approval of `pairs`, [(ID, digest)], with user.signingkey, check that it
-    verifies against the approvers file on the committed trunk, and write it to <state>/approvals/.
-    Raises SystemExit, having written nothing, if it can't sign or the signature doesn't verify.
-    stdin stays the terminal's, for a passphrase."""
+def sign_message(message, noun="approval", outcome="nothing was approved"):
+    """[signing]: sign `message` with user.signingkey, check that it verifies against the approvers
+    file on the committed trunk, and write it to <state>/approvals/. Raises SystemExit, having
+    written nothing, if it can't sign or the signature doesn't verify. stdin stays the
+    terminal's, for a passphrase. Returns the file written."""
     why = approve_problem()
     if why:
         raise SystemExit(f"refused: {why}")
     keygen, key, text = ssh_keygen(), config_value("user.signingkey"), approvers_text()
-    message = approval_message(pairs)
     with tempfile.TemporaryDirectory(prefix="ergon-sign-") as d:
-        msg = Path(d) / "approval.txt"
+        msg = Path(d) / f"{noun}.txt"
         msg.write_text(message)
         cmd = [keygen, "-Y", "sign", "-n", SIGN_NAMESPACE]
         if key.startswith("key::"):  # a literal public key: its private half is in the ssh-agent
@@ -857,13 +1033,13 @@ def sign_approvals(pairs):
             r = subprocess.CompletedProcess(cmd, 1, "", str(err))
         sig = msg.with_name(msg.name + ".sig")
         if r.returncode or not sig.is_file():
-            raise SystemExit(f"refused: signing the approval failed, so nothing was approved: "
+            raise SystemExit(f"refused: signing the {noun} failed, so {outcome}: "
                              f"{(r.stderr or r.stdout).strip()[:300]}\n" + signing_howto())
         allowed = Path(d) / "allowed_signers"
         allowed.write_text(text)
         if not verify_signature(keygen, allowed, message.encode(), sig):
             raise SystemExit(f"refused: your signature doesn't verify against {approvers_path()} on {where()}, "
-                             f"so nothing was approved: is your key listed there, with "
+                             f"so {outcome}: is your key listed there, with "
                              f"namespaces=\"{SIGN_NAMESPACE}\" or none?\n" + signing_howto())
         folder = approvals_dir()
         folder.mkdir(parents=True, exist_ok=True)
@@ -880,6 +1056,27 @@ def sign_approvals(pairs):
         tmp.write_text(message)
         tmp.replace(out)
     return out
+
+
+def sign_approvals(pairs):
+    """[signing]: sign one approval of `pairs`, [(ID, digest)] (sign_message)."""
+    return sign_message(approval_message(pairs))
+
+
+def decision_at():
+    """The `at` line's time: now, UTC, to the microsecond."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def sign_decisions(lines, at=None):
+    """[signing] (T-229): sign one message deciding `lines`, [(verb, ID, digest)], at `at`
+    (decision_at() if None), as sign_message does: a failure raises SystemExit, having written
+    nothing, so a caller signs before it writes. Returns the history rows' field naming the file
+    (`{"signature": name}`), or {} without [signing], signing nothing."""
+    if not _config.SIGNING or not lines:
+        return {}
+    message = f"at {at or decision_at()}\n" + "".join(f"{v} {tid} sha256:{d}\n" for v, tid, d in lines)
+    return {"signature": sign_message(message, "decision", "nothing was changed").name}
 
 
 def sign_state(label, trailers, paths=(), undo=True):

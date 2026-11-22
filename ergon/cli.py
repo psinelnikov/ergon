@@ -560,7 +560,10 @@ def main():
         "round used up, worktree and branch kept. The run launches nothing more before the reset (--watch "
         "waits for it; a plain run ends with `paused by the 5-hour limit until HH:MM: T-…`), and any dispatch "
         "scan at or after it moves the task back to doing and restarts the step it stopped at: the worker or "
-        "round (its session resumed, or a fresh worker), or only the review. --dry-run and the board show "
+        "round (its session resumed, or a fresh worker), or only the review. The recorded reset may be stale "
+        "— the login changed, the limit lifted early — so while anything waits on it each scan re-checks the "
+        "limit with one probe (limit_probe = false keeps the plain wait): a live window resumes the parked "
+        "work at once, a limit reply waits out the fresher reset it names. --dry-run and the board show "
         "`limited until HH:MM`; only dispatch writes the mark, and a human's close clears it."))
     d.add_argument("--tier", choices=_config.WORKER_TIERS)
     d.add_argument("--epic")

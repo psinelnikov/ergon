@@ -57,22 +57,50 @@ def parse(out):
     return dict(win, cost=cost) if win else None
 
 
-def probe():
-    """Read the 5-hour window with one minimal haiku call (about $0.003), or None: no
-    subscription window, `claude` failed, a second Ctrl-C, or probes are off. Never raises."""
+def _probe_out():
+    """The probe call's stream-json output, or None: probes off, `claude` failed or timed out.
+    Never raises."""
     from . import dispatch as _dispatch  # dispatch imports this module
     try:
         if not enabled():
             return None
         with tempfile.TemporaryDirectory() as cwd:  # no project hooks or CLAUDE.md to load
-            out, _ = _dispatch.run_proc(["claude", "-p", "--model", "haiku", "--max-turns", "1",
-                                         "--output-format", "stream-json", "--verbose", "Reply: ok"],
-                                        cwd, PROBE_TIMEOUT)
-        return parse(out)
+            return _dispatch.run_proc(["claude", "-p", "--model", "haiku", "--max-turns", "1",
+                                       "--output-format", "stream-json", "--verbose", "Reply: ok"],
+                                      cwd, PROBE_TIMEOUT)[0]
     except _config.NotConfigured:
         raise
     except Exception:  # noqa: BLE001 - a probe is a nicety, never a reason to stop
         return None
+
+
+def probe():
+    """Read the 5-hour window with one minimal haiku call (about $0.003), or None: no
+    subscription window, `claude` failed, a second Ctrl-C, or probes are off. Never raises."""
+    out = _probe_out()
+    return parse(out) if out is not None else None
+
+
+def active(now=None):
+    """Whether the plan's usage limit blocks a launch right now, per one probe call: {"limited":
+    stop()'s dict} if the probe itself was stopped — its resets_at is the wait's, fresher than a
+    parked task's mark — {"free": True} if a result came back at all, meaning this login isn't
+    limited, or None when inconclusive (probes off, `claude` failed, no result line)."""
+    out = _probe_out()
+    if out is None:
+        return None
+    res = None
+    for line in out.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("type") == "result" and isinstance(d.get("result"), str):
+            res = d
+    if res is None:
+        return None
+    s = stop(res, now)
+    return {"limited": s} if s else {"free": True}
 
 
 def measure(before, after, cost):

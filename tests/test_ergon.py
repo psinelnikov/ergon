@@ -30,7 +30,8 @@ holds $FAKE_CONTEXT tokens (default 1000). With $FAKE_ASK set, a worker whose pr
 answer yet commits, then ends with $FAKE_ASK (QUESTION lines) and RESULT: asking. Called
 without --agent it is dispatch's 5-hour-window probe: it counts itself in $FAKE_PROBES and, with
 $FAKE_FIVE_HOUR set (|-separated utilizations, the nth probe the nth, the last repeating), streams
-a rate_limit_event; without it, no window, as on an API key. A worker writes its task ID over
+a rate_limit_event; without it, no window, as on an API key. With $FAKE_PROBE_LIMIT the probe
+itself ends the way a still-limited login does ($FAKE_LIMIT_TEXT). A worker writes its task ID over
 $FAKE_SHARED (and $FAKE_PUB_SHARED in the companion) too, so two tasks conflict, and sleeps
 $FAKE_SLEEP_<TIER> first. Handed a conflict round, it merges each base named and keeps both sides
 of each conflicted file, then ends $FAKE_CONFLICT_RESULT (default RESULT: done), and so does an
@@ -63,6 +64,8 @@ if "--agent" not in sys.argv:
     if os.environ.get("FAKE_PROBES"):
         n = len(open(os.environ["FAKE_PROBES"]).read()) if os.path.exists(os.environ["FAKE_PROBES"]) else 0
         open(os.environ["FAKE_PROBES"], "a").write("p")
+    if os.environ.get("FAKE_PROBE_LIMIT"):
+        limit_stop()
     seq = [x for x in os.environ.get("FAKE_FIVE_HOUR", "").split("|") if x]
     if seq:
         u, resets = float(seq[min(n, len(seq) - 1)]), int(os.environ.get("FAKE_RESETS_" + str(n), "1794935400"))
@@ -2544,6 +2547,12 @@ class TestDispatch(DispatchProject):
         self.assertEqual(ea["touches"], ["x.py"])
         self.assertNotIn("done", eb)
 
+    def test_parse_found_ignores_no_op_sentinels(self):
+        from ergon.dispatch import parse_found
+        for t in ("none", "None.", "**nothing**", "N/A", "no", "-"):
+            self.assertEqual(parse_found(f"FOUND: {t}\nRESULT: done"), [], t)
+        self.assertEqual(len(parse_found("FOUND: none\nFOUND: Real — why\nDONE WHEN: x")), 1)
+
     def test_found_category_line(self):
         self.ergon("new", "task", "Source", "--tier", "sonnet")
         stamp(self.task_file("T-001"))
@@ -4765,7 +4774,8 @@ class TestConflictRounds(DispatchProject):
                 at = int(time.time() + 3600)
                 # an old transcript (age 4000) makes the restart a fresh worker
                 self.env.update(FAKE_STOPS="ok|ok|limit|ok", FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"),
-                                FAKE_LIMIT_TEXT=f"Claude AI usage limit reached|{at}", FAKE_TRANSCRIPT_AGE=age)
+                                FAKE_LIMIT_TEXT=f"Claude AI usage limit reached|{at}", FAKE_TRANSCRIPT_AGE=age,
+                                FAKE_PROBE_LIMIT="1")
                 out = self.ergon("dispatch", "--max", "6", "--jobs", "2").stdout
                 self.assertEqual(self.status("T-002"), "blocked", out)
                 self.assertRegex(self.task_file("T-002").read_text(), r"(?m)^limited: \S+ conflict 1$")
@@ -6789,6 +6799,215 @@ class TestSignedLocal(DispatchProject):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("[signing] is for local mode", r.stdout + r.stderr)
 
+    # ---- accept, reject, close, answer and pin are signed too (T-229) ----
+
+    def decisions(self):
+        """The decision messages in <state>/approvals/, oldest first."""
+        return [p.read_text() for p in sorted((self.root / "tasks" / "approvals").glob("*.txt"))
+                if not re.match(r"[TE]-\d+ sha256:", p.read_text())]
+
+    def undecided(self, tid, why, what="ready"):
+        """next leaves tid out, check reports `why`, dispatch skips it: a decision on it is unsigned."""
+        if what == "ready":
+            r = self.ergon("next")
+            self.assertNotIn(f"  {tid}  ", r.stdout)
+            self.assertIn(f"left out because a human decision on them isn't signed: {tid}", r.stdout)
+            r = self.ergon("dispatch", "--dry-run")
+            self.assertNotIn(f"would run  {tid}", r.stdout)
+            self.assertIn(f"skipped  {tid}  approval doesn't verify: {why}", r.stdout)
+        r = self.ergon("check", check=False)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(f"{tid}: {what}, but {why}", r.stdout)
+
+    def held(self, tid):
+        """tid, with accept: yes, approved and dispatched: dispatch holds it at review."""
+        f = self.task_file(tid)
+        f.write_text(f.read_text().replace("\ntier:", "\naccept: yes\ntier:", 1))
+        self.approve(tid)
+        out = self.ergon("dispatch", "--ids", tid).stdout
+        self.assertEqual(self.status(tid), "review", out)
+
+    def edit_status(self, tid, new, note=None):
+        f = self.task_file(tid)
+        text = re.sub(r"(?m)^status: \w+$", f"status: {new}", f.read_text())
+        if note:
+            text = text.rstrip() + ("" if "## Notes" in text else "\n\n## Notes") + f"\n- {time.strftime('%Y-%m-%d')} {note}\n"
+        f.write_text(text)
+
+    def test_a_pin_written_by_hand_doesnt_count(self):
+        self.approve("T-001")
+        self.ergon("pin", "T-001", "first")
+        msgs = self.decisions()
+        self.assertEqual(len(msgs), 1)
+        self.assertRegex(msgs[0], r"^at \d{4}-\d\d-\d\dT[\d:.]+Z\npin T-001 sha256:[0-9a-f]{64}\n$")
+        row = [r for r in history(self.root) if r["event"] == "pinned"][-1]
+        self.assertTrue(row.get("signature"))
+        self.counts("T-001")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("pin: first", "pin: last"))
+        self.undecided("T-001", "pin: last without a signed `ergon pin` (written by hand, or before [signing])")
+        f.write_text(re.sub(r"(?m)^pin:.*\n", "", f.read_text()))
+        self.undecided("T-001", "its signed pin (first) was removed by hand")
+        self.ergon("pin", "T-001", "clear")  # the newest signed pin counts
+        self.counts("T-001")
+        # copying the old `first` under a newer name changes nothing: the time that counts is signed
+        old = sorted((self.root / "tasks" / "approvals").glob("*.txt"))
+        pin_first = next(p for p in old if p.read_text().startswith("at ") and p.read_text() == msgs[0])
+        for suffix in ("", ".sig"):
+            (pin_first.parent / f"2099-12-31-235959-1-0.txt{suffix}").write_bytes(
+                (pin_first.parent / (pin_first.name + suffix)).read_bytes())
+        self.counts("T-001")
+        f.write_text(f.read_text().replace("\ntier:", "\npin: first\ntier:", 1))
+        self.undecided("T-001", "pin: first without a signed `ergon pin`")
+
+    def test_a_decision_signed_by_an_unlisted_key_doesnt_count_and_isnt_made(self):
+        self.approve("T-001")
+        sh("git", "config", "user.signingkey", str(self.keys / "x.pub"), cwd=self.root)
+        r = self.ergon("pin", "T-001", "first", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("isn't in .ergon/approvers on main", r.stderr)
+        self.assertNotIn("pin:", self.task_file("T-001").read_text())
+        self.assertEqual(self.decisions(), [])
+        r = self.ergon("close", "T-001", "--as", "dropped", "--reason", "moot", inp="y\n", check=False)
+        self.assertIn("isn't in .ergon/approvers on main", r.stderr)
+        self.assertEqual(self.status("T-001"), "ready")
+        # what pin refused to make, signed with x by hand
+        from ergon import gitops as G
+        at = "2026-11-22T10:00:00.000000Z"
+        folder = self.root / "tasks" / "approvals"
+        msg = folder / "2026-11-22-100000-1-0.txt"
+        msg.write_text(f"at {at}\npin T-001 sha256:{G.pin_digest('T-001', 'first', at)}\n")
+        sh("ssh-keygen", "-Y", "sign", "-n", "ergon", "-f", str(self.keys / "x"), str(msg), cwd=folder)
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("\ntier:", "\npin: first\ntier:", 1))
+        self.undecided("T-001", "pin: first without a signed `ergon pin`")
+
+    def test_a_close_or_reject_written_by_hand_doesnt_count(self):
+        for title in ("Two", "Three", "Four"):
+            self.ergon("new", "task", title, "--tier", "haiku")
+        self.approve("T-001", "T-004")
+        self.edit_status("T-001", "dropped")  # a close by hand
+        self.edit_status("T-002", "dropped")  # a reject by hand
+        why = ("dropped without a signed `ergon reject` or `ergon close` (written by hand), so it doesn't count "
+               "as dropped: its epic doesn't finish; a human confirms it with `ergon close {} --as dropped --reason R`")
+        self.undecided("T-001", why.format("T-001"), what="dropped")
+        self.undecided("T-002", why.format("T-002"), what="dropped")
+        # the real thing signs, and counts
+        r = self.ergon("reject", "T-003", "--reason", "not now", inp="y\n")
+        self.assertIn("dropped 1", r.stdout)
+        r = self.ergon("close", "T-004", "--as", "dropped", "--reason", "moot", inp="y\n")
+        self.assertIn("closed 1", r.stdout)
+        self.assertEqual([m.splitlines()[1].split()[:2] for m in self.decisions()], [["reject", "T-003"], ["close", "T-004"]])
+        rows = {r["task"]: r for r in history(self.root) if r["event"] in ("rejected", "closed")}
+        self.assertTrue(rows["T-003"].get("signature") and rows["T-004"].get("signature"))
+        out = self.ergon("check", check=False).stdout
+        self.assertNotIn("T-003:", out)
+        self.assertNotIn("T-004:", out)
+        # a human confirms the hand-written ones by closing them again, which signs them
+        r = self.ergon("close", "T-001", "T-002", "T-003", "--as", "dropped", "--reason", "confirmed", inp="y\n")
+        self.assertIn("skip T-003: already dropped", r.stdout)
+        self.assertIn("closed 2", r.stdout)
+        self.ergon("check")
+        # editing the brief of a dropped task afterwards un-signs its drop
+        f = self.task_file("T-004")
+        f.write_text(f.read_text().replace("## What\n", "## What\nSomething else.\n"))
+        self.assertIn("T-004: dropped, but dropped without a signed `ergon reject` or `ergon close` (the task "
+                      "changed after the signed decision)", self.ergon("check", check=False).stdout)
+
+    def test_a_drop_written_by_hand_doesnt_finish_its_epic(self):
+        agent = clean_env(CLAUDECODE="1")
+        self.ergon("new", "epic", "Big", env=agent)
+        for title in ("Part A", "Part B"):
+            self.ergon("new", "task", title, "--tier", "haiku", "--category", "chore", "--epic", "E-001", env=agent)
+        self.approve("E-001")
+        self.approve("E-001")  # its tasks
+        epic = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        self.edit_status("T-002", "dropped")  # by hand
+        r = self.ergon("close", "T-003", "--as", "dropped", "--reason", "moot", inp="y\n")
+        self.assertIn("status: open", epic.read_text(), r.stdout)  # T-002's drop doesn't count
+        r = self.ergon("close", "T-002", "--as", "dropped", "--reason", "confirmed", inp="y\n")
+        self.assertIn("closed 1", r.stdout)
+        self.assertIn("status: done", epic.read_text(), r.stdout)  # now it's complete
+
+    def test_an_accept_written_by_hand_doesnt_count(self):
+        self.ergon("new", "task", "After", "--tier", "haiku")
+        self.ergon("set", "T-002", "depends=T-001")
+        self.held("T-001")
+        self.approve("T-002")
+        self.assertNotIn("  T-002  ", self.ergon("next").stdout)  # waits on T-001
+        self.edit_status("T-001", "done")  # an accept by hand
+        self.undecided("T-001", "done without a signed `ergon accept` or `ergon close` (written by hand), so it "
+                                "doesn't count as done: its epic doesn't finish and the tasks that depend on it wait",
+                       what="done")
+        self.assertNotIn("  T-002  ", self.ergon("next").stdout)  # still waits on T-001
+        self.assertNotIn("would run  T-002", self.ergon("dispatch", "--dry-run").stdout)
+        self.edit_status("T-001", "review")
+        r = self.ergon("accept", "T-001", inp="y\n")
+        self.assertEqual(self.status("T-001"), "done", r.stdout)
+        self.assertEqual([m.splitlines()[1].split()[:2] for m in self.decisions()], [["accept", "T-001"]])
+        self.assertTrue([r for r in history(self.root) if r["event"] == "accepted"][-1].get("signature"))
+        self.ergon("check")
+        self.counts("T-002")
+
+    def test_a_send_back_written_by_hand_doesnt_count(self):
+        self.held("T-001")
+        self.edit_status("T-001", "ready")  # out of review by hand, no Note
+        self.undecided("T-001", "moved out of review by hand: its last Note is dispatch's hold for `ergon accept`")
+        self.edit_status("T-001", "ready", note="review: rejected by Tester: also delete the backups")
+        self.undecided("T-001", "sent back from review without a signed `ergon reject` (written by hand)")
+        self.edit_status("T-001", "review")
+        self.ergon("reject", "T-001", "--reason", "add a test", inp="y\n")
+        self.assertEqual(self.status("T-001"), "ready")
+        self.assertEqual([m.splitlines()[1].split()[:2] for m in self.decisions()], [["reject", "T-001"]])
+        self.counts("T-001")
+        f = self.task_file("T-001")  # the signed Note, reworded by hand
+        f.write_text(f.read_text().replace("add a test", "also delete the backups"))
+        self.undecided("T-001", "sent back from review without a signed `ergon reject` (the task changed after "
+                                "the signed decision)")
+
+    def test_an_answer_written_by_hand_doesnt_count(self):
+        self.approve("T-001")
+        self.env["FAKE_ASK"] = "QUESTION: which side?"
+        out = self.ergon("dispatch", "--ids", "T-001").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        f = self.task_file("T-001")
+        asking = f.read_text()
+        f.write_text(asking.replace("status: blocked", "status: ready").replace("\nasking:", "\nanswered:")
+                     .rstrip() + f"\n- {time.strftime('%Y-%m-%d')} answer by Tester: the left one\n")
+        self.undecided("T-001", "answered: without a signed `ergon answer` (written by hand)")
+        f.write_text(asking)
+        self.ergon("answer", "T-001", "the right one", inp="y\n")
+        self.assertEqual(self.status("T-001"), "ready")
+        self.assertEqual([m.splitlines()[1].split()[:2] for m in self.decisions()], [["answer", "T-001"]])
+        self.assertTrue([r for r in history(self.root) if r["event"] == "answered"][-1].get("signature"))
+        self.counts("T-001")
+        f.write_text(f.read_text().replace("the right one", "the left one"))  # the answer, swapped by hand
+        self.undecided("T-001", "answered: without a signed `ergon answer` (the task changed after the signed decision)")
+
+
+class TestUnsignedDecisions(DispatchProject):
+    """Without [signing], accept, reject, close, answer and pin sign nothing and check nothing
+    new: a hand-written decision counts as it always has (T-229)."""
+
+    def setUp(self):
+        super().setUp()
+        self.env["ERGON_ASK_STDIN"] = "1"
+        for title in ("One", "Two", "Three"):
+            self.ergon("new", "task", title, "--tier", "haiku")
+
+    def test_nothing_is_signed_or_checked(self):
+        stamp(self.task_file("T-001"))
+        stamp(self.task_file("T-002"))
+        self.ergon("pin", "T-001", "first")
+        self.ergon("close", "T-002", "--as", "dropped", "--reason", "moot", inp="y\n")
+        self.ergon("reject", "T-003", "--reason", "no", inp="y\n")
+        self.assertFalse((self.root / "tasks" / "approvals").exists())
+        self.assertFalse([r for r in history(self.root) if r.get("signature")])
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("pin: first", "pin: last"))  # by hand, as before
+        self.assertIn("  T-001  ", self.ergon("next").stdout)
+        self.ergon("check")
+
 
 class TestAutoApprove(DispatchProject):
     """A FOUND follow-up that is a bugfix, refactor or chore is approved by inheritance (T-136)."""
@@ -7487,7 +7706,8 @@ class TestUsageLimit(DispatchProject):
         home.mkdir()
         self.seen = Path(self.tmp.name) / "seen.jsonl"
         self.env.update(FAKE_SEEN=str(self.seen), HOME=str(home), FAKE_TRANSCRIPT_AGE="0",
-                        FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"))
+                        FAKE_STOPS_FILE=str(Path(self.tmp.name) / "stops"),
+                        FAKE_PROBE_LIMIT="1")  # the limit is real in this class: the probe reports it too
         self.env.pop("CLAUDE_CONFIG_DIR", None)
         self.ergon("new", "task", "Job", "--tier", "sonnet", "--touches", "a.py")
         stamp(self.task_file("T-001"))
@@ -7542,9 +7762,11 @@ class TestUsageLimit(DispatchProject):
         self.assertIn(f"limited until {self.clock(at)}", self.ergon("board").stdout)
         self.ergon("check")
 
-        # Before the reset a scan skips it, and says until when.
+        # Before the reset a scan re-checks the limit with a probe (T-266): it still reports the
+        # limit, so the task waits — the run launches nothing and names the probe's reset.
         out = self.ergon("dispatch", "--max", "6").stdout
-        self.assertIn(f"skipped  T-001  limited until {self.clock(at)}", out)
+        self.assertIn(f"probe: still limited until {self.clock(at)}", out)
+        self.assertIn(f"paused by the 5-hour limit until {self.clock(at)}: T-001", out)
         self.assertIn(f"limited until {self.clock(at)}", self.ergon("dispatch", "--dry-run").stdout)
         self.assertEqual(self.status("T-001"), "blocked")
         self.assertEqual(len(self.calls()), 1)
@@ -7564,6 +7786,46 @@ class TestUsageLimit(DispatchProject):
         self.assertEqual([(r["after"], r["session"]) for r in self.rows("resumed")], [("limit", "s-1")])
         self.assertEqual([r.get("after") for r in self.rows("worker_end")], [None, "limit"])
         self.ergon("check")
+
+    def test_a_scan_rechecks_the_limit_and_resumes_early(self):
+        """T-266: a `limited:` mark's recorded reset can be stale — the login changed or the limit
+        lifted early — so while anything waits on it a scan probes the limit and resumes the parked
+        step when this login isn't limited."""
+        at = self.limit_at(3600)
+        self.env.update(FAKE_STOPS="limit|ok", FAKE_PROBES=str(Path(self.tmp.name) / "probes"))
+        out = self.ergon("dispatch", "--max", "6").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        self.assertTrue(self.mark())
+
+        # the account was switched: the next scan's probe answers, so the mark's wait is stale
+        self.env.pop("FAKE_PROBE_LIMIT")
+        out = self.ergon("dispatch", "--max", "6").stdout
+        self.assertIn("probe: this login isn't limited; resuming parked work", out)
+        self.assertEqual(self.status("T-001"), "done", out)
+        self.assertIsNone(self.mark())
+        calls = self.calls()
+        self.assertEqual([(c["agent"], c["resume"]) for c in calls], [("SONNET", None), ("SONNET", "s-1")])
+        self.assertIn("The usage limit stopped your work on T-001 during its run", calls[1]["prompt"])
+        self.assertEqual([(r["after"], r["step"]) for r in self.rows("dispatched") if r.get("after")],
+                         [("limit", "worker")])
+        self.assertEqual([(r["after"], r["session"]) for r in self.rows("resumed")], [("limit", "s-1")])
+        self.ergon("check")
+
+    def test_probes_off_keeps_the_plain_wait(self):
+        """T-266: `limit_probe = false` leaves no way to re-check, so the wait is the mark's."""
+        cfg = self.root / ".ergon.toml"
+        cfg.write_text("limit_probe = false\n" + cfg.read_text())
+        self.env.pop("FAKE_PROBE_LIMIT", None)
+        probes = Path(self.tmp.name) / "probes"
+        self.env["FAKE_PROBES"] = str(probes)
+        at = self.limit_at(3600)
+        self.env["FAKE_STOPS"] = "limit|ok"
+        self.ergon("dispatch", "--max", "6")
+        self.assertEqual(self.status("T-001"), "blocked")
+        out = self.ergon("dispatch", "--max", "6").stdout
+        self.assertIn(f"skipped  T-001  limited until {self.clock(at)}", out)
+        self.assertEqual(self.status("T-001"), "blocked")
+        self.assertFalse(probes.exists())
 
     def test_no_reset_in_the_message_waits_half_an_hour(self):
         self.env.update(FAKE_STOPS="limit", FAKE_LIMIT_TEXT="You've hit your limit")

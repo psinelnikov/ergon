@@ -50,7 +50,8 @@ FOUND_CLAUSE = (
     "behaviour, better code; chore: docs, help text, tests, config, tooling); a feature needs a `CRUX: <what the "
     "choice turns on>` line and 2 to 4 peer lines `OPTION: <lens>: <approach> — optimizes for … — gives up … — "
     "regret if …`, one per lens (minimal, durable, operator, risk, defer), one of them `defer` (what happens if "
-    "nothing is built now), none of them marked as better than the rest; a human chooses from them before approving it)")
+    "nothing is built now), none of them marked as better than the rest; a human chooses from them before approving it). "
+    "If you find nothing to file, write no `FOUND:` line at all (never `FOUND: none`)")
 
 WORKER_PROMPT = """You are dispatched on {id}.
 
@@ -907,6 +908,9 @@ FOUND_TIERS = ("haiku", "sonnet", "opus", "human")
 FOUND_CATEGORIES = ("feature", "bugfix", "refactor", "chore")  # tasks.CATEGORIES; a circular import
 
 
+NO_FOUND = {"none", "nothing", "n/a", "no", "-"}  # a FOUND title that says there is nothing to file
+
+
 _LENS_LABELS = (("optimizes for", "optimizes"), ("gives up", "gives_up"), ("regret if", "regret"))
 
 
@@ -949,7 +953,7 @@ def parse_found(text):
         m = re.match(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", line)
         if m:
             cur = None
-            if md_trim(m[1]):
+            if md_trim(m[1]) and md_trim(m[1]).rstrip(".").strip().lower() not in NO_FOUND:
                 cur = {}
                 out.append((md_trim(m[1]), md_trim(m[2]), cur))
             continue
@@ -3636,7 +3640,15 @@ def dispatch(args):
     NO_TOUCHES = "(none declared)"
     every_touch = {k for c in _config.COMPANIONS for k in c["touches"]}
 
-    def eligible(tasks):
+    def parked_limited(now):
+        """A task is parked `blocked` with a `limited:` mark whose reset is still ahead."""
+        for t in _tasks.load(_config.ITEMS).values():
+            lim = _tasks.limited(t)
+            if lim and lim[0] > now:
+                return True
+        return False
+
+    def eligible(tasks, limit_free=False):
         epics.update(_tasks.load(_config.EPICS))  # another run or session may have closed one
         apr = _gitops.approvals()  # shared mode (verified now, after the scan's sync) or [signing]; None otherwise
         now = time.time()
@@ -3646,7 +3658,7 @@ def dispatch(args):
                     or (ids and t["id"] not in ids) or (args.tier and t["tier"] != args.tier)
                     or (args.epic and t.get("epic") != args.epic)):
                 continue
-            if lim and lim[0] > now:
+            if lim and lim[0] > now and not limit_free:  # limit_free: this scan's probe cleared it
                 limited_until[t["id"]] = lim[0]
                 skipped[t["id"]] = (f"limited until {_limits.clock(lim[0])}: the usage limit stopped "
                                     f"{limit_step_text(lim[1])}; a dispatch at or after then resumes it")
@@ -4717,6 +4729,7 @@ def dispatch(args):
         running, launched, active = {}, 0, {}  # active: running task id -> task
         fu_launched = 0  # auto-approved follow-ups launched, bounded by follow_ups
         limit_wait = False
+        probe_limited_said = False  # a scan's probe already reported the limit still holding
         capped_said = set()  # (cap, task id) pairs already reported as held back by a cap
         if args.drain:
             print("draining the queue: no --max or follow_ups cap; stops when nothing is left to launch"
@@ -4750,11 +4763,33 @@ def dispatch(args):
                             say_sync(f"failed, so nothing launches this scan: {unsynced}")
                         # the lock is held only for the scan, so `approve` works between scans
                         limit_wait = paused > time.time()  # the usage limit: nothing launches before its reset
+                        # T-266: a wait trusts a recorded reset that may be stale (the login changed, the
+                        # limit lifted early), so before honoring it re-check the limit itself: one probe a
+                        # scan, only while something waits on it. Free -> this scan ignores ahead marks;
+                        # still limited -> wait out the fresher reset it names; inconclusive -> wait as before.
+                        limit_free = False
+                        if probing and (limit_wait or parked_limited(time.time())):
+                            chk = _limits.active()
+                            if chk and chk.get("free"):
+                                limit_free, paused, limit_wait, probe_limited_said = True, 0.0, False, False
+                                print("  limit    probe: this login isn't limited; resuming parked work",
+                                      flush=True)
+                            elif chk and chk.get("limited"):
+                                s = chk["limited"]
+                                r = s["resets_at"] if isinstance(s.get("resets_at"), (int, float)) \
+                                    and s["resets_at"] > time.time() \
+                                    else int(time.time() + _limits.RETRY_MINUTES * 60)
+                                if not probe_limited_said:
+                                    print(f"  limit    probe: still limited until {_limits.clock(r)}",
+                                          flush=True)
+                                    probe_limited_said = True
+                                paused, limit_wait = r, True
                         with _gitops.state_lock():
                             if cap is not None and spent() >= cap:
                                 capped = True
                             limited_until.clear()
-                            queue = [] if capped or unsynced or limit_wait else list(eligible(_tasks.load(_config.ITEMS)))
+                            queue = [] if capped or unsynced or limit_wait else \
+                                list(eligible(_tasks.load(_config.ITEMS), limit_free))
                             if first_ready is None and not unsynced and not limit_wait:
                                 first_ready = {t["id"] for t in queue}
                             cap_held = {}
@@ -4864,8 +4899,10 @@ def dispatch(args):
                             if (args.watch and not capped and not unsynced and not limit_wait and len(running) < args.jobs
                                     and "learn" not in running.values() and learn_due()):
                                 running[pool.submit(learn_job)] = "learn"
-                        # --watch: while the usage limit holds, the next scan is at its reset
-                        next_scan = time.monotonic() + max(args.interval, paused - time.time())
+                        # while the usage limit holds, the next scan is at its reset — but a probe can
+                        # clear it sooner (T-266), so with probes on it re-checks each interval
+                        next_scan = time.monotonic() + (args.interval if probing
+                                                        else max(args.interval, paused - time.time()))
                     scan = False
                     # nothing running means no worker can file a follow-up now, and the scan above has launched any ready
                     over = stopping or capped or launched >= args.max
