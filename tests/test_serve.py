@@ -364,6 +364,38 @@ class TestServe(ServeFixture):
         f.write_text(f.read_text().rstrip("\n") + "\n\n## Options\n"
                      + "".join(f"{n}. {o}" + (" (recommended)" if n == 1 else "") + "\n" for n, o in enumerate(opts, 1)))
 
+    def add_lens_options(self, tid, crux, *opts):
+        f = self.task_file(tid)
+        f.write_text(f.read_text().rstrip("\n") + f"\n\n## Options\nCrux: {crux}\n" + "".join(
+            f"- {lens}: {approach}\n  Optimizes for: {o}\n  Gives up: {g}\n  Regret if: {r}\n"
+            for lens, approach, o, g, r in opts))
+
+    def test_lens_options_shown_with_no_recommended_mark(self):
+        """T-262: a lens-format ## Options shows its crux and each option's fields in lens order on
+        /review and /t/T-NNN, nothing marked recommended, and the choose commands count in that order."""
+        self.add_lens_options("T-004", "whether the page stays one <ol>",
+                              ("risk", "a second list for fields", "a flat section",
+                               "a nested list", "fields read as options too"),
+                              ("minimal", "fields inside each <li>", "one list, few rules",
+                               "a deeper <li>", "an option field hides"))
+        for path in ("/review", "/t/T-004"):
+            _, _, page = self.req("GET", path)
+            self.assertIn("<p class=crux>Crux: whether the page stays one &lt;ol&gt;</p>", page)
+            sec = page.split('<ol class=options>')[1].split("</ol>")[0]
+            self.assertLess(sec.index("minimal: fields inside each &lt;li&gt;"),
+                            sec.index("risk: a second list for fields"))  # LENSES order, not written order
+            self.assertIn("Optimizes for: one list, few rules", sec)
+            self.assertIn("Gives up: a deeper &lt;li&gt;", sec)
+            self.assertIn("Regret if: an option field hides", sec)
+            self.assertNotIn("recommended", sec)
+            self.assertIn("ergon choose T-004 1</code>", page)
+            self.assertIn("ergon choose T-004 2</code>", page)
+        self.ergon("choose", "T-004", "1", inp="y\n", env=dict(self.env, ERGON_ASK_STDIN="1"))
+        _, _, page = self.req("GET", "/t/T-004")
+        li = page.split('<li class="option chosen">')[1].split("</li>")[0]
+        self.assertIn("minimal: fields inside each &lt;li&gt;", li)  # 1 counts in lens order
+        self.assertIn("chosen by", li)
+
     def test_options_shown_with_choose_commands(self):
         """T-194: /review and /t/T-NNN list a task's options, the recommended one marked, one `ergon choose`
         command each plus --own; after a choice, the chosen mark shows and the commands are gone."""

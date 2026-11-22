@@ -356,20 +356,28 @@ def counts(tasks):
 
 
 def options_html(t):
-    """A task's `## Options` as a numbered list: the first marked recommended, a chosen one marked
-    with who and when, and `ergon choose` commands to copy while nothing is chosen. '' without
-    options. Read-only: the page takes no input."""
+    """A task's `## Options` as a numbered list: a chosen one marked with who and when, and `ergon
+    choose` commands to copy while nothing is chosen. A numbered section marks its first option
+    recommended; a lens-format one shows its crux and each option's fields, none recommended.
+    '' without options. Read-only: the page takes no input."""
     if not _tasks.has_options(t):
         return ""
     opts, chosen = _tasks.options(t)
     tid = str(t["id"])
-    o = ["<h3>Options</h3><ol class=options>"]
+    o = ["<h3>Options</h3>"]
+    if opts.crux is not None:
+        o.append(f"<p class=crux>Crux: {esc(opts.crux)}</p>")
+    o.append("<ol class=options>")
     for n, text in enumerate(opts, 1):
         is_chosen = bool(chosen) and chosen["option"] == n
         o.append(f'<li class="option{" chosen" if is_chosen else ""}">{esc(text)}'
-                 + (' <span class=tier>recommended</span>' if n == 1 else "")
+                 + (' <span class=tier>recommended</span>' if n == 1 and opts.crux is None else "")
                  + (f' <span class="tier chosen-mark">chosen by {esc(chosen["by"])} {esc(chosen["date"])}</span>'
-                    if is_chosen else "") + "</li>")
+                    if is_chosen else ""))
+        if isinstance(text, _tasks.LensOption):
+            o.append("<ul class=fields>" + "".join(f"<li>{label}: {esc(getattr(text, key))}</li>"
+                                                  for key, label in _tasks.LENS_FIELDS) + "</ul>")
+        o.append("</li>")
     o.append("</ol>")
     if chosen and chosen["option"] == "own":
         o.append(f'<p class="option chosen">own: {esc(chosen["text"])} '
