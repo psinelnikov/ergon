@@ -775,6 +775,17 @@ class TestDispatchClaims(Shared):
         self.ergon(self.a, "close", "T-001", "--as", "done", "--reason", "x", inp="y\n", env=self.env_a)
         self.assertEqual(self.remote_status("T-001"), "done")
 
+    def test_board_and_review_mark_a_task_held_elsewhere(self):
+        self.held_in_review()
+        self.ergon(self.a, "sync")
+        self.ergon(self.b, "sync", env=self.env_b)
+        for cmd in ("board", "review"):
+            out = self.ergon(self.b, cmd, env=self.env_b).stdout
+            self.assertIn(f"held on ann@{self.host}", out, cmd)
+            out = self.ergon(self.a, cmd, env=self.env_a).stdout  # the holder: no marker
+            self.assertIn("T-001", out)
+            self.assertNotIn("held on", out, cmd)
+
     def test_reject_of_a_review_task_held_elsewhere_is_refused(self):
         self.held_in_review()
         self.ergon(self.a, "new", "task", "Two", "--tier", "haiku")

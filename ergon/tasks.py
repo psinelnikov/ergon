@@ -716,6 +716,8 @@ def line(t, tasks):
     flags = []
     if t.get("epic"):
         flags.append(t["epic"])
+    if who := held_elsewhere(t):
+        flags.append(f"held on {who}")
     if t["status"] == "ready" and not deps_done(t, tasks):
         flags.append("waits on " + ",".join(d for d in t["depends"]
                                              if tasks.get(d, {}).get("status") != "done"))

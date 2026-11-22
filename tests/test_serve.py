@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -725,6 +726,37 @@ class TestReview(ServeFixture):
 
 
 class TestServeUnits(unittest.TestCase):
+    def test_held_elsewhere_marker_is_shown_and_escaped(self):
+        from ergon import config as C, tasks as T
+        t = {"id": "T-009", "tier": "opus", "title": "x", "status": "review", "tags": [],
+             "_body": "## Notes\n- 2026-11-22 dispatch: done (held: <b>dana</b>@laptop)\n"}
+        real = C.SHARED
+        try:
+            C.SHARED = {"remote": "r", "branch": "b"}
+            li = S.task_li(t, {"T-009": t})
+            self.assertIn("held on &lt;b&gt;dana&lt;/b&gt;@laptop", li)
+            self.assertNotIn("<b>dana", li)
+            self.assertIn("held on <b>dana</b>@laptop", T.line(t, {"T-009": t}))
+            real_id = T.clone_id
+            T.clone_id = lambda: "<b>dana</b>@laptop"
+            try:
+                self.assertNotIn("held on", S.task_li(t, {"T-009": t}))
+            finally:
+                T.clone_id = real_id
+            real_load = T.load
+            T.load = lambda d: {"T-009": t}
+            try:
+                with tempfile.TemporaryDirectory() as d, \
+                        mock.patch.multiple(C, create=True, ITEMS=Path(d), HOME=Path(d), RUNS=Path(d), STATE=Path(d), CONCEPTS={}):
+                    page = S.task_page("T-009", "n")
+                self.assertIn("held on &lt;b&gt;dana&lt;/b&gt;@laptop", page)
+            finally:
+                T.load = real_load
+            C.SHARED = None  # local mode
+            self.assertNotIn("held on", S.task_li(t, {"T-009": t}))
+        finally:
+            C.SHARED = real
+
     def test_quiz_items(self):
         from ergon import cli
         q = [{"task": "T-001"}]
