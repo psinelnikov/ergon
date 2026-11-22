@@ -1500,6 +1500,50 @@ class TestBasics(Project):
                 why = self.guard(tool, dict(inp, file_path=str(p)))
                 self.assertEqual(why is None, ok, (tool, header, val, why))
 
+    def test_protocol_and_config_path_env_behind_reserved_words_and_wrappers(self):
+        """T-268: a GIT_ALLOW_PROTOCOL or config-path (GIT_CONFIG_GLOBAL, HOME, ...) assignment behind a
+        reserved word (`{`, `if ... then`, `!`) or a wrapper (`builtin`, `command`) is read past them
+        (_command_head), as T-249 reads git command variables: `{ export GIT_ALLOW_PROTOCOL=ext; }; git
+        fetch` is refused like the same command without the braces, and so is a `builtin cd` into another
+        repository. The same words given to echo, or a value without ext, still pass."""
+        from ergon.gates import config_source_reason, git_config_reason
+        leads = ["{ {s}; }", "builtin {s}", "command {s}", "if true; then {s}; fi", "! {s}", "{ { {s}; }; }",
+                 "builtin command {s}"]
+        for lead in leads:
+            for s in ["export GIT_ALLOW_PROTOCOL=ext", "declare -x GIT_ALLOW_PROTOCOL=file:ext",
+                      "export GIT_ALLOW_PROTOCOL=$P", "export GIT_ALLOW_PROTOCOL+=:ext"]:
+                for cmd in [lead.replace("{s}", s), lead.replace("{s}", s) + "; git fetch o"]:
+                    self.assertIn("GIT_ALLOW_PROTOCOL", git_config_reason(cmd) or "", cmd)
+                    self.assertTrue(self.guard("Bash", {"command": cmd}), cmd)
+        for cmd in ["{ GIT_ALLOW_PROTOCOL=ext; }; git fetch o", "if true; then GIT_ALLOW_PROTOCOL=ext; fi; git fetch o"]:
+            self.assertIn("GIT_ALLOW_PROTOCOL", git_config_reason(cmd) or "", cmd)
+        for cmd in ["{ export GIT_ALLOW_PROTOCOL=file:https; }; git fetch o", "builtin export GIT_ALLOW_PROTOCOL=ssh",
+                    "{ GIT_ALLOW_PROTOCOL=ext echo hi; }", "builtin echo GIT_ALLOW_PROTOCOL=ext",
+                    "{ echo GIT_ALLOW_PROTOCOL=ext; }; git fetch o", "command env GIT_ALLOW_PROTOCOL=ext ls"]:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+        # config paths: an alias running a human-only verb in a file the agent picked, or another repository
+        root = self.root
+        alias = "[alias]\n\tx = !ergon approve T-1\n"
+        (root / "evil.inc").write_text(alias)
+        (root / "h").mkdir()
+        (root / "h" / ".gitconfig").write_text(alias)
+        (root / "xdg" / "git").mkdir(parents=True)
+        (root / "xdg" / "git" / "config").write_text(alias)
+        sh("git", "init", "-q", "--bare", "bare", cwd=root)
+        (root / "bare" / "config").write_text("[core]\n\tbare = true\n" + alias)
+        for lead in leads:
+            for s in [f"export GIT_CONFIG_GLOBAL={root / 'evil.inc'}", "export HOME=h", "declare -x HOME=h",
+                      f"export XDG_CONFIG_HOME={root / 'xdg'}", "export GIT_DIR=bare", "cd bare"]:
+                cmd = lead.replace("{s}", s) + "; git x"
+                self.assertIn("human-only", config_source_reason(cmd, str(root)) or "", cmd)
+                self.assertTrue(self.guard("Bash", {"command": cmd}), cmd)
+            for s in ["export GIT_CONFIG_GLOBAL=\"$F\"", "export HOME=$D", "cd \"$D\"; git -C sub"]:
+                cmd = lead.replace("{s}", s) + "; git x"
+                self.assertTrue(config_source_reason(cmd, str(root)), cmd)
+        for cmd in ["{ export HOME=/tmp/nowhere-t268; }; git status", "builtin cd tasks && git status",
+                    "{ cd tasks; }; git status", "{ HOME=h ls; }; git status", "builtin echo HOME=h; git status"]:
+            self.assertIsNone(config_source_reason(cmd, str(root)), cmd)
+
     def test_guard_refuses_unseen_git_url_arguments(self):
         """T-236: git runs an ext:: URL given as clone's, fetch's, push's, ... repository argument
         (T-215 checks one the text shows), so one an expansion may make ext:: is refused: in the

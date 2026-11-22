@@ -1968,8 +1968,9 @@ def _allow_protocol_reason(words, vals):
     variable as a `:` list of the protocols it allows, so `ext` in it (or a value the text doesn't hold)
     turns the ext:: transport on. It counts where git inherits it: ahead of a git call, alone or
     exported, or ahead of a shell that may run one; ahead of another program it's data. vals holds
-    the value set so far, for `+=`."""
-    head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+    the value set so far, for `+=`. The program is found past reserved words and wrappers
+    (_command_head: `{ export GIT_ALLOW_PROTOCOL=ext; }`, `builtin export ...`), T-268."""
+    head = _command_head(words)
     prog = _program(words[head]) if head < len(words) else ""
     inherits = (head == len(words) or prog in SHELL_DECLARE or (CODE_RUNNER.fullmatch(prog) is not None and prog != "env")
                 or any(True for _ in _git_calls(words)))
@@ -2834,7 +2835,7 @@ def config_source_reason(cmd, cwd, _base=None):
         for name, append, val in _env_assignments(words):
             if name in CONFIG_PATH_ENV or name.startswith("GIT_CONFIG_"):
                 local[name] = (None if local.get(name, "") is None else local.get(name, "") + val) if append else val
-        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        head = _command_head(words)  # `{ export HOME=...; }`, `builtin cd ...` (T-268)
         if head == len(words) or _program(words[head]) in SHELL_DECLARE:
             env = local
         if head < len(words) and _program(words[head]) in ("cd", "pushd"):
