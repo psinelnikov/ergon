@@ -2588,26 +2588,49 @@ class TestDispatch(DispatchProject):
         self.env.update(FAKE_FOUND=found, FAKE_FOUND_SEP="~")
         return self.ergon("dispatch", *args).stdout
 
-    def test_found_feature_options_become_an_options_section(self):
-        self.found_run("Cache it \u2014 slow\nCATEGORY: feature\nOPTIONS: an LRU | `a redis cache` | | c | d | e")
+    LENS_FOUND = ("Cache it \u2014 slow\nCATEGORY: feature\nCRUX: how much to keep in memory\n"
+                  "OPTION: defer: keep reading from disk \u2014 optimizes for zero new code \u2014 gives up lookup speed \u2014 regret if load grows\n"
+                  "OPTION: minimal: an LRU of 1000 entries \u2014 optimizes for a small change \u2014 gives up shared state \u2014 regret if we need many workers\n"
+                  "OPTION: durable: a redis cache layer \u2014 optimizes for sharing across hosts \u2014 gives up simplicity \u2014 regret if redis goes away\n")
+
+    def test_found_feature_lens_options_become_an_options_section(self):
+        self.found_run(self.LENS_FOUND)
         text = self.task_file("T-002").read_text()
         self.assertEqual(self.status("T-002"), "proposed")
-        self.assertIn("## Options\n1. an LRU (recommended)\n2. a redis cache\n3. c\n4. d\n\n## Notes", text)
+        sec = text.partition("## Options\n")[2].partition("\n## ")[0]
+        self.assertTrue(sec.startswith("Crux: how much to keep in memory\n- minimal: an LRU"), sec)
+        self.assertLess(sec.index("- minimal"), sec.index("- durable"))
+        self.assertLess(sec.index("- durable"), sec.index("- defer"))
+        self.assertIn("  Regret if: load grows", sec)
         self.assertNotIn("no options given", text)
         self.ergon("check")
-        r = self.ergon("approve", "T-002", inp="y\n", check=False, env=dict(self.env, ERGON_ASK_STDIN="1"))
-        self.assertNotEqual(r.returncode, 0)
-        self.assertEqual(self.status("T-002"), "proposed")
-        self.ergon("choose", "T-002", "1", inp="y\n", env=dict(self.env, ERGON_ASK_STDIN="1"))
-        self.assertIn("Chosen:", self.task_file("T-002").read_text())
 
-    def test_found_two_options(self):
+    def test_found_feature_malformed_lens_options_are_named(self):
+        bad = self.LENS_FOUND.replace("OPTION: defer:", "OPTION: risk:").replace("gives up lookup speed", "gives up").replace(
+            "a small change", "the best small change")
+        self.found_run(bad)
+        text = self.task_file("T-002").read_text()
+        self.assertEqual(self.status("T-002"), "proposed")
+        self.assertNotIn("## Options", text)
+        for w in ("no `defer` option", "recommendation wording", "has no Gives up"):
+            self.assertIn(w, text)
+        self.assertIn("options from T-001 not filed", text)
+
+    def test_found_feature_without_crux_or_repeating_a_lens(self):
+        self.found_run(self.LENS_FOUND.replace("CRUX: how much to keep in memory\n", "").replace("OPTION: durable:", "OPTION: minimal:"))
+        text = self.task_file("T-002").read_text()
+        self.assertNotIn("## Options", text)
+        self.assertIn("no `Crux:` line", text)
+        self.assertIn("minimal lens more than once", text)
+
+    def test_found_old_options_line_files_no_options(self):
         self.found_run("Cache it \u2014 slow\nOPTIONS: a | b")
-        self.assertEqual(self.task_file("T-002").read_text().partition("## Options\n")[2].partition("\n## ")[0],
-                         "1. a (recommended)\n2. b\n")
+        text = self.task_file("T-002").read_text()
+        self.assertNotIn("## Options", text)
+        self.assertIn("no options given by T-001", text)
 
     def test_found_feature_without_options_gets_a_note(self):
-        self.found_run("Cache it \u2014 slow\nOPTIONS: only one~Other \u2014 x")
+        self.found_run("Cache it \u2014 slow~Other \u2014 x")
         for tid in ("T-002", "T-003"):
             text = self.task_file(tid).read_text()
             self.assertNotIn("## Options", text)
@@ -2616,7 +2639,7 @@ class TestDispatch(DispatchProject):
             self.assertEqual(self.status(tid), "proposed")
 
     def test_found_bugfix_options_are_ignored(self):
-        self.found_run("Fix X \u2014 y breaks\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix\nOPTIONS: a | b", "--ids", "T-001")
+        self.found_run("Fix X \u2014 y breaks\nTOUCHES: a.py\nDONE WHEN: ok\nCATEGORY: bugfix\nCRUX: c\nOPTION: defer: a \u2014 optimizes for x \u2014 gives up y \u2014 regret if z", "--ids", "T-001")
         text = self.task_file("T-002").read_text()
         self.assertEqual(self.status("T-002"), "ready")
         self.assertNotIn("## Options", text)
@@ -2626,7 +2649,7 @@ class TestDispatch(DispatchProject):
         from ergon.dispatch import parse_questions, parse_found
         text = "QUESTION: q\nFOUND: f \u2014 why\nOPTIONS: x | y\n"
         self.assertEqual(parse_questions(text), [("q", [])])
-        self.assertEqual(parse_found(text)[0][2]["options"], ["x", "y"])
+        self.assertNotIn("options", parse_found(text)[0][2])
         text = "FOUND: f \u2014 why\nTIER: haiku \u2014 s\nQUESTION: q\nOPTIONS: a | b\n"
         self.assertEqual(parse_questions(text), [("q", ["a", "b"])])
 
