@@ -184,9 +184,21 @@ def targets(ids, tasks, epics, status="proposed"):
     return out
 
 
+def decision_ready():
+    """[signing] in local mode (T-229): refuse (SystemExit), before anything is asked or written,
+    unless a decision signed here would verify. Nothing to check otherwise."""
+    if _config.SIGNING:
+        why = _gitops.approve_problem()
+        if why:
+            raise SystemExit(f"refused: {why}")
+
+
 def signing():
     """Shared mode, joined: human decisions are SSH-signed state commits. Refuses (SystemExit)
-    if this clone can't sign, saying how to set it up. Returns whether to sign."""
+    if this clone can't sign, saying how to set it up. Returns whether to sign a state commit.
+    With [signing] in local mode, refuses unless a signed decision would verify (decision_ready)
+    and returns False: the command signs its decision itself (gitops.sign_decisions)."""
+    decision_ready()
     if not _shared.joined():
         return False
     why = _gitops.signing_problem()
@@ -281,7 +293,7 @@ def stamp_approved(todo):
     waiting = []
     if signed:  # e.g. a key user.signingkey didn't name, so approve_ready couldn't check it
         for t in todo:
-            why = apr.problem(t)
+            why = apr.approval_problem(t)
             if t["id"] in two and why:
                 waiting.append(t["id"])
             if t["id"] in two and (not why or apr.signers(t)):
@@ -332,8 +344,8 @@ def approve(args):
     # shared mode: an approved task whose approval no longer verifies (its brief was edited, or it
     # was stamped by hand) is approved again by naming it; its status stays
     again = {t["id"]: why for t in named if apr and t["id"] in args.ids and t["status"] in ("ready", "blocked")
-             and (why := apr.problem(t))}
-    again.update((e["id"], apr.problem(e)) for e in briefs if e["status"] == "open")
+             and (why := apr.approval_problem(t))}
+    again.update((e["id"], apr.approval_problem(e)) for e in briefs if e["status"] == "open")
     # local mode: no digest, so an approved task whose touches:, harden: or suppress_ok: gained an
     # entry since its approval (a hand edit) is approved again by naming it, or the weakening check
     # won't count the entry
@@ -487,10 +499,16 @@ def review_brief(e, at, tasks, apr, tally):
             with _gitops.state_lock():
                 if sign:
                     _shared.commit_pending()  # hand edits go in a commit of their own
+                try:  # [signing]: signed before it's written (T-229)
+                    sig = _gitops.sign_decisions([("reject", e["id"], _gitops.ended_digest("reject", e))])
+                except SystemExit as err:  # nothing written: the brief is as it was
+                    e = _tasks.parse(e["_path"])
+                    print(err)
+                    continue
                 _tasks.dump(e, _tasks.EPIC_KEYS)
                 if sign:
                     _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {e['id']}"], [e["_path"]])
-            _history.record("rejected", e, by=approver(), reason=reason, **{"from": "proposed", "to": "dropped"})
+            _history.record("rejected", e, by=approver(), reason=reason, **{"from": "proposed", "to": "dropped"}, **sig)
             tally["dropped"] += 1
             return True
         if choice == "a":
@@ -658,10 +676,16 @@ def review_interactive(args):
                 with _gitops.state_lock():
                     if sign:
                         _shared.commit_pending()  # hand edits go in a commit of their own
+                    try:  # [signing]: signed before it's written (T-229)
+                        sig = _gitops.sign_decisions([("reject", t["id"], _gitops.ended_digest("reject", t))])
+                    except SystemExit as err:  # nothing written: the task is as it was
+                        t = _tasks.parse(t["_path"])
+                        print(err)
+                        continue
                     _tasks.dump(t, _tasks.TASK_KEYS)
                     if sign:
                         _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {t['id']}"], [t["_path"]])
-                _history.record("rejected", t, by=approver(), reason=reason, **{"from": "proposed", "to": "dropped"})
+                _history.record("rejected", t, by=approver(), reason=reason, **{"from": "proposed", "to": "dropped"}, **sig)
                 tally["dropped"] += 1
                 break
             if choice == "t":
@@ -747,18 +771,21 @@ def reject(args):
         for t in briefs + todo:
             t["status"] = "dropped"
             t["_body"] = t["_body"].rstrip() + f"\n\nRejected {_tasks.today()}: {args.reason}\n"
-            _tasks.dump(t, _tasks.EPIC_KEYS if _tasks.is_epic(t) else _tasks.TASK_KEYS)
         for t in back:
             t["status"] = "ready"
             _dispatch.add_note(t, f"rejected by {approver()}: {args.reason}", who="review")
-            _tasks.dump(t, _tasks.TASK_KEYS)
+        # [signing]: one signature over what this rejection writes, before any of it is written (T-229)
+        sig = _gitops.sign_decisions([("reject", t["id"], _gitops.ended_digest("reject", t)) for t in briefs + todo]
+                                     + [("reject", t["id"], _gitops.sent_back_digest(t)) for t in back])
+        for t in briefs + todo + back:
+            _tasks.dump(t, _tasks.EPIC_KEYS if _tasks.is_epic(t) else _tasks.TASK_KEYS)
         if sign:
             _gitops.sign_state("reject", [f"{_gitops.REJECT_TRAILER}: {t['id']}" for t in briefs + todo + back],
                                [t["_path"] for t in briefs + todo + back])
         for t in briefs + todo:
-            _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "proposed", "to": "dropped"})
+            _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "proposed", "to": "dropped"}, **sig)
         for t in back:
-            _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "review", "to": "ready"})
+            _history.record("rejected", t, by=approver(), reason=args.reason, **{"from": "review", "to": "ready"}, **sig)
     print(", ".join(x for x in (f"dropped {len(briefs)} epic brief(s)" if briefs else "",
                                 f"dropped {len(todo)}" if todo else "",
                                 f"sent {len(back)} back to ready" if back else "") if x))
@@ -810,6 +837,10 @@ def accept(args):
         print(_tasks.line(t, tasks) + f"  [{_config.TASK_BRANCH}{t['id']}]")
     if not human_gate(f"Accept and land these {len(todo)} task(s) as {approver()}?"):
         raise SystemExit("aborted")
+    # [signing]: one signature over every acceptance, before anything lands (T-229). It covers each
+    # task done with its brief as it is now; one that doesn't land after all is simply not done.
+    sig = _gitops.sign_decisions([("accept", t["id"], _gitops.ended_digest("accept", dict(t, status="done")))
+                                  for t in todo])
     who, failed = f"{approver()} {_tasks.today()}", 0
     for tid in [t["id"] for t in todo]:
         passes, recorded = 0, False
@@ -834,7 +865,7 @@ def accept(args):
                     failed += 1
                     break
                 if not recorded:
-                    _history.record("accepted", t, by=approver())
+                    _history.record("accepted", t, by=approver(), **sig)
                     recorded = True
                 if _config.CONFLICT_ROUNDS:
                     try:
@@ -945,6 +976,7 @@ def answer_task(t, text=""):
     approved:, tier, touches: or accept:. Raises SystemExit, writing nothing, if no answer is
     given or confirmed."""
     tid = t["id"]
+    decision_ready()  # [signing]: refuse before asking if the answer couldn't be signed
     if not text:
         qs, parts = _dispatch.asked(t)[0], []
         for n, (q, opts) in enumerate(qs or [("(no question recorded)", [])], 1):
@@ -966,9 +998,12 @@ def answer_task(t, text=""):
         session = t.pop("asking")
         t["status"], t["answered"] = "ready", session
         _dispatch.add_note(t, text, who=f"answer by {approver()}")
+        # [signing]: the session and the answer as dispatch will read them back, signed before
+        # they're written (T-229)
+        sig = _gitops.sign_decisions([("answer", tid, _gitops.answer_digest(t))])
         _tasks.dump(t, _tasks.TASK_KEYS)
         _history.record("answered", t, by=approver(), answer=text,
-                        session=None if session == _dispatch.NO_SESSION else session)
+                        session=None if session == _dispatch.NO_SESSION else session, **sig)
     print(f"{tid} is ready: the next `ergon dispatch` resumes its worker with your answer")
 
 
@@ -1045,16 +1080,21 @@ def pin(args):
     priority score in the order. Reorders only, so it asks for no confirmation."""
     if in_agent_shell():
         raise SystemExit("refused: running inside an agent shell. A human pins from their own terminal.")
+    decision_ready()
     with _gitops.state_lock():
         t = _tasks.load(_config.ITEMS).get(args.id)
         if not t:
             raise SystemExit(f"no such task: {args.id}")
+        # [signing]: first, last or clear at a signed time, signed before it's written; the newest
+        # signed pin is the one that counts (T-229)
+        at = _gitops.decision_at()
+        sig = _gitops.sign_decisions([("pin", args.id, _gitops.pin_digest(args.id, args.where, at))], at=at)
         if args.where == "clear":
             t.pop("pin", None)
         else:
             t["pin"] = args.where
         _tasks.dump(t, _tasks.TASK_KEYS)
-        _history.record("pinned", t, by=approver(), pin=None if args.where == "clear" else args.where)
+        _history.record("pinned", t, by=approver(), pin=None if args.where == "clear" else args.where, **sig)
     print(f"{args.id}: " + ("pin cleared" if args.where == "clear" else f"pinned {args.where}"))
 
 
@@ -1066,6 +1106,7 @@ def close(args):
     if _config.SHARED:  # act on the latest state, and publish the result
         sync_for_count(args.ids, what="close")
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
+    apr = _gitops.approvals() if _config.SIGNING else None
     todo = []
     for i in args.ids:
         t = tasks.get(i)
@@ -1073,7 +1114,9 @@ def close(args):
             raise SystemExit(f"no such task: {i}")
         if t["status"] == "proposed":
             raise SystemExit(f"{i} is proposed: use `ergon reject {i}` (nobody approved it)")
-        if t["status"] in ("done", "dropped"):
+        # [signing]: a task already done or dropped whose decision doesn't verify (written by hand)
+        # is closed again as it is, which signs it (T-229)
+        if t["status"] in ("done", "dropped") and not (apr and t["status"] == args.as_ and apr.decision_problem(t)):
             print(f"skip {i}: already {t['status']}")
             continue
         todo.append(t)
@@ -1096,12 +1139,15 @@ def close(args):
             t.pop("answered", None)
             t.pop("limited", None)
             t["_body"] = t["_body"].rstrip() + f"\n\nClosed {_tasks.today()} as {args.as_}: {args.reason}\n"
+        # [signing]: one signature over every task closed, before any is written (T-229)
+        sig = _gitops.sign_decisions([("close", t["id"], _gitops.ended_digest("close", t)) for t in todo])
+        for t in todo:
             _tasks.dump(t, _tasks.TASK_KEYS)
         if sign:
             _gitops.sign_state("close", [f"{_gitops.CLOSE_TRAILER}: {t['id']} {args.as_}" for t in todo],
                                [t["_path"] for t in todo])
         for t in todo:
-            _history.record("closed", t, by=approver(), reason=args.reason, **{"as": args.as_})
+            _history.record("closed", t, by=approver(), reason=args.reason, **{"as": args.as_}, **sig)
     print(f"closed {len(todo)} as {args.as_}")
     for eid in sorted({t["epic"] for t in todo if t.get("epic") in epics}):
         if epics[eid]["status"] == "open" and _gitops.epic_complete(eid, _tasks.load(_config.ITEMS)):

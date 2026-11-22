@@ -450,7 +450,13 @@ def epic_of(t, epics):
 # ---------- views ----------
 
 def deps_done(t, tasks):
-    return all(tasks.get(d, {}).get("status") == "done" for d in t.get("depends") or [])
+    """Is every task t depends on done? With [signing] (T-229), a done one whose acceptance or
+    close doesn't verify (written by hand) isn't."""
+    deps = [tasks.get(d, {}) for d in t.get("depends") or []]
+    if not all(d.get("status") == "done" for d in deps):
+        return False
+    apr = _gitops.approvals() if _config.SIGNING and any(needs_accept(d) for d in deps) else None
+    return not (apr and any(apr.decision_problem(d) for d in deps))
 
 
 def line(t, tasks):
@@ -744,8 +750,10 @@ def nxt(args):
     ok = [t for t in tasks.values() if t["status"] == "ready" and deps_done(t, tasks)
           and (not args.tier or t["tier"] == args.tier)]
     apr = _gitops.approvals()  # shared mode or [signing]: only tasks whose signed approval verifies
-    hidden = [t for t in ok if apr and apr.problem(t)]
+    hidden = [t for t in ok if apr and apr.approval_problem(t)]
     ok = [t for t in ok if t not in hidden]
+    undecided = [t for t in ok if apr and apr.decision_problem(t)]  # [signing]: a decision by hand (T-229)
+    ok = [t for t in ok if t not in undecided]
     waiting = [t for t in ok if epic_problem(epic_of(t, epics), apr)]  # its epic's brief isn't approved
     ok = [t for t in ok if t not in waiting]
     from . import priority as _pri
@@ -756,6 +764,9 @@ def nxt(args):
     if hidden:
         print(f"({len(hidden)} ready task(s) left out because their approval doesn't verify: "
               f"{', '.join(sorted(t['id'] for t in hidden))}; `ergon check` says why)")
+    if undecided:
+        print(f"({len(undecided)} ready task(s) left out because a human decision on them isn't signed: "
+              f"{', '.join(sorted(t['id'] for t in undecided))}; `ergon check` says why)")
     if waiting:
         why = {}
         for t in waiting:
@@ -1380,7 +1391,10 @@ def lint(warns=None):
             errs.append(f"{where}: status {t.get('status')!r} not in {TASK_STATUSES}")
         # shared mode or [signing]: an open task's approval must verify (a signed commit from an approver
         # approving its current brief); the approved: stamp is only a copy
-        why = apr.problem(t) if apr and t.get("status") in _gitops.GATED else None
+        why = apr.approval_problem(t) if apr and t.get("status") in _gitops.GATED else None
+        decided = apr.decision_problem(t) if apr and not why else None  # [signing]: a decision by hand (T-229)
+        if decided:
+            errs.append(f"{where}: {t['status']}, but {decided}")
         if why:
             errs.append(f"{where}: {t['status']}, but its approval doesn't verify: {why}")
         elif t.get("status") in NEEDS_APPROVAL and not t.get("approved"):

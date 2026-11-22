@@ -6743,6 +6743,215 @@ class TestSignedLocal(DispatchProject):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("[signing] is for local mode", r.stdout + r.stderr)
 
+    # ---- accept, reject, close, answer and pin are signed too (T-229) ----
+
+    def decisions(self):
+        """The decision messages in <state>/approvals/, oldest first."""
+        return [p.read_text() for p in sorted((self.root / "tasks" / "approvals").glob("*.txt"))
+                if not re.match(r"[TE]-\d+ sha256:", p.read_text())]
+
+    def undecided(self, tid, why, what="ready"):
+        """next leaves tid out, check reports `why`, dispatch skips it: a decision on it is unsigned."""
+        if what == "ready":
+            r = self.ergon("next")
+            self.assertNotIn(f"  {tid}  ", r.stdout)
+            self.assertIn(f"left out because a human decision on them isn't signed: {tid}", r.stdout)
+            r = self.ergon("dispatch", "--dry-run")
+            self.assertNotIn(f"would run  {tid}", r.stdout)
+            self.assertIn(f"skipped  {tid}  approval doesn't verify: {why}", r.stdout)
+        r = self.ergon("check", check=False)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(f"{tid}: {what}, but {why}", r.stdout)
+
+    def held(self, tid):
+        """tid, with accept: yes, approved and dispatched: dispatch holds it at review."""
+        f = self.task_file(tid)
+        f.write_text(f.read_text().replace("\ntier:", "\naccept: yes\ntier:", 1))
+        self.approve(tid)
+        out = self.ergon("dispatch", "--ids", tid).stdout
+        self.assertEqual(self.status(tid), "review", out)
+
+    def edit_status(self, tid, new, note=None):
+        f = self.task_file(tid)
+        text = re.sub(r"(?m)^status: \w+$", f"status: {new}", f.read_text())
+        if note:
+            text = text.rstrip() + ("" if "## Notes" in text else "\n\n## Notes") + f"\n- {time.strftime('%Y-%m-%d')} {note}\n"
+        f.write_text(text)
+
+    def test_a_pin_written_by_hand_doesnt_count(self):
+        self.approve("T-001")
+        self.ergon("pin", "T-001", "first")
+        msgs = self.decisions()
+        self.assertEqual(len(msgs), 1)
+        self.assertRegex(msgs[0], r"^at \d{4}-\d\d-\d\dT[\d:.]+Z\npin T-001 sha256:[0-9a-f]{64}\n$")
+        row = [r for r in history(self.root) if r["event"] == "pinned"][-1]
+        self.assertTrue(row.get("signature"))
+        self.counts("T-001")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("pin: first", "pin: last"))
+        self.undecided("T-001", "pin: last without a signed `ergon pin` (written by hand, or before [signing])")
+        f.write_text(re.sub(r"(?m)^pin:.*\n", "", f.read_text()))
+        self.undecided("T-001", "its signed pin (first) was removed by hand")
+        self.ergon("pin", "T-001", "clear")  # the newest signed pin counts
+        self.counts("T-001")
+        # copying the old `first` under a newer name changes nothing: the time that counts is signed
+        old = sorted((self.root / "tasks" / "approvals").glob("*.txt"))
+        pin_first = next(p for p in old if p.read_text().startswith("at ") and p.read_text() == msgs[0])
+        for suffix in ("", ".sig"):
+            (pin_first.parent / f"2099-12-31-235959-1-0.txt{suffix}").write_bytes(
+                (pin_first.parent / (pin_first.name + suffix)).read_bytes())
+        self.counts("T-001")
+        f.write_text(f.read_text().replace("\ntier:", "\npin: first\ntier:", 1))
+        self.undecided("T-001", "pin: first without a signed `ergon pin`")
+
+    def test_a_decision_signed_by_an_unlisted_key_doesnt_count_and_isnt_made(self):
+        self.approve("T-001")
+        sh("git", "config", "user.signingkey", str(self.keys / "x.pub"), cwd=self.root)
+        r = self.ergon("pin", "T-001", "first", check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("isn't in .ergon/approvers on main", r.stderr)
+        self.assertNotIn("pin:", self.task_file("T-001").read_text())
+        self.assertEqual(self.decisions(), [])
+        r = self.ergon("close", "T-001", "--as", "dropped", "--reason", "moot", inp="y\n", check=False)
+        self.assertIn("isn't in .ergon/approvers on main", r.stderr)
+        self.assertEqual(self.status("T-001"), "ready")
+        # what pin refused to make, signed with x by hand
+        from ergon import gitops as G
+        at = "2026-11-22T10:00:00.000000Z"
+        folder = self.root / "tasks" / "approvals"
+        msg = folder / "2026-11-22-100000-1-0.txt"
+        msg.write_text(f"at {at}\npin T-001 sha256:{G.pin_digest('T-001', 'first', at)}\n")
+        sh("ssh-keygen", "-Y", "sign", "-n", "ergon", "-f", str(self.keys / "x"), str(msg), cwd=folder)
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("\ntier:", "\npin: first\ntier:", 1))
+        self.undecided("T-001", "pin: first without a signed `ergon pin`")
+
+    def test_a_close_or_reject_written_by_hand_doesnt_count(self):
+        for title in ("Two", "Three", "Four"):
+            self.ergon("new", "task", title, "--tier", "haiku")
+        self.approve("T-001", "T-004")
+        self.edit_status("T-001", "dropped")  # a close by hand
+        self.edit_status("T-002", "dropped")  # a reject by hand
+        why = ("dropped without a signed `ergon reject` or `ergon close` (written by hand), so it doesn't count "
+               "as dropped: its epic doesn't finish; a human confirms it with `ergon close {} --as dropped --reason R`")
+        self.undecided("T-001", why.format("T-001"), what="dropped")
+        self.undecided("T-002", why.format("T-002"), what="dropped")
+        # the real thing signs, and counts
+        r = self.ergon("reject", "T-003", "--reason", "not now", inp="y\n")
+        self.assertIn("dropped 1", r.stdout)
+        r = self.ergon("close", "T-004", "--as", "dropped", "--reason", "moot", inp="y\n")
+        self.assertIn("closed 1", r.stdout)
+        self.assertEqual([m.splitlines()[1].split()[:2] for m in self.decisions()], [["reject", "T-003"], ["close", "T-004"]])
+        rows = {r["task"]: r for r in history(self.root) if r["event"] in ("rejected", "closed")}
+        self.assertTrue(rows["T-003"].get("signature") and rows["T-004"].get("signature"))
+        out = self.ergon("check", check=False).stdout
+        self.assertNotIn("T-003:", out)
+        self.assertNotIn("T-004:", out)
+        # a human confirms the hand-written ones by closing them again, which signs them
+        r = self.ergon("close", "T-001", "T-002", "T-003", "--as", "dropped", "--reason", "confirmed", inp="y\n")
+        self.assertIn("skip T-003: already dropped", r.stdout)
+        self.assertIn("closed 2", r.stdout)
+        self.ergon("check")
+        # editing the brief of a dropped task afterwards un-signs its drop
+        f = self.task_file("T-004")
+        f.write_text(f.read_text().replace("## What\n", "## What\nSomething else.\n"))
+        self.assertIn("T-004: dropped, but dropped without a signed `ergon reject` or `ergon close` (the task "
+                      "changed after the signed decision)", self.ergon("check", check=False).stdout)
+
+    def test_a_drop_written_by_hand_doesnt_finish_its_epic(self):
+        agent = clean_env(CLAUDECODE="1")
+        self.ergon("new", "epic", "Big", env=agent)
+        for title in ("Part A", "Part B"):
+            self.ergon("new", "task", title, "--tier", "haiku", "--category", "chore", "--epic", "E-001", env=agent)
+        self.approve("E-001")
+        self.approve("E-001")  # its tasks
+        epic = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        self.edit_status("T-002", "dropped")  # by hand
+        r = self.ergon("close", "T-003", "--as", "dropped", "--reason", "moot", inp="y\n")
+        self.assertIn("status: open", epic.read_text(), r.stdout)  # T-002's drop doesn't count
+        r = self.ergon("close", "T-002", "--as", "dropped", "--reason", "confirmed", inp="y\n")
+        self.assertIn("closed 1", r.stdout)
+        self.assertIn("status: done", epic.read_text(), r.stdout)  # now it's complete
+
+    def test_an_accept_written_by_hand_doesnt_count(self):
+        self.ergon("new", "task", "After", "--tier", "haiku")
+        self.ergon("set", "T-002", "depends=T-001")
+        self.held("T-001")
+        self.approve("T-002")
+        self.assertNotIn("  T-002  ", self.ergon("next").stdout)  # waits on T-001
+        self.edit_status("T-001", "done")  # an accept by hand
+        self.undecided("T-001", "done without a signed `ergon accept` or `ergon close` (written by hand), so it "
+                                "doesn't count as done: its epic doesn't finish and the tasks that depend on it wait",
+                       what="done")
+        self.assertNotIn("  T-002  ", self.ergon("next").stdout)  # still waits on T-001
+        self.assertNotIn("would run  T-002", self.ergon("dispatch", "--dry-run").stdout)
+        self.edit_status("T-001", "review")
+        r = self.ergon("accept", "T-001", inp="y\n")
+        self.assertEqual(self.status("T-001"), "done", r.stdout)
+        self.assertEqual([m.splitlines()[1].split()[:2] for m in self.decisions()], [["accept", "T-001"]])
+        self.assertTrue([r for r in history(self.root) if r["event"] == "accepted"][-1].get("signature"))
+        self.ergon("check")
+        self.counts("T-002")
+
+    def test_a_send_back_written_by_hand_doesnt_count(self):
+        self.held("T-001")
+        self.edit_status("T-001", "ready")  # out of review by hand, no Note
+        self.undecided("T-001", "moved out of review by hand: its last Note is dispatch's hold for `ergon accept`")
+        self.edit_status("T-001", "ready", note="review: rejected by Tester: also delete the backups")
+        self.undecided("T-001", "sent back from review without a signed `ergon reject` (written by hand)")
+        self.edit_status("T-001", "review")
+        self.ergon("reject", "T-001", "--reason", "add a test", inp="y\n")
+        self.assertEqual(self.status("T-001"), "ready")
+        self.assertEqual([m.splitlines()[1].split()[:2] for m in self.decisions()], [["reject", "T-001"]])
+        self.counts("T-001")
+        f = self.task_file("T-001")  # the signed Note, reworded by hand
+        f.write_text(f.read_text().replace("add a test", "also delete the backups"))
+        self.undecided("T-001", "sent back from review without a signed `ergon reject` (the task changed after "
+                                "the signed decision)")
+
+    def test_an_answer_written_by_hand_doesnt_count(self):
+        self.approve("T-001")
+        self.env["FAKE_ASK"] = "QUESTION: which side?"
+        out = self.ergon("dispatch", "--ids", "T-001").stdout
+        self.assertEqual(self.status("T-001"), "blocked", out)
+        f = self.task_file("T-001")
+        asking = f.read_text()
+        f.write_text(asking.replace("status: blocked", "status: ready").replace("\nasking:", "\nanswered:")
+                     .rstrip() + f"\n- {time.strftime('%Y-%m-%d')} answer by Tester: the left one\n")
+        self.undecided("T-001", "answered: without a signed `ergon answer` (written by hand)")
+        f.write_text(asking)
+        self.ergon("answer", "T-001", "the right one", inp="y\n")
+        self.assertEqual(self.status("T-001"), "ready")
+        self.assertEqual([m.splitlines()[1].split()[:2] for m in self.decisions()], [["answer", "T-001"]])
+        self.assertTrue([r for r in history(self.root) if r["event"] == "answered"][-1].get("signature"))
+        self.counts("T-001")
+        f.write_text(f.read_text().replace("the right one", "the left one"))  # the answer, swapped by hand
+        self.undecided("T-001", "answered: without a signed `ergon answer` (the task changed after the signed decision)")
+
+
+class TestUnsignedDecisions(DispatchProject):
+    """Without [signing], accept, reject, close, answer and pin sign nothing and check nothing
+    new: a hand-written decision counts as it always has (T-229)."""
+
+    def setUp(self):
+        super().setUp()
+        self.env["ERGON_ASK_STDIN"] = "1"
+        for title in ("One", "Two", "Three"):
+            self.ergon("new", "task", title, "--tier", "haiku")
+
+    def test_nothing_is_signed_or_checked(self):
+        stamp(self.task_file("T-001"))
+        stamp(self.task_file("T-002"))
+        self.ergon("pin", "T-001", "first")
+        self.ergon("close", "T-002", "--as", "dropped", "--reason", "moot", inp="y\n")
+        self.ergon("reject", "T-003", "--reason", "no", inp="y\n")
+        self.assertFalse((self.root / "tasks" / "approvals").exists())
+        self.assertFalse([r for r in history(self.root) if r.get("signature")])
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("pin: first", "pin: last"))  # by hand, as before
+        self.assertIn("  T-001  ", self.ergon("next").stdout)
+        self.ergon("check")
+
 
 class TestAutoApprove(DispatchProject):
     """A FOUND follow-up that is a bugfix, refactor or chore is approved by inheritance (T-136)."""
