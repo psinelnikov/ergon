@@ -9071,5 +9071,136 @@ class TestOptions(Project):
         self.assertEqual([x["option"] for x in history(self.root) if x["event"] == "chosen"], [2])
 
 
+class TestLensOptions(Project):
+    """E-009 / T-252: the lens format of ## Options (a Crux, one option per lens, none recommended)."""
+    LENS = textwrap.dedent("""\
+        Crux: whether lookups must be fast now or can wait
+        - defer: build nothing now and look again when the table passes a million rows
+          Optimizes for: no work today and nothing new to run
+          Gives up: faster lookups for the people using it now
+          Regret if: the slow page drives users away before we look again
+        - minimal: an in-memory LRU inside each worker process, sized by config
+          Optimizes for: the least code and no new service to operate
+          Gives up: one cache shared across all of the workers
+          Regret if: we scale out to many workers and the hit rate collapses
+        - durable: a redis cache that every worker shares, with a TTL per key
+          Optimizes for: one warm cache that survives restarts and deploys
+          Gives up: simplicity, since redis is one more service to run
+          Regret if: the load never grows and redis sits there idle
+        """)
+
+    def task(self, section, tid="T-001"):
+        if not self.task_file_exists(tid):
+            self.ergon("new", "task", "Cache it", "--tier", "sonnet")
+        f = self.task_file(tid)
+        text = f.read_text()
+        head, _, rest = text.partition("## Notes")
+        f.write_text(head.split("\n## Options\n")[0].rstrip("\n") + "\n\n## Options\n" + section + "\n## Notes" + rest)
+        return f
+
+    def task_file_exists(self, tid):
+        return bool(list((self.root / "tasks").rglob(f"{tid}-*.md")))
+
+    def check(self):
+        return self.ergon("check", check=False).stdout
+
+    def test_options_come_back_in_lens_order_with_the_crux(self):
+        f = self.task(self.LENS)
+        opts, chosen = ergon.tasks.options(ergon.tasks.parse(f))
+        self.assertIsNone(chosen)
+        self.assertEqual([o.lens for o in opts], ["minimal", "durable", "defer"])
+        self.assertEqual(opts.crux, "whether lookups must be fast now or can wait")
+        self.assertEqual(opts[0], "minimal: an in-memory LRU inside each worker process, sized by config")
+        self.assertEqual(opts[2].fields(), {
+            "lens": "defer", "approach": "build nothing now and look again when the table passes a million rows",
+            "optimizes": "no work today and nothing new to run",
+            "gives_up": "faster lookups for the people using it now",
+            "regret": "the slow page drives users away before we look again"})
+        self.assertNotIn("T-001", self.check())  # a well-formed section passes
+        out = self.ergon("show", "T-001").stdout
+        self.assertIn("Crux: whether lookups", out)
+        self.assertIn("   Gives up: one cache shared", out)
+        self.assertNotIn("recommended", out)
+
+    def test_numbered_section_reads_as_before(self):
+        f = self.task("1. an LRU (recommended)\n2. a redis cache\n3. nothing\n4. a file cache\n")
+        opts, _ = ergon.tasks.options(ergon.tasks.parse(f))
+        self.assertEqual(opts, ["an LRU", "a redis cache", "nothing", "a file cache"])
+        self.assertIsNone(opts.crux)
+        self.assertNotIn("T-001", self.check())
+
+    def test_check_reports_each_lens_problem(self):
+        lens = self.LENS
+        cases = {
+            "the minimal option uses recommendation wording (recommended)": lens.replace("sized by config", "sized by config (recommended)"),
+            "the crux uses recommendation wording (best)": lens.replace("whether lookups", "the BEST way: whether lookups"),
+            "the durable lens more than once": lens + "- durable: a second durable option, written out at the same length\n"
+                                                      "  Optimizes for: x\n  Gives up: y\n  Regret if: z\n",
+            "unknown lens 'fancy'": lens.replace("- durable:", "- fancy:"),
+            "the minimal option has no Gives up": lens.replace("  Gives up: one cache shared across all of the workers\n", ""),
+            "the durable option has no Regret if": lens.replace("Regret if: the load never grows and redis sits there idle",
+                                                                "Regret if:"),
+            "the minimal option is under half the median": lens.replace(
+                "- minimal: an in-memory LRU inside each worker process, sized by config\n"
+                "  Optimizes for: the least code and no new service to operate\n"
+                "  Gives up: one cache shared across all of the workers\n"
+                "  Regret if: we scale out to many workers and the hit rate collapses",
+                "- minimal: LRU\n  Optimizes for: code\n  Gives up: sharing\n  Regret if: scale"),
+            "no `Crux:` line, or an empty one": lens.replace("Crux: whether lookups must be fast now or can wait\n", ""),
+            "no `Crux:` line, or an empty one ": lens.replace("Crux: whether lookups must be fast now or can wait", "Crux:"),
+            "1 option(s); it needs 2 to 4": lens.split("- minimal:")[0],
+        }
+        for want, section in cases.items():
+            with self.subTest(want):
+                self.task(section)
+                out = self.check()
+                self.assertIn("T-001: ## Options: " + want.strip(), out)
+
+    def test_lens_problems_and_lens_section_round_trip(self):
+        _, entries = ergon.tasks.parse_lens(self.LENS)
+        crux = "whether lookups must be fast now or can wait"
+        self.assertEqual(ergon.tasks.lens_problems(crux, entries, require_defer=True), [])
+        without = [e for e in entries if e.lens != "defer"]
+        self.assertEqual(ergon.tasks.lens_problems(crux, without, require_defer=True), [
+            "no `defer` option (what happens if nothing is built now)"])
+        self.assertEqual(ergon.tasks.lens_problems(crux, without), [])
+        five = entries + [dict(e.fields(), lens=lens) for e, lens in zip(entries, ("operator", "risk"))]
+        self.assertIn("5 option(s); it needs 2 to 4, one per lens", ergon.tasks.lens_problems(crux, five))
+        # whole words only: `recommendation` and `bestow` are not recommendation wording
+        fine = [dict(e.fields(), approach=e.approach + " to bestow a recommendation") for e in entries]
+        self.assertEqual(ergon.tasks.lens_problems(crux, fine), [])
+        for word in ("recommend", "Preferred", "best", "(recommended)"):
+            marked = [dict(entries[0].fields(), regret=entries[0].regret + " " + word)] + entries[1:]
+            self.assertEqual(len(ergon.tasks.lens_problems(crux, marked)), 1, word)
+        section = ergon.tasks.lens_section(crux, entries)
+        self.assertTrue(section.startswith("\n## Options\nCrux: whether lookups"))
+        self.assertLess(section.index("- minimal:"), section.index("- durable:"))
+        self.assertLess(section.index("- durable:"), section.index("- defer:"))
+        self.assertNotRegex(section.lower(), r"recommend|preferred|\bbest\b")
+        t = {"id": "T-009", "_body": "## What\nx\n" + section}
+        opts, _ = ergon.tasks.options(t)
+        self.assertEqual(ergon.tasks.options_problems(t), [])
+        self.assertEqual(ergon.tasks.lens_problems(opts.crux, opts, require_defer=True), [])
+        self.assertEqual([o.fields() for o in opts], [e.fields() for e in sorted(entries, key=ergon.tasks._lens_rank)])
+
+    def test_chosen_counts_in_lens_order(self):
+        f = self.task("Chosen: 3 by Tester 2026-11-22\n" + self.LENS)
+        _, chosen = ergon.tasks.options(ergon.tasks.parse(f))
+        self.assertEqual(chosen["text"], "defer: build nothing now and look again when the table passes a million rows")
+
+    def test_brief_digest_of_an_old_format_task_is_unchanged(self):
+        """Pinned to hashes taken before the lens format was added (T-252)."""
+        body = ("\n## What\nCache the lookups.\n\n## Done when\nLookups hit the cache.\n\n## Options\n%s"
+                "1. an in-memory LRU (recommended)\n2. a redis cache\n3. no cache\n\n## Notes\nscratch\n")
+        want = {"": "ef204420065830a5785df78989d1ca20fa498801d4f069c598cbc30294d89592",
+                "Chosen: 2 by Pavel Sinelnikov 2026-11-20\n":
+                    "0e2747d37bda0f28144057c2917d48bfc54b8d170e362276705e871b694c462a",
+                "Chosen: own by Pavel Sinelnikov 2026-11-20 — a file cache, keyed by path\n":
+                    "3c4a77648052e4cbbf29e3dfe0b4aca6d30cc90435711a119e2122de06bfe9cb"}
+        for chosen, digest in want.items():
+            t = {"id": "T-042", "title": "Cache it", "tier": "sonnet", "touches": ["ergon/tasks.py"], "_body": body % chosen}
+            self.assertEqual(ergon.tasks.brief_digest(t), digest, chosen)
+
+
 if __name__ == "__main__":
     unittest.main()

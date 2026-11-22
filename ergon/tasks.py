@@ -269,10 +269,153 @@ def brief_digest(t):
 # recommended. A human picks one with `ergon choose`, which writes a first line
 # `Chosen: <N> by <name> <date>` (or `Chosen: own by <name> <date> — <text>`) above the list.
 # `approve` refuses a task whose section has no such line; the guard refuses an agent's edit of it.
+#
+# The lens format (E-009) presents the options as peers, none recommended: a `Crux:` line saying
+# what the choice turns on, then one option per lens, each with what it optimizes for, what it
+# gives up and when you'd regret it:
+#
+#   Crux: <what the choice turns on>
+#   - minimal: <approach>
+#     Optimizes for: …
+#     Gives up: …
+#     Regret if: …
+#   - defer: <approach>
+#     …
+#
+# A section with a `Crux:` line or a `- <word>: …` bullet is lens format; any other is the old
+# numbered list, read and checked as before. `options(t)` gives a lens section's options in LENSES
+# order whatever order they were written in, so `Chosen: <N>` counts in that order.
 
 OPTION_ITEM = re.compile(r"^\s*(\d+)[.)]\s+(.*?)\s*$")
 CHOSEN = re.compile(r"^Chosen:\s+(\d+|own)\s+by\s+(.+?)\s+(\d{4}-\d\d-\d\d)(?:\s+—\s+(.*?))?\s*$")
 RECOMMENDED = re.compile(r"\s*\((?:recommended)\)\s*$", re.I)
+LENSES = ("minimal", "durable", "operator", "risk", "defer")
+LENS_FIELDS = (("optimizes", "Optimizes for"), ("gives_up", "Gives up"), ("regret", "Regret if"))
+CRUX = re.compile(r"^crux:\s*(.*?)\s*$", re.I)
+LENS_ITEM = re.compile(r"^[-*]\s+([A-Za-z][\w-]*)\s*:\s*(.*?)\s*$")  # unindented: `- <lens>: <approach>`
+LENS_FIELD = re.compile(r"^\s*(?:[-*]\s+)?(optimizes for|gives up|regret if)\s*:\s*(.*?)\s*$", re.I)
+LENS_KEYS = ("lens", "approach") + tuple(k for k, _ in LENS_FIELDS)  # LensOption.fields()' keys
+RECOMMEND_WORDS = re.compile(r"\b(recommend(?:ed)?|preferred|best)\b", re.I)  # `(recommended)` too
+
+
+class LensOption(str):
+    """One lens-format option. It reads as `<lens>: <approach>` wherever an option's text is shown
+    or recorded, and carries .lens, .approach and the LENS_FIELDS (.optimizes, .gives_up, .regret),
+    each with its whitespace collapsed."""
+
+    def __new__(cls, lens, approach, optimizes="", gives_up="", regret=""):
+        one = lambda x: " ".join(str(x or "").split())
+        lens, approach = one(lens).lower(), one(approach)
+        o = super().__new__(cls, f"{lens}: {approach}")
+        o.lens, o.approach, o.optimizes, o.gives_up, o.regret = lens, approach, one(optimizes), one(gives_up), one(regret)
+        return o
+
+    def fields(self):
+        """{lens, approach, optimizes, gives_up, regret}."""
+        return {k: getattr(self, k) for k in LENS_KEYS}
+
+
+class Options(list):
+    """What `options(t)` lists. .crux is None for a numbered section, and the `Crux:` line's text
+    ('' when it has none) for a lens-format one."""
+    crux = None
+
+
+def _lens_option(e):
+    """e as a LensOption: e may be one already, or a mapping with LensOption.fields()' keys."""
+    return e if isinstance(e, LensOption) else LensOption(**{k: e.get(k, "") for k in LENS_KEYS})
+
+
+def _lens_rank(e):
+    return LENSES.index(e.lens) if e.lens in LENSES else len(LENSES)
+
+
+def is_lens_section(text):
+    """Is this `## Options` text in the lens format: has it a `Crux:` line or a `- <word>: …` bullet?"""
+    return any(CRUX.match(l) or (LENS_ITEM.match(l) and not LENS_FIELD.match(l)) for l in text.split("\n"))
+
+
+def parse_lens(text):
+    """(crux, entries) of lens-format text: crux the first `Crux:` line's text ('' without one),
+    entries a LensOption per `- <lens>: <approach>` bullet in the order written, with the field lines
+    under it. An indented line that is no field continues the text before it. `Chosen:` lines, and
+    lines outside any option, are left out."""
+    crux, entries, cur, last = None, [], None, None
+    for l in text.split("\n"):
+        if not l.strip() or l.strip().startswith("Chosen:"):
+            continue
+        if m := CRUX.match(l):
+            crux = m[1] if crux is None else crux
+            cur = None
+            continue
+        if (m := LENS_FIELD.match(l)) and cur is not None:
+            last = dict((label.lower(), k) for k, label in LENS_FIELDS)[m[1].lower()]
+            cur[last] = (cur[last] + " " + m[2]).strip()
+        elif m := LENS_ITEM.match(l):
+            cur = {"lens": m[1], "approach": m[2], **{k: "" for k, _ in LENS_FIELDS}}
+            entries.append(cur)
+            last = "approach"
+        elif cur is not None and l[:1].isspace():
+            cur[last] = (cur[last] + " " + l.strip()).strip()
+        else:
+            cur = None
+    return crux or "", [_lens_option(e) for e in entries]
+
+
+def _median(xs):
+    xs = sorted(xs)
+    mid = len(xs) // 2
+    return xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2
+
+
+def lens_problems(crux, entries, require_defer=False):
+    """Everything wrong with a lens-format set of options, one line each, or []. entries are
+    LensOptions or mappings of their fields(). Checked: recommendation wording (recommend,
+    recommended, preferred, best, as whole words in any case) in the crux or any option; an unknown
+    or repeated lens; a missing or empty approach or field; an option under half the median
+    option's length; a missing or empty crux; fewer than 2 or more than 4 options; and, with
+    require_defer, no `defer` option."""
+    entries = [_lens_option(e) for e in entries]
+    out = []
+    if not " ".join(str(crux or "").split()):
+        out.append("no `Crux:` line, or an empty one: say in one line what the choice turns on")
+    if not 2 <= len(entries) <= 4:
+        out.append(f"{len(entries)} option(s); it needs 2 to 4, one per lens")
+    seen = []
+    for e in entries:
+        if e.lens not in LENSES:
+            out.append(f"unknown lens {e.lens!r} (the lenses: {', '.join(LENSES)})")
+        elif e.lens in seen:
+            out.append(f"the {e.lens} lens more than once; each lens gives one option")
+        seen.append(e.lens)
+        missing = [label for key, label in (("approach", "approach"),) + LENS_FIELDS if not getattr(e, key)]
+        if missing:
+            out.append(f"the {e.lens or '(no lens)'} option has no {', '.join(missing)}")
+    if require_defer and "defer" not in seen:
+        out.append("no `defer` option (what happens if nothing is built now)")
+    size = lambda e: len(" ".join(x for x in e.fields().values() if x))
+    if len(entries) >= 2:
+        half = _median([size(e) for e in entries]) / 2
+        out += [f"the {e.lens} option is under half the median option's length: give it the same care as the rest"
+                for e in entries if size(e) < half]
+    for where, text in [("the crux", str(crux or ""))] + [(f"the {e.lens} option", " ".join(e.fields().values()))
+                                                         for e in entries]:
+        words = sorted({w.lower() for w in RECOMMEND_WORDS.findall(text)})
+        if words:
+            out.append(f"{where} uses recommendation wording ({', '.join(words)}): the options are peers, "
+                       f"none recommended")
+    return out
+
+
+def lens_section(crux, entries):
+    """The lens-format `## Options` section for crux and entries (LensOptions or mappings of their
+    fields()): the crux first, then the options in LENSES order (unknown lenses last), none marked."""
+    entries = sorted((_lens_option(e) for e in entries), key=_lens_rank)
+    lines = ["", "## Options", f"Crux: {' '.join(str(crux or '').split())}"]
+    for e in entries:
+        lines.append(f"- {e.lens}: {e.approach}")
+        lines += [f"  {label}: {getattr(e, key)}" for key, label in LENS_FIELDS]
+    return "\n".join(lines) + "\n"
 
 
 def _body_of(text):
@@ -293,13 +436,15 @@ def chosen_lines(text):
 
 
 def options(t):
-    """(options, chosen) of t's `## Options` section. options: the numbered list's texts in order
-    (a trailing `(recommended)` taken off). chosen: the first `Chosen:` line as {"option": N (an
-    int) or "own", "text": the chosen option's text or the human's own, "by", "date", "line"},
-    or None when there is none. A Chosen: line that doesn't read gives {"option": None, "line"}.
-    ([], None) when t has no section."""
+    """(options, chosen) of t's `## Options` section. options: an Options list. For a numbered
+    section, the list's texts in order (a trailing `(recommended)` taken off), and .crux None. For
+    a lens-format one, a LensOption per option in LENSES order whatever order they were written in
+    (unknown lenses last, as written), and .crux the `Crux:` text. chosen: the first `Chosen:` line
+    as {"option": N (an int) or "own", "text": the chosen option's text or the human's own, "by",
+    "date", "line"}, or None when there is none. A Chosen: line that doesn't read gives
+    {"option": None, "line"}. ([], None) when t has no section."""
     text = sections(t.get("_body") or "", "options")
-    opts, chosen = [], None
+    opts, chosen = Options(), None
     for l in text.split("\n"):
         s = l.strip()
         if s.startswith("Chosen:"):
@@ -314,6 +459,10 @@ def options(t):
         m = OPTION_ITEM.match(l)
         if m and m[2]:
             opts.append(RECOMMENDED.sub("", m[2]))
+    if is_lens_section(text):
+        crux, entries = parse_lens(text)
+        opts = Options(sorted(entries, key=_lens_rank))
+        opts.crux = crux
     if chosen and isinstance(chosen["option"], int):
         n = chosen["option"]
         chosen["text"] = opts[n - 1] if 1 <= n <= len(opts) else ""
@@ -321,12 +470,21 @@ def options(t):
 
 
 def options_problems(t):
-    """What is wrong with t's `## Options` section, one line each, or [] (also for no section)."""
+    """What is wrong with t's `## Options` section, one line each, or [] (also for no section). A
+    lens-format section is held to lens_problems (no `defer` required); a numbered one only needs
+    2 options."""
     if not has_options(t):
         return []
     opts, chosen = options(t)
     out = []
-    if len(opts) < 2:
+    if opts.crux is not None:
+        text = sections(t.get("_body") or "", "options").split("\n")
+        out += [f"## Options: {why}" for why in lens_problems(opts.crux, opts)]
+        if sum(bool(CRUX.match(l)) for l in text) > 1:
+            out.append("## Options has more than one `Crux:` line")
+        if any(OPTION_ITEM.match(l) and not l[:1].isspace() for l in text):
+            out.append("## Options mixes numbered items with lens options: write each as `- <lens>: <approach>`")
+    elif len(opts) < 2:
         out.append(f"## Options lists {len(opts)} numbered option(s); it needs at least 2 (`1. …`, `2. …`)")
     if len(chosen_lines(t.get("_body") or "")) > 1:
         out.append("## Options has more than one `Chosen:` line")
@@ -387,11 +545,18 @@ def options_section(opts):
 
 
 def print_options(t, indent="  "):
-    """Print t's options, the recommended and the chosen one marked."""
+    """Print t's options, the chosen one marked, and in a numbered section the recommended one. A
+    lens-format section prints its crux first and each option's fields under it, none recommended."""
     opts, chosen = options(t)
+    if opts.crux is not None:
+        print(f"{indent}Crux: {opts.crux}")
     for n, o in enumerate(opts, 1):
-        marks = [m for m, on in (("recommended", n == 1), ("chosen", bool(chosen) and chosen["option"] == n)) if on]
+        marks = [m for m, on in (("recommended", n == 1 and opts.crux is None),
+                                 ("chosen", bool(chosen) and chosen["option"] == n)) if on]
         print(f"{indent}{n}. {o}" + (f"  ({', '.join(marks)})" if marks else ""))
+        if isinstance(o, LensOption):
+            for key, label in LENS_FIELDS:
+                print(f"{indent}   {label}: {getattr(o, key)}")
     if chosen and chosen["option"] == "own":
         print(f"{indent}own. {chosen['text']}  (chosen)")
 
