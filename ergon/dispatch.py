@@ -48,7 +48,8 @@ FOUND_CLAUSE = (
     "`TIER: haiku|sonnet|opus|human — <why>`, `OPTIONS: a | b | c`, `CATEGORY: feature|bugfix|refactor|chore` (feature: new behaviour "
     "a user would notice; bugfix: existing behaviour is wrong, security holes included; refactor: same "
     "behaviour, better code; chore: docs, help text, tests, config, tooling); a feature needs an `OPTIONS:` line "
-    "with 2 to 4 approaches to take, the recommended one first, which a human chooses from before approving it)")
+    "with 2 to 4 approaches to take, the recommended one first, which a human chooses from before approving it). "
+    "If you find nothing to file, write no `FOUND:` line at all (never `FOUND: none`)")
 
 WORKER_PROMPT = """You are dispatched on {id}.
 
@@ -892,6 +893,9 @@ FOUND_TIERS = ("haiku", "sonnet", "opus", "human")
 FOUND_CATEGORIES = ("feature", "bugfix", "refactor", "chore")  # tasks.CATEGORIES; a circular import
 
 
+NO_FOUND = {"none", "nothing", "n/a", "no", "-"}  # a FOUND title that says there is nothing to file
+
+
 def parse_found(text):
     """[(title, why, extra)] from a worker's FOUND: lines. TOUCHES (once), DONE WHEN (repeatable)
     and TIER, CATEGORY and OPTIONS (`a | b | c`, at most 4) lines (once each) directly after a FOUND
@@ -910,7 +914,7 @@ def parse_found(text):
         m = re.match(r"^\W*FOUND:\s*(.*?)(?:\s+[—–]\s+(.*))?$", line)
         if m:
             cur = None
-            if md_trim(m[1]):
+            if md_trim(m[1]) and md_trim(m[1]).rstrip(".").strip().lower() not in NO_FOUND:
                 cur = {}
                 out.append((md_trim(m[1]), md_trim(m[2]), cur))
             continue

@@ -2544,6 +2544,12 @@ class TestDispatch(DispatchProject):
         self.assertEqual(ea["touches"], ["x.py"])
         self.assertNotIn("done", eb)
 
+    def test_parse_found_ignores_no_op_sentinels(self):
+        from ergon.dispatch import parse_found
+        for t in ("none", "None.", "**nothing**", "N/A", "no", "-"):
+            self.assertEqual(parse_found(f"FOUND: {t}\nRESULT: done"), [], t)
+        self.assertEqual(len(parse_found("FOUND: none\nFOUND: Real — why\nDONE WHEN: x")), 1)
+
     def test_found_category_line(self):
         self.ergon("new", "task", "Source", "--tier", "sonnet")
         stamp(self.task_file("T-001"))
