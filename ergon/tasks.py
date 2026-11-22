@@ -265,8 +265,8 @@ def brief_digest(t):
 
 
 # ---------- a task's options (E-006) ----------
-# A proposed feature may carry a `## Options` section: a numbered list of approaches, the first
-# recommended. A human picks one with `ergon choose`, which writes a first line
+# A proposed feature may carry a `## Options` section: a numbered list of approaches, none marked
+# (an old trailing `(recommended)` is still read, and never shown). A human picks one with `ergon choose`, which writes a first line
 # `Chosen: <N> by <name> <date>` (or `Chosen: own by <name> <date> — <text>`) above the list.
 # `approve` refuses a task whose section has no such line; the guard refuses an agent's edit of it.
 #
@@ -595,12 +595,6 @@ def set_chosen(body, line):
             continue
         out.append(l)
     return "\n".join(out)
-
-
-def options_section(opts):
-    """The `## Options` section `ergon new task --option` writes, the first option recommended."""
-    return "\n## Options\n" + "".join(f"{n}. {o}" + (" (recommended)" if n == 1 else "") + "\n"
-                                      for n, o in enumerate(opts, 1))
 
 
 def option_lines(t, indent="  "):

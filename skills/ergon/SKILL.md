@@ -171,7 +171,7 @@ pin: first              # optional, HUMAN ONLY (`ergon pin ID first|last|clear`)
 ## Done when
 ## Options
 Chosen: 1 by Pavel Sinelnikov 2026-11-19
-1. Keep it in memory, an LRU of 1000 entries (recommended)
+1. Keep it in memory, an LRU of 1000 entries
 2. Put it in redis
 ## Notes
 ```

@@ -9012,6 +9012,28 @@ class TestOptions(Project):
         self.assertIn("at least 2", r.stderr)
         self.assertEqual(len(list((self.root / "tasks").rglob("T-002-*.md"))), 0)
 
+    def test_no_prompt_help_or_surface_marks_a_recommended_option(self):
+        """T-260: options are peers; nothing the agents read or a human sees says "recommend"."""
+        import ergon.dispatch, ergon.learn
+        self.assertNotIn("recommend", ergon.dispatch.BREAKDOWN_PROMPT.lower())
+        self.assertNotIn("recommend", ergon.learn.PROMPT.lower())
+        for f in sorted((ERGON.parent / "agents").glob("task-*.md")):
+            self.assertNotIn("recommend", f.read_text().lower(), f.name)
+        for args in (["-h"], ["new", "-h"], ["choose", "-h"]):
+            r = self.ergon(*args, check=False)
+            self.assertNotIn("recommend", (r.stdout + r.stderr).lower(), args)
+        # an old task with a `(recommended)` mark shows none on show, review or /t/T-NNN
+        self.new_feature("an in-memory LRU", "a redis cache")
+        f = self.task_file("T-001")
+        f.write_text(f.read_text().replace("1. an in-memory LRU", "1. an in-memory LRU (recommended)"))
+        self.assertIn("(recommended)", f.read_text())
+        self.assertNotIn("recommended", self.ergon("show", "T-001").stdout)
+        self.assertNotIn("recommended", self.ergon("review").stdout)
+        code = ("import ergon.config as c, ergon.serve as s; c.configure(); print(s.task_page('T-001', 'n'))")
+        r = sh(sys.executable, "-c", code, cwd=self.root, env={**self.env, "PYTHONPATH": str(ERGON.parent)})
+        self.assertIn("an in-memory LRU", r.stdout)
+        self.assertNotIn("recommended", r.stdout)
+
     def test_choose_writes_chosen_line_and_row_then_approve(self):
         self.new_feature("an in-memory LRU", "a redis cache")
         f = self.task_file("T-001")
