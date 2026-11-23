@@ -1378,6 +1378,30 @@ class TestBasics(Project):
                     "builtin echo GIT_EDITOR=$x"]:
             self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
 
+    def test_guard_git_command_env_set_by_zsh_print_and_vared(self):
+        """T-269: zsh's `print -v NAME` (its flags combined, `-rv`, or after an option's value, `-f %s`)
+        and `vared NAME` (and zsh's other setters, NAME_SETS_ANY) set a git command variable to a value
+        the text doesn't show, as `printf -v` does, so git_env_reason refuses them with the name written
+        out, behind a reserved word or wrapper too. print's other uses, and a name print only prints
+        (after `--`, `-R`, or as a value), pass."""
+        from ergon.gates import git_env_reason
+        for cmd in ["print -v GIT_EDITOR x; git commit", "print -rv GIT_EDITOR x; git commit",
+                    "print -rvGIT_PAGER x; git log", "print -n -v GIT_EDITOR vim; git commit",
+                    "print -f %s -v GIT_PAGER cat; git log", "print --v GIT_EDITOR x; git commit",
+                    "print -v 'GIT_EDITOR[1,-1]' vim; git commit", "vared GIT_EDITOR; git commit",
+                    "vared -p 'editor: ' GIT_PAGER; git log", "vared 'GIT_EDITOR[1]'; git commit",
+                    "zparseopts -A GIT_EDITOR a; git commit", "zparseopts e=GIT_EDITOR; git commit",
+                    "strftime -sGIT_PAGER %s 0; git log", "{ print -rv GIT_EDITOR x; }; git commit",
+                    "builtin print -v GIT_PAGER x; git log", "if vared GIT_EDITOR; then git commit; fi"]:
+            self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        self.assertIn("named by `-$o`", git_env_reason("print -$o GIT_EDITOR x; git commit") or "")
+        for cmd in ['print -r -- "$x"', "print -r -- GIT_EDITOR", "print GIT_EDITOR", "print -n GIT_EDITOR=x",
+                    "print -R -v GIT_EDITOR", "print -v out GIT_EDITOR", "print -rv out \"$x\"", "print -- -v GIT_EDITOR",
+                    "printf '%s' -v GIT_EDITOR", "vared line", "echo vared GIT_EDITOR; git commit"]:
+            self.assertIsNone(git_env_reason(cmd), cmd)
+        self.assertIn("can't see", self.guard("Bash", {"command": "print -rv GIT_EDITOR x; git commit"}) or "")
+        self.assertIsNone(self.guard("Bash", {"command": 'print -r -- "$x"'}))
+
     def test_guard_refuses_unseen_git_url_config(self):
         """T-226: a remote's or submodule's URL key (GIT_URL_KEYS) runs an ext:: URL as a command, so
         T-060's unseen-value checks cover it: set through --config-env, GIT_CONFIG_KEY_<n> /
