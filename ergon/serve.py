@@ -1373,6 +1373,37 @@ def epic_cards(briefs):
     return b
 
 
+def epic_task_cards(proposed, tasks, epics, found):
+    """The /review task cards, one section per epic (in epic order, then the tasks with no epic), like
+    epic_maps. Inside a section the depends-chain groups come first, then the independent tasks.
+    With no epic anywhere there is one flat section, no epic headings."""
+    by_epic = {}
+    for t in proposed:
+        by_epic.setdefault(str(t["epic"]) if t.get("epic") else None, []).append(t)
+    keys = sorted(k for k in by_epic if k) + ([None] if None in by_epic else [])
+    h = []
+    for k in keys:
+        ts = by_epic[k]
+        if keys != [None]:
+            n = len(ts)
+            count = f' <span class=muted>({n} task{"s" if n != 1 else ""})</span>'
+            if k is None:
+                h.append(f"<h3 class=ehead id=e-none>No epic{count}</h3>")
+            else:
+                title = (epics.get(k) or {}).get("title")
+                h.append(f'<h3 class=ehead id="e-{esc(k)}"><a href="/e/{esc(k)}">{esc(k)}</a>'
+                         + (f" {esc(title)}" if title else "") + f"{count}</h3>")
+        groups, alone = review_groups(ts, tasks)
+        for g in groups:
+            h.append(group_header(g, tasks))
+            h.extend(review_card(t, tasks, found[t["id"]]) for t in g)
+        if alone:
+            if groups:
+                h.append(f"<h3 class=ghead id=g-independent{'' if k is None else '-' + esc(k)}>Independent</h3>")
+            h.extend(review_card(t, tasks, found[t["id"]]) for t in alone)
+    return h
+
+
 def review_page(nonce):
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     briefs = epic_briefs(epics)
@@ -1411,14 +1442,7 @@ def review_page(nonce):
              'in this one too.</p>')
 
     b.append("<h2>Tasks</h2>")
-    groups, alone = review_groups(proposed, tasks)
-    for ts in groups:
-        b.append(group_header(ts, tasks))
-        b.extend(review_card(t, tasks, found[t["id"]]) for t in ts)
-    if alone:
-        if groups:
-            b.append("<h3 class=ghead id=g-independent>Independent</h3>")
-        b.extend(review_card(t, tasks, found[t["id"]]) for t in alone)
+    b.extend(epic_task_cards(proposed, tasks, epics, found))
 
     b.append(f"<h2 id=findings>Findings ({sum(map(len, flagged.values()))})</h2>")
     if flagged:

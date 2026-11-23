@@ -613,6 +613,26 @@ class TestReview(ServeFixture):
         self.assertIn('<a href="#T-005"><g class="box st-proposed flag">', svgs[1])
         self.assertEqual(page.count("<h3 class=ghead"), page.split("<h2>Tasks</h2>")[1].count("<h3 class=ghead"))
 
+    def test_task_cards_grouped_by_epic(self):
+        # cards sit under one heading per epic (linked), the tasks with no epic last; chain order kept inside
+        self.ergon("new", "epic", "Second " + HOSTILE)
+        self.ergon("new", "task", "Other epic", "--tier", "haiku", "--epic", "E-002")
+        self.ergon("new", "task", "Other two", "--tier", "haiku", "--epic", "E-002")
+        self.ergon("new", "task", "Loose", "--tier", "haiku")
+        f = self.task_file("T-007")
+        f.write_text(re.sub(r"^depends:.*$", "depends: [T-006]", f.read_text(), flags=re.M))
+        page = self.req("GET", "/review")[2]
+        sec = page.split("<h2>Tasks</h2>")[1].split("<h2")[0]
+        self.assertEqual(re.findall(r'<h3 class=ehead id="?(e-[\w-]+)', sec), ["e-E-001", "e-E-002", "e-none"])
+        self.assertIn('<a href="/e/E-002">E-002</a>', sec)
+        self.assertNotIn(HOSTILE, sec)
+        parts = re.split(r"<h3 class=ehead", sec)[1:]
+        ids = [re.findall(r'<section class=card id="(T-\d+)">', p) for p in parts]
+        self.assertEqual(ids[1][:2], ["T-006", "T-007"])  # the chain, in order
+        self.assertEqual(ids[2], ["T-008"])
+        self.assertIn("(1 task)", parts[2])
+        self.assertEqual(sorted(i for p in ids for i in p), sorted(re.findall(r'<section class=card id="(T-\d+)">', page)))
+
     def test_findings(self):
         page = self.req("GET", "/review")[2]
         f4 = re.search(r'<div class=finding id="find-T-004">.*?</div>', page, re.S)[0]
@@ -961,8 +981,10 @@ class TestReviewGroups(ServeFixture):
         self.link("T-009", ["T-001"])
         page = self.req("GET", "/review")[2]
         order = self.order(page)
-        self.assertEqual(order[:3], ["T-006", "T-007", "T-008"])
-        self.assertEqual(sorted(order[3:]), ["T-004", "T-005", "T-009"])
+        # E-001's two (T-004, T-005) come first as their own section; the no-epic section holds the chain
+        self.assertEqual(order[:2], ["T-004", "T-005"])
+        self.assertEqual(order[2:5], ["T-006", "T-007", "T-008"])
+        self.assertEqual(order[5:], ["T-009"])
         g = self.region(page, "T-006")
         self.assertIn("T-006</a> → <a", g)
         self.assertIn("3 linked tasks, no epic", g)
@@ -993,6 +1015,8 @@ class TestReviewGroups(ServeFixture):
         self.assertEqual(self.order(page).count("T-006"), 1)
         self.assertEqual(self.order(page).count("T-007"), 1)
         self.assertRegex(page, r'depends on proposed <a href="/t/T-007">T-007</a>: approving this alone leaves it waiting\.')
+        f = self.task_file("T-004")  # take it out of E-001 so it can share a group with T-006
+        f.write_text(re.sub(r"^epic:.*$", "epic:", f.read_text(), flags=re.M))
         self.link("T-004", ["T-006"])  # the hostile title sits in a group
         page = self.req("GET", "/review")[2]
         self.assertIn(f"<code class=cmd>{APPROVE} T-004 T-006 T-007</code>", self.region(page, "T-004") or self.region(page, "T-006"))
