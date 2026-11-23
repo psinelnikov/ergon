@@ -1434,6 +1434,32 @@ class TestBasics(Project):
         self.assertIn("can't see", self.guard("Bash", {"command": "print -rv GIT_EDITOR x; git commit"}) or "")
         self.assertIsNone(self.guard("Bash", {"command": 'print -r -- "$x"'}))
 
+    def test_guard_git_command_env_set_through_a_subscript(self):
+        """T-271: `NAME[0]` is the scalar itself in bash, and zsh's `NAME[1]=v` / `NAME[1,-1]=v` sets part or all
+        of an exported scalar and keeps the rest. So read / mapfile into one of git's command variables with a
+        subscript (or zsh's `read 'NAME?prompt'`, bash's `read -aNAME`), a subscripted assignment where an
+        assignment counts (alone, ahead of a program, export / declare), `${NAME[1]:=v}` and a nameref to
+        `NAME[0]` are refused. A plain assignment the text shows, another array's subscript, and the
+        same words as data pass."""
+        from ergon.gates import git_env_reason
+        for cmd in ["read 'GIT_EDITOR[0]'; git commit", "mapfile 'GIT_PAGER[0]' <f; git log",
+                    "GIT_EDITOR[0]=$x; git commit", "GIT_EDITOR[0]=vim; git commit", "GIT_EDITOR[1]=vim git commit",
+                    "GIT_EDITOR[0]+=x; git commit", "export 'GIT_EDITOR[1]=q'; git commit",
+                    "declare GIT_EDITOR[0]=$x; git commit", "{ GIT_EDITOR[0]=$x; }; git commit",
+                    "read -r 'GIT_EDITOR[1,-1]'; git commit", "read 'GIT_EDITOR?editor: '; git commit",
+                    "read -aGIT_EDITOR; git commit", "read -ra GIT_EDITOR; git commit",
+                    "readarray -t 'GIT_PAGER[0]' <f; git log", "if read 'GIT_EDITOR[0]'; then git commit; fi",
+                    ": ${GIT_EDITOR[1]:=vim}; git commit", "declare -n r=GIT_EDITOR[0]; r=$x; git commit"]:
+            self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        self.assertIn("named by `$x`", git_env_reason('read -a"$x"; git commit') or "")
+        for cmd in ["GIT_EDITOR=vim git commit", "GIT_EDITOR=vim; git commit", "arr[0]=$x", "arr[0]=$x; git commit",
+                    "a[1]=x b=2 git log", "echo GIT_EDITOR[0]=$x", "git commit -m 'GIT_EDITOR[0]=$x'",
+                    "read -d GIT_EDITOR line", "read -r line; git log", "mapfile -t lines <f; git log",
+                    ": ${GIT_EDITOR:=vim}; git commit"]:
+            self.assertIsNone(git_env_reason(cmd), cmd)
+        self.assertIn("can't see", self.guard("Bash", {"command": "GIT_EDITOR[0]=$x; git commit"}) or "")
+        self.assertIsNone(self.guard("Bash", {"command": "arr[0]=$x; git status"}))
+
     def test_guard_refuses_unseen_git_url_config(self):
         """T-226: a remote's or submodule's URL key (GIT_URL_KEYS) runs an ext:: URL as a command, so
         T-060's unseen-value checks cover it: set through --config-env, GIT_CONFIG_KEY_<n> /

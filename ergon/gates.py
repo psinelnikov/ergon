@@ -1724,19 +1724,33 @@ def _env_config_commands(vals, name):
             if key is not None and val is not None and (c := git_config_command(key, val)) is not None]
 
 
-def _env_assignments(words):
-    """(name, "+" or "", value) of each NAME=value or NAME+=value among a simple command's words that
-    sets the environment of what it runs or of later commands: ahead of its program (or alone),
-    as an argument of export / declare, or ahead of a git call behind a wrapper (sudo, env, nice).
-    Anywhere else (after git, as echo's argument) it's data. The program is found past reserved
-    words and wrappers (_command_head: `{ export X=v; }`, `builtin export X=v`), T-249."""
+def _assigning_words(words):
+    """The words of a simple command that set the environment of what it runs or of later commands
+    when they are assignments: ahead of its program (or all of them), the arguments of export /
+    declare, or the words ahead of a git call behind a wrapper (sudo, env, nice). Anywhere else
+    (after git, as echo's argument) an assignment-shaped word is data. The program is found past
+    reserved words and wrappers (_command_head: `{ export X=v; }`, `builtin export X=v`), T-249."""
     git_at = next((k for k, w in enumerate(words) if _program(w) == "git" or _program(w).startswith("git-")), -1)
     head = _command_head(words)
     declares = head < len(words) and _program(words[head]) in SHELL_DECLARE
-    for k, w in enumerate(words):
-        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)", w, re.S)
-        if m and (k < head or declares or k < git_at):
+    return [w for k, w in enumerate(words) if k < head or declares or k < git_at]
+
+
+def _env_assignments(words):
+    """(name, "+" or "", value) of each NAME=value or NAME+=value among a simple command's words that
+    sets the environment of what it runs or of later commands (_assigning_words)."""
+    for w in _assigning_words(words):
+        if m := re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)", w, re.S):
             yield m.groups()
+
+
+def _subscript_assignments(words):
+    """(name, word) of each NAME[subscript]=value or NAME[subscript]+=value where _env_assignments
+    reads a NAME=value (T-271). In zsh one sets part of a scalar and keeps the rest (`X[1]=v`,
+    `export 'X[1]=v'`, ahead of a program too); in bash `X[0]=v` sets X's value, as an array."""
+    for w in _assigning_words(words):
+        if m := SUBSCRIPT_ASSIGNMENT.match(w):
+            yield m.group(1), w
 
 
 def env_commands(cmds):
@@ -2203,8 +2217,6 @@ def git_config_reason(cmd):
 # too and which a profile or script often sets from another variable.
 GIT_ONLY_ENV = {n for n in GIT_COMMAND_ENV if n.startswith("GIT_")}
 GIT_ONLY_ENV_IN = re.compile(r"\b(?:" + "|".join(sorted(GIT_ONLY_ENV, key=len, reverse=True)) + r")\b")
-# Programs that set the variables they name to a value from their input.
-ENV_FROM_INPUT = {"read", "mapfile", "readarray"}
 
 
 # What git_env_reason may read a `$NAME` in a git command variable's value as (T-241). The bash and zsh
@@ -2302,6 +2314,29 @@ def _print_var(prog, args):
     return None
 
 
+def _read_names(prog, args):
+    """The words naming the variables read / mapfile / readarray (NAME_READS) sets: past `--`, every
+    word not an option nor an option's value (`-d delim`, `-d:`), zsh's `read 'name?prompt'` without
+    its prompt, and the value of bash's `read -a NAME` / `-aNAME`. A subscript is kept (T-271)."""
+    names, takes, opts, j = [], NAME_READ_OPT_ARGS[prog], True, 0
+    while j < len(args):
+        a = args[j]
+        j += 1
+        if opts and a == "--":
+            opts = False
+        elif opts and a.startswith("-") and len(a) > 1:
+            for i, c in enumerate(a[1:], 1):
+                if c in takes or (prog == "read" and c == "a"):
+                    if i == len(a) - 1:  # its value is the next word: read's -a NAME is read as a name below
+                        j += c != "a"
+                    elif c == "a":
+                        names.append(a[i + 1:])
+                    break
+        else:
+            names.append(a.partition("?")[0] if prog == "read" else a)
+    return names
+
+
 def _command_head(words):
     """The index of a simple command's program among its words, or len(words) if it has none: past
     NAME=value words, the reserved words that start a command (`{`, `if`, `then`, `do`, `!`, ...),
@@ -2344,19 +2379,7 @@ def _dynamic_name(words):
         name = _print_var(prog, args)
         return f"`{prog}` sets a variable named by `{name}`" if name is not None and _unseen(name) else None
     if prog in NAME_READS:
-        names, takes, opts, j = [], NAME_READ_OPT_ARGS[prog], True, 0
-        while j < len(args):
-            a = args[j]
-            j += 1
-            if opts and a == "--":
-                opts = False
-            elif opts and a.startswith("-") and len(a) > 1:
-                # `-d delim`, `-d:`: the rest of the word, or the next word, is a value (read -a NAME's is a name)
-                at = next((i for i, c in enumerate(a[1:], 1) if c in takes), None)
-                j += at == len(a) - 1
-            else:
-                names.append(a.partition("?")[0] if prog == "read" else a)  # zsh `read 'name?prompt'`
-        return next((f"`{prog}` sets a variable named by `{a}`" for a in names if _unseen(a)), None)
+        return next((f"`{prog}` sets a variable named by `{a}`" for a in _read_names(prog, args) if _unseen(a)), None)
     if prog == "getopts":
         name = args[1] if len(args) > 1 else ""
         return f"`getopts` sets a variable named by `{name}`" if _unseen(name) else None
@@ -2472,6 +2495,10 @@ def git_env_reason(cmd):
                     return why
         if how := _dynamic_name(words):
             return DYNAMIC_NAME_MSG.format(how=how)
+        for name, w in _subscript_assignments(words):  # `GIT_EDITOR[0]=$x`, zsh's `GIT_EDITOR[1]=v git commit` (T-271)
+            if name in GIT_ONLY_ENV:
+                return unseen_env_msg(name, f"`{w}` sets it through a subscript, which may keep part of a value "
+                                      "set outside this command")
         for name, append, val in _env_assignments(words):
             if name in GIT_ONLY_ENV:
                 shown = val
@@ -2492,12 +2519,13 @@ def git_env_reason(cmd):
             if id(words) in sure and name in names:
                 vals[name] = (vals.get(name, "${" + name + "}") if append else "") + _expand_text(val, vals, budget)
         for w in _without_messages(words, assigns=True):
-            for m in re.finditer(r"\$\{(\w+):{0,2}=([^}]*)(\}?)", w):  # zsh's `::=` too
+            # zsh's `::=` too; `${NAME[1]:=v}` sets it through a subscript (T-271)
+            for m in re.finditer(r"\$\{(\w+)(\[[^]}]*\])?:{0,2}=([^}]*)(\}?)", w):
                 if m.group(1) not in GIT_ONLY_ENV:
                     continue
-                if _unseen(m.group(2)) or "{" in m.group(2) or not m.group(3):
+                if m.group(2) or _unseen(m.group(3)) or "{" in m.group(3) or not m.group(4):
                     return unseen_env_msg(m.group(1), f"`{m.group(0)}` sets it to a value it can't read")
-                if human_cmd(m.group(2)):
+                if human_cmd(m.group(3)):
                     return HUMAN_MSG
                 seen.add(m.group(1))
         head = _command_head(words)  # `{ export ...`, `if read ...`, `builtin printf -v ...` (T-249)
@@ -2510,17 +2538,20 @@ def git_env_reason(cmd):
             return unseen_env_msg(name, f"`{prog} -v` sets it")
         if prog in NAME_SETS_ANY and (m := next(filter(None, map(NAME_SETS_GIT_ENV.fullmatch, args)), None)):
             return unseen_env_msg(m.group(1), f"`{prog}` sets it to a value from outside the text")
+        # `read NAME`, `read -r 'NAME[0]'`, zsh's `read 'NAME?prompt'`, `mapfile 'NAME[0]'` (T-271)
+        if prog in NAME_READS and (name := next((n for a in _read_names(prog, args)
+                                                 if (n := a.partition("[")[0]) in GIT_ONLY_ENV), None)):
+            return unseen_env_msg(name, f"`{prog}` sets it from its input")
         for j, a in enumerate(args):
-            if prog in ("declare", "typeset", "local") and "n" in opts and a.partition("=")[2] in GIT_ONLY_ENV:
-                return unseen_env_msg(a.partition("=")[2], f"`{a}` makes a nameref that sets it under another name")
+            target = a.partition("=")[2].partition("[")[0]  # `declare -n r=NAME[0]` too (T-271)
+            if prog in ("declare", "typeset", "local") and "n" in opts and target in GIT_ONLY_ENV:
+                return unseen_env_msg(target, f"`{a}` makes a nameref that sets it under another name")
             if redefines and prog not in SHELL_DECLARE and a.partition("=")[0].removesuffix("+") in GIT_ONLY_ENV:
                 # `alias git=export; git GIT_EDITOR=...`, `git() { read "$1"; }; git GIT_EDITOR` (T-242)
                 return unseen_env_msg(a.partition("=")[0].removesuffix("+"), "a function or alias this command "
                                       f"defines may make `{prog}` set it")
             if a not in GIT_ONLY_ENV:
                 continue
-            if prog in ENV_FROM_INPUT:
-                return unseen_env_msg(a, f"`{prog}` sets it from its input")
             if prog in ("for", "select") and j == 0:
                 return unseen_env_msg(a, f"a `{prog}` loop sets it to each of its words")
             if a not in seen and ((prog == "export" and "n" not in opts)
@@ -3309,7 +3340,9 @@ GIT_LIST_BRANCH = {"-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "
                    "--no-color", "--color"}
 READ_ONLY_ERGON = {"board", "show", "next", "review", "rules", "guide", "check", "audit", "stats", "related"}
 FIND_WRITES = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
-ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+# NAME=value, or with a subscript, NAME[subscript]=value, which bash and zsh read as an assignment too (T-271).
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[.*\])?\+?=", re.S)
+SUBSCRIPT_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\[.*\]\+?=", re.S)
 # Redirects that write nowhere: to /dev/null, or from one descriptor to another (2>&1, >&2, >&-).
 HARMLESS_REDIRECT = re.compile(r"(?:[0-9]*|&)>>?\|?[ \t]*/dev/null(?![^\s;&|()<>])|[0-9]*>&(?:[0-9]+|-)(?![^\s;&|()<>])")
 READ_ONLY_MSG = ("the breakdown agent is read-only: {what}. Read files with Read, Grep and Glob, and run only "
