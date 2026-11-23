@@ -1452,6 +1452,48 @@ class TestBasics(Project):
                     "for ((i=0;i<2;i++)); do :; done; E=echo; $E approve T-1"]:
             self.assertFalse(human_cmd(cmd), cmd)
 
+    def test_guard_human_cmd_forgets_values_eval_source_and_namerefs_change(self):
+        """T-273: eval, source / `.` and zsh's `emulate -c` run text the guard reads as data in this shell,
+        so every value is unknown after one; an assignment (or read, unset, ...) through a nameref or a
+        zsh `typeset -T` tie sets the name it's linked to, so that name's value is unknown after one,
+        and after eval / source or a nameref whose name is an expansion any name may be linked. A value
+        set again afterwards, and a name nothing links, keep what the text gave them."""
+        from ergon.gates import human_cmd
+        for cmd in ["E=echo; eval E=ergon; $E approve T-1", "E=echo; source f; $E approve T-1",
+                    "F=echo; declare -n R=F; R=ergon; $F approve T-1", "E=echo; . ./f; $E approve T-1",
+                    "E=echo; builtin eval E=ergon; $E approve T-1", "E=echo; command source f; $E approve T-1",
+                    "E=echo; (eval E=ergon); $E approve T-1", "E=echo; if true; then eval E=ergon; fi; $E approve T-1",
+                    "E=echo; emulate sh -c E=ergon; $E approve T-1", "V=show; eval V=approve; ergon $V T-1",
+                    "E=echo; typeset -T E e; e=(ergon); $E approve T-1",
+                    "E=echo; typeset -T E e; e[1]=ergon; $E approve T-1",
+                    "E=echo; typeset -T X E; X=ergon; $E approve T-1",
+                    "F=echo; local -n R=F; R=ergon; $F approve T-1", "F=echo; typeset -n R=F; R=ergon; $F approve T-1",
+                    "F=echo; declare -gn R=F; R=ergon; $F approve T-1", "F=echo; nameref R=F; R=ergon; $F approve T-1",
+                    "F=echo; declare -n R=F; read R; $F approve T-1", "F=echo; declare -n R=F; unset R; $F approve T-1",
+                    "F=echo; declare -n R=F; printf -v R ergon; $F approve T-1",
+                    "F=echo; declare -n R=F; for R in ergon; do $F approve T-1; done",
+                    "F=echo; declare -n R=F; R+=x; $F approve T-1", "F=echo; declare -n R=F; : ${R:=ergon}; $F approve T-1",
+                    "F=echo; declare -n R=F; (R=ergon); $F approve T-1",
+                    "F=echo; declare -n R=F; R=x; F=ergon; $R approve T-1",
+                    "F=echo; declare -n R=F; declare -n Q=R; Q=ergon; $F approve T-1",
+                    "F=echo; declare -n R='F[0]'; R=ergon; $F approve T-1",
+                    "F=echo; declare -n R; R=F; R=ergon; $F approve T-1",
+                    "F=echo; declare -n R=$x; R=ergon; $F approve T-1",
+                    "F=echo; declare -$o R=F; R=ergon; $F approve T-1",
+                    'F=echo; declare "$o" R=F; R=ergon; $F approve T-1',
+                    'eval "declare -n R=F"; F=echo; R=ergon; $F approve T-1',
+                    "source f; F=echo; R=ergon; $F approve T-1"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["E=echo; $E approve T-1", "E=echo; eval true; ergon show T-1",
+                    "eval true; E=echo; $E approve T-1", "source f; E=echo; $E approve T-1",
+                    "E=echo; eval E=x; E=echo; $E approve T-1", "E=echo; echo eval E=x; $E approve T-1",
+                    "E=echo; ./source; $E approve T-1", "E=echo; emulate zsh; $E approve T-1",
+                    "declare -n R=F; E=echo; $E approve T-1", "E=echo; declare -n R=F; R=ergon; $E approve T-1",
+                    "F=echo; declare -n R=F; E=x; $F approve T-1", "E=echo; typeset -T P p; p=(x); $E approve T-1",
+                    "E=echo; declare -n R=F; read line; $E approve T-1",
+                    "source venv/bin/activate; ergon show T-1", 'eval "$(ssh-agent)"; ergon list']:
+            self.assertFalse(human_cmd(cmd), cmd)
+
     def test_guard_git_command_env_set_by_zsh_print_and_vared(self):
         """T-269: zsh's `print -v NAME` (its flags combined, `-rv`, or after an option's value, `-f %s`)
         and `vared NAME` (and zsh's other setters, NAME_SETS_ANY) set a git command variable to a value

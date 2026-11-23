@@ -1843,23 +1843,88 @@ def expand_vars(cmds, split=True, kept=None):
     `printf -v E`, `unset E`: _unread_sets) is unknown again from there on, wherever that command
     runs (T-272). With kept None it keeps its value: where the command doesn't run in this shell
     (`(read P); bash -c "$P"`) that value is the one the shell uses, and what it refuses stays refused.
+    So too, with kept, every name is unknown again after a command that runs text as code in this shell
+    (`eval E=x`, `source f`: _runs_text_here), and a command that sets a name forgets the names a
+    nameref or zsh tie made earlier links it to (`declare -n R=F; R=x` or `F=x`, `typeset -T E e;
+    e=(x)`: _ref_links, _forget_linked). After `eval` / `source`, or a nameref whose name is an
+    expansion, any name may be one, so a command that sets a name forgets all the others (T-273).
     human_cmd reads the text both ways: a value resolved where the shell has none can hide a refusal
     as well as add one (`$E` as the program or the verb is refused only while it can't be seen)."""
     vals, out, budget = {}, [], [MAX_EXPANDED]
+    links, any_link = {}, False  # what namerefs and ties link each name to (T-273), and whether any name may be
     for words, docs in cmds:
         keeps = kept is None or _keeps_assignments(words, kept)
         if vals:
             words = [f for w in words for f in _expand_word(w, vals, budget, split)]
             docs = [(_expand_text(d, vals, budget) if expands else d, expands) for d, expands in docs]
         for name, append, val in _env_assignments(words):
+            if kept is not None:
+                vals = _forget_linked(vals, links, any_link, name)
             if keeps:
                 vals[name] = (vals.get(name, "${" + name + "}") if append else "") + val
             else:
                 vals.pop(name, None)
-        for name in _unread_sets(words, docs, vals) if kept is not None else ():
-            vals.pop(name, None)
+        if kept is not None:
+            runs_text = _runs_text_here(words)
+            for name in list(vals) if runs_text else _unread_sets(words, docs, vals):
+                vals = _forget_linked(vals, links, any_link, name)
+                vals.pop(name, None)
+            new_links = _ref_links(words)
+            any_link = any_link or runs_text or new_links is None
+            for x, y in new_links or ():
+                links.setdefault(x, set()).add(y)
+                links.setdefault(y, set()).add(x)
         out.append((words, docs))
     return out
+
+
+def _forget_linked(vals, links, any_link, name):
+    """vals without the names a nameref or zsh tie links to name, directly or through others (links,
+    from _ref_links), which a command setting name sets too (T-273): every name but name itself where
+    one of them is a nameref whose target the text doesn't show, or where any name may be one (any_link)."""
+    if not any_link and name not in links:
+        return vals
+    seen, todo = {name}, [name]
+    while todo and not any_link:
+        for m in links.get(todo.pop(), ()):
+            if m is None:
+                any_link = True
+            elif m not in seen:
+                seen.add(m)
+                todo.append(m)
+    return {k: v for k, v in vals.items() if k == name or (not any_link and k not in seen)}
+
+
+def _runs_text_here(words):
+    """Whether a simple command runs text as code in this shell, where it may set any name or make one
+    a nameref (T-273): `eval`, `source` / `.` (a file the guard doesn't read), zsh's `emulate -c`."""
+    head = _command_head(words)
+    if head == len(words):
+        return False
+    prog, args = words[head], words[head + 1:]
+    return prog in ("eval", "source", ".") or (prog == "emulate" and any(a.startswith("-") and "c" in a for a in args))
+
+
+def _ref_links(words):
+    """The pairs of names a simple command links so that setting one sets the other (T-273): a nameref
+    and its target (bash's `declare -n R=F`, `local -n`, `typeset -n`, ksh's `nameref`; None for a
+    target the text doesn't show, `declare -n R` or `declare -n R=$x`), and the names zsh's `typeset
+    -T E e` ties. None where an option or a name is an expansion (`declare -$o R=F`, `declare "$o"
+    R=F`): any name may be one from there on."""
+    head = _command_head(words)
+    if head == len(words) or words[head] not in ("declare", "typeset", "local", "nameref"):
+        return []
+    prog, args = words[head], words[head + 1:]
+    opts = "".join(a[1:] for a in args if a.startswith("-"))
+    pairs = [(n.removesuffix("+").partition("[")[0], t if eq else None) for a in args
+             if not a.startswith(("-", "+")) for n, eq, t in [a.partition("=")]]
+    if _unseen(opts) or any(_unseen(n) for n, _ in pairs):
+        return None
+    if prog == "nameref" or "n" in opts:
+        return [(n, None if t is None or _unseen(t) else t.partition("[")[0]) for n, t in pairs]
+    if "T" in opts:
+        return list(zip([n for n, _ in pairs], [n for n, _ in pairs][1:]))
+    return []
 
 
 def _unread_sets(words, docs, vals):
