@@ -1494,6 +1494,44 @@ class TestBasics(Project):
                     "source venv/bin/activate; ergon show T-1", 'eval "$(ssh-agent)"; ergon list']:
             self.assertFalse(human_cmd(cmd), cmd)
 
+    def test_guard_human_cmd_reads_loop_and_function_bodies_as_they_run(self):
+        """T-274: a loop's body runs again with the values set later in it, so it is read again until
+        they stay (inside a subshell or $(...) too); a function's body runs where it's called, so it is
+        read with only the values the text sets once, and a call (or an expansion as the program, or any
+        command once a hook or trap may run one) leaves unknown what that function, and the ones it
+        calls, may set. A function never called, and a loop that sets nothing, change nothing."""
+        from ergon.gates import human_cmd
+        for cmd in ["E=echo; for x in 1 2; do $E approve T-1; E=ergon; done",
+                    "E=echo; f() { $E approve T-1; }; E=ergon; f", "f() { E=ergon; }; E=echo; f; $E approve T-1",
+                    "E=echo\nwhile true\ndo\n$E approve T-1\nE=ergon\ndone",
+                    "V=show; for x in 1 2; do ergon $V T-1; V=approve; done",
+                    "E=echo; until false; do $E approve T-1; unset E; done",
+                    "E=echo; while true; do if true; then $E approve T-1; fi; read E; done",
+                    "E=echo; for x in 1 2; do $E approve T-1; eval E=ergon; done",
+                    "E=echo; for x in 1 2; do for y in 1; do $E approve T-1; done; E=ergon; done",
+                    "E=echo; (for x in 1 2; do $E approve T-1; E=ergon; done)",
+                    "E=echo; echo $(for x in 1 2; do $E approve T-1; E=ergon; done)",
+                    "E=echo; f() for x in 1 2; do $E approve T-1; E=ergon; done; f",
+                    "f() { E=ergon; }; E=echo; for x in 1 2; do $E approve T-1; f; done",
+                    "function f { E=ergon; }; E=echo; f; $E approve T-1",
+                    "function f\n{\nE=ergon\n}\nE=echo\nf\n$E approve T-1",
+                    "f() { E=ergon; }; g() { f; }; E=echo; g; $E approve T-1",
+                    "E=echo; g() { f; }; f() { $E approve T-1; }; E=ergon; g",
+                    "E=echo; f() { $E approve T-1; }; read E; f", "E=echo; f() { $E approve T-1; }; E=ergon f",
+                    "E=echo; f() { $E approve T-1; }; export E=ergon; f",
+                    "V=show; f() { ergon $V T-1; }; V=approve; f",
+                    "f() { E=ergon; }; E=echo; $F; $E approve T-1",
+                    "chpwd() { E=ergon; }; E=echo; cd /; $E approve T-1",
+                    "f() { E=ergon; }; trap f DEBUG; E=echo; $E approve T-1"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["E=echo; $E approve T-1", "for id in T-1 T-2; do ergon show $id; done",
+                    "f() { E=x; }; E=echo; $E approve T-1", "f() { E=x; }; E=echo; g() { :; }; g; $E approve T-1",
+                    "V=show; for id in T-1 T-2; do ergon $V $id; done", "V=show; f() { ergon $V T-1; }; f",
+                    "V=show; while read -r id; do ergon $V $id; done", "E=echo; f() { :; }; f; $E approve T-1",
+                    "f() { ergon show \"$1\"; }; f T-1; f T-2", "for f in *.py; do grep -n approve $f; done",
+                    "while read -r l; do echo \"$l\"; done < x; ergon list"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+
     def test_guard_git_command_env_set_by_zsh_print_and_vared(self):
         """T-269: zsh's `print -v NAME` (its flags combined, `-rv`, or after an option's value, `-f %s`)
         and `vared NAME` (and zsh's other setters, NAME_SETS_ANY) set a git command variable to a value

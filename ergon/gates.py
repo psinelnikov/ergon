@@ -1217,7 +1217,7 @@ GIT_WRITE = re.compile(r"\bgit\b[^;&|]*\s(add|commit|checkout|switch|reset|resto
                        r"clean|update-ref|commit-tree|notes|gc|prune)\b")
 
 
-def shell_commands(s, i=0, close=None, top=None):
+def shell_commands(s, i=0, close=None, top=None, levels=None):
     """Split shell text into simple commands, each (its words after quote removal, its heredoc
     bodies as (text, expands)). A command piped from one with heredocs shares them (`cat <<EOF | sh`
     runs the body). The commands inside $(...), `...` and (...) come out as commands of
@@ -1225,7 +1225,9 @@ def shell_commands(s, i=0, close=None, top=None):
     after `close`). Raises ValueError on text it can't split (an open quote, an unclosed paren).
     A list given as top gets (words, before, after) for each command at this level, not inside
     $(...), `...` or (...): the operators around it (";", "\n", "&&", "||", "|", "&", "(", ")", None
-    at either end). An operator ahead of an empty command (`a &&` + newline) carries over to the next."""
+    at either end). An operator ahead of an empty command (`a &&` + newline) carries over to the next.
+    A list given as levels gets, for each $(...), `...` and (...), a (top, commands) pair: its own
+    commands' top list and the commands it holds, nested ones too (T-274)."""
     cmds, words, docs, word, pending, n = [], [], [], [], [], len(s)
     inword, before = False, None
 
@@ -1248,8 +1250,15 @@ def shell_commands(s, i=0, close=None, top=None):
         elif before not in ("&&", "||", "|", "&"):
             before = after
 
+    def nested(text, at, close):  # the commands of a $(...), `...` or (...), with its own top list in levels
+        inner = None if levels is None else []
+        found, j = shell_commands(text, at, close, inner, levels)
+        if levels is not None:
+            levels.append((inner, found))
+        return found, j
+
     def sub(i):  # s[i:] starts with "$(": the commands up to its ")" are commands too
-        found, j = shell_commands(s, i + 2, ")")
+        found, j = nested(s, i + 2, ")")
         cmds.extend(found)
         word.append(s[i:j])
         return j
@@ -1260,7 +1269,7 @@ def shell_commands(s, i=0, close=None, top=None):
             j += 2 if s[j] == "\\" else 1
         if j >= n:
             raise ValueError("open backtick")
-        cmds.extend(shell_commands(re.sub(r"\\([`$\\\"])", r"\1", s[i + 1:j]))[0])
+        cmds.extend(nested(re.sub(r"\\([`$\\\"])", r"\1", s[i + 1:j]), 0, None)[0])
         word.append(s[i:j + 1])
         return j + 1
 
@@ -1362,7 +1371,7 @@ def shell_commands(s, i=0, close=None, top=None):
             i += 1
         elif c == "(":
             end_cmd("(")
-            found, i = shell_commands(s, i + 1, ")")
+            found, i = nested(s, i + 1, ")")
             cmds.extend(found)
         elif c == ")":
             if close != ")" or pending:
@@ -1779,6 +1788,9 @@ VAR_REF = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\
 # How much text expand_vars substitutes for one command line (`V=x; V=$V$V; ...` doubles it each time).
 # Past it, what's left stays an expansion: the guard reads that as text it can't see.
 MAX_EXPANDED = 1 << 20
+# How many times expand_vars reads a loop's body, each with the values the one before left (T-274): past
+# it, the body is read once more with no values at all.
+MAX_LOOP_READS = 32
 
 
 def _resolvable(m, vals, budget):
@@ -1823,7 +1835,7 @@ def _expand_word(word, vals, budget, split):
     return [f for f in fields if f]
 
 
-def expand_vars(cmds, split=True, kept=None):
+def expand_vars(cmds, split=True, kept=None, flow=None):
     """The commands of shell_commands with the variables assigned earlier in the same text resolved
     (T-228): `V=x; prog $V` reads as `prog x`, and `P='prog x'; GIT_PAGER=$P git log` sets GIT_PAGER
     to `prog x`. The lexer has dropped the quotes, so it can't tell `$V` from `"$V"`: split says how
@@ -1848,11 +1860,31 @@ def expand_vars(cmds, split=True, kept=None):
     nameref or zsh tie made earlier links it to (`declare -n R=F; R=x` or `F=x`, `typeset -T E e;
     e=(x)`: _ref_links, _forget_linked). After `eval` / `source`, or a nameref whose name is an
     expansion, any name may be one, so a command that sets a name forgets all the others (T-273).
+    With kept, flow (_shell_flow) has bodies read as they run, not once in text order (T-274): a
+    while / until / for / select body is read again with the values its later commands left, until
+    they stay (`E=echo; for x in 1 2; do $E approve; E=ergon; done`: $E is unknown); a function's body
+    is read with only the values the text sets once (`E=echo; f() { $E approve; }; E=ergon; f`), and
+    what it, and the functions it calls, may set is unknown after a call, its definition, a command
+    whose program is an expansion, or any command once a hook or trap may run a function
+    (`f() { E=ergon; }; E=echo; f; $E approve`).
     human_cmd reads the text both ways: a value resolved where the shell has none can hide a refusal
     as well as add one (`$E` as the program or the verb is refused only while it can't be seen)."""
     vals, out, budget = {}, [], [MAX_EXPANDED]
     links, any_link = {}, False  # what namerefs and ties link each name to (T-273), and whether any name may be
-    for words, docs in cmds:
+    flow = flow if kept is not None else None
+
+    def forget(names):  # what a function call may set (_shell_flow's "sets"), None for any name
+        nonlocal vals, any_link
+        if names is None:
+            vals, any_link = {}, True
+        for name in names or ():
+            vals = _forget_linked(vals, links, any_link, name)
+            vals.pop(name, None)
+
+    def step(words, docs):
+        nonlocal vals, any_link
+        if flow and flow["hooks"]:  # a function may run ahead of this command
+            forget(flow["any"])
         keeps = kept is None or _keeps_assignments(words, kept)
         if vals:
             words = [f for w in words for f in _expand_word(w, vals, budget, split)]
@@ -1874,7 +1906,47 @@ def expand_vars(cmds, split=True, kept=None):
             for x, y in new_links or ():
                 links.setdefault(x, set()).add(y)
                 links.setdefault(y, set()).add(x)
+        if flow:  # a call of a function the text defines, or of any an expansion may name
+            head = _command_head(words)
+            if head < len(words) and (words[head] in flow["sets"] or _unseen(words[head])):
+                forget(flow["sets"].get(words[head], flow["any"]))
         out.append((words, docs))
+
+    def state():
+        return dict(vals), {k: set(v) for k, v in links.items()}, any_link
+
+    def run(lo, hi, entered=0):  # cmds[lo:hi + 1], inside the first `entered` of the bodies starting at lo
+        nonlocal vals, links, any_link
+        j = lo
+        while j <= hi:
+            bodies = (flow["starts"].get(j, []) if flow else [])[entered if j == lo else 0:]
+            if not bodies:
+                step(*cmds[j])
+                j += 1
+                continue
+            kind, end, word, name = bodies[0]
+            end = min(end, hi)
+            inner = (entered if j == lo else 0) + 1
+            if kind == "func":  # it runs where it's called: read it with only the values set once
+                saved = vals, links, any_link
+                vals, links = {k: v for k, v in vals.items() if k in flow["stable"]}, state()[1]
+            if word in SHELL_LOOPS:  # again with the values its later commands leave, until they stay
+                for _ in range(MAX_LOOP_READS):
+                    before = state()
+                    run(j, end, inner)
+                    if (vals, links, any_link) == before:
+                        break
+                else:
+                    vals = {}
+                    run(j, end, inner)
+            else:
+                run(j, end, inner)
+            if kind == "func":  # defining it may run it (a hook), as a call does
+                vals, links, any_link = saved
+                forget(flow["sets"].get(name, flow["any"]))
+            j = end + 1
+
+    run(0, len(cmds) - 1)
     return out
 
 
@@ -1975,6 +2047,12 @@ SHELL_KEEPS = {"export", "declare", "typeset", "readonly"}
 # runs later or never: what's assigned in it may not be what the rest of the text sees. And what ends one.
 SHELL_BLOCKS = {"if", "while", "until", "for", "select", "case"}
 SHELL_BLOCK_ENDS = {"}", "fi", "done", "esac"}
+# The blocks among those whose body runs again, with the values set later in it (T-274).
+SHELL_LOOPS = {"while", "until", "for", "select"}
+# The functions the shell runs itself, not where the text calls them: zsh's hooks and traps (TRAPDEBUG
+# runs ahead of every command), and bash's and zsh's handler for a command not found.
+SHELL_HOOK_FUNCS = re.compile(r"chpwd|precmd|preexec|periodic|zshaddhistory|zshexit|TRAP[A-Z0-9]+"
+                              r"|command_not_found_handler?")
 
 
 def _keeps_assignments(words, kept):
@@ -1999,8 +2077,29 @@ def _kept_commands(top):
     (`f() { ...; }`, `function f { ...; }`). A plain `{ ...; }` group runs in this shell and keeps them,
     unless it is itself piped, put in the background or behind && / ||. A block left open is read as
     one that doesn't keep them."""
-    ok_before, ok_after = (None, ";", "\n"), (None, ";", "\n", "&&", "||")
-    opens, stack, func = [], [], False  # per command the blocks it opens, each [kind, its command, its end]
+    opens, kept, stack = _shell_blocks(top), set(), []
+    for i, (words, before, after) in enumerate(top):
+        if words[0] in SHELL_BLOCK_ENDS and stack:
+            stack.pop()
+        stack += opens[i]
+        lead = words[:_command_head(words)]
+        if (before in SHELL_OK_BEFORE and after in SHELL_OK_AFTER and all(b[0] == "group" for b in stack)
+                and all(w == "{" or ASSIGNMENT.match(w) for w in lead)):
+            kept.add(id(words))
+    return kept
+
+
+# The operators around a command (shell_commands' top list) that leave it run in this shell, as it is.
+SHELL_OK_BEFORE, SHELL_OK_AFTER = (None, ";", "\n"), (None, ";", "\n", "&&", "||")
+
+
+def _shell_blocks(top):
+    """Per command of shell_commands' top list, the blocks it opens, outermost first, each [kind, the index
+    of the command opening it, of the one ending it (None if left open), its opening word]: kind "func" for
+    a function's body (`f() { ...; }`, `function f { ...; }`, `f() for ...`), "group" for a `{ ...; }` the
+    shell runs as it is, in this shell (not piped, put in the background or behind && / ||), "{" for any
+    other `{`, "block" for an if / while / until / for / select / case."""
+    opens, stack, func = [], [], False
     for i, (words, before, after) in enumerate(top):
         if words[0] in SHELL_BLOCK_ENDS and stack:
             stack.pop()[2] = i
@@ -2008,7 +2107,7 @@ def _kept_commands(top):
         while k < len(words):
             w = words[k]
             if w == "{" or w in SHELL_BLOCKS:
-                block, func = ["func" if func else w if w == "{" else "block", i, None], False
+                block, func = ["func" if func else w if w == "{" else "block", i, None, w], False
                 mine.append(block)
                 stack.append(block)
             elif w == "function":
@@ -2019,18 +2118,112 @@ def _kept_commands(top):
         opens.append(mine)
         func = after == "(" or (words[0] == "function" and not mine)  # `f() {`, `f()` + newline + `{`, `function f` + newline + `{`
     for block in [b for mine in opens for b in mine]:  # a group the shell runs as it is, in this shell
-        if block[0] == "{" and block[2] is not None and top[block[1]][1] in ok_before and top[block[2]][2] in ok_after:
+        if (block[0] == "{" and block[2] is not None and top[block[1]][1] in SHELL_OK_BEFORE
+                and top[block[2]][2] in SHELL_OK_AFTER):
             block[0] = "group"
-    kept, stack = set(), []
-    for i, (words, before, after) in enumerate(top):
-        if words[0] in SHELL_BLOCK_ENDS and stack:
-            stack.pop()
-        stack += opens[i]
-        lead = words[:_command_head(words)]
-        if (before in ok_before and after in ok_after and all(b[0] == "group" for b in stack)
-                and all(w == "{" or ASSIGNMENT.match(w) for w in lead)):
-            kept.add(id(words))
-    return kept
+    return opens
+
+
+def _shell_flow(cmds, top, levels=()):
+    """What expand_vars needs, reading only the assignments the shell keeps, to read loop and function
+    bodies as the shell runs them (T-274), from shell_commands' commands, top list and levels: "starts",
+    per index into cmds, the loop and function bodies starting there, outermost first, each (kind as
+    _shell_blocks gives it, the index of its last command, its opening word, the function's name);
+    "sets", per name the text defines a function by, the names its bodies, and the functions they call,
+    may set (_may_set), None for any; "any", what any of them may set; "stable", the names the text sets
+    in one command alone, whose value a function body has wherever it's called once that one ran, but
+    the shell's own (SHELL_SET_NAMES); "hooks", whether a function may run ahead of any command (a zsh
+    hook or trap function, bash's command_not_found_handle, `trap`, `add-zsh-hook`, a zsh
+    `*_functions` hook array)."""
+    at = {id(words): j for j, (words, _) in enumerate(cmds)}
+    starts, sets, calls, bodies = {}, {}, {}, []
+    for lvl, found in [(top, cmds)] + list(levels):
+        if not lvl:
+            continue
+        idx = [at[id(words)] for words, _, _ in lvl]
+        first = [at[id(found[0][0])]] + [j + 1 for j in idx]  # where each command's own substitutions start
+        for words, _, after in lvl:
+            head = _command_head(words)
+            named = [words[k + 1] for k in range(min(head, len(words) - 1)) if words[k] == "function"]
+            if after == "(" and IDENT.fullmatch(words[-1]) and words[-1] not in SHELL_BLOCKS | SHELL_LEADS:
+                named.append(words[-1])  # `f() ...`
+            sets.update({n: set() for n in named})
+        for mine in _shell_blocks(lvl):
+            for kind, s, e, w in mine:
+                if kind == "func" or w in SHELL_LOOPS:
+                    end, name = idx[len(lvl) - 1 if e is None else e], None
+                    if kind == "func":
+                        name = _function_name(lvl, s)
+                        bodies.append((name, first[s], end))
+                    starts.setdefault(first[s], []).append((kind, end, w, name))
+    for found in starts.values():  # the outermost, ending last, first
+        found.sort(key=lambda b: -b[1])
+    names = dict.fromkeys({n for words, _ in cmds for n, _, _ in _env_assignments(words)} | {""})
+
+    def join(a, b):  # None is any name
+        return None if a is None or b is None else a | b
+
+    for name, lo, hi in bodies:
+        for words, docs in cmds[lo:hi + 1]:
+            sets[name] = join(sets.get(name, set()), _may_set(words, docs, names))
+            head = _command_head(words)
+            if head < len(words) and words[head] in sets:
+                calls.setdefault(name, set()).add(words[head])
+    unnamed = sets.pop(None, set())  # a body whose name wasn't read: any call may run it
+    sets = {n: join(v, unnamed) for n, v in sets.items()}
+    changed = True
+    while changed:  # what the functions a function calls set, it sets
+        changed = False
+        for n in sets:
+            for m in calls.get(n, ()):
+                if (new := join(sets[n], sets.get(m, set()))) != sets[n]:
+                    sets[n], changed = new, True
+    every = unnamed
+    for v in sets.values():
+        every = join(every, v)
+    counts = {}
+    for words, docs in cmds:
+        got = _may_set(words, docs, names)
+        if got is None:
+            counts = None
+            break
+        for n in got:
+            counts[n] = counts.get(n, 0) + 1
+    stable = set() if counts is None else {n for n, c in counts.items() if c == 1 and n not in SHELL_SET_NAMES
+                                            and not n.startswith(("BASH", "ZSH"))}
+    hooks = any(SHELL_HOOK_FUNCS.fullmatch(f) for f in sets) or any(
+        any(re.search(r"_functions\b", w) for w in words)
+        or ((h := _command_head(words)) < len(words) and _program(words[h]) in ("trap", "add-zsh-hook"))
+        for words, _ in cmds)
+    return {"starts": starts, "sets": sets, "any": every, "stable": stable, "hooks": hooks}
+
+
+def _function_name(lvl, s):
+    """The name of the function whose body command s of a top list opens: `function f {` names it on
+    that line, `f() {` and `function f` + newline + `{` on the one before. None if neither does."""
+    words = lvl[s][0]
+    lead = range(min(_command_head(words), len(words) - 1))
+    name = next((words[k + 1] for k in lead if words[k] == "function"), None)
+    if name is None and s:
+        prev, _, after = lvl[s - 1]
+        if after == "(":
+            name = prev[-1]
+        elif prev[0] == "function" and len(prev) > 1:
+            name = prev[1]
+    return name
+
+
+def _may_set(words, docs, names):
+    """The names a simple command, as the text shows it, may set (T-274), or None for any: its
+    assignments and what _unread_sets finds (names, a dict holding "", to match zsh's setters
+    against: "" back means any), or any where it runs text as code in this shell, makes a nameref or
+    a tie, sets a name built at run time (_dynamic_name), or its program is an expansion."""
+    head = _command_head(words)
+    if (_runs_text_here(words) or _ref_links(words) != [] or _dynamic_name(words)
+            or (head < len(words) and _unseen(words[head]))):
+        return None
+    got = {n for n, _, _ in _env_assignments(words)} | set(_unread_sets(words, docs, names))
+    return None if "" in got else got
 
 
 def human_cmd(cmd):
@@ -2048,15 +2241,19 @@ def human_cmd(cmd):
     every assignment and once with only those the shell keeps (`(E=echo); $E approve`, T-270); an ergon
     call whose verb is still an expansion (`ergon $X`, `ergon $(cat f)`), or a command whose program
     is one ahead of a human-only verb (`$E approve`), runs a verb the guard can't see and counts."""
-    top = []
+    top, levels = [], []
     try:
-        cmds = shell_commands(cmd, top=top)[0]
+        cmds = shell_commands(cmd, top=top, levels=levels)[0]
     except (ValueError, RecursionError):
         return bool(HUMAN_CMD.search(cmd))
-    kept, seen = _kept_commands(top), []
-    # `$V` and `"$V"`: either may be meant. Every assignment, and only those the shell keeps (T-270).
+    kept, flow, seen = _kept_commands(top), _shell_flow(cmds, top, levels), []
+    # `$V` and `"$V"`: either may be meant. Every assignment, and only those the shell keeps (T-270),
+    # with loop and function bodies read as the shell runs them (T-274).
     for split, keep in ((True, None), (False, None), (True, kept), (False, kept)):
-        view = expand_vars(cmds, split, keep)
+        try:
+            view = expand_vars(cmds, split, keep, flow)
+        except RecursionError:  # loop and function bodies nested too deep to read: what they run is unseen
+            return True
         if view not in seen:
             if _runs_human(cmd, view):
                 return True
