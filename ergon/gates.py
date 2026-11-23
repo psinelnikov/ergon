@@ -1217,7 +1217,7 @@ GIT_WRITE = re.compile(r"\bgit\b[^;&|]*\s(add|commit|checkout|switch|reset|resto
                        r"clean|update-ref|commit-tree|notes|gc|prune)\b")
 
 
-def shell_commands(s, i=0, close=None, top=None):
+def shell_commands(s, i=0, close=None, top=None, levels=None):
     """Split shell text into simple commands, each (its words after quote removal, its heredoc
     bodies as (text, expands)). A command piped from one with heredocs shares them (`cat <<EOF | sh`
     runs the body). The commands inside $(...), `...` and (...) come out as commands of
@@ -1225,7 +1225,9 @@ def shell_commands(s, i=0, close=None, top=None):
     after `close`). Raises ValueError on text it can't split (an open quote, an unclosed paren).
     A list given as top gets (words, before, after) for each command at this level, not inside
     $(...), `...` or (...): the operators around it (";", "\n", "&&", "||", "|", "&", "(", ")", None
-    at either end). An operator ahead of an empty command (`a &&` + newline) carries over to the next."""
+    at either end). An operator ahead of an empty command (`a &&` + newline) carries over to the next.
+    A list given as levels gets, for each $(...), `...` and (...), a (top, commands) pair: its own
+    commands' top list and the commands it holds, nested ones too (T-274)."""
     cmds, words, docs, word, pending, n = [], [], [], [], [], len(s)
     inword, before = False, None
 
@@ -1248,8 +1250,15 @@ def shell_commands(s, i=0, close=None, top=None):
         elif before not in ("&&", "||", "|", "&"):
             before = after
 
+    def nested(text, at, close):  # the commands of a $(...), `...` or (...), with its own top list in levels
+        inner = None if levels is None else []
+        found, j = shell_commands(text, at, close, inner, levels)
+        if levels is not None:
+            levels.append((inner, found))
+        return found, j
+
     def sub(i):  # s[i:] starts with "$(": the commands up to its ")" are commands too
-        found, j = shell_commands(s, i + 2, ")")
+        found, j = nested(s, i + 2, ")")
         cmds.extend(found)
         word.append(s[i:j])
         return j
@@ -1260,7 +1269,7 @@ def shell_commands(s, i=0, close=None, top=None):
             j += 2 if s[j] == "\\" else 1
         if j >= n:
             raise ValueError("open backtick")
-        cmds.extend(shell_commands(re.sub(r"\\([`$\\\"])", r"\1", s[i + 1:j]))[0])
+        cmds.extend(nested(re.sub(r"\\([`$\\\"])", r"\1", s[i + 1:j]), 0, None)[0])
         word.append(s[i:j + 1])
         return j + 1
 
@@ -1362,7 +1371,7 @@ def shell_commands(s, i=0, close=None, top=None):
             i += 1
         elif c == "(":
             end_cmd("(")
-            found, i = shell_commands(s, i + 1, ")")
+            found, i = nested(s, i + 1, ")")
             cmds.extend(found)
         elif c == ")":
             if close != ")" or pending:
@@ -1724,18 +1733,33 @@ def _env_config_commands(vals, name):
             if key is not None and val is not None and (c := git_config_command(key, val)) is not None]
 
 
+def _assigning_words(words):
+    """The words of a simple command that set the environment of what it runs or of later commands
+    when they are assignments: ahead of its program (or all of them), the arguments of export /
+    declare, or the words ahead of a git call behind a wrapper (sudo, env, nice). Anywhere else
+    (after git, as echo's argument) an assignment-shaped word is data. The program is found past
+    reserved words and wrappers (_command_head: `{ export X=v; }`, `builtin export X=v`), T-249."""
+    git_at = next((k for k, w in enumerate(words) if _program(w) == "git" or _program(w).startswith("git-")), -1)
+    head = _command_head(words)
+    declares = head < len(words) and _program(words[head]) in SHELL_DECLARE
+    return [w for k, w in enumerate(words) if k < head or declares or k < git_at]
+
+
 def _env_assignments(words):
     """(name, "+" or "", value) of each NAME=value or NAME+=value among a simple command's words that
-    sets the environment of what it runs or of later commands: ahead of its program (or alone),
-    as an argument of export / declare, or ahead of a git call behind a wrapper (sudo, env, nice).
-    Anywhere else (after git, as echo's argument) it's data."""
-    git_at = next((k for k, w in enumerate(words) if _program(w) == "git" or _program(w).startswith("git-")), -1)
-    head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
-    declares = head < len(words) and _program(words[head]) in SHELL_DECLARE
-    for k, w in enumerate(words):
-        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)", w, re.S)
-        if m and (k < head or declares or k < git_at):
+    sets the environment of what it runs or of later commands (_assigning_words)."""
+    for w in _assigning_words(words):
+        if m := re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)", w, re.S):
             yield m.groups()
+
+
+def _subscript_assignments(words):
+    """(name, word) of each NAME[subscript]=value or NAME[subscript]+=value where _env_assignments
+    reads a NAME=value (T-271). In zsh one sets part of a scalar and keeps the rest (`X[1]=v`,
+    `export 'X[1]=v'`, ahead of a program too); in bash `X[0]=v` sets X's value, as an array."""
+    for w in _assigning_words(words):
+        if m := SUBSCRIPT_ASSIGNMENT.match(w):
+            yield m.group(1), w
 
 
 def env_commands(cmds):
@@ -1764,6 +1788,9 @@ VAR_REF = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\
 # How much text expand_vars substitutes for one command line (`V=x; V=$V$V; ...` doubles it each time).
 # Past it, what's left stays an expansion: the guard reads that as text it can't see.
 MAX_EXPANDED = 1 << 20
+# How many times expand_vars reads a loop's body, each with the values the one before left (T-274): past
+# it, the body is read once more with no values at all.
+MAX_LOOP_READS = 32
 
 
 def _resolvable(m, vals, budget):
@@ -1808,7 +1835,7 @@ def _expand_word(word, vals, budget, split):
     return [f for f in fields if f]
 
 
-def expand_vars(cmds, split=True):
+def expand_vars(cmds, split=True, kept=None, flow=None):
     """The commands of shell_commands with the variables assigned earlier in the same text resolved
     (T-228): `V=x; prog $V` reads as `prog x`, and `P='prog x'; GIT_PAGER=$P git log` sets GIT_PAGER
     to `prog x`. The lexer has dropped the quotes, so it can't tell `$V` from `"$V"`: split says how
@@ -1816,18 +1843,387 @@ def expand_vars(cmds, split=True):
     the shell's or a program's environment (_env_assignments) is recorded once its own command's
     expansions are resolved, in text order. A `+=` onto a name the text didn't set keeps the outside
     part as `${NAME}`, and a value holding an expansion the guard can't resolve keeps it, so what it
-    can't see still reads as an expansion. Where the shell doesn't keep an assignment (a subshell,
-    `X=1 cmd`) it's kept anyway: a value resolved where the shell has none can only add a refusal.
-    A variable the text never sets ($HOME) stays as it is, and so does everything past MAX_EXPANDED."""
+    can't see still reads as an expansion. A variable the text never sets ($HOME) stays as it is, and
+    so does everything past MAX_EXPANDED.
+    With kept None, every assignment is recorded, even where the shell doesn't keep it (a subshell,
+    `X=1 cmd`, a branch that may not run): that value may be the one a program inherits (env_commands).
+    With kept, the ids of the commands whose assignments the shell keeps (_kept_commands), only a
+    lone NAME=value or an option-less export / declare / typeset / readonly of one of those is
+    recorded, and any other assignment makes the name unknown again, as the shell reads it: in
+    `(E=echo); $E approve` or `X=1 E=echo true; $E approve`, $E keeps its outside value (T-270).
+    With kept, a name a command sets to a value the guard doesn't read (`read E`, `for E in ...`,
+    `printf -v E`, `unset E`: _unread_sets) is unknown again from there on, wherever that command
+    runs (T-272). With kept None it keeps its value: where the command doesn't run in this shell
+    (`(read P); bash -c "$P"`) that value is the one the shell uses, and what it refuses stays refused.
+    So too, with kept, every name is unknown again after a command that runs text as code in this shell
+    (`eval E=x`, `source f`: _runs_text_here), and a command that sets a name forgets the names a
+    nameref or zsh tie made earlier links it to (`declare -n R=F; R=x` or `F=x`, `typeset -T E e;
+    e=(x)`: _ref_links, _forget_linked). After `eval` / `source`, or a nameref whose name is an
+    expansion, any name may be one, so a command that sets a name forgets all the others (T-273).
+    With kept, flow (_shell_flow) has bodies read as they run, not once in text order (T-274): a
+    while / until / for / select body is read again with the values its later commands left, until
+    they stay (`E=echo; for x in 1 2; do $E approve; E=ergon; done`: $E is unknown); a function's body
+    is read with only the values the text sets once (`E=echo; f() { $E approve; }; E=ergon; f`), and
+    what it, and the functions it calls, may set is unknown after a call, its definition, a command
+    whose program is an expansion, or any command once a hook or trap may run a function
+    (`f() { E=ergon; }; E=echo; f; $E approve`).
+    human_cmd reads the text both ways: a value resolved where the shell has none can hide a refusal
+    as well as add one (`$E` as the program or the verb is refused only while it can't be seen)."""
     vals, out, budget = {}, [], [MAX_EXPANDED]
-    for words, docs in cmds:
+    links, any_link = {}, False  # what namerefs and ties link each name to (T-273), and whether any name may be
+    flow = flow if kept is not None else None
+
+    def forget(names):  # what a function call may set (_shell_flow's "sets"), None for any name
+        nonlocal vals, any_link
+        if names is None:
+            vals, any_link = {}, True
+        for name in names or ():
+            vals = _forget_linked(vals, links, any_link, name)
+            vals.pop(name, None)
+
+    def step(words, docs):
+        nonlocal vals, any_link
+        if flow and flow["hooks"]:  # a function may run ahead of this command
+            forget(flow["any"])
+        keeps = kept is None or _keeps_assignments(words, kept)
         if vals:
             words = [f for w in words for f in _expand_word(w, vals, budget, split)]
             docs = [(_expand_text(d, vals, budget) if expands else d, expands) for d, expands in docs]
         for name, append, val in _env_assignments(words):
-            vals[name] = (vals.get(name, "${" + name + "}") if append else "") + val
+            if kept is not None:
+                vals = _forget_linked(vals, links, any_link, name)
+            if keeps:
+                vals[name] = (vals.get(name, "${" + name + "}") if append else "") + val
+            else:
+                vals.pop(name, None)
+        if kept is not None:
+            runs_text = _runs_text_here(words)
+            for name in list(vals) if runs_text else _unread_sets(words, docs, vals):
+                vals = _forget_linked(vals, links, any_link, name)
+                vals.pop(name, None)
+            new_links = _ref_links(words)
+            any_link = any_link or runs_text or new_links is None
+            for x, y in new_links or ():
+                links.setdefault(x, set()).add(y)
+                links.setdefault(y, set()).add(x)
+        if flow:  # a call of a function the text defines, or of any an expansion may name
+            head = _command_head(words)
+            if head < len(words) and (words[head] in flow["sets"] or _unseen(words[head])):
+                forget(flow["sets"].get(words[head], flow["any"]))
         out.append((words, docs))
+
+    def state():
+        return dict(vals), {k: set(v) for k, v in links.items()}, any_link
+
+    def run(lo, hi, entered=0):  # cmds[lo:hi + 1], inside the first `entered` of the bodies starting at lo
+        nonlocal vals, links, any_link
+        j = lo
+        while j <= hi:
+            bodies = (flow["starts"].get(j, []) if flow else [])[entered if j == lo else 0:]
+            if not bodies:
+                step(*cmds[j])
+                j += 1
+                continue
+            kind, end, word, name = bodies[0]
+            end = min(end, hi)
+            inner = (entered if j == lo else 0) + 1
+            if kind == "func":  # it runs where it's called: read it with only the values set once
+                saved = vals, links, any_link
+                vals, links = {k: v for k, v in vals.items() if k in flow["stable"]}, state()[1]
+            if word in SHELL_LOOPS:  # again with the values its later commands leave, until they stay
+                for _ in range(MAX_LOOP_READS):
+                    before = state()
+                    run(j, end, inner)
+                    if (vals, links, any_link) == before:
+                        break
+                else:
+                    vals = {}
+                    run(j, end, inner)
+            else:
+                run(j, end, inner)
+            if kind == "func":  # defining it may run it (a hook), as a call does
+                vals, links, any_link = saved
+                forget(flow["sets"].get(name, flow["any"]))
+            j = end + 1
+
+    run(0, len(cmds) - 1)
     return out
+
+
+def _forget_linked(vals, links, any_link, name):
+    """vals without the names a nameref or zsh tie links to name, directly or through others (links,
+    from _ref_links), which a command setting name sets too (T-273): every name but name itself where
+    one of them is a nameref whose target the text doesn't show, or where any name may be one (any_link)."""
+    if not any_link and name not in links:
+        return vals
+    seen, todo = {name}, [name]
+    while todo and not any_link:
+        for m in links.get(todo.pop(), ()):
+            if m is None:
+                any_link = True
+            elif m not in seen:
+                seen.add(m)
+                todo.append(m)
+    return {k: v for k, v in vals.items() if k == name or (not any_link and k not in seen)}
+
+
+def _runs_text_here(words):
+    """Whether a simple command runs text as code in this shell, where it may set any name or make one
+    a nameref (T-273): `eval`, `source` / `.` (a file the guard doesn't read), zsh's `emulate -c`."""
+    head = _command_head(words)
+    if head == len(words):
+        return False
+    prog, args = words[head], words[head + 1:]
+    return prog in ("eval", "source", ".") or (prog == "emulate" and any(a.startswith("-") and "c" in a for a in args))
+
+
+def _ref_links(words):
+    """The pairs of names a simple command links so that setting one sets the other (T-273): a nameref
+    and its target (bash's `declare -n R=F`, `local -n`, `typeset -n`, ksh's `nameref`; None for a
+    target the text doesn't show, `declare -n R` or `declare -n R=$x`), and the names zsh's `typeset
+    -T E e` ties. None where an option or a name is an expansion (`declare -$o R=F`, `declare "$o"
+    R=F`): any name may be one from there on."""
+    head = _command_head(words)
+    if head == len(words) or words[head] not in ("declare", "typeset", "local", "nameref"):
+        return []
+    prog, args = words[head], words[head + 1:]
+    opts = "".join(a[1:] for a in args if a.startswith("-"))
+    pairs = [(n.removesuffix("+").partition("[")[0], t if eq else None) for a in args
+             if not a.startswith(("-", "+")) for n, eq, t in [a.partition("=")]]
+    if _unseen(opts) or any(_unseen(n) for n, _ in pairs):
+        return None
+    if prog == "nameref" or "n" in opts:
+        return [(n, None if t is None or _unseen(t) else t.partition("[")[0]) for n, t in pairs]
+    if "T" in opts:
+        return list(zip([n for n, _ in pairs], [n for n, _ in pairs][1:]))
+    return []
+
+
+def _unread_sets(words, docs, vals):
+    """The names among vals a simple command (its variables resolved) may give a value expand_vars
+    doesn't read, so that it reads them as unknown again (T-272): `read` / `mapfile` / `readarray`
+    (_read_names), `printf -v` / zsh's `print -v` (_print_var), `getopts`, a `for` / `select` /
+    `foreach` loop's names, `unset` (not `-f`), zsh's setters (NAME_SETS_ANY) handed the name, a
+    subscript assignment (`E[1,-1]=x`, which may keep part of the value), and `${NAME:=value}` /
+    `${NAME=value}` / zsh's `${NAME::=value}`, in a word or a heredoc the shell expands. Where the name
+    such a command sets is itself an expansion (`read "$x"`, `unset -m 'E*'`, `${!x:=v}`), or a word
+    holds zsh's `${(flags)...}`, which may set any name, all of vals."""
+    names = [n for n, _ in _subscript_assignments(words)]
+    for t in words + [d for d, expands in docs if expands]:
+        if INDIRECT_SET.search(t) or "${(" in t or t.endswith("${"):  # the lexer splits zsh's `${(L)E:=x}` at `(`
+            return list(vals)
+        names += re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:\[[^]}]*\])?:{0,2}=", t)
+    head = _command_head(words)
+    prog, args = (_program(words[head]), words[head + 1:]) if head < len(words) else ("", [])
+    if prog in NAME_READS:
+        names += _read_names(prog, args)
+    elif prog in PRINT_OPT_ARGS:
+        names += [n for n in [_print_var(prog, args)] if n is not None]
+    elif prog == "getopts":
+        names += args[1:2]
+    elif prog in ("for", "select", "foreach"):
+        names += [a for a in args[:next((j for j, a in enumerate(args) if a in ("in", "do", "(")), len(args))]
+                  if not a.startswith("((")]
+    elif prog == "unset":
+        opts = "".join(a[1:] for a in args if a.startswith("-"))
+        if "m" in opts:
+            return list(vals)
+        if "f" not in opts:
+            names += [a for a in args if not a.startswith("-")]
+    elif prog in NAME_SETS_ANY:
+        if any(_unseen(a) for a in args):
+            return list(vals)
+        names += [n for n in vals if any(re.fullmatch(r"(?:-[A-Za-z]*|[^=]*=)?" + n + r"(?:\[.*)?", a, re.S)
+                                         for a in args)]
+    if any(_unseen(n) for n in names):
+        return list(vals)
+    return [n.partition("[")[0] for n in names]
+
+
+# The builtins whose NAME=value arguments set a variable for the rest of the text when run at the top
+# level (local only sets one in a function).
+SHELL_KEEPS = {"export", "declare", "typeset", "readonly"}
+# The reserved words that open a block whose body may not run, may run more than once, or (a function's)
+# runs later or never: what's assigned in it may not be what the rest of the text sees. And what ends one.
+SHELL_BLOCKS = {"if", "while", "until", "for", "select", "case"}
+SHELL_BLOCK_ENDS = {"}", "fi", "done", "esac"}
+# The blocks among those whose body runs again, with the values set later in it (T-274).
+SHELL_LOOPS = {"while", "until", "for", "select"}
+# The functions the shell runs itself, not where the text calls them: zsh's hooks and traps (TRAPDEBUG
+# runs ahead of every command), and bash's and zsh's handler for a command not found.
+SHELL_HOOK_FUNCS = re.compile(r"chpwd|precmd|preexec|periodic|zshaddhistory|zshexit|TRAP[A-Z0-9]+"
+                              r"|command_not_found_handler?")
+
+
+def _keeps_assignments(words, kept):
+    """Whether the shell keeps the NAME=value words of a command among kept (_kept_commands) for the
+    rest of the text: they are all its words (`E=echo`, `{ E=echo; }`), or the arguments of an
+    export / declare / typeset / readonly with no options and no NAME=value ahead of it. Ahead of a
+    program (`X=1 E=echo true`, `E=x export F=y`) they only set that program's environment."""
+    if id(words) not in kept:
+        return False
+    head = _command_head(words)
+    if head == len(words):
+        return True
+    return (_program(words[head]) in SHELL_KEEPS and not any(ASSIGNMENT.match(w) for w in words[:head])
+            and not any(a[:1] in "-+" for a in words[head + 1:]))
+
+
+def _kept_commands(top):
+    """The ids of the words of the commands whose assignments the shell keeps for the rest of the text,
+    from shell_commands' top list: at the top level (not in (...), $(...) or `...`, which are subshells),
+    not piped or put in the background, not behind && / || (`P=x && ...` is fine), led by no reserved word
+    but `{`, and not inside an if / while / until / for / select / case block or a function's body
+    (`f() { ...; }`, `function f { ...; }`). A plain `{ ...; }` group runs in this shell and keeps them,
+    unless it is itself piped, put in the background or behind && / ||. A block left open is read as
+    one that doesn't keep them."""
+    opens, kept, stack = _shell_blocks(top), set(), []
+    for i, (words, before, after) in enumerate(top):
+        if words[0] in SHELL_BLOCK_ENDS and stack:
+            stack.pop()
+        stack += opens[i]
+        lead = words[:_command_head(words)]
+        if (before in SHELL_OK_BEFORE and after in SHELL_OK_AFTER and all(b[0] == "group" for b in stack)
+                and all(w == "{" or ASSIGNMENT.match(w) for w in lead)):
+            kept.add(id(words))
+    return kept
+
+
+# The operators around a command (shell_commands' top list) that leave it run in this shell, as it is.
+SHELL_OK_BEFORE, SHELL_OK_AFTER = (None, ";", "\n"), (None, ";", "\n", "&&", "||")
+
+
+def _shell_blocks(top):
+    """Per command of shell_commands' top list, the blocks it opens, outermost first, each [kind, the index
+    of the command opening it, of the one ending it (None if left open), its opening word]: kind "func" for
+    a function's body (`f() { ...; }`, `function f { ...; }`, `f() for ...`), "group" for a `{ ...; }` the
+    shell runs as it is, in this shell (not piped, put in the background or behind && / ||), "{" for any
+    other `{`, "block" for an if / while / until / for / select / case."""
+    opens, stack, func = [], [], False
+    for i, (words, before, after) in enumerate(top):
+        if words[0] in SHELL_BLOCK_ENDS and stack:
+            stack.pop()[2] = i
+        mine, k = [], 0
+        while k < len(words):
+            w = words[k]
+            if w == "{" or w in SHELL_BLOCKS:
+                block, func = ["func" if func else w if w == "{" else "block", i, None, w], False
+                mine.append(block)
+                stack.append(block)
+            elif w == "function":
+                func, k = True, k + 1  # `function f {`: f is its name
+            elif w not in SHELL_LEADS:
+                break
+            k += 1
+        opens.append(mine)
+        func = after == "(" or (words[0] == "function" and not mine)  # `f() {`, `f()` + newline + `{`, `function f` + newline + `{`
+    for block in [b for mine in opens for b in mine]:  # a group the shell runs as it is, in this shell
+        if (block[0] == "{" and block[2] is not None and top[block[1]][1] in SHELL_OK_BEFORE
+                and top[block[2]][2] in SHELL_OK_AFTER):
+            block[0] = "group"
+    return opens
+
+
+def _shell_flow(cmds, top, levels=()):
+    """What expand_vars needs, reading only the assignments the shell keeps, to read loop and function
+    bodies as the shell runs them (T-274), from shell_commands' commands, top list and levels: "starts",
+    per index into cmds, the loop and function bodies starting there, outermost first, each (kind as
+    _shell_blocks gives it, the index of its last command, its opening word, the function's name);
+    "sets", per name the text defines a function by, the names its bodies, and the functions they call,
+    may set (_may_set), None for any; "any", what any of them may set; "stable", the names the text sets
+    in one command alone, whose value a function body has wherever it's called once that one ran, but
+    the shell's own (SHELL_SET_NAMES); "hooks", whether a function may run ahead of any command (a zsh
+    hook or trap function, bash's command_not_found_handle, `trap`, `add-zsh-hook`, a zsh
+    `*_functions` hook array)."""
+    at = {id(words): j for j, (words, _) in enumerate(cmds)}
+    starts, sets, calls, bodies = {}, {}, {}, []
+    for lvl, found in [(top, cmds)] + list(levels):
+        if not lvl:
+            continue
+        idx = [at[id(words)] for words, _, _ in lvl]
+        first = [at[id(found[0][0])]] + [j + 1 for j in idx]  # where each command's own substitutions start
+        for words, _, after in lvl:
+            head = _command_head(words)
+            named = [words[k + 1] for k in range(min(head, len(words) - 1)) if words[k] == "function"]
+            if after == "(" and IDENT.fullmatch(words[-1]) and words[-1] not in SHELL_BLOCKS | SHELL_LEADS:
+                named.append(words[-1])  # `f() ...`
+            sets.update({n: set() for n in named})
+        for mine in _shell_blocks(lvl):
+            for kind, s, e, w in mine:
+                if kind == "func" or w in SHELL_LOOPS:
+                    end, name = idx[len(lvl) - 1 if e is None else e], None
+                    if kind == "func":
+                        name = _function_name(lvl, s)
+                        bodies.append((name, first[s], end))
+                    starts.setdefault(first[s], []).append((kind, end, w, name))
+    for found in starts.values():  # the outermost, ending last, first
+        found.sort(key=lambda b: -b[1])
+    names = dict.fromkeys({n for words, _ in cmds for n, _, _ in _env_assignments(words)} | {""})
+
+    def join(a, b):  # None is any name
+        return None if a is None or b is None else a | b
+
+    for name, lo, hi in bodies:
+        for words, docs in cmds[lo:hi + 1]:
+            sets[name] = join(sets.get(name, set()), _may_set(words, docs, names))
+            head = _command_head(words)
+            if head < len(words) and words[head] in sets:
+                calls.setdefault(name, set()).add(words[head])
+    unnamed = sets.pop(None, set())  # a body whose name wasn't read: any call may run it
+    sets = {n: join(v, unnamed) for n, v in sets.items()}
+    changed = True
+    while changed:  # what the functions a function calls set, it sets
+        changed = False
+        for n in sets:
+            for m in calls.get(n, ()):
+                if (new := join(sets[n], sets.get(m, set()))) != sets[n]:
+                    sets[n], changed = new, True
+    every = unnamed
+    for v in sets.values():
+        every = join(every, v)
+    counts = {}
+    for words, docs in cmds:
+        got = _may_set(words, docs, names)
+        if got is None:
+            counts = None
+            break
+        for n in got:
+            counts[n] = counts.get(n, 0) + 1
+    stable = set() if counts is None else {n for n, c in counts.items() if c == 1 and n not in SHELL_SET_NAMES
+                                            and not n.startswith(("BASH", "ZSH"))}
+    hooks = any(SHELL_HOOK_FUNCS.fullmatch(f) for f in sets) or any(
+        any(re.search(r"_functions\b", w) for w in words)
+        or ((h := _command_head(words)) < len(words) and _program(words[h]) in ("trap", "add-zsh-hook"))
+        for words, _ in cmds)
+    return {"starts": starts, "sets": sets, "any": every, "stable": stable, "hooks": hooks}
+
+
+def _function_name(lvl, s):
+    """The name of the function whose body command s of a top list opens: `function f {` names it on
+    that line, `f() {` and `function f` + newline + `{` on the one before. None if neither does."""
+    words = lvl[s][0]
+    lead = range(min(_command_head(words), len(words) - 1))
+    name = next((words[k + 1] for k in lead if words[k] == "function"), None)
+    if name is None and s:
+        prev, _, after = lvl[s - 1]
+        if after == "(":
+            name = prev[-1]
+        elif prev[0] == "function" and len(prev) > 1:
+            name = prev[1]
+    return name
+
+
+def _may_set(words, docs, names):
+    """The names a simple command, as the text shows it, may set (T-274), or None for any: its
+    assignments and what _unread_sets finds (names, a dict holding "", to match zsh's setters
+    against: "" back means any), or any where it runs text as code in this shell, makes a nameref or
+    a tie, sets a name built at run time (_dynamic_name), or its program is an expansion."""
+    head = _command_head(words)
+    if (_runs_text_here(words) or _ref_links(words) != [] or _dynamic_name(words)
+            or (head < len(words) and _unseen(words[head]))):
+        return None
+    got = {n for n, _, _ in _env_assignments(words)} | set(_unread_sets(words, docs, names))
+    return None if "" in got else got
 
 
 def human_cmd(cmd):
@@ -1841,15 +2237,28 @@ def human_cmd(cmd):
     alias or a command-valued config key it sets) are checked as commands, as are the ones it runs
     from the environment a command line sets for it (env_commands: GIT_PAGER=..., GIT_EDITOR=...,
     GIT_CONFIG_PARAMETERS=..., GIT_CONFIG_KEY_<n>=... GIT_CONFIG_VALUE_<n>=...). A variable assigned
-    earlier in the same text is read as its value (expand_vars: `V=approve; ergon $V`); an ergon
+    earlier in the same text is read as its value (expand_vars: `V=approve; ergon $V`), once with
+    every assignment and once with only those the shell keeps (`(E=echo); $E approve`, T-270); an ergon
     call whose verb is still an expansion (`ergon $X`, `ergon $(cat f)`), or a command whose program
     is one ahead of a human-only verb (`$E approve`), runs a verb the guard can't see and counts."""
+    top, levels = [], []
     try:
-        cmds = shell_commands(cmd)[0]
+        cmds = shell_commands(cmd, top=top, levels=levels)[0]
     except (ValueError, RecursionError):
         return bool(HUMAN_CMD.search(cmd))
-    split, whole = expand_vars(cmds), expand_vars(cmds, split=False)  # `$V` and `"$V"`: either may be meant
-    return _runs_human(cmd, split) or (whole != split and _runs_human(cmd, whole))
+    kept, flow, seen = _kept_commands(top), _shell_flow(cmds, top, levels), []
+    # `$V` and `"$V"`: either may be meant. Every assignment, and only those the shell keeps (T-270),
+    # with loop and function bodies read as the shell runs them (T-274).
+    for split, keep in ((True, None), (False, None), (True, kept), (False, kept)):
+        try:
+            view = expand_vars(cmds, split, keep, flow)
+        except RecursionError:  # loop and function bodies nested too deep to read: what they run is unseen
+            return True
+        if view not in seen:
+            if _runs_human(cmd, view):
+                return True
+            seen.append(view)
+    return False
 
 
 def _runs_human(cmd, cmds):
@@ -1864,7 +2273,7 @@ def _runs_human(cmd, cmds):
             return True
         if any(human_cmd(t) for t in git_commands(words)):
             return True
-        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        head = _command_head(words)  # `{ $E approve; }`, `builtin $E approve` (T-249)
         for k, w in enumerate(words):
             ergon = _program(w) in ("ergon", "ergon.py") or w.endswith("ergon/__main__.py")
             if not ergon and not (k == head and _unseen(w)):
@@ -1967,8 +2376,9 @@ def _allow_protocol_reason(words, vals):
     variable as a `:` list of the protocols it allows, so `ext` in it (or a value the text doesn't hold)
     turns the ext:: transport on. It counts where git inherits it: ahead of a git call, alone or
     exported, or ahead of a shell that may run one; ahead of another program it's data. vals holds
-    the value set so far, for `+=`."""
-    head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+    the value set so far, for `+=`. The program is found past reserved words and wrappers
+    (_command_head: `{ export GIT_ALLOW_PROTOCOL=ext; }`, `builtin export ...`), T-268."""
+    head = _command_head(words)
     prog = _program(words[head]) if head < len(words) else ""
     inherits = (head == len(words) or prog in SHELL_DECLARE or (CODE_RUNNER.fullmatch(prog) is not None and prog != "env")
                 or any(True for _ in _git_calls(words)))
@@ -2116,8 +2526,6 @@ def git_config_reason(cmd):
 # too and which a profile or script often sets from another variable.
 GIT_ONLY_ENV = {n for n in GIT_COMMAND_ENV if n.startswith("GIT_")}
 GIT_ONLY_ENV_IN = re.compile(r"\b(?:" + "|".join(sorted(GIT_ONLY_ENV, key=len, reverse=True)) + r")\b")
-# Programs that set the variables they name to a value from their input.
-ENV_FROM_INPUT = {"read", "mapfile", "readarray"}
 
 
 # What git_env_reason may read a `$NAME` in a git command variable's value as (T-241). The bash and zsh
@@ -2159,6 +2567,14 @@ NAME_READS = {"read", "mapfile", "readarray"}
 NAME_READ_OPT_ARGS = {"read": "du", "mapfile": "dnOsuCc", "readarray": "dnOsuCc"}
 NAME_SETS_ANY = {"vared", "getln", "zparseopts", "zstyle", "zformat", "strftime", "zstat", "sysread", "zselect",
                  "zregexparse", "pcre_match", "zgetattr", "zlistattr", "zsystem"}
+# A word of one of those naming one of git's command variables (T-269): the name alone or with a
+# subscript (`vared GIT_EDITOR`, `vared 'GIT_EDITOR[1,-1]'`), after an option's letters (`strftime
+# -sGIT_EDITOR`) or an `=` (`zparseopts e=GIT_EDITOR`). A style or prompt so named is refused with it.
+NAME_SETS_GIT_ENV = re.compile(r"(?:-[A-Za-z]*|[^=]*=)?(" + "|".join(sorted(GIT_ONLY_ENV, key=len, reverse=True))
+                               + r")(?:\[.*)?", re.S)
+# The options of zsh's print that take a value, the rest of the word or the next one (-v's is the name
+# it sets; builtin.c's optstr "abcC:Df:ilmnNoOpPrRsSu:v:x:X:z-"); printf's only option is -v (bash, zsh).
+PRINT_OPT_ARGS = {"print": "CfuvxX", "printf": "v"}
 # The words ahead of a simple command's program that leave it the program: reserved words that start
 # a command, and the wrappers that run the next word as a builtin (SHELL_RUNS_NEXT).
 SHELL_LEADS = SHELL_RUNS_NEXT | {"{", "if", "then", "else", "elif", "while", "until", "do"}
@@ -2178,6 +2594,82 @@ def indirect_set_msg(cmd):
     return None
 
 
+def _print_var(prog, args):
+    """The word naming the variable `print -v` / `printf -v` sets, or None, with print's options read
+    the way zsh reads them (T-269): flags combine (`print -rv NAME`, `print -rvNAME`), the options that
+    take a value take it first (`print -u 2 -v NAME`, `print -f %s -v NAME`), and `--`, `-`, a word not
+    starting with `-`, one like `-1`, or `-R` without -f (the words after it are echo's) ends them.
+    zsh reads `--v` as `-v`. An option word holding an expansion is returned itself: it may be -v."""
+    takes, seen, j = PRINT_OPT_ARGS[prog], "", 0
+    while j < len(args):
+        a = args[j]
+        j += 1
+        if a in ("--", "-") or not a.startswith("-") or a[1:2].isdigit():
+            return None
+        if _unseen(a):
+            return a
+        a = a[1:] if a.startswith("--") else a
+        for i, c in enumerate(a[1:], 1):
+            seen += c
+            if c in takes:
+                val = a[i + 1:]
+                if not val:
+                    val, j = (args[j] if j < len(args) else ""), j + 1
+                if c == "v":
+                    return val
+                break
+        if prog == "print" and "R" in seen and "f" not in seen:
+            return None
+    return None
+
+
+def _read_names(prog, args):
+    """The words naming the variables read / mapfile / readarray (NAME_READS) sets: past `--`, every
+    word not an option nor an option's value (`-d delim`, `-d:`), zsh's `read 'name?prompt'` without
+    its prompt, and the value of bash's `read -a NAME` / `-aNAME`. A subscript is kept (T-271)."""
+    names, takes, opts, j = [], NAME_READ_OPT_ARGS[prog], True, 0
+    while j < len(args):
+        a = args[j]
+        j += 1
+        if opts and a == "--":
+            opts = False
+        elif opts and a.startswith("-") and len(a) > 1:
+            for i, c in enumerate(a[1:], 1):
+                if c in takes or (prog == "read" and c == "a"):
+                    if i == len(a) - 1:  # its value is the next word: read's -a NAME is read as a name below
+                        j += c != "a"
+                    elif c == "a":
+                        names.append(a[i + 1:])
+                    break
+        else:
+            names.append(a.partition("?")[0] if prog == "read" else a)
+    return names
+
+
+def _command_head(words):
+    """The index of a simple command's program among its words, or len(words) if it has none: past
+    NAME=value words, the reserved words that start a command (`{`, `if`, `then`, `do`, `!`, ...),
+    `function NAME`, and the wrappers that run the next word (`builtin`, `command`, `exec`) with their
+    options (`command -p`, `exec -a NAME`). So `{ export X=v; }`, `if read X` and `builtin printf -v X`
+    are export, read and printf (T-249). After `builtin`, `command`, `exec`, `noglob` or zsh's `-`,
+    bash and zsh run a NAME=value word as the program's name (`command X=1 cmd` sets no X), so it is
+    the program there; after `time`, `!` and zsh's `nocorrect` it is an assignment."""
+    k, wrapper = 0, None
+    while k < len(words):
+        w = words[k]
+        if ASSIGNMENT.match(w) and wrapper in (None, "time", "!", "nocorrect"):
+            k += 1
+        elif w in SHELL_LEADS:
+            k, wrapper = k + 1, (w if w in SHELL_RUNS_NEXT else None)
+        elif w == "function":
+            k += 2  # `function f { ...`: f is its name
+        elif wrapper and w.startswith("-") and w != "-":
+            k += 1 + (wrapper == "exec" and w == "-a")  # `command -p read`, `exec -a name prog`
+        else:
+            break
+    return min(k, len(words))
+
+
 def _dynamic_name(words):
     """How a simple command sets a shell variable whose name the text doesn't show, or None: a name
     with a `$` or backtick expansion given to printf / print -v, read, mapfile, getopts, a declare-like
@@ -2186,46 +2678,17 @@ def _dynamic_name(words):
     zparseopts, ...). A name the text shows is left to the callers' own checks. Its program is found
     past assignments, reserved words (`if`, `{`, `do`), `function NAME` and wrappers (`builtin`,
     `command`), so the body of a function that sets `"$1"` counts (T-242)."""
-    k, after_wrapper = 0, False
-    while k < len(words):
-        w = words[k]
-        if ASSIGNMENT.match(w) and not after_wrapper:
-            k += 1
-        elif w in SHELL_LEADS:
-            k, after_wrapper = k + 1, w in SHELL_RUNS_NEXT
-        elif w == "function":
-            k += 2  # `function f { ...`: f is its name
-        elif after_wrapper and w.startswith("-"):
-            k += 1  # `command -p read`
-        else:
-            break
+    k = _command_head(words)
     if k >= len(words):
         return None
     prog, args = _program(words[k]), words[k + 1:]
     if prog in NAME_SETS_ANY:
         return next((f"`{prog}` sets a variable named by `{a}`" for a in args if _unseen(a)), None)
-    if prog in ("printf", "print"):
-        for j, a in enumerate(args):
-            if a == "--" or not a.startswith("-"):
-                return None
-            if m := re.fullmatch(r"-[A-Za-z]*v(.*)", a, re.S):
-                name = m.group(1) or (args[j + 1] if j + 1 < len(args) else "")
-                return f"`{prog} -v {name}`" if _unseen(name) else None
-        return None
+    if prog in PRINT_OPT_ARGS:
+        name = _print_var(prog, args)
+        return f"`{prog}` sets a variable named by `{name}`" if name is not None and _unseen(name) else None
     if prog in NAME_READS:
-        names, takes, opts, j = [], NAME_READ_OPT_ARGS[prog], True, 0
-        while j < len(args):
-            a = args[j]
-            j += 1
-            if opts and a == "--":
-                opts = False
-            elif opts and a.startswith("-") and len(a) > 1:
-                # `-d delim`, `-d:`: the rest of the word, or the next word, is a value (read -a NAME's is a name)
-                at = next((i for i, c in enumerate(a[1:], 1) if c in takes), None)
-                j += at == len(a) - 1
-            else:
-                names.append(a.partition("?")[0] if prog == "read" else a)  # zsh `read 'name?prompt'`
-        return next((f"`{prog}` sets a variable named by `{a}`" for a in names if _unseen(a)), None)
+        return next((f"`{prog}` sets a variable named by `{a}`" for a in _read_names(prog, args) if _unseen(a)), None)
     if prog == "getopts":
         name = args[1] if len(args) > 1 else ""
         return f"`getopts` sets a variable named by `{name}`" if _unseen(name) else None
@@ -2307,8 +2770,8 @@ def git_env_reason(cmd):
     GIT_SSH_COMMAND, ...) to a value human_cmd can't check, or None. Where env_commands reads an
     assignment (ahead of a program or a git call, alone, exported): a value with a `$` or backtick
     expansion, now or when git runs it through the shell, or a `+=` onto a value the text didn't set.
-    Anywhere: exporting it with no value the text set earlier, `read` / `mapfile` / `printf -v` into
-    it, a `for` / `select` loop over it, a nameref to it, or `${NAME:=value}` with an unseen value (a
+    Anywhere: exporting it with no value the text set earlier, `read` / `mapfile` / `printf -v` /
+    zsh's `print -v` or `vared` (NAME_SETS_ANY) into it, a `for` / `select` loop over it, a nameref to it, or `${NAME:=value}` with an unseen value (a
     value the text shows is checked by human_cmd). Strings run as code are checked too.
     A `$P` / `${P}` in the value is read as the value the text gave P where that's sure to be the one
     git gets (_resolvable_names: `P=cat; GIT_PAGER=$P git log`), and the value it makes, with what an
@@ -2341,6 +2804,10 @@ def git_env_reason(cmd):
                     return why
         if how := _dynamic_name(words):
             return DYNAMIC_NAME_MSG.format(how=how)
+        for name, w in _subscript_assignments(words):  # `GIT_EDITOR[0]=$x`, zsh's `GIT_EDITOR[1]=v git commit` (T-271)
+            if name in GIT_ONLY_ENV:
+                return unseen_env_msg(name, f"`{w}` sets it through a subscript, which may keep part of a value "
+                                      "set outside this command")
         for name, append, val in _env_assignments(words):
             if name in GIT_ONLY_ENV:
                 shown = val
@@ -2361,33 +2828,39 @@ def git_env_reason(cmd):
             if id(words) in sure and name in names:
                 vals[name] = (vals.get(name, "${" + name + "}") if append else "") + _expand_text(val, vals, budget)
         for w in _without_messages(words, assigns=True):
-            for m in re.finditer(r"\$\{(\w+):{0,2}=([^}]*)(\}?)", w):  # zsh's `::=` too
+            # zsh's `::=` too; `${NAME[1]:=v}` sets it through a subscript (T-271)
+            for m in re.finditer(r"\$\{(\w+)(\[[^]}]*\])?:{0,2}=([^}]*)(\}?)", w):
                 if m.group(1) not in GIT_ONLY_ENV:
                     continue
-                if _unseen(m.group(2)) or "{" in m.group(2) or not m.group(3):
+                if m.group(2) or _unseen(m.group(3)) or "{" in m.group(3) or not m.group(4):
                     return unseen_env_msg(m.group(1), f"`{m.group(0)}` sets it to a value it can't read")
-                if human_cmd(m.group(2)):
+                if human_cmd(m.group(3)):
                     return HUMAN_MSG
                 seen.add(m.group(1))
-        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        head = _command_head(words)  # `{ export ...`, `if read ...`, `builtin printf -v ...` (T-249)
         if head == len(words):
             continue
         prog, args = _program(words[head]), words[head + 1:]
         opts = "".join(a[1:] for a in args if re.fullmatch(r"-[A-Za-z]+", a))
+        # `printf -v NAME`, `print -rv NAME`, `print -v 'NAME[1]'`; vared, zparseopts, ... handed NAME (T-269)
+        if prog in PRINT_OPT_ARGS and (name := (_print_var(prog, args) or "").partition("[")[0]) in GIT_ONLY_ENV:
+            return unseen_env_msg(name, f"`{prog} -v` sets it")
+        if prog in NAME_SETS_ANY and (m := next(filter(None, map(NAME_SETS_GIT_ENV.fullmatch, args)), None)):
+            return unseen_env_msg(m.group(1), f"`{prog}` sets it to a value from outside the text")
+        # `read NAME`, `read -r 'NAME[0]'`, zsh's `read 'NAME?prompt'`, `mapfile 'NAME[0]'` (T-271)
+        if prog in NAME_READS and (name := next((n for a in _read_names(prog, args)
+                                                 if (n := a.partition("[")[0]) in GIT_ONLY_ENV), None)):
+            return unseen_env_msg(name, f"`{prog}` sets it from its input")
         for j, a in enumerate(args):
-            if prog in ("declare", "typeset", "local") and "n" in opts and a.partition("=")[2] in GIT_ONLY_ENV:
-                return unseen_env_msg(a.partition("=")[2], f"`{a}` makes a nameref that sets it under another name")
-            if prog == "printf" and a.startswith("-v") and (a[2:] or (args[j + 1] if j + 1 < len(args) else "")) \
-                    in GIT_ONLY_ENV:
-                return unseen_env_msg(a[2:] or args[j + 1], "`printf -v` sets it")
+            target = a.partition("=")[2].partition("[")[0]  # `declare -n r=NAME[0]` too (T-271)
+            if prog in ("declare", "typeset", "local") and "n" in opts and target in GIT_ONLY_ENV:
+                return unseen_env_msg(target, f"`{a}` makes a nameref that sets it under another name")
             if redefines and prog not in SHELL_DECLARE and a.partition("=")[0].removesuffix("+") in GIT_ONLY_ENV:
                 # `alias git=export; git GIT_EDITOR=...`, `git() { read "$1"; }; git GIT_EDITOR` (T-242)
                 return unseen_env_msg(a.partition("=")[0].removesuffix("+"), "a function or alias this command "
                                       f"defines may make `{prog}` set it")
             if a not in GIT_ONLY_ENV:
                 continue
-            if prog in ENV_FROM_INPUT:
-                return unseen_env_msg(a, f"`{prog}` sets it from its input")
             if prog in ("for", "select") and j == 0:
                 return unseen_env_msg(a, f"a `{prog}` loop sets it to each of its words")
             if a not in seen and ((prog == "export" and "n" not in opts)
@@ -2821,7 +3294,7 @@ def config_source_reason(cmd, cwd, _base=None):
         for name, append, val in _env_assignments(words):
             if name in CONFIG_PATH_ENV or name.startswith("GIT_CONFIG_"):
                 local[name] = (None if local.get(name, "") is None else local.get(name, "") + val) if append else val
-        head = next((k for k, w in enumerate(words) if not ASSIGNMENT.match(w)), len(words))
+        head = _command_head(words)  # `{ export HOME=...; }`, `builtin cd ...` (T-268)
         if head == len(words) or _program(words[head]) in SHELL_DECLARE:
             env = local
         if head < len(words) and _program(words[head]) in ("cd", "pushd"):
@@ -3176,7 +3649,9 @@ GIT_LIST_BRANCH = {"-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "
                    "--no-color", "--color"}
 READ_ONLY_ERGON = {"board", "show", "next", "review", "rules", "guide", "check", "audit", "stats", "related"}
 FIND_WRITES = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
-ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+# NAME=value, or with a subscript, NAME[subscript]=value, which bash and zsh read as an assignment too (T-271).
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[.*\])?\+?=", re.S)
+SUBSCRIPT_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\[.*\]\+?=", re.S)
 # Redirects that write nowhere: to /dev/null, or from one descriptor to another (2>&1, >&2, >&-).
 HARMLESS_REDIRECT = re.compile(r"(?:[0-9]*|&)>>?\|?[ \t]*/dev/null(?![^\s;&|()<>])|[0-9]*>&(?:[0-9]+|-)(?![^\s;&|()<>])")
 READ_ONLY_MSG = ("the breakdown agent is read-only: {what}. Read files with Read, Grep and Glob, and run only "

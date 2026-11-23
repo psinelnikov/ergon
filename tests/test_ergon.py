@@ -1314,6 +1314,274 @@ class TestBasics(Project):
         for cmd in ["read -r line", "export \"PATH=$HOME/bin:$PATH\"", "printf -v out %s \"$x\""]:
             self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
 
+    def test_guard_git_command_env_set_behind_reserved_words_and_wrappers(self):
+        """T-249: a literal-name setter (export, declare, read, printf -v, a bare NAME=value, a nameref,
+        a for loop) behind a reserved word that starts a command (`{`, `if`, `then`, `else`, `do`,
+        `while`, `until`, `!`), `function NAME`, or a wrapper that runs the next word (`builtin`,
+        `command`, `exec`) is read as that setter: env_commands / human_cmd check the value it gives a
+        git command variable, and git_env_reason refuses one it can't see. The same words given to
+        echo or after git stay data, and a value the text shows that runs no human-only verb passes."""
+        from ergon.gates import env_commands, git_env_reason, human_cmd, shell_commands
+        leads = ["{ {s}; }", "if {s}; then :; fi", "if true; then {s}; fi", "if x; then :; else {s}; fi",
+                 "while {s}; do :; done", "until {s}; do :; done", "while x; do {s}; done", "! {s}",
+                 "builtin {s}", "command {s}", "command -p {s}", "exec {s}", "exec -a n {s}", "builtin command {s}",
+                 "if ! {s}; then :; fi", "{ { {s}; }; }", "function f { {s}; }; f", "time {s}"]
+
+        def at(lead, s):
+            return lead.replace("{s}", s)
+        for lead in leads:
+            for verb in ["approve", "close", "review -i"]:
+                for s in [f"export GIT_EDITOR='ergon {verb} T-1'", f"declare -x GIT_PAGER='ergon {verb} T-1'",
+                          f"typeset -x GIT_SSH_COMMAND='ergon {verb} T-1'"]:
+                    cmd = at(lead, s) + "; git commit"
+                    self.assertTrue(human_cmd(cmd), cmd)
+                    self.assertTrue(any(human_cmd(t) for t in env_commands(shell_commands(cmd)[0])), cmd)
+            for s in ["export GIT_EDITOR=$x", "export GIT_EDITOR=\"$(cat f)\"", "declare -x GIT_PAGER=`cat f`",
+                      "export GIT_EDITOR", "declare -x GIT_PAGER", "export GIT_EDITOR+=x", "read GIT_EDITOR",
+                      "read -r GIT_PAGER", "mapfile GIT_EDITOR", "printf -v GIT_EDITOR %s x", "printf -vGIT_PAGER x",
+                      "declare -n r=GIT_EDITOR", "local -n r=GIT_PAGER"]:
+                cmd = at(lead, s) + "; git commit"
+                self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        # a bare assignment behind a reserved word (a wrapper would run it as a program's name)
+        for lead in ["{ {s}; }", "if true; then {s}; fi", "while x; do {s}; done", "! {s}", "time {s}"]:
+            cmd = at(lead, "GIT_EDITOR='ergon approve T-1'") + "; git commit"
+            self.assertTrue(human_cmd(cmd), cmd)
+            self.assertIn("can't see", git_env_reason(at(lead, "GIT_EDITOR=$x") + "; git commit") or "", lead)
+        for cmd in ["{ for GIT_EDITOR in a b; do git commit; done; }", "if true; then for GIT_PAGER in a; do :; done; fi"]:
+            self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        # a program that is still an expansion, behind a reserved word or a wrapper, ahead of a human-only verb
+        for cmd in ["{ $E approve T-1; }", "builtin $E approve T-1", "if $E close T-1; then :; fi", "! $E answer T-1",
+                    # bash and zsh run `E=echo` as a program's name after command / builtin / exec / noglob: E stays unset
+                    "command E=echo; $E approve T-1", "builtin E=echo; $E approve T-1", "noglob E=echo; $E approve T-1"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        self.assertFalse(human_cmd("{ E=echo; }; $E approve T-1"))  # braces set E in this shell
+        # what those words leave alone: values the text shows, data, and other names (a function the
+        # text defines may make echo set what it's handed, T-242, so it's left out here)
+        for lead in [x for x in leads if not x.startswith("function")]:
+            for s in ["export GIT_EDITOR=vim", "export GIT_PAGER='less -R'", "declare -x GIT_PAGER=cat",
+                      "echo GIT_EDITOR=$x", "echo export GIT_EDITOR", "read -r line", "printf -v out %s x",
+                      "export PATH=$PATH:/x", "export FOO", "git commit -m GIT_EDITOR=$x"]:
+                cmd = at(lead, s) + "; git log"
+                self.assertIsNone(git_env_reason(cmd), cmd)
+                self.assertFalse(human_cmd(cmd), cmd)
+            cmd = at(lead, "export X='ergon approve T-1'") + "; git log"
+            self.assertFalse(human_cmd(cmd), cmd)  # not a variable git runs
+        # end to end through the hook
+        for cmd in ["{ export GIT_EDITOR='ergon approve T-1'; }; git commit",
+                    "builtin export GIT_PAGER='ergon close T-1'; git log",
+                    "if true; then export GIT_EDITOR='ergon answer T-1'; fi; git commit"]:
+            self.assertIn("human-only", self.guard("Bash", {"command": cmd}) or "", cmd)
+        for cmd in ["builtin export GIT_EDITOR=$x; git commit", "if read GIT_EDITOR; then git commit; fi",
+                    "{ printf -v GIT_PAGER %s x; }; git log", "command export GIT_EDITOR; git commit"]:
+            self.assertIn("can't see", self.guard("Bash", {"command": cmd}) or "", cmd)
+        for cmd in ["{ export GIT_PAGER=cat; }; git log", "if true; then export GIT_EDITOR=vim; fi; git commit",
+                    "builtin echo GIT_EDITOR=$x"]:
+            self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
+
+    def test_guard_human_cmd_reads_only_kept_assignments_as_the_program(self):
+        """T-270: an expansion as the program or the verb is read as a value the text gave it only where
+        the shell keeps that assignment. One made in a subshell, ahead of another program, piped, put in
+        the background, behind && / ||, or in a block or function body that may not run leaves the name
+        with its outside value, so `$E approve` is refused as it is with E never set. Every assignment is
+        still read too, so what that reading refuses stays refused."""
+        from ergon.gates import expand_vars, human_cmd, shell_commands, _kept_commands
+        for cmd in ["(E=echo); $E approve T-1", "(E=echo)\n$E approve T-1", "$(E=echo); $E approve T-1",
+                    "echo `E=echo`; $E approve T-1", "X=1 E=echo true; $E approve T-1", "E=echo true; $E close T-1",
+                    "E=x export F=y; $E approve T-1", "E=echo | cat; $E approve T-1", "E=echo & $E approve T-1",
+                    "false && E=echo; $E approve T-1", "true || E=echo; $E reject T-1",
+                    "if false; then E=echo; fi; $E approve T-1", "if false; then\nE=echo\nfi\n$E approve T-1",
+                    "while false; do E=echo; done; $E approve T-1", "f() { E=echo; }; $E approve T-1",
+                    "f()\n{\nE=echo\n}\n$E approve T-1", "function f { E=echo; }; $E approve T-1",
+                    "false && { E=echo; }; $E approve T-1", "{ E=echo; } | cat; $E approve T-1",
+                    "local E=echo; $E approve T-1", "declare -n E=F; $E approve T-1",
+                    "E=echo; (E=ergon); $E approve T-1", "E=foo; X=1 E=echo true; $E approve T-1",
+                    "(V=status); ergon $V T-1", "X=1 V=board true; ergon $V T-1", "(V='ergon approve'); $V T-1"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["E=echo; $E approve T-1", "E=echo\n$E approve T-1", "E=echo && $E approve T-1",
+                    "E=echo || true; $E approve T-1", "export E=echo; $E approve T-1", "declare E=echo; $E approve T-1",
+                    "readonly E=echo; $E approve T-1", "{ E=echo; }; $E approve T-1", "{ { E=echo; }; }; $E approve T-1",
+                    "(cd x); E=echo; $E approve T-1", "if true; then :; fi; E=echo; $E approve T-1",
+                    "f() { E=x; }; E=echo; $E approve T-1", "V=board; ergon $V", "(V=x); ergon show T-1"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+        # what's read with every assignment still counts: an outside value is unknown either way
+        self.assertTrue(human_cmd("X=1 P='ergon approve T-1' true; GIT_PAGER=$P git log"))
+        top = []
+        cmds = shell_commands("(E=echo); X=1 E=echo true; $E approve T-1", top=top)[0]
+        self.assertEqual(expand_vars(cmds)[-1][0], ["echo", "approve", "T-1"])
+        self.assertEqual(expand_vars(cmds, kept=_kept_commands(top))[-1][0], ["$E", "approve", "T-1"])
+
+    def test_guard_human_cmd_forgets_a_value_a_later_command_changes(self):
+        """T-272: once a command gives a name a value the guard doesn't read (read, mapfile, printf /
+        print -v, getopts, a for / select / foreach loop, unset, zsh's vared and other setters, a
+        subscript assignment, `${NAME:=value}`), expand_vars reads the name as unknown again, so `$E` as
+        the program ahead of a human-only verb, or as ergon's verb, is refused. A name the text sets
+        again afterwards, and a command that sets some other name, leave it as it was."""
+        from ergon.gates import human_cmd
+        for cmd in ["E=echo; read E; $E approve T-1", "E=echo; for E in ergon; do $E approve T-1; done",
+                    "E=echo; printf -v E ergon; $E approve T-1", "E=echo; unset E; $E approve T-1",
+                    "V=show; read V; ergon $V T-1", "E=echo; for E (ergon) $E approve T-1",
+                    "E=echo; foreach E (ergon); $E approve T-1; end",
+                    "E=echo; select E in ergon; do $E approve T-1; done",
+                    "E=echo; while read -r E; do $E approve T-1; done", "E=echo; mapfile E; $E approve T-1",
+                    "E=echo; readarray -t E; $E approve T-1", "E=echo; getopts a E; $E approve T-1",
+                    "E=echo; print -rv E ergon; $E approve T-1", "E=echo; vared E; $E approve T-1",
+                    "E=echo; strftime -sE %s 0; $E approve T-1", "E=echo; zparseopts e=E; $E approve T-1",
+                    "E=echo; unset -v E; $E approve T-1", "E=echo; unset 'E[0]'; $E approve T-1",
+                    "E=echo; unset -m 'E*'; $E approve T-1", "E=echo; read 'E?x'; $E approve T-1",
+                    "E=echo; read -a E; $E approve T-1", "E=echo; read -d : E; $E approve T-1",
+                    'E=echo; read "$x"; $E approve T-1', "E=echo; N=E; read $N; $E approve T-1",
+                    "E=echo; for a E in x ergon; do $E approve T-1; done",
+                    "E=echo; E[1,-1]=ergon; $E approve T-1", "E=echo; printf -v 'E[1]' x; $E approve T-1",
+                    "E=; : ${E:=ergon}; $E approve T-1", "E=; : ${E::=ergon}; $E approve T-1",
+                    "E=; : ${E[1]:=ergon}; $E approve T-1", "E=echo; : ${(L)E::=ergon}; $E approve T-1",
+                    "E=; cat <<X\n${E:=ergon}\nX\n$E approve T-1", "E=echo; builtin read E; $E approve T-1",
+                    "E=echo; { read E; }; $E approve T-1", "E=echo; if read E; then $E approve T-1; fi",
+                    "E=echo; read E; E+=x; $E approve T-1",
+                    # read in a subshell leaves the value the text gave, which is still read too
+                    "P='ergon approve T-1'; (read P); bash -c \"$P\"",
+                    "P='ergon approve T-1'; false && unset P; bash -c \"$P\""]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["E=echo; $E approve T-1", "read line; E=echo; $E approve T-1",
+                    "E=echo; read E; E=echo; $E approve T-1", "E=echo; read F; $E approve T-1",
+                    "E=echo; unset -f E; $E approve T-1", "E=echo; for x in a; do :; done; $E approve T-1",
+                    "V=show; while read -r id; do ergon $V $id; done", "for id in T-1 T-2; do ergon show $id; done",
+                    "E=echo; printf '%s' -v E; $E approve T-1", "E=echo; print -- -v E; $E approve T-1",
+                    "E=echo; : ${F:=x}; $E approve T-1", "E=echo; vared line; $E approve T-1",
+                    "E=echo; getopts a opt; $E approve T-1", "E=echo; echo read E; $E approve T-1",
+                    "E=echo; read -d E x; $E approve T-1",
+                    "for ((i=0;i<2;i++)); do :; done; E=echo; $E approve T-1"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+
+    def test_guard_human_cmd_forgets_values_eval_source_and_namerefs_change(self):
+        """T-273: eval, source / `.` and zsh's `emulate -c` run text the guard reads as data in this shell,
+        so every value is unknown after one; an assignment (or read, unset, ...) through a nameref or a
+        zsh `typeset -T` tie sets the name it's linked to, so that name's value is unknown after one,
+        and after eval / source or a nameref whose name is an expansion any name may be linked. A value
+        set again afterwards, and a name nothing links, keep what the text gave them."""
+        from ergon.gates import human_cmd
+        for cmd in ["E=echo; eval E=ergon; $E approve T-1", "E=echo; source f; $E approve T-1",
+                    "F=echo; declare -n R=F; R=ergon; $F approve T-1", "E=echo; . ./f; $E approve T-1",
+                    "E=echo; builtin eval E=ergon; $E approve T-1", "E=echo; command source f; $E approve T-1",
+                    "E=echo; (eval E=ergon); $E approve T-1", "E=echo; if true; then eval E=ergon; fi; $E approve T-1",
+                    "E=echo; emulate sh -c E=ergon; $E approve T-1", "V=show; eval V=approve; ergon $V T-1",
+                    "E=echo; typeset -T E e; e=(ergon); $E approve T-1",
+                    "E=echo; typeset -T E e; e[1]=ergon; $E approve T-1",
+                    "E=echo; typeset -T X E; X=ergon; $E approve T-1",
+                    "F=echo; local -n R=F; R=ergon; $F approve T-1", "F=echo; typeset -n R=F; R=ergon; $F approve T-1",
+                    "F=echo; declare -gn R=F; R=ergon; $F approve T-1", "F=echo; nameref R=F; R=ergon; $F approve T-1",
+                    "F=echo; declare -n R=F; read R; $F approve T-1", "F=echo; declare -n R=F; unset R; $F approve T-1",
+                    "F=echo; declare -n R=F; printf -v R ergon; $F approve T-1",
+                    "F=echo; declare -n R=F; for R in ergon; do $F approve T-1; done",
+                    "F=echo; declare -n R=F; R+=x; $F approve T-1", "F=echo; declare -n R=F; : ${R:=ergon}; $F approve T-1",
+                    "F=echo; declare -n R=F; (R=ergon); $F approve T-1",
+                    "F=echo; declare -n R=F; R=x; F=ergon; $R approve T-1",
+                    "F=echo; declare -n R=F; declare -n Q=R; Q=ergon; $F approve T-1",
+                    "F=echo; declare -n R='F[0]'; R=ergon; $F approve T-1",
+                    "F=echo; declare -n R; R=F; R=ergon; $F approve T-1",
+                    "F=echo; declare -n R=$x; R=ergon; $F approve T-1",
+                    "F=echo; declare -$o R=F; R=ergon; $F approve T-1",
+                    'F=echo; declare "$o" R=F; R=ergon; $F approve T-1',
+                    'eval "declare -n R=F"; F=echo; R=ergon; $F approve T-1',
+                    "source f; F=echo; R=ergon; $F approve T-1"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["E=echo; $E approve T-1", "E=echo; eval true; ergon show T-1",
+                    "eval true; E=echo; $E approve T-1", "source f; E=echo; $E approve T-1",
+                    "E=echo; eval E=x; E=echo; $E approve T-1", "E=echo; echo eval E=x; $E approve T-1",
+                    "E=echo; ./source; $E approve T-1", "E=echo; emulate zsh; $E approve T-1",
+                    "declare -n R=F; E=echo; $E approve T-1", "E=echo; declare -n R=F; R=ergon; $E approve T-1",
+                    "F=echo; declare -n R=F; E=x; $F approve T-1", "E=echo; typeset -T P p; p=(x); $E approve T-1",
+                    "E=echo; declare -n R=F; read line; $E approve T-1",
+                    "source venv/bin/activate; ergon show T-1", 'eval "$(ssh-agent)"; ergon list']:
+            self.assertFalse(human_cmd(cmd), cmd)
+
+    def test_guard_human_cmd_reads_loop_and_function_bodies_as_they_run(self):
+        """T-274: a loop's body runs again with the values set later in it, so it is read again until
+        they stay (inside a subshell or $(...) too); a function's body runs where it's called, so it is
+        read with only the values the text sets once, and a call (or an expansion as the program, or any
+        command once a hook or trap may run one) leaves unknown what that function, and the ones it
+        calls, may set. A function never called, and a loop that sets nothing, change nothing."""
+        from ergon.gates import human_cmd
+        for cmd in ["E=echo; for x in 1 2; do $E approve T-1; E=ergon; done",
+                    "E=echo; f() { $E approve T-1; }; E=ergon; f", "f() { E=ergon; }; E=echo; f; $E approve T-1",
+                    "E=echo\nwhile true\ndo\n$E approve T-1\nE=ergon\ndone",
+                    "V=show; for x in 1 2; do ergon $V T-1; V=approve; done",
+                    "E=echo; until false; do $E approve T-1; unset E; done",
+                    "E=echo; while true; do if true; then $E approve T-1; fi; read E; done",
+                    "E=echo; for x in 1 2; do $E approve T-1; eval E=ergon; done",
+                    "E=echo; for x in 1 2; do for y in 1; do $E approve T-1; done; E=ergon; done",
+                    "E=echo; (for x in 1 2; do $E approve T-1; E=ergon; done)",
+                    "E=echo; echo $(for x in 1 2; do $E approve T-1; E=ergon; done)",
+                    "E=echo; f() for x in 1 2; do $E approve T-1; E=ergon; done; f",
+                    "f() { E=ergon; }; E=echo; for x in 1 2; do $E approve T-1; f; done",
+                    "function f { E=ergon; }; E=echo; f; $E approve T-1",
+                    "function f\n{\nE=ergon\n}\nE=echo\nf\n$E approve T-1",
+                    "f() { E=ergon; }; g() { f; }; E=echo; g; $E approve T-1",
+                    "E=echo; g() { f; }; f() { $E approve T-1; }; E=ergon; g",
+                    "E=echo; f() { $E approve T-1; }; read E; f", "E=echo; f() { $E approve T-1; }; E=ergon f",
+                    "E=echo; f() { $E approve T-1; }; export E=ergon; f",
+                    "V=show; f() { ergon $V T-1; }; V=approve; f",
+                    "f() { E=ergon; }; E=echo; $F; $E approve T-1",
+                    "chpwd() { E=ergon; }; E=echo; cd /; $E approve T-1",
+                    "f() { E=ergon; }; trap f DEBUG; E=echo; $E approve T-1"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["E=echo; $E approve T-1", "for id in T-1 T-2; do ergon show $id; done",
+                    "f() { E=x; }; E=echo; $E approve T-1", "f() { E=x; }; E=echo; g() { :; }; g; $E approve T-1",
+                    "V=show; for id in T-1 T-2; do ergon $V $id; done", "V=show; f() { ergon $V T-1; }; f",
+                    "V=show; while read -r id; do ergon $V $id; done", "E=echo; f() { :; }; f; $E approve T-1",
+                    "f() { ergon show \"$1\"; }; f T-1; f T-2", "for f in *.py; do grep -n approve $f; done",
+                    "while read -r l; do echo \"$l\"; done < x; ergon list"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+
+    def test_guard_git_command_env_set_by_zsh_print_and_vared(self):
+        """T-269: zsh's `print -v NAME` (its flags combined, `-rv`, or after an option's value, `-f %s`)
+        and `vared NAME` (and zsh's other setters, NAME_SETS_ANY) set a git command variable to a value
+        the text doesn't show, as `printf -v` does, so git_env_reason refuses them with the name written
+        out, behind a reserved word or wrapper too. print's other uses, and a name print only prints
+        (after `--`, `-R`, or as a value), pass."""
+        from ergon.gates import git_env_reason
+        for cmd in ["print -v GIT_EDITOR x; git commit", "print -rv GIT_EDITOR x; git commit",
+                    "print -rvGIT_PAGER x; git log", "print -n -v GIT_EDITOR vim; git commit",
+                    "print -f %s -v GIT_PAGER cat; git log", "print --v GIT_EDITOR x; git commit",
+                    "print -v 'GIT_EDITOR[1,-1]' vim; git commit", "vared GIT_EDITOR; git commit",
+                    "vared -p 'editor: ' GIT_PAGER; git log", "vared 'GIT_EDITOR[1]'; git commit",
+                    "zparseopts -A GIT_EDITOR a; git commit", "zparseopts e=GIT_EDITOR; git commit",
+                    "strftime -sGIT_PAGER %s 0; git log", "{ print -rv GIT_EDITOR x; }; git commit",
+                    "builtin print -v GIT_PAGER x; git log", "if vared GIT_EDITOR; then git commit; fi"]:
+            self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        self.assertIn("named by `-$o`", git_env_reason("print -$o GIT_EDITOR x; git commit") or "")
+        for cmd in ['print -r -- "$x"', "print -r -- GIT_EDITOR", "print GIT_EDITOR", "print -n GIT_EDITOR=x",
+                    "print -R -v GIT_EDITOR", "print -v out GIT_EDITOR", "print -rv out \"$x\"", "print -- -v GIT_EDITOR",
+                    "printf '%s' -v GIT_EDITOR", "vared line", "echo vared GIT_EDITOR; git commit"]:
+            self.assertIsNone(git_env_reason(cmd), cmd)
+        self.assertIn("can't see", self.guard("Bash", {"command": "print -rv GIT_EDITOR x; git commit"}) or "")
+        self.assertIsNone(self.guard("Bash", {"command": 'print -r -- "$x"'}))
+
+    def test_guard_git_command_env_set_through_a_subscript(self):
+        """T-271: `NAME[0]` is the scalar itself in bash, and zsh's `NAME[1]=v` / `NAME[1,-1]=v` sets part or all
+        of an exported scalar and keeps the rest. So read / mapfile into one of git's command variables with a
+        subscript (or zsh's `read 'NAME?prompt'`, bash's `read -aNAME`), a subscripted assignment where an
+        assignment counts (alone, ahead of a program, export / declare), `${NAME[1]:=v}` and a nameref to
+        `NAME[0]` are refused. A plain assignment the text shows, another array's subscript, and the
+        same words as data pass."""
+        from ergon.gates import git_env_reason
+        for cmd in ["read 'GIT_EDITOR[0]'; git commit", "mapfile 'GIT_PAGER[0]' <f; git log",
+                    "GIT_EDITOR[0]=$x; git commit", "GIT_EDITOR[0]=vim; git commit", "GIT_EDITOR[1]=vim git commit",
+                    "GIT_EDITOR[0]+=x; git commit", "export 'GIT_EDITOR[1]=q'; git commit",
+                    "declare GIT_EDITOR[0]=$x; git commit", "{ GIT_EDITOR[0]=$x; }; git commit",
+                    "read -r 'GIT_EDITOR[1,-1]'; git commit", "read 'GIT_EDITOR?editor: '; git commit",
+                    "read -aGIT_EDITOR; git commit", "read -ra GIT_EDITOR; git commit",
+                    "readarray -t 'GIT_PAGER[0]' <f; git log", "if read 'GIT_EDITOR[0]'; then git commit; fi",
+                    ": ${GIT_EDITOR[1]:=vim}; git commit", "declare -n r=GIT_EDITOR[0]; r=$x; git commit"]:
+            self.assertIn("can't see", git_env_reason(cmd) or "", cmd)
+        self.assertIn("named by `$x`", git_env_reason('read -a"$x"; git commit') or "")
+        for cmd in ["GIT_EDITOR=vim git commit", "GIT_EDITOR=vim; git commit", "arr[0]=$x", "arr[0]=$x; git commit",
+                    "a[1]=x b=2 git log", "echo GIT_EDITOR[0]=$x", "git commit -m 'GIT_EDITOR[0]=$x'",
+                    "read -d GIT_EDITOR line", "read -r line; git log", "mapfile -t lines <f; git log",
+                    ": ${GIT_EDITOR:=vim}; git commit"]:
+            self.assertIsNone(git_env_reason(cmd), cmd)
+        self.assertIn("can't see", self.guard("Bash", {"command": "GIT_EDITOR[0]=$x; git commit"}) or "")
+        self.assertIsNone(self.guard("Bash", {"command": "arr[0]=$x; git status"}))
+
     def test_guard_refuses_unseen_git_url_config(self):
         """T-226: a remote's or submodule's URL key (GIT_URL_KEYS) runs an ext:: URL as a command, so
         T-060's unseen-value checks cover it: set through --config-env, GIT_CONFIG_KEY_<n> /
@@ -1435,6 +1703,50 @@ class TestBasics(Project):
                               ("Edit", {"old_string": "[core]", "new_string": add + "[core]"})]:
                 why = self.guard(tool, dict(inp, file_path=str(p)))
                 self.assertEqual(why is None, ok, (tool, header, val, why))
+
+    def test_protocol_and_config_path_env_behind_reserved_words_and_wrappers(self):
+        """T-268: a GIT_ALLOW_PROTOCOL or config-path (GIT_CONFIG_GLOBAL, HOME, ...) assignment behind a
+        reserved word (`{`, `if ... then`, `!`) or a wrapper (`builtin`, `command`) is read past them
+        (_command_head), as T-249 reads git command variables: `{ export GIT_ALLOW_PROTOCOL=ext; }; git
+        fetch` is refused like the same command without the braces, and so is a `builtin cd` into another
+        repository. The same words given to echo, or a value without ext, still pass."""
+        from ergon.gates import config_source_reason, git_config_reason
+        leads = ["{ {s}; }", "builtin {s}", "command {s}", "if true; then {s}; fi", "! {s}", "{ { {s}; }; }",
+                 "builtin command {s}"]
+        for lead in leads:
+            for s in ["export GIT_ALLOW_PROTOCOL=ext", "declare -x GIT_ALLOW_PROTOCOL=file:ext",
+                      "export GIT_ALLOW_PROTOCOL=$P", "export GIT_ALLOW_PROTOCOL+=:ext"]:
+                for cmd in [lead.replace("{s}", s), lead.replace("{s}", s) + "; git fetch o"]:
+                    self.assertIn("GIT_ALLOW_PROTOCOL", git_config_reason(cmd) or "", cmd)
+                    self.assertTrue(self.guard("Bash", {"command": cmd}), cmd)
+        for cmd in ["{ GIT_ALLOW_PROTOCOL=ext; }; git fetch o", "if true; then GIT_ALLOW_PROTOCOL=ext; fi; git fetch o"]:
+            self.assertIn("GIT_ALLOW_PROTOCOL", git_config_reason(cmd) or "", cmd)
+        for cmd in ["{ export GIT_ALLOW_PROTOCOL=file:https; }; git fetch o", "builtin export GIT_ALLOW_PROTOCOL=ssh",
+                    "{ GIT_ALLOW_PROTOCOL=ext echo hi; }", "builtin echo GIT_ALLOW_PROTOCOL=ext",
+                    "{ echo GIT_ALLOW_PROTOCOL=ext; }; git fetch o", "command env GIT_ALLOW_PROTOCOL=ext ls"]:
+            self.assertIsNone(git_config_reason(cmd), cmd)
+        # config paths: an alias running a human-only verb in a file the agent picked, or another repository
+        root = self.root
+        alias = "[alias]\n\tx = !ergon approve T-1\n"
+        (root / "evil.inc").write_text(alias)
+        (root / "h").mkdir()
+        (root / "h" / ".gitconfig").write_text(alias)
+        (root / "xdg" / "git").mkdir(parents=True)
+        (root / "xdg" / "git" / "config").write_text(alias)
+        sh("git", "init", "-q", "--bare", "bare", cwd=root)
+        (root / "bare" / "config").write_text("[core]\n\tbare = true\n" + alias)
+        for lead in leads:
+            for s in [f"export GIT_CONFIG_GLOBAL={root / 'evil.inc'}", "export HOME=h", "declare -x HOME=h",
+                      f"export XDG_CONFIG_HOME={root / 'xdg'}", "export GIT_DIR=bare", "cd bare"]:
+                cmd = lead.replace("{s}", s) + "; git x"
+                self.assertIn("human-only", config_source_reason(cmd, str(root)) or "", cmd)
+                self.assertTrue(self.guard("Bash", {"command": cmd}), cmd)
+            for s in ["export GIT_CONFIG_GLOBAL=\"$F\"", "export HOME=$D", "cd \"$D\"; git -C sub"]:
+                cmd = lead.replace("{s}", s) + "; git x"
+                self.assertTrue(config_source_reason(cmd, str(root)), cmd)
+        for cmd in ["{ export HOME=/tmp/nowhere-t268; }; git status", "builtin cd tasks && git status",
+                    "{ cd tasks; }; git status", "{ HOME=h ls; }; git status", "builtin echo HOME=h; git status"]:
+            self.assertIsNone(config_source_reason(cmd, str(root)), cmd)
 
     def test_guard_refuses_unseen_git_url_arguments(self):
         """T-236: git runs an ext:: URL given as clone's, fetch's, push's, ... repository argument

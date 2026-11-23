@@ -552,6 +552,8 @@ def task_li(t, tasks, extra=""):
         flags.append(f'<span class=park>{esc(park_mark(t))}</span>')
     if t.get("epic"):
         flags.append(f'<a href="/e/{esc(t["epic"])}">{esc(t["epic"])}</a>')
+    if who := _tasks.held_elsewhere(t):
+        flags.append(f"held on {esc(who)}")
     if t["status"] == "ready" and not _tasks.deps_done(t, tasks):
         waits = [d for d in t.get("depends") or [] if tasks.get(d, {}).get("status") != "done"]
         flags.append("waits on " + link_ids(esc(",".join(waits)), tasks))
@@ -853,7 +855,8 @@ def task_page(tid, nonce):
          f'<h1>{esc(tid)} {esc(t.get("title"))}</h1>',
          f'<p><span class="status st-{esc(t["status"])}">{esc(t["status"])}</span> · '
          f'<span class=tier>{esc(t.get("tier"))}</span> <span class=tier>{esc(_tasks.category(t))}</span>'
-         + (f' · <span class=park>{esc(park_mark(t))}</span>' if park_mark(t) else "") + '</p>']
+         + (f' · <span class=park>{esc(park_mark(t))}</span>' if park_mark(t) else "")
+         + (f' · <span class=flags>held on {esc(who)}</span>' if (who := _tasks.held_elsewhere(t)) else "") + '</p>']
 
     if _tasks.is_asking(t):
         b.append("<h2>Open questions</h2>")
