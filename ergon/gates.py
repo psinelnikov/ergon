@@ -1809,7 +1809,7 @@ def _expand_word(word, vals, budget, split):
     return [f for f in fields if f]
 
 
-def expand_vars(cmds, split=True):
+def expand_vars(cmds, split=True, kept=None):
     """The commands of shell_commands with the variables assigned earlier in the same text resolved
     (T-228): `V=x; prog $V` reads as `prog x`, and `P='prog x'; GIT_PAGER=$P git log` sets GIT_PAGER
     to `prog x`. The lexer has dropped the quotes, so it can't tell `$V` from `"$V"`: split says how
@@ -1817,18 +1817,94 @@ def expand_vars(cmds, split=True):
     the shell's or a program's environment (_env_assignments) is recorded once its own command's
     expansions are resolved, in text order. A `+=` onto a name the text didn't set keeps the outside
     part as `${NAME}`, and a value holding an expansion the guard can't resolve keeps it, so what it
-    can't see still reads as an expansion. Where the shell doesn't keep an assignment (a subshell,
-    `X=1 cmd`) it's kept anyway: a value resolved where the shell has none can only add a refusal.
-    A variable the text never sets ($HOME) stays as it is, and so does everything past MAX_EXPANDED."""
+    can't see still reads as an expansion. A variable the text never sets ($HOME) stays as it is, and
+    so does everything past MAX_EXPANDED.
+    With kept None, every assignment is recorded, even where the shell doesn't keep it (a subshell,
+    `X=1 cmd`, a branch that may not run): that value may be the one a program inherits (env_commands).
+    With kept, the ids of the commands whose assignments the shell keeps (_kept_commands), only a
+    lone NAME=value or an option-less export / declare / typeset / readonly of one of those is
+    recorded, and any other assignment makes the name unknown again, as the shell reads it: in
+    `(E=echo); $E approve` or `X=1 E=echo true; $E approve`, $E keeps its outside value (T-270).
+    human_cmd reads the text both ways: a value resolved where the shell has none can hide a refusal
+    as well as add one (`$E` as the program or the verb is refused only while it can't be seen)."""
     vals, out, budget = {}, [], [MAX_EXPANDED]
     for words, docs in cmds:
+        keeps = kept is None or _keeps_assignments(words, kept)
         if vals:
             words = [f for w in words for f in _expand_word(w, vals, budget, split)]
             docs = [(_expand_text(d, vals, budget) if expands else d, expands) for d, expands in docs]
         for name, append, val in _env_assignments(words):
-            vals[name] = (vals.get(name, "${" + name + "}") if append else "") + val
+            if keeps:
+                vals[name] = (vals.get(name, "${" + name + "}") if append else "") + val
+            else:
+                vals.pop(name, None)
         out.append((words, docs))
     return out
+
+
+# The builtins whose NAME=value arguments set a variable for the rest of the text when run at the top
+# level (local only sets one in a function).
+SHELL_KEEPS = {"export", "declare", "typeset", "readonly"}
+# The reserved words that open a block whose body may not run, may run more than once, or (a function's)
+# runs later or never: what's assigned in it may not be what the rest of the text sees. And what ends one.
+SHELL_BLOCKS = {"if", "while", "until", "for", "select", "case"}
+SHELL_BLOCK_ENDS = {"}", "fi", "done", "esac"}
+
+
+def _keeps_assignments(words, kept):
+    """Whether the shell keeps the NAME=value words of a command among kept (_kept_commands) for the
+    rest of the text: they are all its words (`E=echo`, `{ E=echo; }`), or the arguments of an
+    export / declare / typeset / readonly with no options and no NAME=value ahead of it. Ahead of a
+    program (`X=1 E=echo true`, `E=x export F=y`) they only set that program's environment."""
+    if id(words) not in kept:
+        return False
+    head = _command_head(words)
+    if head == len(words):
+        return True
+    return (_program(words[head]) in SHELL_KEEPS and not any(ASSIGNMENT.match(w) for w in words[:head])
+            and not any(a[:1] in "-+" for a in words[head + 1:]))
+
+
+def _kept_commands(top):
+    """The ids of the words of the commands whose assignments the shell keeps for the rest of the text,
+    from shell_commands' top list: at the top level (not in (...), $(...) or `...`, which are subshells),
+    not piped or put in the background, not behind && / || (`P=x && ...` is fine), led by no reserved word
+    but `{`, and not inside an if / while / until / for / select / case block or a function's body
+    (`f() { ...; }`, `function f { ...; }`). A plain `{ ...; }` group runs in this shell and keeps them,
+    unless it is itself piped, put in the background or behind && / ||. A block left open is read as
+    one that doesn't keep them."""
+    ok_before, ok_after = (None, ";", "\n"), (None, ";", "\n", "&&", "||")
+    opens, stack, func = [], [], False  # per command the blocks it opens, each [kind, its command, its end]
+    for i, (words, before, after) in enumerate(top):
+        if words[0] in SHELL_BLOCK_ENDS and stack:
+            stack.pop()[2] = i
+        mine, k = [], 0
+        while k < len(words):
+            w = words[k]
+            if w == "{" or w in SHELL_BLOCKS:
+                block, func = ["func" if func else w if w == "{" else "block", i, None], False
+                mine.append(block)
+                stack.append(block)
+            elif w == "function":
+                func, k = True, k + 1  # `function f {`: f is its name
+            elif w not in SHELL_LEADS:
+                break
+            k += 1
+        opens.append(mine)
+        func = after == "(" or (words[0] == "function" and not mine)  # `f() {`, `f()` + newline + `{`, `function f` + newline + `{`
+    for block in [b for mine in opens for b in mine]:  # a group the shell runs as it is, in this shell
+        if block[0] == "{" and block[2] is not None and top[block[1]][1] in ok_before and top[block[2]][2] in ok_after:
+            block[0] = "group"
+    kept, stack = set(), []
+    for i, (words, before, after) in enumerate(top):
+        if words[0] in SHELL_BLOCK_ENDS and stack:
+            stack.pop()
+        stack += opens[i]
+        lead = words[:_command_head(words)]
+        if (before in ok_before and after in ok_after and all(b[0] == "group" for b in stack)
+                and all(w == "{" or ASSIGNMENT.match(w) for w in lead)):
+            kept.add(id(words))
+    return kept
 
 
 def human_cmd(cmd):
@@ -1842,15 +1918,24 @@ def human_cmd(cmd):
     alias or a command-valued config key it sets) are checked as commands, as are the ones it runs
     from the environment a command line sets for it (env_commands: GIT_PAGER=..., GIT_EDITOR=...,
     GIT_CONFIG_PARAMETERS=..., GIT_CONFIG_KEY_<n>=... GIT_CONFIG_VALUE_<n>=...). A variable assigned
-    earlier in the same text is read as its value (expand_vars: `V=approve; ergon $V`); an ergon
+    earlier in the same text is read as its value (expand_vars: `V=approve; ergon $V`), once with
+    every assignment and once with only those the shell keeps (`(E=echo); $E approve`, T-270); an ergon
     call whose verb is still an expansion (`ergon $X`, `ergon $(cat f)`), or a command whose program
     is one ahead of a human-only verb (`$E approve`), runs a verb the guard can't see and counts."""
+    top = []
     try:
-        cmds = shell_commands(cmd)[0]
+        cmds = shell_commands(cmd, top=top)[0]
     except (ValueError, RecursionError):
         return bool(HUMAN_CMD.search(cmd))
-    split, whole = expand_vars(cmds), expand_vars(cmds, split=False)  # `$V` and `"$V"`: either may be meant
-    return _runs_human(cmd, split) or (whole != split and _runs_human(cmd, whole))
+    kept, seen = _kept_commands(top), []
+    # `$V` and `"$V"`: either may be meant. Every assignment, and only those the shell keeps (T-270).
+    for split, keep in ((True, None), (False, None), (True, kept), (False, kept)):
+        view = expand_vars(cmds, split, keep)
+        if view not in seen:
+            if _runs_human(cmd, view):
+                return True
+            seen.append(view)
+    return False
 
 
 def _runs_human(cmd, cmds):

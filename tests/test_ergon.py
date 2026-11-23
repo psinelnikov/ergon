@@ -1378,6 +1378,38 @@ class TestBasics(Project):
                     "builtin echo GIT_EDITOR=$x"]:
             self.assertIsNone(self.guard("Bash", {"command": cmd}), cmd)
 
+    def test_guard_human_cmd_reads_only_kept_assignments_as_the_program(self):
+        """T-270: an expansion as the program or the verb is read as a value the text gave it only where
+        the shell keeps that assignment. One made in a subshell, ahead of another program, piped, put in
+        the background, behind && / ||, or in a block or function body that may not run leaves the name
+        with its outside value, so `$E approve` is refused as it is with E never set. Every assignment is
+        still read too, so what that reading refuses stays refused."""
+        from ergon.gates import expand_vars, human_cmd, shell_commands, _kept_commands
+        for cmd in ["(E=echo); $E approve T-1", "(E=echo)\n$E approve T-1", "$(E=echo); $E approve T-1",
+                    "echo `E=echo`; $E approve T-1", "X=1 E=echo true; $E approve T-1", "E=echo true; $E close T-1",
+                    "E=x export F=y; $E approve T-1", "E=echo | cat; $E approve T-1", "E=echo & $E approve T-1",
+                    "false && E=echo; $E approve T-1", "true || E=echo; $E reject T-1",
+                    "if false; then E=echo; fi; $E approve T-1", "if false; then\nE=echo\nfi\n$E approve T-1",
+                    "while false; do E=echo; done; $E approve T-1", "f() { E=echo; }; $E approve T-1",
+                    "f()\n{\nE=echo\n}\n$E approve T-1", "function f { E=echo; }; $E approve T-1",
+                    "false && { E=echo; }; $E approve T-1", "{ E=echo; } | cat; $E approve T-1",
+                    "local E=echo; $E approve T-1", "declare -n E=F; $E approve T-1",
+                    "E=echo; (E=ergon); $E approve T-1", "E=foo; X=1 E=echo true; $E approve T-1",
+                    "(V=status); ergon $V T-1", "X=1 V=board true; ergon $V T-1", "(V='ergon approve'); $V T-1"]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["E=echo; $E approve T-1", "E=echo\n$E approve T-1", "E=echo && $E approve T-1",
+                    "E=echo || true; $E approve T-1", "export E=echo; $E approve T-1", "declare E=echo; $E approve T-1",
+                    "readonly E=echo; $E approve T-1", "{ E=echo; }; $E approve T-1", "{ { E=echo; }; }; $E approve T-1",
+                    "(cd x); E=echo; $E approve T-1", "if true; then :; fi; E=echo; $E approve T-1",
+                    "f() { E=x; }; E=echo; $E approve T-1", "V=board; ergon $V", "(V=x); ergon show T-1"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+        # what's read with every assignment still counts: an outside value is unknown either way
+        self.assertTrue(human_cmd("X=1 P='ergon approve T-1' true; GIT_PAGER=$P git log"))
+        top = []
+        cmds = shell_commands("(E=echo); X=1 E=echo true; $E approve T-1", top=top)[0]
+        self.assertEqual(expand_vars(cmds)[-1][0], ["echo", "approve", "T-1"])
+        self.assertEqual(expand_vars(cmds, kept=_kept_commands(top))[-1][0], ["$E", "approve", "T-1"])
+
     def test_guard_git_command_env_set_by_zsh_print_and_vared(self):
         """T-269: zsh's `print -v NAME` (its flags combined, `-rv`, or after an option's value, `-f %s`)
         and `vared NAME` (and zsh's other setters, NAME_SETS_ANY) set a git command variable to a value
