@@ -1410,6 +1410,48 @@ class TestBasics(Project):
         self.assertEqual(expand_vars(cmds)[-1][0], ["echo", "approve", "T-1"])
         self.assertEqual(expand_vars(cmds, kept=_kept_commands(top))[-1][0], ["$E", "approve", "T-1"])
 
+    def test_guard_human_cmd_forgets_a_value_a_later_command_changes(self):
+        """T-272: once a command gives a name a value the guard doesn't read (read, mapfile, printf /
+        print -v, getopts, a for / select / foreach loop, unset, zsh's vared and other setters, a
+        subscript assignment, `${NAME:=value}`), expand_vars reads the name as unknown again, so `$E` as
+        the program ahead of a human-only verb, or as ergon's verb, is refused. A name the text sets
+        again afterwards, and a command that sets some other name, leave it as it was."""
+        from ergon.gates import human_cmd
+        for cmd in ["E=echo; read E; $E approve T-1", "E=echo; for E in ergon; do $E approve T-1; done",
+                    "E=echo; printf -v E ergon; $E approve T-1", "E=echo; unset E; $E approve T-1",
+                    "V=show; read V; ergon $V T-1", "E=echo; for E (ergon) $E approve T-1",
+                    "E=echo; foreach E (ergon); $E approve T-1; end",
+                    "E=echo; select E in ergon; do $E approve T-1; done",
+                    "E=echo; while read -r E; do $E approve T-1; done", "E=echo; mapfile E; $E approve T-1",
+                    "E=echo; readarray -t E; $E approve T-1", "E=echo; getopts a E; $E approve T-1",
+                    "E=echo; print -rv E ergon; $E approve T-1", "E=echo; vared E; $E approve T-1",
+                    "E=echo; strftime -sE %s 0; $E approve T-1", "E=echo; zparseopts e=E; $E approve T-1",
+                    "E=echo; unset -v E; $E approve T-1", "E=echo; unset 'E[0]'; $E approve T-1",
+                    "E=echo; unset -m 'E*'; $E approve T-1", "E=echo; read 'E?x'; $E approve T-1",
+                    "E=echo; read -a E; $E approve T-1", "E=echo; read -d : E; $E approve T-1",
+                    'E=echo; read "$x"; $E approve T-1', "E=echo; N=E; read $N; $E approve T-1",
+                    "E=echo; for a E in x ergon; do $E approve T-1; done",
+                    "E=echo; E[1,-1]=ergon; $E approve T-1", "E=echo; printf -v 'E[1]' x; $E approve T-1",
+                    "E=; : ${E:=ergon}; $E approve T-1", "E=; : ${E::=ergon}; $E approve T-1",
+                    "E=; : ${E[1]:=ergon}; $E approve T-1", "E=echo; : ${(L)E::=ergon}; $E approve T-1",
+                    "E=; cat <<X\n${E:=ergon}\nX\n$E approve T-1", "E=echo; builtin read E; $E approve T-1",
+                    "E=echo; { read E; }; $E approve T-1", "E=echo; if read E; then $E approve T-1; fi",
+                    "E=echo; read E; E+=x; $E approve T-1",
+                    # read in a subshell leaves the value the text gave, which is still read too
+                    "P='ergon approve T-1'; (read P); bash -c \"$P\"",
+                    "P='ergon approve T-1'; false && unset P; bash -c \"$P\""]:
+            self.assertTrue(human_cmd(cmd), cmd)
+        for cmd in ["E=echo; $E approve T-1", "read line; E=echo; $E approve T-1",
+                    "E=echo; read E; E=echo; $E approve T-1", "E=echo; read F; $E approve T-1",
+                    "E=echo; unset -f E; $E approve T-1", "E=echo; for x in a; do :; done; $E approve T-1",
+                    "V=show; while read -r id; do ergon $V $id; done", "for id in T-1 T-2; do ergon show $id; done",
+                    "E=echo; printf '%s' -v E; $E approve T-1", "E=echo; print -- -v E; $E approve T-1",
+                    "E=echo; : ${F:=x}; $E approve T-1", "E=echo; vared line; $E approve T-1",
+                    "E=echo; getopts a opt; $E approve T-1", "E=echo; echo read E; $E approve T-1",
+                    "E=echo; read -d E x; $E approve T-1",
+                    "for ((i=0;i<2;i++)); do :; done; E=echo; $E approve T-1"]:
+            self.assertFalse(human_cmd(cmd), cmd)
+
     def test_guard_git_command_env_set_by_zsh_print_and_vared(self):
         """T-269: zsh's `print -v NAME` (its flags combined, `-rv`, or after an option's value, `-f %s`)
         and `vared NAME` (and zsh's other setters, NAME_SETS_ANY) set a git command variable to a value

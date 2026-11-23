@@ -1839,6 +1839,10 @@ def expand_vars(cmds, split=True, kept=None):
     lone NAME=value or an option-less export / declare / typeset / readonly of one of those is
     recorded, and any other assignment makes the name unknown again, as the shell reads it: in
     `(E=echo); $E approve` or `X=1 E=echo true; $E approve`, $E keeps its outside value (T-270).
+    With kept, a name a command sets to a value the guard doesn't read (`read E`, `for E in ...`,
+    `printf -v E`, `unset E`: _unread_sets) is unknown again from there on, wherever that command
+    runs (T-272). With kept None it keeps its value: where the command doesn't run in this shell
+    (`(read P); bash -c "$P"`) that value is the one the shell uses, and what it refuses stays refused.
     human_cmd reads the text both ways: a value resolved where the shell has none can hide a refusal
     as well as add one (`$E` as the program or the verb is refused only while it can't be seen)."""
     vals, out, budget = {}, [], [MAX_EXPANDED]
@@ -1852,8 +1856,51 @@ def expand_vars(cmds, split=True, kept=None):
                 vals[name] = (vals.get(name, "${" + name + "}") if append else "") + val
             else:
                 vals.pop(name, None)
+        for name in _unread_sets(words, docs, vals) if kept is not None else ():
+            vals.pop(name, None)
         out.append((words, docs))
     return out
+
+
+def _unread_sets(words, docs, vals):
+    """The names among vals a simple command (its variables resolved) may give a value expand_vars
+    doesn't read, so that it reads them as unknown again (T-272): `read` / `mapfile` / `readarray`
+    (_read_names), `printf -v` / zsh's `print -v` (_print_var), `getopts`, a `for` / `select` /
+    `foreach` loop's names, `unset` (not `-f`), zsh's setters (NAME_SETS_ANY) handed the name, a
+    subscript assignment (`E[1,-1]=x`, which may keep part of the value), and `${NAME:=value}` /
+    `${NAME=value}` / zsh's `${NAME::=value}`, in a word or a heredoc the shell expands. Where the name
+    such a command sets is itself an expansion (`read "$x"`, `unset -m 'E*'`, `${!x:=v}`), or a word
+    holds zsh's `${(flags)...}`, which may set any name, all of vals."""
+    names = [n for n, _ in _subscript_assignments(words)]
+    for t in words + [d for d, expands in docs if expands]:
+        if INDIRECT_SET.search(t) or "${(" in t or t.endswith("${"):  # the lexer splits zsh's `${(L)E:=x}` at `(`
+            return list(vals)
+        names += re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?:\[[^]}]*\])?:{0,2}=", t)
+    head = _command_head(words)
+    prog, args = (_program(words[head]), words[head + 1:]) if head < len(words) else ("", [])
+    if prog in NAME_READS:
+        names += _read_names(prog, args)
+    elif prog in PRINT_OPT_ARGS:
+        names += [n for n in [_print_var(prog, args)] if n is not None]
+    elif prog == "getopts":
+        names += args[1:2]
+    elif prog in ("for", "select", "foreach"):
+        names += [a for a in args[:next((j for j, a in enumerate(args) if a in ("in", "do", "(")), len(args))]
+                  if not a.startswith("((")]
+    elif prog == "unset":
+        opts = "".join(a[1:] for a in args if a.startswith("-"))
+        if "m" in opts:
+            return list(vals)
+        if "f" not in opts:
+            names += [a for a in args if not a.startswith("-")]
+    elif prog in NAME_SETS_ANY:
+        if any(_unseen(a) for a in args):
+            return list(vals)
+        names += [n for n in vals if any(re.fullmatch(r"(?:-[A-Za-z]*|[^=]*=)?" + n + r"(?:\[.*)?", a, re.S)
+                                         for a in args)]
+    if any(_unseen(n) for n in names):
+        return list(vals)
+    return [n.partition("[")[0] for n in names]
 
 
 # The builtins whose NAME=value arguments set a variable for the rest of the text when run at the top
