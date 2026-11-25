@@ -15,6 +15,14 @@ components, as arrays of tables so that config.mini_toml reads it on Pythons wit
     fns = ["guard_reason"]                       # optional: the functions that implement it
     introduced_by = "T-136"                      # optional: the task that creates it
 
+    [[ignore]]
+    id = "packaging"
+    files = ["ergon/__init__.py"]                # tracked files no component needs to cover
+
+Coverage (T-278): the leading directory of every component `files` pattern that names one is a
+root; `ergon check` warns about each tracked file under a root that matches no component's or
+[[ignore]] entry's `files` (config.protect_hit). No git, or no repo, skips it quietly.
+
 A task's `concepts:` frontmatter lists component ids. `ergon tag` writes it: one `claude -p` per
 batch of BATCH tasks, run like `grade` with no tools from an empty folder, picks from the map's
 ids, and any other id in its reply is dropped. Matching words alone tags too much ("approve"
@@ -62,6 +70,7 @@ function-level touch never exempts its file.
 """
 import re
 import secrets
+import subprocess
 
 from . import config as _config
 from . import gitops as _gitops
@@ -77,6 +86,8 @@ ID = re.compile(r"[A-Za-z0-9][\w.-]*")  # fits a one-line frontmatter list: no c
 TASK_ID = re.compile(r"T-\d{3,}")
 CONCERN_KEYS = {"id", "label"}
 COMPONENT_KEYS = {"id", "label", "concern", "files", "terms", "fns", "introduced_by"}
+IGNORE_KEYS = {"id", "label", "files"}
+GLOB = set("*?[")
 
 PROMPT = """You are tagging task briefs for a software project with the components of its concept \
 map, so that tasks about the same part of the system can be found together. Below is the map, \
@@ -117,16 +128,16 @@ def as_list(v):
 # ---------- the map ----------
 
 def check_map(raw):
-    """(map, errors) for a parsed map file. map is {"concerns": {id: {...}}, "components": {id: {...}}}
-    with every well-formed entry; errors says what isn't. Task IDs in introduced_by are not
-    looked up here (lint does, with the tasks)."""
+    """(map, errors) for a parsed map file. map is {"concerns": {id: {...}}, "components": {id: {...}},
+    "ignore": {id: {...}}} with every well-formed entry; errors says what isn't. Task IDs in
+    introduced_by are not looked up here (lint does, with the tasks)."""
     errs = []
-    concerns, comps = {}, {}
+    concerns, comps, ignore = {}, {}, {}
     if not isinstance(raw, dict):
-        return {"concerns": concerns, "components": comps}, ["not a TOML table"]
+        return {"concerns": concerns, "components": comps, "ignore": ignore}, ["not a TOML table"]
     for k in raw:
-        if k not in ("concern", "component"):
-            errs.append(f"unknown key {k!r}: the map holds [[concern]] and [[component]] tables only")
+        if k not in ("concern", "component", "ignore"):
+            errs.append(f"unknown key {k!r}: the map holds [[concern]], [[component]] and [[ignore]] tables only")
 
     def entries(kind):
         v = raw.get(kind) or []
@@ -184,7 +195,23 @@ def check_map(raw):
             comps[cid] = {"id": cid, "concern": c["concern"], "label": str(c.get("label") or ""),
                           "files": [x.strip("/") for x in c["files"]], "terms": list(c["terms"]),
                           "fns": list(c.get("fns") or []), "introduced_by": intro or None}
-    return {"concerns": concerns, "components": comps}, errs
+    for n, c in enumerate(entries("ignore"), 1):
+        iid = c.get("id") if isinstance(c, dict) else None
+        where = f"[[ignore]] #{n}" + (f" ({iid})" if isinstance(iid, str) else "")
+        if not isinstance(iid, str) or not ID.fullmatch(iid):
+            errs.append(f"{where}: needs an id: letters, digits, '.', '_' or '-'")
+            continue
+        if iid in ignore:
+            errs.append(f"{where}: duplicate ignore id {iid}")
+            continue
+        bad = sorted(set(c) - IGNORE_KEYS)
+        if bad:
+            errs.append(f"{where}: unknown key(s) {', '.join(bad)}")
+        if "files" not in c or not strs(c["files"]):
+            errs.append(f"{where}: files must be a list of strings")
+            continue
+        ignore[iid] = {"id": iid, "label": str(c.get("label") or ""), "files": [x.strip("/") for x in c["files"]]}
+    return {"concerns": concerns, "components": comps, "ignore": ignore}, errs
 
 
 def read_map(path=None):
@@ -195,9 +222,9 @@ def read_map(path=None):
     try:
         raw = _config.read_config(path, name)
     except FileNotFoundError:
-        return {"concerns": {}, "components": {}}, [f"{name}: no such file ({path})"]
+        return {"concerns": {}, "components": {}, "ignore": {}}, [f"{name}: no such file ({path})"]
     except (OSError, _config.NotConfigured) as err:
-        return {"concerns": {}, "components": {}}, [str(err)]
+        return {"concerns": {}, "components": {}, "ignore": {}}, [str(err)]
     cmap, errs = check_map(raw)
     return cmap, [f"{name}: {e}" for e in errs]
 
@@ -213,6 +240,39 @@ def load(who="ergon"):
         raise SystemExit(f"{who}: the concept map doesn't hold:\n  " + "\n  ".join(errs)
                          + "\n`ergon check` lists every problem")
     return cmap
+
+
+# ---------- coverage ----------
+
+def tracked_files():
+    """The repo's tracked files (one `git ls-files`), or None when git can't be run or this
+    isn't a repo."""
+    try:
+        r = subprocess.run(["git", "-C", str(_config.REPO), "ls-files", "-z"], capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode:
+        return None
+    return [f for f in r.stdout.split("\0") if f]
+
+
+def roots(cmap, files):
+    """The coverage roots: the leading directory of each component `files` pattern that names
+    one (no glob characters, and some tracked file lies under it)."""
+    heads = {p.split("/")[0] for c in cmap["components"].values() for p in c["files"]}
+    heads = {h for h in heads if h and not GLOB & set(h)}
+    under = {f.split("/")[0] for f in files if "/" in f}
+    return sorted(heads & under)
+
+
+def uncovered(cmap, files):
+    """Tracked files under the coverage roots that match no component's `files` and no
+    [[ignore]] pattern (config.protect_hit, as for touches:)."""
+    rs = roots(cmap, files)
+    pats = [p for c in cmap["components"].values() for p in c["files"]]
+    pats += [p for c in cmap.get("ignore", {}).values() for p in c["files"]]
+    return [f for f in files if f.split("/")[0] in rs and "/" in f
+            and not any(_config.protect_hit(f, p) for p in pats)]
 
 
 # ---------- tags ----------
@@ -616,7 +676,8 @@ def related(args):
 def lint(tasks):
     """(errors, warnings) for `ergon check`: the map's problems, introduced_by IDs that name no
     task and an open task's malformed function-level touches are errors; missing depends, tags the
-    map lacks, a dropped introducer and a function the map doesn't list are warnings. Without a
+    map lacks, a dropped introducer, a function the map doesn't list and a tracked file under a
+    coverage root that no component or [[ignore]] entry covers are warnings. Without a
     `concepts` key, only a `hold_by` that doesn't hold, malformed touches and the function-level
     touches that count as their whole file for want of a map."""
     hold = hold_by_problem()
@@ -627,12 +688,15 @@ def lint(tasks):
                for n in fn_notes(t, None)]
         return ([hold] if hold else []) + bad, fns
     cmap, errs = read_map()
+    files = None if errs else tracked_files()  # a map that doesn't hold would report spurious gaps
     if hold:
         errs.append(hold)
     errs += bad
     name = _config.CONCEPTS.name
     warns = [f"{i}: touches: {n}" for i, t in sorted(tasks.items()) if t.get("status") in OPEN
              for n in fn_notes(t, cmap)]
+    warns += [f"{name}: {f}: no [[component]] covers it; add it to a component's files or to an [[ignore]] entry"
+              for f in uncovered(cmap, files or [])]
     for c in cmap["components"].values():
         intro = c["introduced_by"]
         if intro and intro not in tasks:

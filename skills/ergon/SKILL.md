@@ -94,6 +94,11 @@ files = ["ergon/gates.py", "hooks/*.json"]   # fnmatch patterns, like [[protect]
 terms = ["guard", "heredoc"]      # words a brief about it tends to use
 fns = ["guard_reason"]            # optional: the functions that implement it
 introduced_by = "T-136"           # optional: the task that creates it
+
+[[ignore]]
+id = "packaging"                  # same id rules as a component
+files = ["ergon/__init__.py", "ergon/__main__.py"]   # fnmatch patterns no component needs to cover
+label = "Package glue"            # optional
 ```
 
 Don't write `[component."approval.guard"]`: the fallback parser has no quoted or dotted table names, and `check` refuses that shape on every Python. ergon's own map is `concepts.toml` in its repo.
@@ -105,7 +110,7 @@ A task's `concepts:` lists component ids. `ergon tag [ID|E-ID ...] [--all] [--mo
 - done tasks it builds on, ranked by component overlap (Jaccard), the top 5;
 - missing depends: a component it uses whose `introduced_by` task is still open (not done or dropped) and isn't in its `depends:` closure.
 
-`/t/T-NNN` in `ergon serve` shows the same lists. `ergon check` fails a map that doesn't hold (a missing file, an unknown concern, a duplicate id, an `introduced_by` naming a missing task) and only warns on a missing depend, on tags the map lacks and on a dropped `introduced_by`. A missing depend is a lead, not a rule: add the depend if the task really needs that work first. By default scheduling ignores the map and dispatch holds tasks apart by shared `touches:` only; `hold_by = "component"` makes it want a shared component too (Dispatch, "Overlap").
+`/t/T-NNN` in `ergon serve` shows the same lists. `ergon check` fails a map that doesn't hold (a missing file, an unknown concern, a duplicate id, an `introduced_by` naming a missing task) and only warns on a missing depend, on tags the map lacks, on a dropped `introduced_by` and on uncovered files. Coverage: the leading directory of every component `files` pattern that names one (`ergon/gates.py` gives `ergon/`, `agents` gives `agents/`) is a root, and every tracked file under a root (one `git ls-files`) must match some component's `files` or an `[[ignore]]` entry's, the way touches match `[[protect]]`. Each one that doesn't is a `warning:` naming it; add it to a component, or to `[[ignore]]` when it needs none. Files outside the roots aren't checked, and the check is skipped when git can't be run, the folder isn't a repo or the map doesn't hold. Warnings never fail `check` and the Stop hook doesn't show them. A missing depend is a lead, not a rule: add the depend if the task really needs that work first. By default scheduling ignores the map and dispatch holds tasks apart by shared `touches:` only; `hold_by = "component"` makes it want a shared component too (Dispatch, "Overlap").
 
 Function-level touches: an entry may name one function as `<path>/::<fn>` (e.g. `ergon/gates.py/::guard_reason`; one entry per function). The `/` before `::` is on purpose: every file-level rule (`[[protect]]`, `[[accept]]`, `[[evidence]]`, `[[two_person]]`, approval by inheritance) matches a touches entry by its `/`-separated leading parts, so the entry still falls under a rule naming `ergon/gates.py`; plain `ergon/gates.py::guard_reason` would not, so `check` fails it and `set` and dispatch refuse it. A function counts only when the concept map lists it (some component's `fns` has it and one of that component's `files` patterns matches the path); otherwise the entry is refused. Two tasks touching different functions of a file don't overlap; the same function, or a file-level touch of the file, does.
 
