@@ -172,7 +172,7 @@ introduced_by = "T-135"
 [[component]]
 id = "plan.priority"
 concern = "planning"
-files = ["ergon/priority.py", "ergon/tasks.py", "ergon/serve.py", "ergon/grade.py"]
+files = ["ergon/priority.py", "ergon/tasks.py", "ergon/serve.py", "ergon/grade.py", "ergon/fill.py", "ergon/obsidian.py"]
 terms = ["priority", "pin", "grade"]
 
 [[component]]
@@ -209,13 +209,13 @@ terms = [".ergon.toml", "[shared]", "two_person", "remote's url"]
 [[component]]
 id = "ui.serve"
 concern = "visibility"
-files = ["ergon/serve.py", "ergon/serve.css", "ergon/serve.js"]
+files = ["ergon/serve.py", "ergon/serve.css", "ergon/serve.js", "ergon/epic.js", "ergon/timeline.py"]
 terms = ["board", "/review", "review page", "web", "serve", "chart", "colours"]
 
 [[component]]
 id = "ui.stats"
 concern = "visibility"
-files = ["ergon/report.py", "ergon/metrics.py", "ergon/history.py", "ergon/serve.css"]
+files = ["ergon/report.py", "ergon/metrics.py", "ergon/history.py", "ergon/serve.css", "ergon/transcripts.py"]
 terms = ["stats", "report", "metrics", "chart"]
 
 [[component]]
@@ -227,5 +227,11 @@ terms = ["history.jsonl", "history table", "log "]
 [[component]]
 id = "docs"
 concern = "model"
-files = ["README.md", "skills/ergon/SKILL.md", "docs/shared-state.md"]
+files = ["README.md", "skills/ergon/SKILL.md", "skills/task-audit/SKILL.md", "docs/shared-state.md"]
 terms = ["readme", "skill.md", "shared-state.md", "document", "say how", "mention"]
+
+# ---------------------------------------------------------------- no component
+[[ignore]]
+id = "packaging"
+files = ["ergon/__init__.py", "ergon/__main__.py"]
+label = "Package glue"
