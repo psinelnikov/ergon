@@ -62,8 +62,10 @@ Then, in a project:
 ```bash
 ergon init            # writes .ergon.toml, tasks/items, tasks/epics and the .gitignore lines
 ergon init --hooks    # optional, any time: also the git commit-msg hook (next section)
-ergon new epic "Ship the thing"
+ergon new epic "Ship the thing" --why "Users can't ship without it" --when-done "A release goes out with one command"
 ```
+
+`--why` and `--when-done` are optional. Each one's text goes word for word under `## Why` and `## When it's done` in the epic's brief. Leave one out and its section stays empty. `ergon new epic` never prompts and never reads stdin. `ergon new task` refuses both flags.
 
 ## Agents other than Claude Code
 

@@ -1955,6 +1955,37 @@ class TestEpicApproval(Project):
     def epic_file(self, eid="E-001"):
         return next((self.root / "tasks" / "epics").glob(f"{eid}-*/EPIC.md"))
 
+    def test_new_epic_writes_why_and_when_done_word_for_word(self):
+        why = "Reviewers  keep asking: *why* this?  — twice"
+        done = "Every brief says why; and `check` is green."
+        self.ergon("new", "epic", "Big thing", "--why", why, "--when-done", done)
+        text = self.epic_file().read_text()
+        self.assertIn(f"## Why\n\n{why}\n\n## When it's done\n\n{done}\n\n## Goal\n", text)
+        self.ergon("check")
+
+    def test_new_epic_without_flags_leaves_both_empty_and_never_reads_stdin(self):
+        # an agent shell with stdin a pipe nobody writes to or closes: reading it would hang
+        p = subprocess.Popen([sys.executable, str(ERGON), "new", "epic", "Big thing"], cwd=self.root,
+                             env=clean_env(CLAUDECODE="1"), stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(p.wait(timeout=30), 0, p.stderr.read())
+        finally:
+            if p.poll() is None:
+                p.kill()
+            p.stdin.close()
+            p.stdout.close()
+            p.stderr.close()
+        text = self.epic_file().read_text()
+        self.assertIn("## Why\n\n## When it's done\n\n## Goal\n", text)
+
+    def test_new_task_refuses_why_and_when_done(self):
+        for flag in ("--why", "--when-done"):
+            r = self.ergon("new", "task", "Part", "--tier", "haiku", flag, "x", check=False)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("for `ergon new epic` only", r.stderr)
+        self.assertEqual(list((self.root / "tasks" / "items").glob("T-*.md")), [])
+
     def test_an_agents_epic_is_proposed_and_its_tasks_wait_until_a_human_approves_it(self):
         agent = clean_env(CLAUDECODE="1")
         self.ergon("new", "epic", "Big thing", env=agent)

@@ -26,7 +26,9 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                `ergon choose`. In an agent shell a feature (category feature or empty)
                                is refused without a crux and well-formed options; elsewhere plain
                                --option text writes a numbered list
-  ergon new epic "Title"
+  ergon new epic "Title" [--why "<text>"] [--when-done "<text>"]
+                               writes each answer word for word under ## Why / ## When it's done
+                               of the brief; a flag not given leaves its section empty. Never prompts
   ergon import gh#123 [--tier T] [--epic E] [--touches a,b]
                                a GitHub issue (or gh:OWNER/REPO#123) as a proposed task, via the
                                `gh` CLI: title, quoted body as What, source: gh#123. Tier is
@@ -449,6 +451,11 @@ def main():
                          "<regret if>\"; give it 2 to 4 times, one per lens (minimal, durable, operator, risk, defer). "
                          "Writes an ## Options section a human picks from with `ergon choose`. In an agent shell a "
                          "feature (category feature or empty) needs --crux and well-formed options")
+    nw.add_argument("--why", metavar="TEXT",
+                    help="epic: why the person wants it, written word for word under ## Why (refused for a task)")
+    nw.add_argument("--when-done", metavar="TEXT",
+                    help="epic: what they expect to be true once it's done, written word for word under "
+                         "## When it's done (refused for a task)")
     im = sub.add_parser("import", help="a GitHub issue as a proposed task: gh#123 or gh:OWNER/REPO#123")
     im.add_argument("ref", metavar="gh#N")
     im.add_argument("--tier", help="default: human, until someone sizes it")

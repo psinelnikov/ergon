@@ -1181,6 +1181,16 @@ EPIC_BODY = """
 """
 
 
+def epic_body(why=None, when_done=None):
+    """EPIC_BODY with the person's answers written word for word under ## Why and ## When it's done;
+    an answer not given leaves its section empty. Nothing is prompted for and stdin is never read."""
+    body = EPIC_BODY
+    for heading, text in (("## Why\n", why), ("## When it's done\n", when_done)):
+        if text:
+            body = body.replace(heading + "\n", f"{heading}\n{text}\n\n", 1)
+    return body
+
+
 def _parse_lens_flag(text):
     """One `--option "<lens>: <approach> | <optimizes for> | <gives up> | <regret if>"` as a mapping of
     LensOption fields. A text with no `<word>:` prefix gets an empty lens; missing fields stay empty."""
@@ -1193,7 +1203,10 @@ def _parse_lens_flag(text):
 
 
 def new(args):
+    why, when_done = getattr(args, "why", None), getattr(args, "when_done", None)
     if args.kind == "task":
+        if why is not None or when_done is not None:
+            raise SystemExit("--why and --when-done are for `ergon new epic` only: a task has no Why or When it's done")
         if args.tier not in TIERS:
             raise SystemExit(f"--tier must be one of {TIERS}")
         if args.category and args.category not in CATEGORIES:
@@ -1235,7 +1248,7 @@ def new(args):
         home = _config.EPICS / f"{eid}-{slug(args.title)}"
         home.mkdir()
         meta = {"id": eid, "title": args.title, "status": "proposed", "created": today(), "approved": "",
-                "_path": home / _config.EPIC_FILE, "_body": EPIC_BODY}
+                "_path": home / _config.EPIC_FILE, "_body": epic_body(why, when_done)}
         dump(meta, EPIC_KEYS)
         _history.record("created", meta, title=args.title, by="new")
     print(meta["_path"].relative_to(_config.HOME))
