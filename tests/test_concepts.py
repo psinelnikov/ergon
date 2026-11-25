@@ -254,6 +254,109 @@ class TestCheck(ConceptProject):
         self.assertEqual(out.strip(), "")  # a missing depend warns in `check`, never in the hook
 
 
+IGNORE = """
+[[ignore]]
+id = "glue"
+label = "Package glue"
+files = ["ergon/__init__.py"]
+"""
+
+
+class TestIgnoreMap(unittest.TestCase):
+    def test_ignore_parses_without_tomllib(self):
+        with mock.patch.dict(sys.modules, {"tomllib": None}):
+            cmap, errs = C.check_map(_config.mini_toml(MAP + IGNORE, "concepts.toml"))
+        self.assertEqual(errs, [])
+        self.assertEqual(cmap["ignore"], {"glue": {"id": "glue", "label": "Package glue",
+                                                   "files": ["ergon/__init__.py"]}})
+
+    def test_bad_ignore_entries(self):
+        bad = MAP + IGNORE + textwrap.dedent("""
+            [[ignore]]
+            id = "glue"
+            files = ["x"]
+
+            [[ignore]]
+            id = "no files"
+
+            [[ignore]]
+            id = "nofiles"
+            colour = "red"
+        """)
+        cmap, errs = C.check_map(_config.mini_toml(bad))
+        text = "\n".join(errs)
+        self.assertIn("[[ignore]] #2 (glue): duplicate ignore id glue", text)
+        self.assertIn("[[ignore]] #3 (no files): needs an id", text)
+        self.assertIn("[[ignore]] #4 (nofiles): unknown key(s) colour", text)
+        self.assertIn("[[ignore]] #4 (nofiles): files must be a list of strings", text)
+        self.assertEqual(list(cmap["ignore"]), ["glue"])
+        _, errs = C.check_map({"concern": [{"id": "x"}], "ignore": {"a": {"files": []}}})
+        self.assertIn('write each ignore as a [[ignore]] table with id = "...", not [ignore.<id>]', errs)
+
+    def test_roots_and_uncovered(self):
+        cmap, _ = C.check_map(_config.mini_toml(MAP + IGNORE))
+        files = ["README.md", "ergon/gates.py", "ergon/serve.py", "ergon/__init__.py", "ergon/fill.py",
+                 "hooks/hooks.json", "hooks/run.sh", "tests/test_x.py"]
+        self.assertEqual(C.roots(cmap, files), ["ergon", "hooks"])
+        self.assertEqual(C.uncovered(cmap, files), ["ergon/fill.py", "hooks/run.sh"])
+
+    def test_no_git_or_no_repo_lists_nothing(self):
+        with mock.patch.object(C, "subprocess") as sp:
+            sp.run.side_effect = FileNotFoundError("git")
+            self.assertIsNone(C.tracked_files())
+        import tempfile
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(_config, "REPO", Path(d)):
+            self.assertIsNone(C.tracked_files())
+
+
+class TestCoverage(ConceptProject):
+    WARN = "warning: concepts.toml: ergon/fill.py: no [[component]] covers it"
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "ergon").mkdir()
+        for f in ("gates.py", "serve.py", "fill.py"):
+            (self.root / "ergon" / f).write_text("")
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "code", cwd=self.root)
+
+    def test_uncovered_file_warns_once_and_check_passes(self):
+        r = self.ergon("check")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.count("no [[component]] covers it"), 1, r.stdout)
+        self.assertIn(self.WARN, r.stdout)
+
+    def test_ignore_or_a_component_clears_it(self):
+        m = self.root / "concepts.toml"
+        m.write_text(MAP + '\n[[ignore]]\nid = "fill"\nfiles = ["ergon/fill.py"]\n')
+        self.assertNotIn("covers it", self.ergon("check").stdout)
+        m.write_text(MAP.replace('files = ["ergon/serve.py"]', 'files = ["ergon/serve.py", "ergon/fill.py"]'))
+        self.assertNotIn("covers it", self.ergon("check").stdout)
+
+    def test_bad_ignore_fails_check(self):
+        (self.root / "concepts.toml").write_text(MAP + '\n[[ignore]]\nid = "fill"\n')
+        r = self.ergon("check", check=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("concepts.toml: [[ignore]] #1 (fill): files must be a list of strings", r.stdout)
+        self.assertNotIn("covers it", r.stdout)
+
+    def test_stop_hook_stays_empty_with_uncovered_files(self):
+        event = json.dumps({"hook_event_name": "Stop", "cwd": str(self.root)})
+        self.assertEqual(self.ergon("hook", "stop", inp=event).stdout.strip(), "")
+
+    def test_no_git_leaves_check_as_it_was(self):
+        _config.configure(self.root)
+        tasks = T.load(_config.ITEMS)
+        with mock.patch.object(C, "tracked_files", return_value=None):
+            errs, warns = C.lint(tasks)
+        self.assertFalse([w for w in warns if "covers it" in w])
+        errs2, warns2 = C.lint(tasks)
+        self.assertEqual(errs, errs2)
+        self.assertEqual([w for w in warns2 if "covers it" not in w], warns)
+        self.assertIn("concepts.toml: ergon/fill.py: no [[component]] covers it; add it to a component's "
+                      "files or to an [[ignore]] entry", warns2)
+
+
 class TestNoMap(Project):
     def test_without_a_concepts_key_nothing_changes(self):
         self.ergon("new", "task", "One", "--tier", "haiku")
