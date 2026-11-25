@@ -254,10 +254,13 @@ The design choices:
 ## Web board: `ergon serve`
 
 ```bash
-ergon serve                          # http://127.0.0.1:4300/
+ergon serve                          # http://127.0.0.1:4300/ (or the next free port)
+ergon serve ~/code/other             # serve another project's tracker (PATH, default: the cwd)
 ergon serve --port 8080
 ergon serve --bind 100.101.102.103   # your tailscale IP, to read it from your phone
 ```
+
+With no `--port`, it takes the first free port from 4300 up (4301, 4302, ..., up to 4399) and prints the address it chose. An explicit `--port` is never moved: if it's taken, `serve` fails.
 
 A small read-only web view of the same state, served by the standard library's `http.server` with its CSS and JS inlined in each page. It loads nothing from elsewhere. It follows the system's light or dark setting and works at phone width.
 
