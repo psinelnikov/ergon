@@ -10228,6 +10228,20 @@ class TestEpicAnswers(Project):
         self.assertNotIn("## When it's done", journal(one))
         self.assertIn("## Why\nPlanning takes a day.\n## When it's done\n- An hour.\n## Goal\nShip the big thing.\n", journal(both))
 
+    def test_an_empty_section_right_above_the_next_heading_reads_as_empty(self):
+        """A `## Goal` with `## Out of scope` on the very next line is an empty Goal, not the
+        Out of scope text, in the merge message and the journal inputs alike (T-293)."""
+        from ergon import gitops
+        e = self.epic(_body="\n## Goal\n## Out of scope\n- Rewriting old epics.\n## Constraints\n"
+                            "## Notes\n- scratch\n")
+        self.assertEqual(gitops.merge_message(e, {}, []), "Merge E-042: Big thing\n")
+        self.assertEqual(gitops.epic_section(e, "Goal"), "")
+        self.assertEqual(gitops.epic_section(e, "Constraints"), "")
+        self.assertIn("## Goal\n(none)\n## Out of scope\n- Rewriting old epics.\n## Constraints\n(none)\n",
+                      gitops.journal_inputs("E-042", {}, {"E-042": e}, []))
+        last = self.epic(_body="\n## Goal\nShip it.")  # no newline at the end of the body
+        self.assertEqual(gitops.merge_message(last, {}, []), "Merge E-042: Big thing\n\nShip it.\n")
+
 
 class TestEpicAnswersSigned(unittest.TestCase):
     """Shared mode: editing an approved epic's Why or When it's done un-approves it, as with Goal
