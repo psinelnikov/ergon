@@ -152,9 +152,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                read-only: per tier, runs / done / blocked / block rate / cost /
                                timeouts from <state>/runs/*.json, epic breakdown runs and cost from
                                <state>/runs/breakdown/, and tasks that blocked twice+
-  ergon serve [--port 4300] [--bind 127.0.0.1]
+  ergon serve [PATH] [--port N] [--bind 127.0.0.1]
                                read-only web board, task pages (brief, runs, reviews, logs, resume
                                commands) and live dispatch state. GET/HEAD only; writes nothing.
+                               PATH: the project to serve (default: the cwd's). With no --port, the
+                               first free port from 4300 up: run it once per project
                                Any --bind other than loopback warns: there is no login.
                                /review is the page to read before approving proposed tasks
   ergon quiz [--all] [--model sonnet] [--per 2] [--budget USD]
@@ -503,7 +505,8 @@ def main():
     rp = sub.add_parser("report")
     rp.add_argument("--since", metavar="DATE|last", help="YYYY-MM-DD, or `last` for the previous report")
     sv = sub.add_parser("serve", help="read-only web board and task pages")
-    sv.add_argument("--port", type=int, default=_serve.DEFAULT_PORT, help=f"default {_serve.DEFAULT_PORT}")
+    sv.add_argument("path", nargs="?", metavar="PATH", help="a directory in the project to serve (default: the current one)")
+    sv.add_argument("--port", type=int, help=f"default: the first free port from {_serve.DEFAULT_PORT} up")
     sv.add_argument("--bind", default="127.0.0.1",
                     help="address to listen on (default 127.0.0.1); anything but loopback warns: no login")
     qz = sub.add_parser("quiz", help="write /review's comprehension quiz on the proposed tasks (runs claude -p)")
@@ -610,7 +613,7 @@ def main():
     if args.cmd == "guide":
         return guide(args)
     try:
-        _config.configure(need_config=args.cmd != "init")
+        _config.configure(args.path if args.cmd == "serve" else None, need_config=args.cmd != "init")
     except _config.NotConfigured as err:
         raise SystemExit(f"ergon: {err}")
     if args.cmd == "init":

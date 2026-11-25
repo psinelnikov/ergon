@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_ergon import ERGON, Project, stamp  # noqa: E402
+from test_ergon import ERGON, Project, git_init, stamp  # noqa: E402
 from ergon import serve as S  # noqa: E402
 
 HOSTILE = '<script>alert("x")</script> <img src=x onerror=alert(1)> [click](javascript:alert(1))'
@@ -822,11 +823,93 @@ class TestServeUnits(unittest.TestCase):
             S.make_server = real
         self.assertNotIn("WARNING", err.getvalue())
 
+    def free_port(self):
+        with socket.socket() as k:
+            k.bind(("127.0.0.1", 0))
+            return min(k.getsockname()[1], 65000)
+
+    def test_first_free_skips_a_taken_port(self):
+        # 0.0.0.0: macOS would let 127.0.0.1 bind beside it, and take over its URL
+        for other in ("127.0.0.1", "0.0.0.0"):
+            base = self.free_port()
+            with mock.patch.object(S, "DEFAULT_PORT", base), S.make_server(other, base), S.first_free("127.0.0.1") as b:
+                self.assertGreater(b.server_address[1], base, other)
+
+    def test_first_free_gives_up(self):
+        base = self.free_port()
+        with mock.patch.object(S, "DEFAULT_PORT", base), mock.patch.object(S, "PORT_TRIES", 1), \
+                S.make_server("127.0.0.1", base):
+            with self.assertRaisesRegex(OSError, "all in use; pass --port"):
+                S.first_free("127.0.0.1")
+
+    def test_only_a_taken_port_moves_on(self):
+        calls = []
+
+        def refuse(bind, port):
+            calls.append(port)
+            raise OSError("no such address")
+        with mock.patch.object(S, "make_server", refuse), mock.patch.object(S, "answers", lambda *a: False), \
+                self.assertRaisesRegex(OSError, "no such address"):
+            S.first_free("127.0.0.1")
+        self.assertEqual(calls, [S.DEFAULT_PORT])
+
     def test_markdown_passes_no_html(self):
         out = S.markdown("# <h1>x</h1>\n\n```\n<script>\n```\n- <a href=x>y</a>\n1. **<i>z</i>**", {})
         self.assertNotRegex(out, r"<(?!/?(h2|pre|code|ul|ol|li|p|strong|br)\b)")
         self.assertIn("&lt;script&gt;", out)
         self.assertIn("<strong>&lt;i&gt;z&lt;/i&gt;</strong>", out)
+
+
+class TestTwoProjects(ServeFixture):
+    """A second project's board beside the fixture's, both started without a port."""
+
+    def board(self, *args, cwd):
+        p = subprocess.Popen([sys.executable, str(ERGON), "serve", *args], cwd=cwd, env=self.env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(p.stderr.close)
+        self.addCleanup(p.stdout.close)
+        self.addCleanup(p.wait, 10)
+        self.addCleanup(p.kill)
+        line = p.stdout.readline()
+        m = re.search(r"http://127\.0\.0\.1:(\d+)/  \((\w+), read-only", line)
+        if not m:
+            p.kill()
+            self.fail(f"no address in {line!r}: {p.stderr.read()}")
+        return int(m[1]), m[2]
+
+    def test_two_boards(self):
+        other = Path(self.tmp.name).resolve() / "other"
+        git_init(other)
+        self.ergon("init", cwd=other)
+        self.ergon("new", "epic", "Elsewhere", cwd=other)
+        self.ergon("new", "task", "Only in other", "--tier", "haiku", "--epic", "E-001", cwd=other)
+        first, name1 = self.board(cwd=self.root)
+        second, name2 = self.board(str(other), cwd=self.root)  # by PATH, from the first project
+        self.assertEqual((name1, name2), ("proj", "other"))
+        self.assertNotEqual(first, second)
+        self.assertGreaterEqual(min(first, second), S.DEFAULT_PORT)
+        for port, name, mine, theirs in ((first, "proj", "Done thing", "Only in other"),
+                                         (second, "other", "Only in other", "Done thing")):
+            self.port = port
+            for path in ("/", "/review", "/metrics", "/e/E-001", "/t/T-001"):
+                code, _, page = self.req("GET", path)
+                self.assertEqual(code, 200, path)
+                self.assertRegex(page, rf"<title>[^<]* · {name}</title>", path)
+                self.assertRegex(page, rf"<div class=top>(<[^>]*>[^<]*)*<(h1|span class=crumb)>{name}\b", path)
+                self.assertNotIn(theirs, page, path)
+            self.assertIn(mine, self.req("GET", "/t/T-001")[2])
+            self.assertEqual(self.req("POST", "/", body="x=1")[0], 405)
+            self.assertEqual(self.req("GET", "/", host="evil.example")[0], 403)
+
+    def test_explicit_port_taken_is_an_error(self):
+        r = self.ergon("serve", "--port", str(self.port), check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(f"can't listen on 127.0.0.1:{self.port}", r.stderr)
+
+    def test_path_outside_a_project(self):
+        r = self.ergon("serve", str(self.home), check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("isn't inside a git repository", r.stderr)
 
 
 class TestEpicTimeline(ServeFixture):

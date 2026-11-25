@@ -35,8 +35,12 @@ The read-only guarantee:
 - The Host header must be an IP literal or `localhost`, so a DNS-rebinding page can't read the
   board through the browser of someone who has it open.
 - Loopback by default. Any other --bind prints a warning: there is no login.
+
+One process serves one project, the one around PATH (default: the cwd). With no --port it takes
+the first free port from 4300 up, so several projects' boards run side by side.
 """
 import datetime
+import errno
 import hashlib
 import html
 import http.server
@@ -68,6 +72,7 @@ from . import timeline as _timeline
 from . import transcripts as _transcripts
 
 DEFAULT_PORT = 4300
+PORT_TRIES = 100  # with no --port: 4300 to 4399
 LOG_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 EV_NAME = LOG_NAME
 EV_DIR = re.compile(r"T-\d{3,}-evidence")
@@ -522,12 +527,13 @@ def asset(name):
 
 
 def page(title, body, nonce, script=False):
-    """script: False, True (serve.js, the board's live table) or the name of another asset."""
+    """script: False, True (serve.js, the board's live table) or the name of another asset. The
+    project's name ends every title, so tabs of several boards can be told apart."""
     js = f'<script nonce="{nonce}">{asset("serve.js" if script is True else script)}</script>' if script else ""
     return ("<!doctype html><html lang=en><head><meta charset=utf-8>"
             '<meta name=viewport content="width=device-width, initial-scale=1">'
             '<meta name=color-scheme content="light dark">'
-            f"<title>{esc(title)}</title><style nonce=\"{nonce}\">{asset('serve.css')}</style></head>"
+            f"<title>{esc(title)} · {esc(_config.HOME.name)}</title><style nonce=\"{nonce}\">{asset('serve.css')}</style></head>"
             f"<body><main>{body}</main>{js}</body></html>")
 
 
@@ -655,7 +661,7 @@ def board_page(nonce):
         b.append("</tbody></table></div>")
     by_tier = {tier: sum(t.get("tier") == tier for t in open_) for tier in _tasks.TIERS}
     b.append("<footer>open by tier: " + esc("  ".join(f"{k}:{v}" for k, v in by_tier.items())) + "</footer>")
-    return page(f"ergon · {_config.HOME.name}", "".join(b), nonce, script=True)
+    return page("ergon", "".join(b), nonce, script=True)
 
 
 def journal_block(eid, tasks):
@@ -1483,7 +1489,8 @@ def metrics_page(query, nonce):
          "epics": sorted(epics)}
     rows = _history.read()
     m = _metrics.compute(tasks, rows, _config.RUNS, f["since"], f["until"], f["epic"], summary, worktree_of)
-    return page("ergon · metrics", _metrics.render(m, esc, money, f), nonce)
+    head = f'<div class=top><span class=crumb>{esc(_config.HOME.name)}</span></div>'
+    return page("ergon · metrics", head + _metrics.render(m, esc, money, f), nonce)
 
 
 # ---------- HTTP ----------
@@ -1615,17 +1622,43 @@ def make_server(bind, port):
     return cls((bind, port), Handler)
 
 
+def answers(bind, port):
+    """Does something already accept connections where this board would be opened? Binding alone
+    doesn't tell everywhere: on macOS a listener on 0.0.0.0:4300 doesn't stop a bind to
+    127.0.0.1:4300 (or the reverse), and the two would share one URL."""
+    host = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}.get(bind, bind)
+    try:
+        socket.create_connection((host, port), timeout=0.5).close()
+        return True
+    except OSError:
+        return False
+
+
+def first_free(bind):
+    """A server on the first free port from DEFAULT_PORT up. Only "in use" moves on to the next
+    port; any other error (a bad --bind, say) is the caller's to report."""
+    for port in range(DEFAULT_PORT, DEFAULT_PORT + PORT_TRIES):
+        if answers(bind, port):
+            continue
+        try:
+            return make_server(bind, port)
+        except OSError as err:
+            if err.errno != errno.EADDRINUSE:
+                raise
+    raise OSError(errno.EADDRINUSE, f"ports {DEFAULT_PORT} to {DEFAULT_PORT + PORT_TRIES - 1} are all in use; pass --port")
+
+
 def serve(args):
     bind = args.bind
     if not is_loopback(bind):
         print(WARNING.format(bind=bind), file=sys.stderr, flush=True)
     try:
-        srv = make_server(bind, args.port)
+        srv = first_free(bind) if args.port is None else make_server(bind, args.port)
     except OSError as err:
-        raise SystemExit(f"ergon serve: can't listen on {bind}:{args.port}: {err}")
+        raise SystemExit(f"ergon serve: can't listen on {bind}:{DEFAULT_PORT if args.port is None else args.port}: {err}")
     host, port = srv.server_address[:2]
     shown = f"[{host}]" if ":" in host else host
-    print(f"ergon serve: http://{shown}:{port}/  (read-only; Ctrl-C to stop)", flush=True)
+    print(f"ergon serve: http://{shown}:{port}/  ({_config.HOME.name}, read-only; Ctrl-C to stop)", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
