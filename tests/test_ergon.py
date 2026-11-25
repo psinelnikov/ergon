@@ -271,7 +271,9 @@ print(json.dumps({"result": "did it\n" + found + evidence + os.environ.get("FAKE
 
 
 def sh(*cmd, cwd, check=True, env=None, inp=None):
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env, input=inp)
+    # no input: never the terminal the tests run in, where `ergon new epic` would stop to ask
+    stdin = {"stdin": subprocess.DEVNULL} if inp is None else {"input": inp}
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env, **stdin)
     if check and r.returncode:
         raise AssertionError(f"{cmd} failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
     return r
@@ -1947,6 +1949,239 @@ def approve_epic(test, eid="E-001"):
     r = test.ergon("approve", eid, env=clean_env(ERGON_ASK_STDIN="1"), inp="y\n")
     test.assertIn("approved 1", r.stdout)
     return r
+
+
+FAKE_EPIC_CLAUDE = r"""#!PYTHON
+'''Stands in for `claude -p` under `ergon new epic`. Logs what it was told per call to $EPIC_TMP/calls.
+Judges an answer concrete when it contains $EPIC_OK, and otherwise follows up on its words. Every
+reply has more suggestions than may be shown, one of them ranked. $EPIC_RAW replies that instead;
+$EPIC_EXIT exits with that status.'''
+import json, os, sys
+prompt = sys.stdin.read()
+known = json.loads(next(l for l in prompt.splitlines() if l.startswith("{")))
+with open(os.path.join(os.environ["EPIC_TMP"], "calls"), "a") as f:
+    f.write(json.dumps({"argv": sys.argv[1:], "known": known, "cwd": os.listdir(".")}) + "\n")
+if os.environ.get("EPIC_EXIT"):
+    sys.exit(int(os.environ["EPIC_EXIT"]))
+about = known.get("answer", known["epic"])
+reply = {"concrete": os.environ.get("EPIC_OK", "\0") in about, "question": f"Who needs {about}?",
+         "suggestions": [f"{n} {about} for people \x1b[31mwho wait" for n in ("Zulu", "Yankee")]
+         + [f"Alpha {about} (Recommended)", "Nothing to do with it at all", 7]
+         + [f"{n} {about} for people who wait" for n in ("Mike", "Lima", "Kilo")]}
+if "answer" not in known:
+    del reply["concrete"], reply["question"]
+print(json.dumps({"type": "result", "is_error": False, "total_cost_usd": 0.001,
+                  "result": os.environ.get("EPIC_RAW") or "Here:\n```json\n" + json.dumps(reply) + "\n```"}))
+"""
+
+
+class TestEpicQuestions(Project):
+    """`ergon new epic` in a person's terminal asks why and when it's done (T-286)."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = Path(self.tmp.name) / "bin"
+        self.bin.mkdir()
+        (self.bin / "claude").write_text(FAKE_EPIC_CLAUDE.replace("#!PYTHON", f"#!{sys.executable}"))
+        (self.bin / "claude").chmod(0o755)
+        self.base = clean_env(PATH=f"{self.bin}:{os.environ['PATH']}", EPIC_TMP=self.tmp.name)
+        self.base.pop("ERGON_ASK_STDIN", None)
+
+    def ask(self, *flags, answers=(), **env):
+        r = self.ergon("new", "epic", "Shorter reviews", *flags, inp="".join(a + "\n" for a in answers),
+                       env=dict(self.base, ERGON_ASK_STDIN="1", **env))
+        for prompt in self.prompts(r):
+            self.assertLessEqual(len(self.listed(prompt)), 4, prompt)
+            self.assertIn("or your own words", prompt)
+            self.assertNotIn("recommend", prompt.lower())
+            self.assertNotIn("\x1b", prompt)
+        return r
+
+    def prompts(self, r):
+        return re.findall(r"(?s)\n(.*?leave it empty\])", r.stdout)
+
+    def listed(self, prompt):
+        return re.findall(r"^  \d\. (.*)$", prompt, re.M)
+
+    def calls(self):
+        f = Path(self.tmp.name) / "calls"
+        return [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
+
+    def brief(self):
+        text = next((self.root / "tasks" / "epics").glob("E-*/EPIC.md")).read_text()
+        self.ergon("check")
+        return [x.strip() for x in re.search(r"(?s)## Why\n(.*?)## When it's done\n(.*?)## Goal\n", text).groups()]
+
+    def test_a_vague_why_is_followed_up_and_a_concrete_answer_is_written_word_for_word(self):
+        why, done = "My  reviewers wait *two* days — and OKAY nobody knows why", "`ergon stats` prints OKAY hours per review"
+        r = self.ask(answers=["faster reviewing", "quick", why, done], EPIC_OK="OKAY")
+        self.assertEqual(self.brief(), [why, done])
+        ps = self.prompts(r)
+        self.assertEqual(len(ps), 4, r.stdout)
+        self.assertIn("What problem does someone have today?", ps[0])
+        self.assertIn("Who needs faster reviewing?", ps[1])
+        self.assertEqual(self.listed(ps[1]), sorted(self.listed(ps[1])))  # the order says nothing
+        self.assertEqual(len(self.listed(ps[1])), 4)
+        for x in self.listed(ps[1]):  # the one that has nothing to do with the answer isn't shown
+            self.assertIn("faster reviewing", x)
+        for x in self.listed(ps[2]):
+            self.assertIn("quick", x)
+        self.assertIn("How could someone check?", ps[3])
+        known = [c["known"] for c in self.calls()]
+        self.assertEqual(known, [
+            {"epic": "Shorter reviews"},
+            {"epic": "Shorter reviews", "earlier_vague_answers": [], "answer": "faster reviewing"},
+            {"epic": "Shorter reviews", "earlier_vague_answers": ["faster reviewing"], "answer": "quick"},
+            {"epic": "Shorter reviews", "earlier_vague_answers": ["faster reviewing", "quick"], "answer": why},
+            {"epic": "Shorter reviews", "why": why},
+            {"epic": "Shorter reviews", "why": why, "earlier_vague_answers": [], "answer": done}])
+        for c in self.calls():  # a cheap call with no tools, in an empty folder
+            self.assertEqual(c["argv"], ["-p", "--model", "haiku", "--tools", "", "--strict-mcp-config",
+                                         "--output-format", "json"])
+            self.assertEqual(c["cwd"], [])
+
+    def test_a_picked_suggestion_is_written_as_shown_and_not_judged(self):
+        r = self.ask(answers=["9", "2", "vague", "1."])
+        ps = self.prompts(r)
+        self.assertIn("There is no 9 in the list", ps[1])
+        self.assertEqual(self.listed(ps[0]), self.listed(ps[1]))
+        self.assertEqual(self.brief(), [self.listed(ps[1])[1], self.listed(ps[3])[0]])
+        self.assertIn("vague", self.brief()[1])
+        self.assertEqual([c["known"].get("answer") for c in self.calls()], [None, None, "vague"])
+
+    def test_an_empty_answer_leaves_the_section_empty_and_says_breakdown_will_ask(self):
+        r = self.ask(answers=["vague", "", "", "unread"])
+        self.assertEqual(self.brief(), ["", ""])
+        self.assertIn("Why is left empty: breakdown will ask for it later", r.stderr)
+        self.assertIn("When it's done is left empty: breakdown will ask for it later", r.stderr)
+
+    def test_the_answers_run_out(self):  # end of input is an empty answer, and no model call is spent on it
+        r = self.ask()
+        self.assertEqual((self.brief(), self.prompts(r), self.calls()), (["", ""], [], []))
+
+    def test_a_flag_skips_its_question_and_both_skip_all(self):
+        r = self.ask("--why", "Reviews stall", answers=["1"])
+        self.assertEqual(len(self.prompts(r)), 1)
+        self.assertNotIn("Why do you want", r.stdout)
+        self.assertEqual(self.brief(), ["Reviews stall", self.listed(self.prompts(r)[0])[0]])
+        self.assertEqual([c["known"] for c in self.calls()], [{"epic": "Shorter reviews", "why": "Reviews stall"}])
+
+    def test_the_other_flag_skips_its_question(self):
+        r = self.ask("--when-done", "It prints 1", answers=["1"])
+        self.assertEqual(len(self.prompts(r)), 1)
+        self.assertNotIn("How could someone check", r.stdout)
+        self.assertEqual(self.brief()[1], "It prints 1")
+
+    def test_both_flags_skip_all_prompting(self):
+        r = self.ask("--why", "Reviews stall", "--when-done", "", answers=["1", "1"])
+        self.assertEqual(self.brief(), ["Reviews stall", ""])
+        self.assertEqual((self.prompts(r), self.calls(), r.stderr), ([], [], ""))
+
+    def test_nothing_is_read_in_an_agent_shell_or_without_a_terminal(self):
+        # stdin is a pipe nobody writes to or closes: reading it would hang
+        for env in ({"CLAUDECODE": "1"}, {"AI_AGENT": "1"}, {"CLAUDECODE": "1", "ERGON_ASK_STDIN": "1"}, {}):
+            p = subprocess.Popen([sys.executable, str(ERGON), "new", "epic", "Big thing"], cwd=self.root,
+                                 env=dict(self.base, **env), stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(p.wait(timeout=30), 0, env)
+                self.assertRegex(p.stdout.read(), r"\A\S+/EPIC\.md\n\Z")
+            finally:
+                p.kill()
+                for f in (p.stdin, p.stdout, p.stderr):
+                    f.close()
+        self.assertEqual(self.brief(), ["", ""])
+        self.assertEqual(self.calls(), [])
+
+    def test_without_claude_the_fixed_suggestions_and_checks_do_it(self):
+        why, done = "Our reviewers wait two days for a build", "The board page shows how long each one waited"
+        for n, env in enumerate(({"EPIC_EXIT": "1"}, {"EPIC_RAW": "sure, happy to help"}, {"EPIC_RAW": "{nope}"}), 1):
+            r = self.ask(answers=["faster deploys.", why, "deploys are nicer", done], **env)
+            ps = self.prompts(r)
+            self.assertEqual(len(ps), 4, r.stdout)
+            self.assertIn("“faster deploys”", ps[1])
+            for p, said in ((ps[1], "faster deploys"), (ps[3], "deploys are nicer")):
+                self.assertEqual(len(self.listed(p)), 4)
+                for x in self.listed(p):
+                    self.assertIn(said, x)
+            self.assertEqual(self.brief(), [why, done])
+            self.assertEqual(len(self.calls()), n)  # one failure, and it isn't called again
+            self.assertEqual(r.stderr.count("no answer from claude"), 1)
+            sh("rm", "-r", str(next((self.root / "tasks" / "epics").glob("E-*"))), cwd=self.root)
+
+    def test_a_suggestion_unlike_the_answer_gives_way_to_ones_built_from_it(self):
+        raw = json.dumps({"concrete": False, "question": "We recommend what?", "suggestions": ["One thing", "Two things"]})
+        r = self.ask(answers=["faster deploys", "1"], EPIC_RAW=raw)
+        p = self.prompts(r)[1]
+        self.assertTrue(all("faster deploys" in x for x in self.listed(p)), p)
+        self.assertIn("Who runs into “faster deploys”", p)
+
+    def test_the_fixed_check(self):
+        from ergon import tasks
+        for key, q in tasks.EPIC_QUESTIONS.items():  # what it offers passes it, and stays within the limit
+            self.assertEqual(len(q["fixed"]), 4)
+            self.assertEqual(len(q["built"]), 4)
+            for x in q["fixed"] + [b.format(said="deploys") for b in q["built"]]:
+                self.assertTrue(tasks.concrete(key, x), x)
+        for key, text, want in (
+                ("why", "make it better", False), ("why", "I want the app to be nicer", False),
+                ("why", "Users are great and happy", False), ("why", "it's too slow", False),
+                ("why", "New users can't find the export button", True),
+                ("why", "I re-type every invoice by hand on Fridays", True),
+                ("when_done", "it works well for everyone", False), ("when_done", "users are happy", False),
+                ("when_done", "the whole product feels modern", False),
+                ("when_done", "`ergon board` prints the wait next to each task", True),
+                ("when_done", "A user can download their invoices as CSV", True)):
+            self.assertEqual(tasks.concrete(key, text), want, text)
+
+    def test_a_slow_or_missing_claude_is_given_up_on(self):
+        from unittest import mock
+        from ergon import tasks
+        (self.bin / "claude").write_text("#!/bin/sh\nsleep 60 &\nsleep 60\n")  # with a child holding its output open
+        with mock.patch.dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}"), \
+                mock.patch.object(tasks, "EPIC_ASK_TIMEOUT", 1):
+            start = time.monotonic()
+            self.assertIsNone(tasks._claude_json("hi"))
+            self.assertLess(time.monotonic() - start, 20)
+        with mock.patch.object(tasks.shutil, "which", return_value=None), \
+                mock.patch.object(tasks.subprocess, "Popen", side_effect=AssertionError("ran")):
+            self.assertIsNone(tasks._claude_json("hi"))
+
+    def test_in_a_real_terminal_it_asks_and_holds_no_lock_meanwhile(self):
+        import pty
+        import select
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.root)
+            os.execve(sys.executable, [sys.executable, str(ERGON), "new", "epic", "Shorter reviews"], self.base)
+        seen = ""
+
+        def until(text):
+            nonlocal seen
+            end = time.monotonic() + 30
+            while text not in seen:
+                self.assertTrue(select.select([fd], [], [], max(0, end - time.monotonic()))[0], seen)
+                try:
+                    seen += os.read(fd, 4096).decode(errors="replace")
+                except OSError:  # the other end closed
+                    self.fail(seen)
+            seen = seen.split(text, 1)[1]
+        try:
+            until("leave it empty]")
+            self.ergon("new", "task", "Meanwhile", "--tier", "haiku")  # would wait for a held lock
+            os.write(fd, b"1\n")
+            until("leave it empty]")
+            os.write(fd, b"\n")
+            until("breakdown will ask for it later")
+            until("EPIC.md")
+            self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), 0)
+            pid = None
+        finally:
+            if pid:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+            os.close(fd)
+        self.assertEqual(self.brief(), ["Mike Shorter reviews for people who wait", ""])
 
 
 class TestEpicApproval(Project):

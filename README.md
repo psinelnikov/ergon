@@ -65,7 +65,9 @@ ergon init --hooks    # optional, any time: also the git commit-msg hook (next s
 ergon new epic "Ship the thing" --why "Users can't ship without it" --when-done "A release goes out with one command"
 ```
 
-`--why` and `--when-done` are optional. Each one's text goes word for word under `## Why` and `## When it's done` in the epic's brief. Leave one out and its section stays empty. `ergon new epic` never prompts and never reads stdin. `ergon new task` refuses both flags.
+`--why` and `--when-done` are optional. Each one's text goes word for word under `## Why` and `## When it's done` in the epic's brief. `ergon new task` refuses both flags.
+
+In your own terminal, `ergon new epic "Title"` asks for each one you leave out. A question comes with up to 4 numbered suggestions, in an order that means nothing. Type a number, or answer in your own words. A vague answer gets a follow-up question with suggestions built from what you said, until the why names a problem someone has today and "when it's done" names something a person could check. What you typed or picked is written word for word. Press Enter to leave a section empty, and breakdown asks for it later. Each step is one `claude -p --model haiku` call with no tools (about 2 to 6 seconds and under a cent, stopped after 20 seconds) that sees the title and your answers. If `claude` is missing, fails or takes too long, ergon uses fixed suggestions and its own simpler check for the rest of the command. With both flags given, in an agent shell (`CLAUDECODE` or `AI_AGENT` set), or when stdin isn't a terminal, nothing is asked or read and a section with no flag stays empty.
 
 ## Agents other than Claude Code
 

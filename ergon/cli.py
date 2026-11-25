@@ -28,7 +28,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                --option text writes a numbered list
   ergon new epic "Title" [--why "<text>"] [--when-done "<text>"]
                                writes each answer word for word under ## Why / ## When it's done
-                               of the brief; a flag not given leaves its section empty. Never prompts
+                               of the brief. In a person's terminal it asks for each one not given:
+                               suggestions to pick from or your own words, and follow-ups until the
+                               answer is concrete (Enter leaves it empty; claude haiku drafts the
+                               suggestions, fixed ones without it). In an agent shell, or when stdin
+                               isn't a terminal, it never prompts and leaves the section empty
   ergon import gh#123 [--tier T] [--epic E] [--touches a,b]
                                a GitHub issue (or gh:OWNER/REPO#123) as a proposed task, via the
                                `gh` CLI: title, quoted body as What, source: gh#123. Tier is
@@ -452,10 +456,13 @@ def main():
                          "Writes an ## Options section a human picks from with `ergon choose`. In an agent shell a "
                          "feature (category feature or empty) needs --crux and well-formed options")
     nw.add_argument("--why", metavar="TEXT",
-                    help="epic: why the person wants it, written word for word under ## Why (refused for a task)")
+                    help="epic: why the person wants it, written word for word under ## Why (refused for a task). Not given: "
+                         "asked for in a person's terminal, with up to 4 suggestions or your own words, until it names "
+                         "a problem someone has today; left empty in an agent shell or when stdin isn't a terminal")
     nw.add_argument("--when-done", metavar="TEXT",
                     help="epic: what they expect to be true once it's done, written word for word under "
-                         "## When it's done (refused for a task)")
+                         "## When it's done (refused for a task). Not given: asked for the same way, until it names "
+                         "something a person could check; with both flags given nothing is asked")
     im = sub.add_parser("import", help="a GitHub issue as a proposed task: gh#123 or gh:OWNER/REPO#123")
     im.add_argument("ref", metavar="gh#N")
     im.add_argument("--tier", help="default: human, until someone sizes it")
@@ -643,13 +650,14 @@ def run(args):
         _tasks.board(args)
     elif args.cmd == "finish" and args.resolve:  # the resolver runs for minutes: it takes the lock only to merge
         _dispatch.finish_resolve(args)
-    elif args.cmd in ("new", "set", "start", "finish", "tidy"):  # read, then write state: one at a time
+    elif args.cmd in ("set", "start", "finish", "tidy"):  # read, then write state: one at a time
         with _gitops.state_lock():
-            {"new": _tasks.new, "set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish,
+            {"set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish,
              "tidy": _tasks.tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours); grade around its
-        # (and tag) around their writes only, not the minutes claude takes to answer
-        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "choose": _gates.choose, "pin": _gates.pin,
+        # (and tag) around their writes only, not the minutes claude takes to answer; new around its
+        # write, not the questions it asks a person
+        {"new": _tasks.new, "next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "choose": _gates.choose, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "breakdown": _dispatch.breakdown, "rules": rules,
          "import": _tasks.import_issue, "obsidian": _obsidian.obsidian, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "learn": _learn.learn, "journal": journal, "sync": _shared.sync}[args.cmd](args)
 

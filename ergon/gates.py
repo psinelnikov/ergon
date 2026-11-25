@@ -162,6 +162,32 @@ def ask(prompt):
         raise SystemExit("refused: no terminal to confirm on.")
 
 
+def can_ask():
+    """Whether a person is there to answer questions: stdin is a TTY with a terminal behind it for
+    ask() to use (or ERGON_ASK_STDIN scripts the answers), and this isn't an agent shell. Reads nothing."""
+    if in_agent_shell():
+        return False
+    if os.environ.get("ERGON_ASK_STDIN"):
+        return True
+    try:
+        with open("/dev/tty", "r"):
+            return sys.stdin.isatty()
+    except (OSError, AttributeError, ValueError):  # no terminal; no stdin, or a closed one
+        return False
+
+
+def ask_made(make_prompt):
+    """ask() for a prompt that costs something to make (a model call). A scripted answer is read
+    first, so once the script has run out nothing is made or shown and the answer is ""."""
+    if not os.environ.get("ERGON_ASK_STDIN") or in_agent_shell():
+        return ask(make_prompt())
+    line = sys.stdin.readline()
+    if line:
+        sys.stdout.write(make_prompt() + "\n")
+        sys.stdout.flush()
+    return line.strip()
+
+
 def human_gate(prompt):
     return ask(prompt + " [y/N] ").lower() == "y"
 
