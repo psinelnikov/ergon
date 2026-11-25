@@ -176,9 +176,13 @@ def today():
 # touches, accept and the What and Done when sections (and Options, with its choice, when a task
 # has one). status, depends, epic and Notes are left
 # out: dispatch moves status and adds dependencies to blocked tasks, and Notes are scratch.
-# An epic's approval covers its id, title and the Goal, Out of scope and Constraints sections.
+# An epic's approval covers its id, title and the Why, When it's done, Goal, Out of scope and
+# Constraints sections.
 
 DIGEST_SECTIONS = ("what", "done when")
+# The person's answers (E-011). In the digest only when non-empty, so an epic signed before they
+# existed, or with neither filled, keeps its digest.
+EPIC_ANSWER_SECTIONS = ("why", "when it's done")
 EPIC_DIGEST_SECTIONS = ("goal", "out of scope", "constraints")
 HEADING = re.compile(r"^#{1,2}\s+(.*?)\s*$")
 
@@ -228,13 +232,17 @@ def brief_digest(t):
     `## Options` section with its `Chosen:` line (E-006): a choice is made before approval, and the
     approval covers it. Each goes in only when set (the layer only with incidents, as it does
     nothing without them), so a task that has none of these keeps the digest it had before they
-    counted."""
+    counted. An epic's Why and When it's done go in the same way, only when non-empty."""
     body = t.get("_body") or ""
     if is_epic(t):
         doc = {"kind": "epic", "id": str(t.get("id") or "").strip(),
                "title": " ".join(str(t.get("title") or "").split())}
         for name in EPIC_DIGEST_SECTIONS:
             doc[name] = normalised(sections(body, name))
+        for name in EPIC_ANSWER_SECTIONS:
+            text = normalised(sections(body, name))
+            if text:
+                doc[name] = text
         return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     doc = {
         "id": str(t.get("id") or "").strip(),
@@ -1041,7 +1049,7 @@ def review(args):
     briefs = sorted((e for e in epics.values() if e.get("status") == "proposed"), key=lambda e: e["id"])
     if briefs:
         print(f"\nEPICS AWAITING APPROVAL ({len(briefs)}): approving one approves its brief "
-              f"(Goal, Out of scope, Constraints) and opens it; its tasks wait until then. "
+              f"(Why, When it's done, Goal, Out of scope, Constraints) and opens it; its tasks wait until then. "
               f"Rejecting one drops its brief")
         for e in briefs:
             kids = sum(t.get("epic") == e["id"] and t["status"] != "dropped" for t in tasks.values())
@@ -1160,6 +1168,10 @@ TASK_BODY = """
 """
 
 EPIC_BODY = """
+## Why
+
+## When it's done
+
 ## Goal
 
 ## Out of scope

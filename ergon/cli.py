@@ -15,8 +15,9 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon review [-i]            everything waiting on human approval, and tasks AWAITING A CHOICE
                                of their options (-i: HUMAN ONLY, walk it item by item: tasks to
                                approve / choose (c) / reject / retier / edit / skip;
-                               epic briefs (Goal, Out of scope, Constraints) to approve, which
-                               opens the epic and leaves its tasks proposed / edit / skip)
+                               epic briefs (Why, When it's done, Goal, Out of scope, Constraints)
+                               to approve, which opens the epic and leaves its tasks proposed /
+                               edit / skip)
   ergon show ID
   ergon new task "Title" --tier sonnet [--epic E-001] [--touches a,b] [--source LOG.md:42]
                       [--category C] [--crux "<text>"] [--option "<lens>: <approach> | <optimizes for> | <gives up> | <regret if>" ...]

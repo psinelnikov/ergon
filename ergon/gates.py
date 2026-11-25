@@ -320,8 +320,9 @@ def brief_due(e, apr):
 
 
 def print_brief(e):
-    """Print what approving epic e approves: its Goal, Out of scope and Constraints sections."""
-    for name in _tasks.EPIC_DIGEST_SECTIONS:
+    """Print what approving epic e approves: its Why, When it's done, Goal, Out of scope and
+    Constraints sections."""
+    for name in _tasks.EPIC_ANSWER_SECTIONS + _tasks.EPIC_DIGEST_SECTIONS:
         text = _tasks.normalised(_tasks.sections(e.get("_body") or "", name))
         print(f"      {name.capitalize()}: " + ("\n        ".join(text.split("\n")) if text else "(empty)"))
 
@@ -384,7 +385,7 @@ def approve(args):
     apr = _gitops.approvals() if count else apr
     for t in todo:
         if _tasks.is_epic(t):
-            print(f"  {t['id']}  epic    {t['title']}  (its brief: Goal, Out of scope, Constraints)"
+            print(f"  {t['id']}  epic    {t['title']}  (its brief: Why, When it's done, Goal, Out of scope, Constraints)"
                   + (f"  (approve again: {again[t['id']]})" if t["id"] in again else ""))
             print_brief(t)
             continue
@@ -469,10 +470,10 @@ def write_policy(t):
 
 def review_brief(e, at, tasks, apr, tally):
     """One epic brief in the interactive review, while its approval is due (`brief_due`): show
-    its Goal, Out of scope and Constraints and offer to approve it, which approves the brief
-    alone as `ergon approve E-NNN` does (signed in shared mode; its tasks stay proposed), reject
-    it (a proposed brief only: drops it as `ergon reject E-NNN` does), edit it, or skip it.
-    Returns False on quit."""
+    its Why, When it's done, Goal, Out of scope and Constraints and offer to approve it, which
+    approves the brief alone as `ergon approve E-NNN` does (signed in shared mode; its tasks stay
+    proposed), reject it (a proposed brief only: drops it as `ergon reject E-NNN` does), edit it,
+    or skip it. Returns False on quit."""
     while brief_due(e, apr):
         why = apr.problem(e) if e["status"] == "open" else ""
         print(f"\n{'=' * 78}\n{at}  {e['id']}  {e['title']}  (epic brief, {e['status']})"

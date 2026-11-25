@@ -315,6 +315,22 @@ class TestServe(ServeFixture):
         self.assertIn("ergon approve E-001 E-002", sec)
         self.assertNotIn("Nothing is waiting", review)
 
+    def test_review_shows_an_epics_why_and_when_its_done(self):
+        f = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        text = f.read_text()
+        card = lambda: re.search(r'<section class=card id="E-001">(.*?)</section>', self.req("GET", "/review")[2], re.S)[1]
+        empty = "<h4>Why</h4><p class=muted>empty</p><h4>When it's done</h4><p class=muted>empty</p><h4>Goal</h4>"
+        self.assertIn(empty, card())
+        f.write_text(text.replace("## Why\n\n## When it's done\n\n", ""))  # a brief from before the sections
+        self.assertNotIn("## Why", f.read_text())
+        self.assertIn(empty, card())
+        f.write_text(text.replace("## Why\n", f"## Why\nIt hurts {HOSTILE}\n", 1)
+                     .replace("## When it's done\n", "## When it's done\n- It stops.\n", 1))
+        c = card()
+        self.assertRegex(c, r"<h4>Why</h4><pre>It hurts &lt;script&gt;")
+        self.assertIn("<h4>When it's done</h4><pre>- It stops.</pre><h4>Goal</h4>", c)
+        self.assertNotIn("<script>alert", c)
+
     def test_priority_on_board_and_task_page(self):
         f = self.task_file("T-004")
         t = f.read_text()

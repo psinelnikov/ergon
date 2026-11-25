@@ -10132,5 +10132,150 @@ class TestLensChoose(Project):
         self.assertIn("Chosen: minimal +", self.ergon("-h").stdout)
 
 
+class TestEpicAnswers(Project):
+    """An epic's `## Why` and `## When it's done` (E-011, T-284): in the brief, in its digest only
+    when non-empty, and in every view of the brief."""
+    REST = ("## Goal\nShip the big thing.\n\n## Out of scope\n- Rewriting old epics.\n\n## Constraints\n"
+            "- Standard library only.\n\n## Notes\n- scratch\n")
+    OLD = "e6d725be55d5a45f819d4cd528886e34125f1b177527918562629eda1c7b9bac"  # taken before the sections existed
+
+    def epic(self, head="", **extra):
+        return {"id": "E-042", "title": "Big thing", "status": "open", "_body": "\n" + head + self.REST, **extra}
+
+    def digest(self, head=""):
+        return ergon.tasks.brief_digest(self.epic(head))
+
+    def epic_file(self, eid="E-001"):
+        return next((self.root / "tasks" / "epics").glob(f"{eid}-*/EPIC.md"))
+
+    def fill(self, why="Planning takes a day.", done="- A plan takes an hour."):
+        f = self.epic_file()
+        f.write_text(f.read_text().replace("## Why\n", f"## Why\n{why}\n", 1)
+                     .replace("## When it's done\n", f"## When it's done\n{done}\n", 1)
+                     .replace("## Goal\n", "## Goal\nShip the big thing.\n", 1))
+
+    def test_new_epic_writes_the_sections_in_order_and_empty(self):
+        self.ergon("new", "epic", "X")
+        text = self.epic_file().read_text()
+        self.assertEqual(re.findall(r"^## (.*)$", text, re.M),
+                         ["Why", "When it's done", "Goal", "Out of scope", "Constraints"])
+        body = ergon.tasks.parse(self.epic_file())["_body"]
+        for name in ("why", "when it's done"):
+            self.assertEqual(ergon.tasks.normalised(ergon.tasks.sections(body, name)), "", name)
+
+    def test_digest_of_an_epic_signed_before_the_sections_is_unchanged(self):
+        self.assertEqual(self.digest(), self.OLD)
+        for head in ("## Why\n\n## When it's done\n\n", "## Why\n## When it's done\n", "## Why\n \n\n\t\n",
+                     "## When it's done\n\n"):
+            self.assertEqual(self.digest(head), self.OLD, repr(head))
+
+    def test_digest_covers_each_answer_when_non_empty(self):
+        heads = ("## Why\nPlanning takes a day.\n\n", "## Why\nPlanning takes a week.\n\n",
+                 "## When it's done\nPlanning takes a day.\n\n",
+                 "## Why\nPlanning takes a day.\n\n## When it's done\n- A plan takes an hour.\n\n")
+        self.assertEqual(len({self.OLD, *map(self.digest, heads)}), 5)
+        # spacing and an empty sibling don't count
+        self.assertEqual(self.digest("## Why\n\nPlanning takes a day.  \n\n\n## When it's done\n\n"), self.digest(heads[0]))
+
+    def test_an_approval_stops_verifying_when_an_answer_changes(self):
+        from ergon import gitops
+        who = [("a@example.com", "Tester", "2026-11-25")]
+        head = "## Why\nPlanning takes a day.\n\n## When it's done\n- A plan takes an hour.\n\n"
+        apr = gitops.Approvals(good={"E-042": {self.digest(head): who}})
+        self.assertIsNone(apr.problem(self.epic(head)))
+        for changed in (head.replace("a day", "a week"), head.replace("an hour", "a minute"), head.replace("- A plan takes an hour.\n", ""), ""):
+            self.assertIn("brief changed after approval", apr.problem(self.epic(changed)) or "", changed)
+        # an approval from before the sections existed verifies, until one is filled
+        apr = gitops.Approvals(good={"E-042": {self.OLD: who}})
+        self.assertIsNone(apr.problem(self.epic()))
+        self.assertIsNone(apr.problem(self.epic("## Why\n\n## When it's done\n\n")))
+        self.assertIn("brief changed after approval", apr.problem(self.epic("## Why\nNew.\n\n")) or "")
+
+    def test_approve_and_review_show_the_answers(self):
+        self.ergon("new", "epic", "Big thing")
+        human = clean_env(ERGON_ASK_STDIN="1")
+        self.assertIn("(Why, When it's done, Goal, Out of scope, Constraints)", self.ergon("review").stdout)
+        empty = "      Why: (empty)\n      When it's done: (empty)\n      Goal: (empty)\n"
+        self.assertIn(empty, self.ergon("review", "-i", inp="q\n", env=human).stdout)
+        f = self.epic_file()
+        text = f.read_text()
+        f.write_text(text.replace("## Why\n\n## When it's done\n\n", ""))  # an old brief, no such headings
+        self.assertIn(empty, self.ergon("review", "-i", inp="q\n", env=human).stdout)
+        self.assertIn(empty, self.ergon("approve", "E-001", inp="n\n", env=human, check=False).stdout)
+        f.write_text(text)
+        self.fill(done="- A plan takes an hour.\n- Nobody asks twice.")
+        want = ("      Why: Planning takes a day.\n      When it's done: - A plan takes an hour.\n"
+                "        - Nobody asks twice.\n      Goal: Ship the big thing.\n")
+        self.assertIn(want, self.ergon("review", "-i", inp="q\n", env=human).stdout)
+        out = approve_epic(self).stdout
+        self.assertIn("(its brief: Why, When it's done, Goal, Out of scope, Constraints)", out)
+        self.assertIn(want, out)
+        self.ergon("check")
+
+    def test_merge_message_and_journal_inputs_include_the_answers_when_non_empty(self):
+        from ergon import gitops
+        merge = lambda head: gitops.merge_message(self.epic(head), {}, [])
+        journal = lambda head: gitops.journal_inputs("E-042", {}, {"E-042": self.epic(head)}, [])
+        for head in ("", "## Why\n\n## When it's done\n\n", "## Why\n## When it's done\n"):
+            self.assertEqual(merge(head), "Merge E-042: Big thing\n\nShip the big thing.\n", head)
+            self.assertNotIn("## Why", journal(head))
+            self.assertNotIn("## When it's done", journal(head))
+        one, both = "## Why\nPlanning takes a day.\n\n", "## Why\nPlanning takes a day.\n\n## When it's done\n- An hour.\n\n"
+        self.assertEqual(merge(one), "Merge E-042: Big thing\n\nWhy:\nPlanning takes a day.\n\n"
+                                     "Goal:\nShip the big thing.\n")
+        self.assertEqual(merge(both), "Merge E-042: Big thing\n\nWhy:\nPlanning takes a day.\n\n"
+                                      "When it's done:\n- An hour.\n\nGoal:\nShip the big thing.\n")
+        self.assertNotIn("## When it's done", journal(one))
+        self.assertIn("## Why\nPlanning takes a day.\n## When it's done\n- An hour.\n## Goal\nShip the big thing.\n", journal(both))
+
+
+class TestEpicAnswersSigned(unittest.TestCase):
+    """Shared mode: editing an approved epic's Why or When it's done un-approves it, as with Goal
+    (T-284). Borrows test_shared's fixture, as TestGateWeakeningFieldsSigned does."""
+
+    def __getattr__(self, name):
+        from test_shared import TestSignedApprovals
+        attr = getattr(TestSignedApprovals, name)
+        return attr.__get__(self) if callable(attr) else attr
+
+    def setUp(self):
+        from test_shared import Shared
+        Shared.setUp(self)
+
+    def tearDown(self):
+        from test_shared import Shared
+        Shared.tearDown(self)
+
+    def test_changing_an_approved_epics_answers_unapproves_it(self):
+        self.start()
+        self.ergon(self.a, "new", "epic", "Big")
+        self.ergon(self.a, "new", "task", "Part", "--tier", "haiku", "--epic", "E-001")
+        epic = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        # approved as a brief with no such headings, like one signed before they existed
+        epic.write_text(epic.read_text().replace("## Why\n\n## When it's done\n\n", "")
+                        .replace("## Goal\n", "## Goal\nShip the big thing.\n"))
+        self.ergon(self.a, "approve", "E-001", inp="y\n")
+        self.ergon(self.a, "approve", "T-002", inp="y\n")
+        self.counts(self.a, "T-002")
+        why = "epic E-001's approval doesn't verify: brief changed after approval"
+        text = epic.read_text()
+        epic.write_text(text.replace("## Goal\n", "## Why\n\n## When it's done\n\n## Goal\n"))
+        self.counts(self.a, "T-002")  # empty headings change nothing
+        epic.write_text(text.replace("## Goal\n", "## Why\nIt hurts.\n\n## When it's done\nIt doesn't.\n\n## Goal\n"))
+        self.assertIn(why, self.ergon(self.a, "next").stdout)
+        self.assertIn(why, self.ergon(self.a, "dispatch", "--dry-run").stdout)
+        self.ergon(self.a, "approve", "E-001", inp="y\n")  # approving it again makes it count
+        self.counts(self.a, "T-002")
+        text = epic.read_text()
+        for old, new in (("It hurts.", "Drop the database."), ("It doesn't.", "Nothing is left."), ("It doesn't.\n", "")):
+            epic.write_text(text.replace(old, new, 1))
+            self.assertIn(why, self.ergon(self.a, "next").stdout)
+            r = self.ergon(self.a, "check", check=False)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("E-001: open, but its approval doesn't verify: brief changed after approval", r.stdout)
+            epic.write_text(text)
+            self.counts(self.a, "T-002")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1375,7 +1375,7 @@ def epic_cards(briefs):
     for e in briefs:
         b.append(f'<section class=card id="{esc(e["id"])}"><h3>{esc(e["id"])} {esc(e.get("title"))}'
                  f' <span class=tier>{esc(e.get("status"))}</span></h3>')
-        for name in ("Goal", "Out of scope", "Constraints"):
+        for name in ("Why", "When it's done", "Goal", "Out of scope", "Constraints"):
             text = section(e.get("_body") or "", name)
             b.append(f"<h4>{name}</h4>" + (f"<pre>{esc(text)}</pre>" if text and not blank(text) else "<p class=muted>empty</p>"))
         b.append("</section>")
