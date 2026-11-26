@@ -71,9 +71,9 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                operator by <name> <date>`; the worker builds what they share and
                                takes each one's distinct part); on a numbered list, one number
                                (`Chosen: N by …`). Written as the section's first line, with a
-                               `chosen` history row. `approve` refuses a task with options and no
-                               choice; `check` fails one past proposed.
-                               Never changes approved:, tier, touches: or accept:
+                               `chosen` history row — and a confirmed choice approves the task
+                               (a task with options and no choice can't be approved, and `check`
+                               fails one past proposed). Never changes tier, touches: or accept:
   ergon close ID [ID ...] --as done|dropped --reason R
                                HUMAN ONLY. An approved task whose work landed elsewhere, or that
                                no longer applies; skips the epic-branch check, closes the epic
@@ -477,7 +477,7 @@ def main():
     an = sub.add_parser("answer", help="HUMAN ONLY: answer a worker's question and requeue its task")
     an.add_argument("id")
     an.add_argument("text", nargs="*", help="the answer; leave it out to pick from the options")
-    ch = sub.add_parser("choose", help="HUMAN ONLY: pick one of a proposed task's options (approve waits on it)")
+    ch = sub.add_parser("choose", help="HUMAN ONLY: pick one of a proposed task's options; a confirmed choice approves it")
     ch.add_argument("id")
     ch.add_argument("picks", nargs="*", metavar="LENS|N",
                     help="lens options: one or more lens names (minimal, durable, operator, risk, defer); several "
