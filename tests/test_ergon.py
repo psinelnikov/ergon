@@ -2221,6 +2221,18 @@ class TestEpicApproval(Project):
             self.assertIn("for `ergon new epic` only", r.stderr)
         self.assertEqual(list((self.root / "tasks" / "items").glob("T-*.md")), [])
 
+    def test_skill_tells_agents_to_ask_why_and_when_done_before_new_epic(self):  # T-287
+        skill = (ERGON.parent / "skills" / "ergon" / "SKILL.md").read_text()
+        start = skill.index("### Before `ergon new epic`: ask why, and what done looks like")
+        section = skill[start:skill.index("\n## Epics → tasks", start)]
+        for want in ("--why", "--when-done", "at most 4 suggestions", "own words", "ask again",
+                     "in the person's words", "goes in Goal", "A dispatched agent",
+                     "with both sections empty", "says so in its final report"):
+            self.assertIn(want, section)
+        self.assertIsNone(re.search(r"(?i)recommend", section))
+        # the worked exchange ends in a real `new epic` command with both flags
+        self.assertRegex(section, r'ergon new epic "[^"]+" \\\n  --why "[^"]+" \\\n  --when-done "')
+
     def test_an_agents_epic_is_proposed_and_its_tasks_wait_until_a_human_approves_it(self):
         agent = clean_env(CLAUDECODE="1")
         self.ergon("new", "epic", "Big thing", env=agent)

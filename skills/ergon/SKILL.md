@@ -210,11 +210,53 @@ The body sections stay short. Cite `file:line`. Don't restate the spec.
 
 **A task with no epic** (in `items/`) is a change that makes sense on the trunk by itself: a bug fix, a doc-drift pass, a config fix. Several such tasks that only share a theme don't need an epic. Grouping them would hold every fix back until the last one lands.
 
-The quick test: if the work fits one tier and one Done when, and could merge to the trunk alone, it's a task. If it takes several of those that only make sense together, it's an epic. Its Goal and scope are the human's call, so an agent may propose one but never opens it: an agent that finds work too big for one task runs `ergon new epic "Title"` (it starts `proposed`), fills in Goal / Out of scope / Constraints, files the tasks it can see under it with `--epic`, and tells the human. Nothing in the epic runs until a human approves its brief with `ergon approve E-NNN`.
+The quick test: if the work fits one tier and one Done when, and could merge to the trunk alone, it's a task. If it takes several of those that only make sense together, it's an epic. Its Goal and scope are the human's call, so an agent may propose one but never opens it: an agent that finds work too big for one task first asks the person the two questions below, then runs `ergon new epic "Title" --why "…" --when-done "…"` (it starts `proposed`), fills in Goal / Out of scope / Constraints, files the tasks it can see under it with `--epic`, and tells the human. Nothing in the epic runs until a human approves its brief with `ergon approve E-NNN`.
+
+### Before `ergon new epic`: ask why, and what done looks like
+
+An agent in chat with a person asks two questions before it files an epic, one at a time:
+- **Why do you want this?** The answer is concrete when it names a problem someone has today (who is stuck, slowed or wrong, and how).
+- **What do you expect once it's done?** The answer is concrete when it names something a person could check (a command that works, a page that shows, a number that changes).
+
+Give each question at most 4 suggestions built from the title and what the person has said so far, as peers: unordered, none marked or ranked above the rest. Always add a line inviting them to answer in their own words instead. If an answer fails its test ("make it better", "cleaner code", "it works"), ask again with new suggestions built from what they said, and keep going until both answers pass or the person says to leave a section empty.
+
+Write the answers with `--why` and `--when-done` in the person's words, as they gave them or picked them, not reworded. Your own reading of the work (what you'll change, how you see the scope) goes in Goal, Out of scope and Constraints, never in Why or When it's done.
+
+A dispatched agent (headless, `claude -p`, no person to ask) never invents the answers: it files the epic with both sections empty (no `--why`, no `--when-done`; they show as `(empty)`) and says so in its final report, so the human can fill them in before approving the brief.
+
+An example exchange:
+
+> **Agent:** Why do you want this? Pick one or say it in your own words:
+> 1. Reviewers can't tell which tasks are waiting on them
+> 2. Approving a long queue takes too many commands
+> 3. Stale tasks pile up and nobody notices
+> 4. New teammates don't know where to start
+>
+> **Person:** It's just messy.
+>
+> **Agent:** Messy for whom, and when does it bite? Pick one or say it in your own words:
+> 1. I scroll past done tasks every morning to find open ones
+> 2. Proposed tasks get lost among ready ones
+> 3. I can't see which epic a task belongs to
+> 4. The list is too long to read on a phone
+>
+> **Person:** 2, I approve things late because I miss them.
+>
+> **Agent:** What do you expect to be true once it's done? Pick one or say it in your own words: …
+>
+> **Person:** `ergon review` shows proposed tasks first, and I can approve the lot in one go.
+
+```bash
+ergon new epic "Surface proposed tasks" \
+  --why "Proposed tasks get lost among ready ones. I approve things late because I miss them." \
+  --when-done "\`ergon review\` shows proposed tasks first, and I can approve the lot in one go."
+```
+
+The example's topic is only an illustration: build each epic's suggestions from its own title and answers.
 
 ## Epics → tasks
 
-1. A human or an agent writes the epic: `ergon new epic "Title" --why "<text>" --when-done "<text>"` (it starts `proposed`; each flag's text goes word for word under its heading, in an agent shell, or when stdin isn't a terminal, a flag left out leaves its section empty and nothing is prompted for or read; in a human's terminal it asks for what the flags leave out, with up to 4 peer suggestions or their own words, and follows up on a vague answer until the why names a problem someone has today and "when it's done" names something a person could check; a haiku call drafts the suggestions, fixed ones stand in without claude, and Enter leaves a section for breakdown to ask about; `ergon new task` refuses both flags), then fills in Why (why the person wants it) / When it's done (what they expect to be true once it's done) / Goal / Out of scope / Constraints. An empty Why or When it's done is fine, and shows as `(empty)`. A human approves the brief with `ergon approve E-00N`, which covers all five sections and opens the epic. `ergon reject E-00N --reason R` drops an unwanted brief instead. `ergon review` lists proposed epics under EPICS AWAITING APPROVAL.
+1. A human or an agent writes the epic (an agent asks the person both questions first, or files them empty when dispatched: see above): `ergon new epic "Title" --why "<text>" --when-done "<text>"` (it starts `proposed`; each flag's text goes word for word under its heading, in an agent shell, or when stdin isn't a terminal, a flag left out leaves its section empty and nothing is prompted for or read; in a human's terminal it asks for what the flags leave out, with up to 4 peer suggestions or their own words, and follows up on a vague answer until the why names a problem someone has today and "when it's done" names something a person could check; a haiku call drafts the suggestions, fixed ones stand in without claude, and Enter leaves a section for breakdown to ask about; `ergon new task` refuses both flags), then fills in Why (why the person wants it) / When it's done (what they expect to be true once it's done) / Goal / Out of scope / Constraints. An empty Why or When it's done is fine, and shows as `(empty)`. A human approves the brief with `ergon approve E-00N`, which covers all five sections and opens the epic. `ergon reject E-00N --reason R` drops an unwanted brief instead. `ergon review` lists proposed epics under EPICS AWAITING APPROVAL.
 2. Once the brief is approved, `ergon dispatch` breaks the epic down by itself if it has no tasks yet (see Dispatch, **Breakdown**), and `ergon breakdown E-00N [--budget USD]` does it on demand. Either way, one read-only opus agent (`task-breakdown`) replies with TASK blocks, and each block that passes `check`'s rules is filed as a `proposed` task with `source: breakdown E-00N`. An interactive agent asked to "break down E-00N" does the same by hand. It reads the epic and the source, creates tasks with `ergon new task … --epic E-00N` (a feature with 2 to 4 `--option`s, see the one rule), one change or one human action each, fills in What / Done when / `tier`/`tier_why`/`depends`/`touches` and **stops**. It doesn't start any of them.
 3. The human runs `ergon review`, edits or rejects what's wrong, and runs `ergon approve E-00N` to approve the rest at once. On an epic that is still `proposed`, that first approves only the brief; running it again approves the tasks.
 4. When every task is done or dropped, the epic closes and its branch merges into the trunk (see below).
