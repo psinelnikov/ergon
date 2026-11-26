@@ -254,6 +254,148 @@ class TestCheck(ConceptProject):
         self.assertEqual(out.strip(), "")  # a missing depend warns in `check`, never in the hook
 
 
+ORIGIN_MAP = """\
+[[concern]]
+id = "core"
+
+[[component]]
+id = "core.a"
+concern = "core"
+files = ["src/a.py"]
+terms = ["a"]
+
+[[component]]
+id = "core.b"
+concern = "core"
+files = ["src/b.py"]
+terms = ["b"]
+
+[[component]]
+id = "core.c"
+concern = "core"
+files = ["src/c.py"]
+terms = ["c"]
+
+[[component]]
+id = "core.d"
+concern = "core"
+files = ["src/d.py"]
+terms = ["d"]
+
+[[component]]
+id = "core.e"
+concern = "core"
+files = ["src/e.py"]
+terms = ["e"]
+introduced_by = "none"
+
+[[component]]
+id = "core.f"
+concern = "core"
+files = ["src/a.py"]
+terms = ["f"]
+introduced_by = "T-003"
+"""
+
+
+class TestOrigins(ConceptProject):
+    """T-280: core.a's file was first added by a commit citing T-001; core.b's by an uncited one;
+    core.c's by a merge; core.d's by a `Merge T-002:` landing subject; core.e is silenced with
+    introduced_by = "none"; core.f already has introduced_by."""
+
+    def commit(self, path, msg, text="x\n"):
+        (self.root / path).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / path).write_text(text)
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", msg, cwd=self.root)
+        return sh("git", "rev-parse", "--short", "HEAD", cwd=self.root).stdout.strip()
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "concepts.toml").write_text(ORIGIN_MAP)
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "origin map", cwd=self.root)
+        self.a = self.commit("src/a.py", "Add a\n\nBuilds the a part (T-001).")
+        self.commit("src/a.py", "Change a (T-002)", "y\n")  # not an add: changes nothing
+        self.commit("src/b.py", "add b without a task")
+        self.commit("src/d.py", "Merge T-002: land d")
+        self.commit("src/e.py", "Add e (T-001)")
+        trunk = sh("git", "rev-parse", "--abbrev-ref", "HEAD", cwd=self.root).stdout.strip()
+        sh("git", "checkout", "-qb", "side", cwd=self.root)
+        self.commit("side.txt", "side work")
+        sh("git", "checkout", "-q", trunk, cwd=self.root)
+        sh("git", "merge", "-q", "--no-ff", "--no-commit", "side", cwd=self.root)
+        (self.root / "src" / "c.py").write_text("c\n")  # a file only the merge adds
+        sh("git", "add", "-A", cwd=self.root)
+        sh("git", "commit", "-qm", "Land side (T-002)", cwd=self.root)
+
+    def test_suggests_the_task_cited_by_the_first_add_only(self):
+        out = self.ergon("related", "--origins").stdout
+        self.assertIn('[[component]] core.a: introduced_by = "T-001"', out)
+        self.assertIn(f"  src/a.py -> {self.a} Add a -> T-001", out)
+        self.assertIn("[[component]] core.b: no suggestion: no first-add commit of its files cites a task", out)
+        self.assertIn("src/b.py -> ", out)
+        self.assertIn("add b without a task -> cites no task", out)
+        self.assertIn("[[component]] core.c: no suggestion: git saw none of its files added", out)
+        self.assertIn("[[component]] core.d: no suggestion", out)
+        self.assertIn("Merge T-002: land d -> a landing merge, skipped", out)
+        self.assertNotIn("core.e:", out)
+        self.assertNotIn("core.f", out)
+        self.assertIn('silenced (introduced_by = "none"): core.e', out)
+        self.assertIn("A suggestion is a guess", out)
+        _config.configure(self.root)
+        got = C.origins(C.read_map()[0], T.load(_config.ITEMS))
+        self.assertEqual({k: v["suggest"] for k, v in got.items()},
+                         {"core.a": ["T-001"], "core.b": [], "core.c": [], "core.d": []})
+
+    def test_writes_nothing(self):
+        before = sh("git", "status", "--porcelain", cwd=self.root).stdout
+        self.ergon("related", "--origins")
+        self.assertEqual(sh("git", "status", "--porcelain", cwd=self.root).stdout, before)
+        self.ergon("check")
+        self.assertEqual(sh("git", "status", "--porcelain", cwd=self.root).stdout, before)
+
+    def test_check_warns_until_filled_in_or_silenced(self):
+        r = self.ergon("check")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.count("no introduced_by"), 1, r.stdout)
+        self.assertIn(f"warning: concepts.toml: component core.a: no introduced_by; src/a.py was first added by "
+                      f"{self.a}, citing T-001. Write introduced_by = \"T-001\" if that task built it, or \"none\"", r.stdout)
+        m = self.root / "concepts.toml"
+        for value in ("T-001", "none"):
+            m.write_text(ORIGIN_MAP.replace('terms = ["a"]', f'terms = ["a"]\nintroduced_by = "{value}"'))
+            self.assertNotIn("no introduced_by", self.ergon("check").stdout)
+        self.assertNotIn("core.a:", self.ergon("related", "--origins").stdout)
+        m.write_text(ORIGIN_MAP.replace('"none"', '"nope"'))
+        r = self.ergon("check", check=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("introduced_by 'nope' isn't a task ID (T-NNN) or \"none\"", r.stdout)
+
+    def test_a_silenced_component_has_no_introducer(self):
+        _config.configure(self.root)
+        cmap, errs = C.read_map()
+        self.assertEqual(errs, [])
+        self.assertIsNone(cmap["components"]["core.e"]["introduced_by"])
+        self.assertTrue(cmap["components"]["core.e"]["no_origin"])
+
+    def test_usage_and_the_guard_lets_agents_run_it(self):
+        for args in ((), ("T-001", "--origins")):
+            r = self.ergon("related", *args, check=False)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("--origins", r.stderr)
+        self.assertIsNone(self.guard("Bash", {"command": "ergon related --origins"}))
+        self.assertIsNone(self.guard("Bash", {"command": "ergon related --origins"}, "--worker"))
+        self.assertIsNone(self.guard("Bash", {"command": "ergon related --origins"}, "--read-only"))
+        self.assertIn("writes nothing, and each suggestion needs a human's judgement",
+                      " ".join(self.ergon("related", "-h").stdout.split()))
+        self.assertIn("ergon related --origins", self.ergon("-h").stdout)
+
+    def test_no_git_suggests_nothing(self):
+        _config.configure(self.root)
+        with mock.patch.object(C.subprocess, "run", side_effect=FileNotFoundError("git")):
+            self.assertEqual(C.origins(C.read_map()[0]), {})
+
+
 IGNORE = """
 [[ignore]]
 id = "glue"

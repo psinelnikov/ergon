@@ -187,6 +187,11 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                a concern; done tasks it builds on (Jaccard overlap of components);
                                missing depends (a component an open task introduces, not in its
                                depends: closure). /t/T-ID shows the same
+  ergon related --origins      read-only: for each component with no introduced_by, the task cited by
+                               the commit that first added its files, with the evidence (file ->
+                               commit -> task). A guess (a move or package split adds files too):
+                               paste the right ones, write introduced_by = "none" to silence a wrong
+                               one. `check` warns about each suggestion until one is written
   ergon learn [--since D] [--model sonnet] [--budget USD] [--dry-run]
                                one `claude -p` (no tools) groups the incidents no task's harden:
                                cites yet into mistake classes, each with the lowest layer that
@@ -534,7 +539,11 @@ def main():
     tg.add_argument("--model", default="sonnet", help="default sonnet")
     tg.add_argument("--budget", type=float, help="max USD per call (--max-budget-usd)")
     tg.add_argument("--dry-run", action="store_true", help="list the tasks; ask nothing, write nothing")
-    sub.add_parser("related", help="tasks related to this one through the concept map").add_argument("id")
+    rl = sub.add_parser("related", help="tasks related to this one through the concept map")
+    rl.add_argument("id", nargs="?", help="the task")
+    rl.add_argument("--origins", action="store_true", help=(
+        "instead of a task: suggest each component's introduced_by from the commit that first added its "
+        "files, with the evidence; writes nothing, and each suggestion needs a human's judgement"))
     ln = sub.add_parser("learn", help="propose harden tasks from recurring incidents (runs claude -p; only proposes)")
     ln.add_argument("--since", metavar="YYYY-MM-DD", help="only incidents caught on or after this day")
     ln.add_argument("--model", default="sonnet", help="default sonnet")
