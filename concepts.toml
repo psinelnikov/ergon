@@ -222,7 +222,7 @@ terms = ["touches", "tasks/` exclusion", "exclusion"]
 [[component]]
 id = "model.config"
 concern = "model"
-files = ["ergon/config.py", "ergon/shared.py", "ergon/gates.py", "ergon/__init__.py", "ergon/__main__.py"]
+files = ["ergon/config.py", "ergon/shared.py", "ergon/gates.py"]
 fns = ["read_config", "mini_toml", "configure"]
 terms = [".ergon.toml", "[shared]", "two_person", "remote's url"]
 
@@ -264,3 +264,10 @@ id = "docs"
 concern = "model"
 files = ["README.md", "skills/ergon/SKILL.md", "docs/shared-state.md"]
 terms = ["readme", "skill.md", "shared-state.md", "document", "say how", "mention"]
+
+# ---------------------------------------------------------------- package glue
+# Entry points that hold no logic of their own; model.config reads the package, not these.
+[[ignore]]
+id = "package-glue"
+label = "Package entry points with no logic of their own"
+files = ["ergon/__init__.py", "ergon/__main__.py"]
