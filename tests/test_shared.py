@@ -899,7 +899,8 @@ class TestBreakdownClaims(Shared):
 
     def empty_epic_in_both(self):
         """A files epic E-001, publishes it and approves it; B joins. It has no tasks."""
-        self.ergon(self.a, "new", "epic", "Widgets", env=self.env_a)
+        self.ergon(self.a, "new", "epic", "Widgets", "--why", "Shop staff can't sell widgets, so orders go elsewhere",
+                   "--when-done", "A widget can be ordered and shows up on the orders page", env=self.env_a)
         f = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
         f.write_text(f.read_text().replace("## Goal\n", "## Goal\nShip widgets end to end.\n"))
         self.ergon(self.a, "sync", "--init", inp="y\n", env=self.env_a)
