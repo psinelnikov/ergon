@@ -3136,9 +3136,17 @@ The epic's brief ({path}):
 {rules}{policies}{protect}{companions}
 {existing}
 
-Write one block per task, in the order they should land, and end with `RESULT: done` as your last line.
-If the brief can't be broken down as it stands, write no blocks and end with
-`RESULT: blocked — <what a human must settle>`. Each block is exactly this:
+First check the brief's `## Why` and `## When it's done`. If either is empty (no heading, or nothing but
+blank lines under it), write no TASK blocks: ask the human instead. Write one `QUESTION: <the question>`
+line per question, each followed by one `OPTIONS: <a> | <b> | …` line of at most 4 peer suggestions drawn
+from the brief and the code, none marked or ranked above another (the human may answer in their own words
+instead), and end with `RESULT: asking — <one line: which sections are empty>` as your last line. With
+either section empty nothing is filed, whatever you reply.
+
+Otherwise plan tasks that together make every "When it's done" item true. Write one block per task, in the
+order they should land, and end with `RESULT: done` as your last line. If the brief can't be broken down as
+it stands, write no blocks and end with `RESULT: blocked — <what a human must settle>` (with QUESTION: /
+OPTIONS: lines before it, as above, when a human's answer would settle it). Each block is exactly this:
 
 TASK: <title: what changes, one line>
 tier: <haiku | sonnet | opus | human>
@@ -3414,14 +3422,23 @@ def run_breakdown(e, args, by="breakdown", gate=None, sync=None):
     except Exception as err:  # noqa: BLE001 - a breakdown never takes dispatch down
         verdict, why = "blocked", f"breakdown crashed: {err}"
     info.update(verdict=verdict, reason=why, seconds=round(time.monotonic() - start, 1))
+    extra = {}
+    if info.get("asked"):
+        extra["asked"] = info["asked"]
+    if info.get("questions"):
+        extra["questions"] = [{"text": q, "options": opts} for q, opts in info["questions"]]
     _history.record("breakdown", e, by=by, verdict=verdict, reason=why or None, cost=info["cost"],
                     seconds=info["seconds"], log=info["log"], session=info.get("session"),
-                    filed=[i for i, _ in info["filed"]], refused=[f"block {n}: {w}" for n, _, w in info["refused"]])
+                    filed=[i for i, _ in info["filed"]], refused=[f"block {n}: {w}" for n, _, w in info["refused"]],
+                    **extra)
     return info
 
 
 def _run_breakdown(e, args, log, info, gate, sync):
     tasks = _tasks.load(_config.ITEMS)
+    missing = _tasks.empty_answers(e)
+    if missing:
+        info["asked"] = missing
     agent = breakdown_agent()
     cmd = ["claude", "-p", "--agents", json.dumps({BREAKDOWN_AGENT: agent}), "--agent", BREAKDOWN_AGENT,
            "--permission-mode", "dontAsk", "--allowedTools", ",".join(BREAKDOWN_ALLOW),
@@ -3452,11 +3469,18 @@ def _run_breakdown(e, args, log, info, gate, sync):
         return "blocked", f"couldn't check the checkout after the breakdown: {err}"
     if changed:
         return "blocked", f"the checkout's `git status` changed during the breakdown (it must stay read-only); nothing filed"
-    found = re.findall(r"^\W*RESULT:\s*(done|blocked)\b[\s—:–-]*(.*)$", text, re.M)
+    found = re.findall(r"^\W*RESULT:\s*(done|blocked|asking)\b[\s—:–-]*(.*)$", text, re.M)
     if not found:
         return "blocked", "breakdown ended without a RESULT line; nothing filed"
-    if found[-1][0] == "blocked":
-        return "blocked", md_trim(found[-1][1].strip(" *`")) or "(no reason given)"
+    if found[-1][0] != "done" or missing:
+        info["questions"] = parse_questions(text)
+    if found[-1][0] != "done":
+        n = len(info["questions"])
+        return "blocked", (md_trim(found[-1][1].strip(" *`"))
+                           or (f"{n} question(s) for a human" if n else "(no reason given)"))
+    if missing:
+        return "blocked", (f"the brief's {' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} empty; "
+                           f"nothing filed until a human fills {'it' if len(missing) == 1 else 'them'}")
     blocks = parse_blocks(text)
     if not blocks:
         return "blocked", "breakdown ended `RESULT: done` with no TASK block"
@@ -3517,6 +3541,13 @@ def print_breakdown(info, indent="  "):
     print(f"{indent}breakdown {eid}  {info['verdict']}: {len(info['filed'])} proposed, {len(info['refused'])} refused, "
           f"${info['cost']:.2f}" + (f"; {info['reason']}" if info.get("reason") else "") + f" (log {info['log']})",
           flush=True)
+    if info.get("asked"):
+        print(f"{indent}  empty in the brief: {', '.join(info['asked'])}. Fill them in {eid}'s brief, approve it "
+              f"again, then run `ergon breakdown {eid}`")
+    for q, opts in info.get("questions") or []:
+        print(f"{indent}  question: {q}")
+        for o in opts:
+            print(f"{indent}    - {o}")
 
 
 def breakdown(args):

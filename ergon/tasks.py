@@ -204,6 +204,14 @@ def sections(body, name):
     return "\n".join(out)
 
 
+def empty_answers(e):
+    """The names ("Why", "When it's done") of epic e's answer sections that are empty: no heading,
+    or nothing but whitespace under it. A breakdown files nothing while either is empty (T-288)."""
+    body = e.get("_body") or ""
+    return [name for key, name in (("why", "Why"), ("when it's done", "When it's done"))
+            if not sections(body, key).strip()]
+
+
 def normalised(text):
     """Text with trailing spaces, runs of blank lines and blank lines at either end taken out."""
     lines, blank = [], False

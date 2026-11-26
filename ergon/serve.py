@@ -677,15 +677,31 @@ def journal_block(eid, tasks):
 
 
 def breakdown_block(eid):
-    """The epic's breakdown runs (history `breakdown` rows): verdict, cost, time, log link. '' if none."""
+    """The epic's breakdown runs (history `breakdown` rows): verdict, cost, time, log link, and for a
+    run that didn't file, its reason, the brief's empty sections (`asked`) and the agent's questions
+    with their suggestions (T-288). '' if none."""
     rows = [r for r in _history.read() if r.get("event") == "breakdown" and r.get("epic") == eid]
     if not rows:
         return ""
     cost = sum(r["cost"] for r in rows if isinstance(r.get("cost"), (int, float)) and not isinstance(r["cost"], bool))
+
+    def asking(r):
+        out = ""
+        if r.get("verdict") != "done" and r.get("reason"):
+            out += f" · {esc(r['reason'])}"
+        if isinstance(r.get("asked"), list) and r["asked"]:
+            out += f'<br><span class=muted>empty in the brief:</span> {esc(", ".join(map(str, r["asked"])))}'
+        qs = [q for q in r.get("questions") or [] if isinstance(q, dict) and q.get("text")]
+        if qs:
+            out += "<ul>" + "".join(
+                f'<li>{esc(q["text"])}' + ("<ul>" + "".join(f"<li>{esc(o)}</li>" for o in q.get("options") or [])
+                                          + "</ul>" if q.get("options") else "") + "</li>" for q in qs) + "</ul>"
+        return out
+
     items = "".join(
         f'<li><span class="v-{esc(r.get("verdict"))}">{esc(r.get("verdict"))}</span> · {money(r.get("cost"))} · '
         f'{esc(secs(r.get("seconds")))} · <span class=muted>{esc(r.get("at"))}</span>'
-        + (f' · log {log_link(r["log"])}' if r.get("log") else "") + "</li>" for r in rows)
+        + (f' · log {log_link(r["log"])}' if r.get("log") else "") + asking(r) + "</li>" for r in rows)
     return f"<h2>Breakdown runs</h2><p>{len(rows)} run(s), {money(cost)}</p><ul>{items}</ul>"
 
 

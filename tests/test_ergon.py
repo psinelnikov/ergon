@@ -6302,8 +6302,10 @@ class TestBreakdown(DispatchProject):
         self.env["FAKE_BREAKDOWN_SEEN"] = str(self.seen)
         self.env["FAKE_BREAKDOWN"] = BREAKDOWN_REPLY
 
-    def new_epic(self, goal="Ship widgets end to end."):
-        self.ergon("new", "epic", "Widgets")
+    def new_epic(self, goal="Ship widgets end to end.", why="Customers can't see their widgets today",
+                 when_done="- GET /widgets lists a customer's widgets"):
+        flags = (["--why", why] if why else []) + (["--when-done", when_done] if when_done else [])
+        self.ergon("new", "epic", "Widgets", *flags)
         f = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
         f.write_text(f.read_text().replace("## Goal\n", f"## Goal\n{goal}\n"))
         return f
@@ -6470,6 +6472,78 @@ class TestBreakdown(DispatchProject):
         self.assertIn("estimated at most $2.00 for 0 task(s) and 1 breakdown(s) at --budget $2 per call", dry)
         self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run", "--tier", "haiku").stdout)
         self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run", "--epic", "E-009").stdout)
+
+    def test_empty_why_files_nothing_even_on_done(self):
+        """T-288: an epic with an empty Why gets no tasks from a reply full of TASK blocks; the
+        verdict is blocked, the reason names Why, and the history row records what was asked."""
+        self.new_epic(why=None)
+        approve_epic(self)
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        self.assertIn("breakdown E-001 blocked: the brief's Why is empty; nothing filed", out)
+        row = [r for r in history(self.root) if r["event"] == "breakdown"][-1]
+        self.assertEqual(row["verdict"], "blocked")
+        self.assertIn("Why", row["reason"])
+        self.assertNotIn("When it's done", row["reason"])
+        self.assertEqual(row["asked"], ["Why"])
+        self.assertEqual(row["filed"], [])
+        prompt = self.calls()[0]["prompt"]
+        self.assertIn("If either is empty", prompt)
+        self.assertIn('make every "When it\'s done" item true', prompt)
+
+    def test_asking_breakdown_shows_each_question_with_its_suggestions(self):
+        """T-288: a blocked reply's QUESTION: / OPTIONS: lines reach `ergon breakdown`'s output, the
+        history row (whole, with their suggestions) and the epic's serve page."""
+        f = self.new_epic(why=None, when_done=None)
+        f.write_text(f.read_text().replace("## Why\n", "## Why\n   \n\n"))  # whitespace only is empty
+        approve_epic(self)
+        self.env["FAKE_BREAKDOWN"] = (
+            "The brief has no Why and no When it's done.\n\n"
+            "QUESTION: Why do you want widgets?\n"
+            "OPTIONS: Customers can't find their widgets | Support answers widget questions by hand\n"
+            "QUESTION: What will be true when it's done?\n"
+            "OPTIONS: GET /widgets lists a customer's widgets | the widgets page loads in under a second | "
+            "support gets no widget tickets for a week\n"
+            "RESULT: blocked — the brief's Why and When it's done are empty\n")
+        r = self.ergon("breakdown", "E-001", check=False)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        out = r.stdout
+        self.assertIn("breakdown E-001  blocked: 0 proposed, 0 refused", out)
+        self.assertIn("the brief's Why and When it's done are empty", out)
+        self.assertIn("empty in the brief: Why, When it's done", out)
+        self.assertIn("question: Why do you want widgets?\n    - Customers can't find their widgets\n"
+                      "    - Support answers widget questions by hand\n", out)
+        self.assertIn("question: What will be true when it's done?\n    - GET /widgets lists a customer's widgets\n"
+                      "    - the widgets page loads in under a second\n    - support gets no widget tickets for a week\n",
+                      out)
+        row = [r for r in history(self.root) if r["event"] == "breakdown"][-1]
+        self.assertEqual(row["verdict"], "blocked")
+        self.assertEqual(row["reason"], "the brief's Why and When it's done are empty")
+        self.assertEqual(row["asked"], ["Why", "When it's done"])
+        self.assertEqual(row["questions"], [
+            {"text": "Why do you want widgets?",
+             "options": ["Customers can't find their widgets", "Support answers widget questions by hand"]},
+            {"text": "What will be true when it's done?",
+             "options": ["GET /widgets lists a customer's widgets", "the widgets page loads in under a second",
+                         "support gets no widget tickets for a week"]}])
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        page = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); from ergon import config, serve; "
+             "config.configure(); print(serve.breakdown_block('E-001'))", str(ERGON.parent)],
+            cwd=self.root, env=self.env, capture_output=True, text=True, check=True).stdout
+        self.assertIn("Why do you want widgets?", page)
+        self.assertIn("<li>support gets no widget tickets for a week</li>", page)
+        self.assertIn("empty in the brief:</span> Why, When it&#x27;s done", page)
+
+    def test_asking_with_no_reason_counts_the_questions(self):
+        self.new_epic(when_done=None)
+        approve_epic(self)
+        self.env["FAKE_BREAKDOWN"] = "QUESTION: What should be true?\nOPTIONS: a | b\nRESULT: asking\n"
+        r = self.ergon("breakdown", "E-001", check=False)
+        self.assertIn("blocked: 0 proposed, 0 refused, $0.05; 1 question(s) for a human", r.stdout)
+        row = [r for r in history(self.root) if r["event"] == "breakdown"][-1]
+        self.assertEqual((row["asked"], row["questions"]), (["When it's done"], [{"text": "What should be true?",
+                                                                                  "options": ["a", "b"]}]))
 
     def test_blocked_breakdown_runs_once_and_by_hand_only_adds(self):
         self.new_epic()
