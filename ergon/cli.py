@@ -185,8 +185,17 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                --all: every one. Not in the brief digest. Record in <state>/runs/tag/
   ergon related T-ID           read-only, with `concepts`: open tasks sharing a component, then only
                                a concern; done tasks it builds on (Jaccard overlap of components);
-                               missing depends (a component an open task introduces, not in its
-                               depends: closure). /t/T-ID shows the same
+                               the files changed by commits on main citing it (one git log; no
+                               merges, no state files) and done tasks ranked by shared files, each
+                               weighted by rarity (log of tasks / tasks changing it); missing
+                               depends (a component an open task introduces, not in its depends:
+                               closure). The two file lists show for untagged tasks too. /t/T-ID
+                               shows the same, without the file lists
+  ergon related --origins      read-only: for each component with no introduced_by, the task cited by
+                               the commit that first added its files, with the evidence (file ->
+                               commit -> task). A guess (a move or package split adds files too):
+                               paste the right ones, write introduced_by = "none" to silence a wrong
+                               one. `check` warns about each suggestion until one is written
   ergon learn [--since D] [--model sonnet] [--budget USD] [--dry-run]
                                one `claude -p` (no tools) groups the incidents no task's harden:
                                cites yet into mistake classes, each with the lowest layer that
@@ -534,7 +543,16 @@ def main():
     tg.add_argument("--model", default="sonnet", help="default sonnet")
     tg.add_argument("--budget", type=float, help="max USD per call (--max-budget-usd)")
     tg.add_argument("--dry-run", action="store_true", help="list the tasks; ask nothing, write nothing")
-    sub.add_parser("related", help="tasks related to this one through the concept map").add_argument("id")
+    rl_help = ("tasks related to this one through the concept map, the files its commits on main changed and "
+               "done tasks ranked by shared files (rarer files weigh more)")
+    rl = sub.add_parser("related", help=rl_help, description=rl_help[0].upper() + rl_help[1:] + (
+        ". The file lists come from one `git log --no-merges --name-only` on main each run (nothing is "
+        "cached); `Merge T-/E-` subjects and files under the state dir don't count. They show for "
+        "untagged tasks too."))
+    rl.add_argument("id", nargs="?", help="the task")
+    rl.add_argument("--origins", action="store_true", help=(
+        "instead of a task: suggest each component's introduced_by from the commit that first added its "
+        "files, with the evidence; writes nothing, and each suggestion needs a human's judgement"))
     ln = sub.add_parser("learn", help="propose harden tasks from recurring incidents (runs claude -p; only proposes)")
     ln.add_argument("--since", metavar="YYYY-MM-DD", help="only incidents caught on or after this day")
     ln.add_argument("--model", default="sonnet", help="default sonnet")

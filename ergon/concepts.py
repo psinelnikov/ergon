@@ -23,6 +23,15 @@ Coverage (T-278): the leading directory of every component `files` pattern that 
 root; `ergon check` warns about each tracked file under a root that matches no component's or
 [[ignore]] entry's `files` (config.protect_hit). No git, or no repo, skips it quietly.
 
+Origins (T-280): for a component with no `introduced_by`, `origins` takes the commit that first
+added each tracked file its `files` match (one `git log --diff-filter=A --no-merges` over the
+history, renames off) and suggests the task IDs the oldest such commit cites (gitops.cites), skipping
+`Merge T-/E-` landing subjects as gitops.branch_commits does. It writes nothing. `ergon related
+--origins` prints each suggestion with its evidence (file -> commit -> tasks); `ergon check` warns
+about each component that has a suggestion. A first add is often a move or a package split, not
+the task that built the component, so a human judges each one: `introduced_by = "none"` on a
+component silences its suggestion for good.
+
 A task's `concepts:` frontmatter lists component ids. `ergon tag` writes it: one `claude -p` per
 batch of BATCH tasks, run like `grade` with no tools from an empty folder, picks from the map's
 ids, and any other id in its reply is dropped. Matching words alone tags too much ("approve"
@@ -68,6 +77,7 @@ touch counts as its whole file. Missing knowledge holds, as with `hold_by = "com
 `names_file` (the gate-file and suppression exemptions) keeps matching the entry exactly: a
 function-level touch never exempts its file.
 """
+import math
 import re
 import secrets
 import subprocess
@@ -88,6 +98,9 @@ CONCERN_KEYS = {"id", "label"}
 COMPONENT_KEYS = {"id", "label", "concern", "files", "terms", "fns", "introduced_by"}
 IGNORE_KEYS = {"id", "label", "files"}
 GLOB = set("*?[")
+NO_ORIGIN = "none"  # introduced_by = "none": a human rejected the suggested origin (T-280)
+CITED = re.compile(r"\bT-\d{3,}\b")  # the task IDs a commit cites, as gitops.cites matches one
+MERGE_SUBJECT = re.compile(r"Merge [TE]-\d")  # dispatch's landing commits, which gitops.branch_commits skips
 
 PROMPT = """You are tagging task briefs for a software project with the components of its concept \
 map, so that tasks about the same part of the system can be found together. Below is the map, \
@@ -188,13 +201,15 @@ def check_map(raw):
             errs.append(f"{where}: fns must be a list of strings")
             ok = False
         intro = c.get("introduced_by")
-        if intro is not None and (not isinstance(intro, str) or not TASK_ID.fullmatch(intro)):
-            errs.append(f"{where}: introduced_by {intro!r} isn't a task ID (T-NNN)")
+        silenced = intro == NO_ORIGIN
+        if intro is not None and not silenced and (not isinstance(intro, str) or not TASK_ID.fullmatch(intro)):
+            errs.append(f"{where}: introduced_by {intro!r} isn't a task ID (T-NNN) or \"{NO_ORIGIN}\"")
             ok = False
         if ok:
             comps[cid] = {"id": cid, "concern": c["concern"], "label": str(c.get("label") or ""),
                           "files": [x.strip("/") for x in c["files"]], "terms": list(c["terms"]),
-                          "fns": list(c.get("fns") or []), "introduced_by": intro or None}
+                          "fns": list(c.get("fns") or []), "introduced_by": None if silenced else intro or None,
+                          "no_origin": silenced}
     for n, c in enumerate(entries("ignore"), 1):
         iid = c.get("id") if isinstance(c, dict) else None
         where = f"[[ignore]] #{n}" + (f" ({iid})" if isinstance(iid, str) else "")
@@ -273,6 +288,99 @@ def uncovered(cmap, files):
     pats += [p for c in cmap.get("ignore", {}).values() for p in c["files"]]
     return [f for f in files if f.split("/")[0] in rs and "/" in f
             and not any(_config.protect_hit(f, p) for p in pats)]
+
+
+# ---------- origins (T-280) ----------
+
+def first_adds():
+    """{path: (short hash, subject, full message)} for the commit that first added each path, oldest
+    add wins: one `git log --diff-filter=A --no-merges` over the whole history. A file a merge
+    added has no entry. None when git can't be run or this isn't a repo."""
+    try:
+        r = subprocess.run(["git", "-C", str(_config.REPO), "-c", "core.quotePath=false", "log", "--reverse",
+                            "--no-renames", "--diff-filter=A", "--no-merges", "--name-only",
+                            "--format=%x1e%h%x1f%s%x1f%B%x1d"], capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode:
+        return None
+    out = {}
+    for chunk in r.stdout.split("\x1e"):
+        head, sep, names = chunk.partition("\x1d")
+        if not sep:
+            continue
+        commit = tuple(head.split("\x1f", 2))
+        if len(commit) != 3:
+            continue
+        for f in names.splitlines():
+            if f.strip() and f not in out:
+                out[f] = commit
+    return out
+
+
+def commit_cites(commit, tasks=None):
+    """The task IDs a first-add commit cites, in order: none for a `Merge T-/E-` subject (a landing
+    commit, as gitops.branch_commits skips them) and, given tasks, only IDs the tracker has."""
+    if MERGE_SUBJECT.match(commit[1]):
+        return []
+    ids = list(dict.fromkeys(CITED.findall(commit[2])))
+    return [i for i in ids if _gitops.cites(commit, i) and (tasks is None or i in tasks)]
+
+
+def origins(cmap, tasks=None, files=None, adds=None):
+    """{component id: {"suggest": [task IDs], "evidence": [(path, hash, subject, [task IDs])]}} for
+    each component with no introduced_by and not marked introduced_by = "none". evidence lists every
+    tracked file its `files` patterns match that git saw added, oldest add first; suggest is what
+    the oldest commit among them that cites a task cites ([] when none does). Writes nothing.
+    {} when git can't be run."""
+    files = tracked_files() if files is None else files
+    adds = first_adds() if adds is None else adds
+    if files is None or adds is None:
+        return {}
+    order = {}
+    for f, c in adds.items():
+        order.setdefault(c[0], len(order))
+    out = {}
+    for c in cmap["components"].values():
+        if c["introduced_by"] or c.get("no_origin"):
+            continue
+        mine = [f for f in files if f in adds and any(_config.protect_hit(f, p) for p in c["files"])]
+        mine.sort(key=lambda f: (order[adds[f][0]], f))
+        ev = [(f, adds[f][0], adds[f][1], commit_cites(adds[f], tasks)) for f in mine]
+        out[c["id"]] = {"suggest": next((ids for *_, ids in ev if ids), []), "evidence": ev}
+    return out
+
+
+def origin_lines(cmap, tasks):
+    """`ergon related --origins`: each component without introduced_by, its suggestion and the
+    evidence (file -> commit -> tasks), as lines."""
+    got = origins(cmap, tasks)
+    name = _config.CONCEPTS.name
+    lines = [f"Suggested introduced_by for {name}, from the commit that first added each file "
+             f"(git log --diff-filter=A --no-merges).",
+             "A suggestion is a guess: the first add may be a move or a package split, not the task that "
+             "built the component.",
+             f"Paste the ones you agree with into {name}; write introduced_by = \"{NO_ORIGIN}\" on a "
+             f"component to silence a wrong one. Nothing here is written.", ""]
+    silenced = [c["id"] for c in cmap["components"].values() if c.get("no_origin")]
+    if not got:
+        lines.append("every component has introduced_by" + (f" or \"{NO_ORIGIN}\"" if silenced else "")
+                     if cmap["components"] else "the map has no components")
+    for cid, o in got.items():
+        if o["suggest"]:
+            lines.append(f"[[component]] {cid}: introduced_by = \"{o['suggest'][0]}\""
+                         + (f"  (that commit also cites {', '.join(o['suggest'][1:])})" if o["suggest"][1:] else ""))
+        else:
+            lines.append(f"[[component]] {cid}: no suggestion: "
+                         + ("no first-add commit of its files cites a task" if o["evidence"]
+                            else "git saw none of its files added"))
+        for f, h, subject, ids in o["evidence"]:
+            why = (", ".join(ids) if ids else "a landing merge, skipped" if MERGE_SUBJECT.match(subject)
+                   else "cites no task")
+            lines.append(f"  {f} -> {h} {subject} -> {why}")
+    if silenced:
+        lines += ["", f"silenced (introduced_by = \"{NO_ORIGIN}\"): {', '.join(silenced)}"]
+    return lines
 
 
 # ---------- tags ----------
@@ -561,6 +669,97 @@ def fn_notes(t, cmap, short=False):
     return out
 
 
+# ---------- files a task's commits changed (T-282) ----------
+
+FILE_OVERLAP = 5  # done tasks `related` lists by file overlap
+SHARED_SHOWN = 4  # shared files a file-overlap row names before "+N more"
+
+
+def task_files(tasks=None):
+    """{task ID: set of paths} changed by the non-merge commits on main that cite each task (one
+    `git log --no-merges --name-only`). A `Merge T-/E-` landing subject cites nothing (as for
+    origins), and paths under the state dir are dropped: shared-mode state commits cite task IDs
+    and change only task files. Given tasks, only IDs the tracker has. None when git can't be run
+    or main can't be read. Stores nothing: each call reads the log again."""
+    try:
+        r = subprocess.run(["git", "-C", str(_config.REPO), "-c", "core.quotePath=false", "log", "--no-merges",
+                            "--name-only", "--format=%x1e%h%x1f%s%x1f%B%x1d", _config.MAIN, "--"],
+                           capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode:
+        return None
+    try:
+        state = _config.STATE.relative_to(_config.HOME).as_posix().strip("/") + "/"
+    except ValueError:
+        state = None  # the state dir is outside the repo: no commit can change it
+    out = {}
+    for chunk in r.stdout.split("\x1e"):
+        head, sep, names = chunk.partition("\x1d")
+        if not sep:
+            continue
+        commit = tuple(head.split("\x1f", 2))
+        if len(commit) != 3:
+            continue
+        files = {f for f in names.splitlines() if f.strip() and not (state and f.startswith(state))}
+        if not files:
+            continue
+        for i in commit_cites(commit, tasks):
+            out.setdefault(i, set()).update(files)
+    return out
+
+
+def rarity(index):
+    """{path: weight}: log(tasks in index / tasks whose commits changed the path). A file every
+    task changes weighs 0, one only a single task changed weighs the most."""
+    n = len(index)
+    seen = {}
+    for files in index.values():
+        for f in files:
+            seen[f] = seen.get(f, 0) + 1
+    return {f: math.log(n / k) for f, k in seen.items()}
+
+
+def file_overlap(tid, tasks, index):
+    """[(task, score, [shared paths, rarest first])] for each done task whose commits changed a file
+    tid's commits changed, best first, the top FILE_OVERLAP. score is the sum of the shared files'
+    rarity, so files most tasks touch (README, docs, shared tests) count for almost nothing. Ties go
+    to more shared files, then to ID order. [] when tid has no citing commits."""
+    mine = index.get(tid) or set()
+    if not mine:
+        return []
+    w = rarity(index)
+    out = []
+    for i, o in sorted(tasks.items()):
+        if i == tid or o.get("status") != "done":
+            continue
+        both = mine & (index.get(i) or set())
+        if both:
+            shared = sorted(both, key=lambda f: (-w[f], f))
+            out.append((o, sum(w[f] for f in both), shared))
+    out.sort(key=lambda x: (-round(x[1], 9), -len(x[2])))  # stable: ties stay in ID order
+    return out[:FILE_OVERLAP]
+
+
+def file_lines(t, tasks):
+    """`related`'s two git sections for t: the files its citing commits changed, then the done tasks
+    ranked by file overlap. Read from git on every call; nothing is stored."""
+    index = task_files(tasks)
+    lines = [f"\nFILES CHANGED (commits on {_config.MAIN} citing {t['id']})"]
+    if index is None:
+        return lines + [f"  git log on {_config.MAIN} could not be read"]
+    mine = sorted(index.get(t["id"]) or ())
+    lines += [f"  {f}" for f in mine] or ["  none"]
+    lines.append("\nDONE, SHARING FILES (ranked by how rare the shared files are)")
+    rows = file_overlap(t["id"], tasks, index)
+    for o, score, shared in rows:
+        more = f", +{len(shared) - SHARED_SHOWN} more" if len(shared) > SHARED_SHOWN else ""
+        lines.append(f"  {o['id']}  {score:.2f}  {o.get('title', '')}  [{', '.join(shared[:SHARED_SHOWN])}{more}]")
+    if not rows:
+        lines.append("  none")
+    return lines
+
+
 # ---------- links ----------
 
 def closure(tid, tasks):
@@ -634,6 +833,13 @@ def stamp_note(t, cmap):
 def related(args):
     cmap = load("ergon related")
     tasks = _tasks.load(_config.ITEMS)
+    if getattr(args, "origins", False):
+        if args.id:
+            raise SystemExit("ergon related: give a task ID or --origins, not both")
+        print("\n".join(origin_lines(cmap, tasks)))
+        return
+    if not args.id:
+        raise SystemExit("ergon related: give a task ID, or --origins for suggested introduced_by")
     t = tasks.get(args.id)
     if not t:
         raise SystemExit(f"no such task: {args.id}")
@@ -643,6 +849,7 @@ def related(args):
     if not ls["components"]:
         print("no concepts: " + (note if note and t.get("tagged") else "untagged")
               + f"; run `ergon tag {t['id']}`")
+        print("\n".join(file_lines(t, tasks)))
         return
     print(f"concepts: {', '.join(ls['components'])}" + (f"  (stale: {note}; `ergon tag {t['id']}`)" if note else ""))
     comps = cmap["components"]
@@ -665,6 +872,7 @@ def related(args):
         print(f"  {o['id']}  {j:.2f}  {o.get('title', '')}  [{', '.join(shared)}]")
     if not ls["builds_on"]:
         print("  none")
+    print("\n".join(file_lines(t, tasks)))
     print("\nMISSING DEPENDS")
     for c, intro in ls["missing"]:
         print(f"  {intro} ({tasks[intro].get('status')}) introduces {c}, which {t['id']} uses, "
@@ -676,8 +884,9 @@ def related(args):
 def lint(tasks):
     """(errors, warnings) for `ergon check`: the map's problems, introduced_by IDs that name no
     task and an open task's malformed function-level touches are errors; missing depends, tags the
-    map lacks, a dropped introducer, a function the map doesn't list and a tracked file under a
-    coverage root that no component or [[ignore]] entry covers are warnings. Without a
+    map lacks, a dropped introducer, a function the map doesn't list, a tracked file under a
+    coverage root that no component or [[ignore]] entry covers and a component with no
+    introduced_by whose files suggest one (origins) are warnings. Without a
     `concepts` key, only a `hold_by` that doesn't hold, malformed touches and the function-level
     touches that count as their whole file for want of a map."""
     hold = hold_by_problem()
@@ -697,6 +906,12 @@ def lint(tasks):
              for n in fn_notes(t, cmap)]
     warns += [f"{name}: {f}: no [[component]] covers it; add it to a component's files or to an [[ignore]] entry"
               for f in uncovered(cmap, files or [])]
+    for cid, o in (origins(cmap, tasks, files) if files is not None else {}).items():
+        if o["suggest"]:
+            f, h = next((f, h) for f, h, _, ids in o["evidence"] if ids)
+            warns.append(f"{name}: component {cid}: no introduced_by; {f} was first added by {h}, citing "
+                         f"{', '.join(o['suggest'])}. Write introduced_by = \"{o['suggest'][0]}\" if that task "
+                         f"built it, or \"{NO_ORIGIN}\" to silence this (`ergon related --origins` shows the evidence)")
     for c in cmap["components"].values():
         intro = c["introduced_by"]
         if intro and intro not in tasks:
