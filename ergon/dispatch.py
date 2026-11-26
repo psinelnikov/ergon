@@ -3203,11 +3203,28 @@ def breakdown_rows(eid=None):
 
 def breakdown_candidates(tasks, epics, apr=None):
     """Epics dispatch breaks down: open, approved (or from before approvals: epic_problem), with
-    no task at all (a dropped one counts: someone looked), never broken down before."""
-    done = {r.get("epic") for r in breakdown_rows()}
+    no task at all (a dropped one counts: someone looked), and either never broken down before or
+    answered since a breakdown asked (rebreak)."""
+    rows = {}
+    for r in breakdown_rows():
+        rows.setdefault(r.get("epic"), []).append(r)
     have = {t.get("epic") for t in tasks.values()}
     return [e for _, e in sorted(epics.items()) if e.get("status") == "open" and e["id"] not in have
-            and e["id"] not in done and not _tasks.epic_problem(e, apr)]
+            and (e["id"] not in rows or rebreak(e, rows[e["id"]])) and not _tasks.epic_problem(e, apr)]
+
+
+def rebreak(e, rows):
+    """Is epic e, broken down before (its history `breakdown` rows, oldest first), to be broken down
+    again? Only once a run asked (a row with `asked`: the brief's Why or When it's done was empty),
+    both sections are now filled, and the brief's digest differs from every asked row's: one
+    automatic re-run per answered brief (T-289). An epic with no asked row stays as it was (never
+    again by itself). A non-asked row after the first asked one doesn't rule the epic out by being
+    non-asked, but a run of this same brief since then did read the answers, so it isn't re-run."""
+    first = next((n for n, r in enumerate(rows) if r.get("asked")), None)
+    if first is None or _tasks.empty_answers(e):
+        return False
+    digest = _tasks.brief_digest(e)
+    return all(r.get("digest") != digest for r in rows[first:])
 
 
 def protect_text():
@@ -3423,6 +3440,10 @@ def run_breakdown(e, args, by="breakdown", gate=None, sync=None):
         verdict, why = "blocked", f"breakdown crashed: {err}"
     info.update(verdict=verdict, reason=why, seconds=round(time.monotonic() - start, 1))
     extra = {}
+    try:  # the brief this run read: an answered epic is broken down again once per new brief (T-289)
+        extra["digest"] = _tasks.brief_digest(e)
+    except Exception:  # noqa: BLE001 - a row without it only means no automatic re-run
+        pass
     if info.get("asked"):
         extra["asked"] = info["asked"]
     if info.get("questions"):
@@ -3542,8 +3563,9 @@ def print_breakdown(info, indent="  "):
           f"${info['cost']:.2f}" + (f"; {info['reason']}" if info.get("reason") else "") + f" (log {info['log']})",
           flush=True)
     if info.get("asked"):
-        print(f"{indent}  empty in the brief: {', '.join(info['asked'])}. Fill them in {eid}'s brief, approve it "
-              f"again, then run `ergon breakdown {eid}`")
+        print(f"{indent}  empty in the brief: {', '.join(info['asked'])}. Fill them in {eid}'s brief (and approve it "
+              f"again where approvals are signed): dispatch then breaks it down again by itself, or run "
+              f"`ergon breakdown {eid}`")
     for q, opts in info.get("questions") or []:
         print(f"{indent}  question: {q}")
         for o in opts:
@@ -5017,8 +5039,13 @@ def dispatch(args):
               + ". `ergon review` lists them for your approval")
         for b in breaks:
             if b["verdict"] != "done":
-                print(f"  breakdown {b['epic']} {b['verdict']}: {b['reason']}. Dispatch won't run it again; "
-                      f"`ergon breakdown {b['epic']}` does")
+                if b.get("asked"):
+                    print(f"  breakdown {b['epic']} {b['verdict']}: {b['reason']}. Dispatch runs it again once "
+                          f"{' and '.join(b['asked'])} {'is' if len(b['asked']) == 1 else 'are'} filled in the brief; "
+                          f"`ergon breakdown {b['epic']}` does now")
+                else:
+                    print(f"  breakdown {b['epic']} {b['verdict']}: {b['reason']}. Dispatch won't run it again; "
+                          f"`ergon breakdown {b['epic']}` does")
     if stopped:
         print("\ninterrupted: stopped launching" + ("; killed running workers" if KILL_ALL.is_set() else ""))
     held_back = sorted(i for i, t in _tasks.load(_config.ITEMS).items() if _tasks.limited(t)) if paused else []

@@ -1007,7 +1007,10 @@ def board(args):
             done = sum(t["status"] == "done" for t in kids)
             pending = sum(t["status"] == "proposed" for t in kids)
             note = f", {pending} awaiting approval" if pending else ""
-            note += "  <- needs breakdown" if not kids and e["status"] == "open" else ""
+            if not kids and e["status"] == "open":
+                empty = empty_answers(e)  # a breakdown files nothing until both are filled (T-288, T-289)
+                note += (f"  <- breakdown waiting on {' / '.join(empty)} (fill in the brief)" if empty
+                         else "  <- needs breakdown")
             note += "  <- brief awaiting approval" if e["status"] == "proposed" else ""
             where = _epic_checkout(e)
             note += f"  {where}" if where else ""

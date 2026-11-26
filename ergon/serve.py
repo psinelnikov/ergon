@@ -676,10 +676,12 @@ def journal_block(eid, tasks):
             + (f' · {money(cost)}' if isinstance(cost, (int, float)) and not isinstance(cost, bool) else "") + "</p>")
 
 
-def breakdown_block(eid):
+def breakdown_block(eid, e=None):
     """The epic's breakdown runs (history `breakdown` rows): verdict, cost, time, log link, and for a
     run that didn't file, its reason, the brief's empty sections (`asked`) and the agent's questions
-    with their suggestions (T-288). '' if none."""
+    with their suggestions (T-288). With the epic e given and a run that asked, a line says whether
+    the breakdown waits on the brief's empty sections or, answered, runs again by itself (T-289).
+    '' if none."""
     rows = [r for r in _history.read() if r.get("event") == "breakdown" and r.get("epic") == eid]
     if not rows:
         return ""
@@ -702,7 +704,14 @@ def breakdown_block(eid):
         f'<li><span class="v-{esc(r.get("verdict"))}">{esc(r.get("verdict"))}</span> · {money(r.get("cost"))} · '
         f'{esc(secs(r.get("seconds")))} · <span class=muted>{esc(r.get("at"))}</span>'
         + (f' · log {log_link(r["log"])}' if r.get("log") else "") + asking(r) + "</li>" for r in rows)
-    return f"<h2>Breakdown runs</h2><p>{len(rows)} run(s), {money(cost)}</p><ul>{items}</ul>"
+    state = ""
+    if e and any(r.get("asked") for r in rows):
+        empty = _tasks.empty_answers(e)
+        if empty:
+            state = f"<p>waiting on {esc(' / '.join(empty))}: fill {'it' if len(empty) == 1 else 'them'} in the brief</p>"
+        elif _dispatch.breakdown_candidates(_tasks.load(_config.ITEMS), {eid: e}, _gitops.approvals()):
+            state = "<p>answered: dispatch breaks it down again on its next scan</p>"
+    return f"<h2>Breakdown runs</h2><p>{len(rows)} run(s), {money(cost)}</p>{state}<ul>{items}</ul>"
 
 
 def epic_page(eid, nonce, now=None):
@@ -721,7 +730,7 @@ def epic_page(eid, nonce, now=None):
     tl = _timeline.build(rows, tasks, eid, now or time.time(), tokens)
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
          f'<h1>{esc(eid)} {esc(e.get("title"))}</h1>']
-    jb = journal_block(eid, tasks) + breakdown_block(eid)
+    jb = journal_block(eid, tasks) + breakdown_block(eid, e)
     if not tl["lanes"]:
         b.append(jb)
         b.append("<p class=muted>no task of this epic has a journal yet</p>")

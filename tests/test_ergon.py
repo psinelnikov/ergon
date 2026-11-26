@@ -6545,6 +6545,75 @@ class TestBreakdown(DispatchProject):
         self.assertEqual((row["asked"], row["questions"]), (["When it's done"], [{"text": "What should be true?",
                                                                                   "options": ["a", "b"]}]))
 
+    def fill(self, f, section, text):
+        """Write text under the brief's `## <section>` heading (which `ergon new epic` always writes)."""
+        f.write_text(f.read_text().replace(f"## {section}\n", f"## {section}\n{text}\n", 1))
+
+    def test_answered_epic_is_broken_down_again_once_per_brief(self):
+        """T-289 (durable): an epic whose only breakdown row is `asked` waits while its sections are
+        empty, is broken down again once they are filled, not again for the same brief, and once
+        more after the brief changes."""
+        from ergon import tasks as T
+        f = self.new_epic(why=None)
+        approve_epic(self)
+        self.env["FAKE_BREAKDOWN"] = "QUESTION: Why do you want widgets?\nOPTIONS: a | b\nRESULT: asking\n"
+        out = self.ergon("dispatch").stdout
+        self.assertIn("Dispatch runs it again once Why is filled in the brief", out)
+        row = [r for r in history(self.root) if r["event"] == "breakdown"][-1]
+        self.assertEqual(row["asked"], ["Why"])
+        self.assertEqual(row["digest"], T.brief_digest(T.parse_text(f.read_text())))
+        # empty still: not a candidate, and the board says what it waits on
+        self.ergon("dispatch")
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertEqual(len(self.calls()), 1)
+        board = self.ergon("board").stdout
+        self.assertIn("E-001  open     0/0 done  <- breakdown waiting on Why (fill in the brief)", board)
+        self.assertNotIn("needs breakdown", board)
+        self.fill(f, "Why", "   ")  # whitespace only is still empty
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        # answered: a candidate again; this run blocks again (a non-asked row with this brief's digest)
+        f.write_text(f.read_text().replace("## Why\n   \n", "## Why\nCustomers can't see their widgets today\n"))
+        self.assertIn("would run  breakdown E-001", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertIn("<- needs breakdown", self.ergon("board").stdout)
+        page = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); from ergon import config, serve, tasks; "
+             "config.configure(); print(serve.breakdown_block('E-001', tasks.load(config.EPICS)['E-001']))",
+             str(ERGON.parent)], cwd=self.root, env=self.env, capture_output=True, text=True, check=True).stdout
+        self.assertIn("answered: dispatch breaks it down again on its next scan", page)
+        self.env["FAKE_BREAKDOWN"] = "QUESTION: Which repo?\nOPTIONS: this one | the API\nRESULT: blocked — say which repo\n"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(len(self.calls()), 2)
+        self.assertIn("Dispatch won't run it again", out)
+        self.assertNotIn("asked", [r for r in history(self.root) if r["event"] == "breakdown"][-1])
+        # the same brief is never broken down twice by dispatch: no loop
+        self.ergon("dispatch")
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertEqual(len(self.calls()), 2)
+        # a changed brief earns one more run; the non-asked row in between doesn't rule the epic out
+        self.fill(f, "Goal", "The widgets live in this repo.")
+        self.env["FAKE_BREAKDOWN"] = BREAKDOWN_REPLY
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(len(self.calls()), 3)
+        self.assertIn("proposed T-001  (breakdown E-001)", out)
+        # with tasks it is done with, whatever the brief does next
+        self.fill(f, "Goal", "More.")
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+
+    def test_a_non_asked_row_after_an_asked_one_does_not_rule_the_epic_out(self):
+        """T-289: only the asked rows' digests matter; a later run that didn't ask (here a crash
+        recorded while the Why was still empty, with no digest) doesn't stop the re-run once the
+        Why is filled."""
+        f = self.new_epic(why=None)
+        approve_epic(self)
+        self.env["FAKE_BREAKDOWN"] = "QUESTION: Why?\nOPTIONS: a | b\nRESULT: asking\n"
+        self.ergon("dispatch")
+        with (self.root / "tasks" / "runs" / "history.jsonl").open("a") as h:
+            h.write(json.dumps({"at": "2026-11-26T10:00:00+00:00", "event": "breakdown", "epic": "E-001",
+                                "verdict": "blocked", "reason": "breakdown crashed: boom"}) + "\n")
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.fill(f, "Why", "Customers can't see their widgets today")
+        self.assertIn("would run  breakdown E-001", self.ergon("dispatch", "--dry-run").stdout)
+
     def test_blocked_breakdown_runs_once_and_by_hand_only_adds(self):
         self.new_epic()
         approve_epic(self)
@@ -6554,6 +6623,11 @@ class TestBreakdown(DispatchProject):
         self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
         self.ergon("dispatch")
         self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertEqual(len(self.calls()), 1)
+        # T-289: a non-asked blocked row behaves as before: editing the brief doesn't bring it back
+        self.fill(next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md")), "Goal", "The widgets live here.")
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertIn("E-001  open     0/0 done  <- needs breakdown", self.ergon("board").stdout)
         self.assertEqual(len(self.calls()), 1)
         # by hand it runs again, and again only adds
         one = "TASK: First\ntier: haiku\ntier_why: w\ncategory: chore\ntouches: a.md\ndepends:\n## What\nx\n## Done when\n- y\nEND TASK\nRESULT: done\n"
@@ -9626,6 +9700,55 @@ class TestGradeKeepsSignedApproval(unittest.TestCase):
         changed = [l for l in show.splitlines() if re.match(r"^[+-](?![+-])", l)]
         self.assertTrue(changed)
         self.assertTrue(all(re.match(r"^\+(cod|cod_why|graded): ", l) for l in changed), changed)
+
+
+class TestAnsweredBreakdownShared(unittest.TestCase):
+    """Shared mode (T-289): filling an asked epic's Why un-approves its brief, so dispatch breaks it
+    down again only after a human approves it again. Borrows test_shared's breakdown fixture,
+    imported here since test_shared imports this module."""
+
+    def __getattr__(self, name):
+        from test_shared import TestBreakdownClaims
+        attr = getattr(TestBreakdownClaims, name)
+        return attr.__get__(self) if callable(attr) else attr
+
+    def setUp(self):
+        import test_shared
+        test_shared.Shared.setUp(self)
+        bindir = Path(self.tmp.name) / "bin"
+        bindir.mkdir()
+        (bindir / "claude").write_text(test_shared.FAKE_CLAUDE.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
+        (bindir / "claude").chmod(0o755)
+        self.calls = Path(self.tmp.name) / "breakdowns.jsonl"
+        self.env_a = clean_env(USER="ann", LOGNAME="ann", ERGON_ASK_STDIN="1", PATH=f"{bindir}:{os.environ['PATH']}",
+                               FAKE_BREAKDOWN=test_shared.BREAKDOWN_ONE, FAKE_BREAKDOWN_SEEN=str(self.calls))
+
+    def tearDown(self):
+        from test_shared import Shared
+        Shared.tearDown(self)
+
+    def test_answered_epic_waits_for_approval_then_is_broken_down_again(self):
+        why = "Shop staff can't sell widgets, so orders go elsewhere"
+        self.ergon(self.a, "new", "epic", "Widgets", "--why", why,
+                   "--when-done", "A widget can be ordered and shows up on the orders page", env=self.env_a)
+        f = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        f.write_text(f.read_text().replace("## Goal\n", "## Goal\nShip widgets end to end.\n").replace(why, ""))
+        self.ergon(self.a, "sync", "--init", inp="y\n", env=self.env_a)
+        self.assertIn("approved 1", self.ergon(self.a, "approve", "E-001", inp="y\n", env=self.env_a).stdout)
+        asking = dict(self.env_a, FAKE_BREAKDOWN="QUESTION: Why widgets?\nOPTIONS: a | b\nRESULT: asking\n")
+        self.ergon(self.a, "dispatch", env=asking)
+        self.assertEqual(len(self.breakdowns()), 1)
+        self.assertNotIn("breakdown E-001", self.ergon(self.a, "dispatch", "--dry-run", env=self.env_a).stdout)
+        # filled: the brief's approval no longer verifies, so no breakdown yet
+        f = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        f.write_text(f.read_text().replace("## Why\n", f"## Why\n{why}\n", 1))
+        self.assertNotIn("breakdown E-001", self.ergon(self.a, "dispatch", "--dry-run", env=self.env_a).stdout)
+        # approved again: dispatch breaks it down again by itself, once
+        self.assertIn("approved 1", self.ergon(self.a, "approve", "E-001", inp="y\n", env=self.env_a).stdout)
+        self.assertIn("would run  breakdown E-001", self.ergon(self.a, "dispatch", "--dry-run", env=self.env_a).stdout)
+        out = self.ergon(self.a, "dispatch", env=self.env_a).stdout
+        self.assertIn("proposed T-001  (breakdown E-001)  Add the schema", out)
+        self.assertEqual(len(self.breakdowns()), 2)
 
 
 FAKE_LEARN_CLAUDE = r'''#!PYTHON
