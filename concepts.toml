@@ -172,7 +172,7 @@ introduced_by = "T-135"
 [[component]]
 id = "plan.priority"
 concern = "planning"
-files = ["ergon/priority.py", "ergon/tasks.py", "ergon/serve.py", "ergon/grade.py", "ergon/fill.py", "ergon/obsidian.py"]
+files = ["ergon/priority.py", "ergon/tasks.py", "ergon/serve.py", "ergon/grade.py"]
 terms = ["priority", "pin", "grade"]
 
 [[component]]
@@ -182,6 +182,27 @@ files = ["ergon/concepts.py", "concepts.toml"]
 fns = ["links", "missing_depends", "tag", "related"]
 terms = ["concept map", "component", "concern", "related", "tag"]
 introduced_by = "T-141"
+
+[[component]]
+id = "plan.intake"
+concern = "planning"
+files = ["ergon/obsidian.py", "ergon/tasks.py"]
+fns = ["obsidian", "tick", "add_ids", "import_issue"]
+terms = ["import", "obsidian", "vault", "gh#", "write_back", "intake"]
+
+[[component]]
+id = "plan.fill"
+concern = "planning"
+files = ["ergon/fill.py"]
+fns = ["fill", "gaps", "run_batch", "apply"]
+terms = ["ergon fill", "fill in", "blank", "gaps", "tier_why"]
+
+[[component]]
+id = "plan.audit"
+concern = "planning"
+files = ["skills/task-audit/SKILL.md", "ergon/tasks.py"]
+fns = ["audit"]
+terms = ["audit", "stale", "retired", "moot", "backlog"]
 
 # ---------------------------------------------------------------- task model
 [[component]]
@@ -201,7 +222,7 @@ terms = ["touches", "tasks/` exclusion", "exclusion"]
 [[component]]
 id = "model.config"
 concern = "model"
-files = ["ergon/config.py", "ergon/shared.py", "ergon/gates.py", "ergon/__init__.py", "ergon/__main__.py"]
+files = ["ergon/config.py", "ergon/shared.py", "ergon/gates.py"]
 fns = ["read_config", "mini_toml", "configure"]
 terms = [".ergon.toml", "[shared]", "two_person", "remote's url"]
 
@@ -209,14 +230,28 @@ terms = [".ergon.toml", "[shared]", "two_person", "remote's url"]
 [[component]]
 id = "ui.serve"
 concern = "visibility"
-files = ["ergon/serve.py", "ergon/serve.css", "ergon/serve.js", "ergon/epic.js", "ergon/timeline.py"]
+files = ["ergon/serve.py", "ergon/serve.css", "ergon/serve.js"]
 terms = ["board", "/review", "review page", "web", "serve", "chart", "colours"]
 
 [[component]]
 id = "ui.stats"
 concern = "visibility"
-files = ["ergon/report.py", "ergon/metrics.py", "ergon/history.py", "ergon/serve.css", "ergon/transcripts.py"]
+files = ["ergon/report.py", "ergon/metrics.py", "ergon/history.py", "ergon/serve.css"]
 terms = ["stats", "report", "metrics", "chart"]
+
+[[component]]
+id = "ui.timeline"
+concern = "visibility"
+files = ["ergon/timeline.py", "ergon/epic.js"]
+fns = ["build", "phases", "svg", "totals"]
+terms = ["timeline", "replay", "lane", "/e/", "phase"]
+
+[[component]]
+id = "obs.transcripts"
+concern = "visibility"
+files = ["ergon/transcripts.py"]
+fns = ["session_summary", "last_request", "read", "describe"]
+terms = ["transcript", "session", "spent", "tokens", "cache-read"]
 
 [[component]]
 id = "obs.history"
@@ -227,5 +262,11 @@ terms = ["history.jsonl", "history table", "log "]
 [[component]]
 id = "docs"
 concern = "model"
-files = ["README.md", "skills/ergon/SKILL.md", "skills/task-audit/SKILL.md", "docs/shared-state.md"]
+files = ["README.md", "skills/ergon/SKILL.md", "docs/shared-state.md"]
 terms = ["readme", "skill.md", "shared-state.md", "document", "say how", "mention"]
+
+# ---------------------------------------------------------------- no component
+[[ignore]]
+id = "packaging"
+label = "Package glue: re-exports and the python -m entry point"
+files = ["ergon/__init__.py", "ergon/__main__.py"]
