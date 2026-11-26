@@ -39,6 +39,8 @@ concern = "approval"
 files = ["ergon/gates.py", "hooks/hooks.json"]
 fns = ["guard_reason", "hook", "shell_commands", "git_commands", "human_cmd", "names_outside_data", "state_git_reason", "git_config_reason", "config_edit_reason", "config_write_reason", "config_source_reason", "config_file_reason", "git_config_entries", "git_config_sets", "git_url_args"]
 terms = ["guard", "heredoc", "alias", "human-only verb", "refuses", "read-only mode", "agent edits"]
+# introduced_by: guard_reason and hooks/hooks.json came with the initial import 1bbbb87; T-023 67d5131 only moved them
+introduced_by = "none"
 
 [[component]]
 id = "approval.stamp"
@@ -46,6 +48,8 @@ concern = "approval"
 files = ["ergon/gates.py", "ergon/gitops.py", "ergon/shared.py"]
 fns = ["approve", "stamp_approved", "approve_ready", "approver", "signing", "approvals", "sign_state", "approve_problem"]
 terms = ["approve", "approval", "approver", "signed", "sign ", "two-person", "keys", "stamp"]
+# introduced_by: approve came with the initial import 1bbbb87 (signing was T-020 cda3bbe); T-023 67d5131 only moved it
+introduced_by = "none"
 
 [[component]]
 id = "approval.commit-hook"
@@ -53,6 +57,8 @@ concern = "approval"
 files = ["ergon/gates.py"]
 fns = ["commit_msg_reason", "commit_msg_hook", "install_commit_hook", "cited_tasks"]
 terms = ["commit-msg"]
+# introduced_by: 78f6bde added commit_msg_hook; the suggested T-023 67d5131 only moved it
+introduced_by = "T-014"
 
 [[component]]
 id = "approval.review"
@@ -60,6 +66,8 @@ concern = "approval"
 files = ["ergon/gates.py", "ergon/cli.py"]
 fns = ["review_interactive", "accept", "reject", "held_branch", "close"]
 terms = ["review -i", "interactive review", "reject", "accept", "review task"]
+# introduced_by: review_interactive and reject came with the initial import 1bbbb87 (accept was T-006); T-023 67d5131 only moved them
+introduced_by = "none"
 
 [[component]]
 id = "approval.auto"
@@ -75,6 +83,8 @@ concern = "dispatch"
 files = ["ergon/dispatch.py", "agents"]
 fns = ["prepare", "run_worker", "worker_prompt", "worker_rules", "worker_agents", "worker_settings"]
 terms = ["worker", "prompt"]
+# introduced_by: run_worker and the task-* agents came with the initial import 1bbbb87; T-005 only added the reviewer agent
+introduced_by = "none"
 
 [[component]]
 id = "dispatch.found"
@@ -82,6 +92,8 @@ concern = "dispatch"
 files = ["ergon/dispatch.py", "agents"]
 fns = ["parse_found", "file_found", "file_human"]
 terms = ["found", "follow-up", "file a "]
+# introduced_by: cfc1ae9 first filed FOUND lines; the suggested T-005 only added the reviewer agent
+introduced_by = "T-001"
 
 [[component]]
 id = "dispatch.ask"
@@ -89,6 +101,8 @@ concern = "dispatch"
 files = ["ergon/dispatch.py", "ergon/gates.py"]
 fns = ["parse_questions", "asked", "park", "answer_lines", "answer", "answer_task"]
 terms = ["asks a question", "asking", "answer"]
+# introduced_by: 1d73ab6 added parse_questions and ergon answer; the suggested T-023 67d5131 only moved code
+introduced_by = "T-028"
 
 [[component]]
 id = "dispatch.conflict"
@@ -96,6 +110,8 @@ concern = "dispatch"
 files = ["ergon/dispatch.py", "ergon/gitops.py", "ergon/gates.py"]
 fns = ["find_conflicts", "conflict_body", "conflict_checks", "conflict_note", "resolved_note", "merge_tree", "merge_check"]
 terms = ["conflict"]
+# introduced_by: merge_check came with the initial import 1bbbb87 and T-095 1b1c3cd added handing conflicts to the worker; T-023 67d5131 only moved code
+introduced_by = "none"
 
 [[component]]
 id = "dispatch.budget"
@@ -103,6 +119,8 @@ concern = "dispatch"
 files = ["ergon/dispatch.py", "ergon/limits.py", "ergon/cli.py"]
 fns = ["print_limit", "rounds_note"]
 terms = ["budget", "dry-run", "estimate", "--help"]
+# introduced_by: a budget came with the initial import 1bbbb87, then --budget-total T-010 and print_limit T-055; T-023 67d5131 only moved code
+introduced_by = "none"
 
 [[component]]
 id = "dispatch.claim"
@@ -110,6 +128,8 @@ concern = "shared"
 files = ["ergon/dispatch.py", "ergon/tasks.py", "ergon/shared.py", "ergon/serve.py"]
 fns = ["claim", "unclaim", "held_by", "held_elsewhere", "clone_id"]
 terms = ["claim", "held on", "holds it", "other clones"]
+# introduced_by: 57fd98b added claim and held_by; the suggested T-023 67d5131 only moved code
+introduced_by = "T-019"
 
 # ---------------------------------------------------------------- gates (E-003)
 [[component]]
@@ -118,6 +138,8 @@ concern = "gates"
 files = ["ergon/dispatch.py"]
 fns = ["run_verify", "verify_detail", "verify_lines", "fix_round"]
 terms = ["verify", "fix round"]
+# introduced_by: 298bf5d added run_verify; the suggested T-023 67d5131 only moved it
+introduced_by = "T-004"
 
 [[component]]
 id = "gates.reviewer"
@@ -125,6 +147,7 @@ concern = "gates"
 files = ["ergon/dispatch.py", "agents"]
 fns = ["reviewer_tier", "review_agent", "review_diff", "run_review", "review_retry"]
 terms = ["reviewer"]
+introduced_by = "T-005"
 
 [[component]]
 id = "gates.weakening"
@@ -132,6 +155,8 @@ concern = "gates"
 files = ["ergon/dispatch.py", "ergon/config.py", "ergon/gates.py"]
 fns = ["gate", "veto_lines"]
 terms = ["weaken", "weakening", "suppression", "red-on-base", "prove:", "gate file", "gates (`verify:`"]
+# introduced_by: built up over T-005 (gate), T-026 (veto_lines), T-102 (red-on-base) and T-105 (weaken); T-023 67d5131 only moved code
+introduced_by = "none"
 
 [[component]]
 id = "gates.harden"
@@ -146,6 +171,8 @@ concern = "gates"
 files = ["ergon/gates.py", "ergon/dispatch.py", "ergon/shared.py", "ergon/learn.py"]
 fns = ["write_policy", "policies_text", "is_policies"]
 terms = ["policies", "policy", "learn"]
+# introduced_by: 0f56c2e added write_policy; the suggested T-023 67d5131 only moved code
+introduced_by = "T-029"
 
 # ---------------------------------------------------------------- epics / planning
 [[component]]
@@ -154,6 +181,8 @@ concern = "planning"
 files = ["ergon/gitops.py", "ergon/gates.py", "ergon/tasks.py", "ergon/cli.py", "ergon/serve.py"]
 fns = ["open_epic", "enter_epic", "finish_epic", "epic_complete", "epic_branch"]
 terms = ["epic"]
+# introduced_by: open_epic and finish_epic came with the initial import 1bbbb87; T-023 67d5131 only moved them
+introduced_by = "none"
 
 [[component]]
 id = "epic.breakdown"
@@ -174,6 +203,8 @@ id = "plan.priority"
 concern = "planning"
 files = ["ergon/priority.py", "ergon/tasks.py", "ergon/serve.py", "ergon/grade.py"]
 terms = ["priority", "pin", "grade"]
+# introduced_by: 771bc13 added priority.py; the suggested T-023 67d5131 only moved tasks.py
+introduced_by = "T-075"
 
 [[component]]
 id = "plan.concepts"
@@ -189,6 +220,8 @@ concern = "planning"
 files = ["ergon/obsidian.py", "ergon/tasks.py"]
 fns = ["obsidian", "tick", "add_ids", "import_issue"]
 terms = ["import", "obsidian", "vault", "gh#", "write_back", "intake"]
+# introduced_by: 7368062 added ergon import gh#N, the first intake (Obsidian was T-155); the suggested T-023 67d5131 only moved tasks.py
+introduced_by = "T-013"
 
 [[component]]
 id = "plan.fill"
@@ -196,6 +229,7 @@ concern = "planning"
 files = ["ergon/fill.py"]
 fns = ["fill", "gaps", "run_batch", "apply"]
 terms = ["ergon fill", "fill in", "blank", "gaps", "tier_why"]
+introduced_by = "T-133"
 
 [[component]]
 id = "plan.audit"
@@ -203,6 +237,8 @@ concern = "planning"
 files = ["skills/task-audit/SKILL.md", "ergon/tasks.py"]
 fns = ["audit"]
 terms = ["audit", "stale", "retired", "moot", "backlog"]
+# introduced_by: the task-audit skill and audit came with the initial import 1bbbb87; T-023 67d5131 only moved code
+introduced_by = "none"
 
 # ---------------------------------------------------------------- task model
 [[component]]
@@ -211,6 +247,8 @@ concern = "model"
 files = ["ergon/tasks.py", "ergon/gitops.py"]
 fns = ["brief_digest", "sections", "normalised"]
 terms = ["digest"]
+# introduced_by: cda3bbe added brief_digest; the suggested T-023 67d5131 only moved code
+introduced_by = "T-020"
 
 [[component]]
 id = "model.touches"
@@ -218,6 +256,8 @@ concern = "model"
 files = ["ergon/dispatch.py", "ergon/gates.py", "ergon/shared.py"]
 fns = ["nested_touch", "companion_touch"]
 terms = ["touches", "tasks/` exclusion", "exclusion"]
+# introduced_by: nested_touch and companion_touch came with the initial import 1bbbb87; T-023 67d5131 only moved them
+introduced_by = "none"
 
 [[component]]
 id = "model.config"
@@ -225,6 +265,8 @@ concern = "model"
 files = ["ergon/config.py", "ergon/shared.py", "ergon/gates.py", "ergon/__init__.py", "ergon/__main__.py"]
 fns = ["read_config", "mini_toml", "configure"]
 terms = [".ergon.toml", "[shared]", "two_person", "remote's url"]
+# introduced_by: read_config and mini_toml came with the initial import 1bbbb87; T-023 67d5131 only moved them
+introduced_by = "none"
 
 # ---------------------------------------------------------------- visibility
 [[component]]
@@ -232,12 +274,15 @@ id = "ui.serve"
 concern = "visibility"
 files = ["ergon/serve.py", "ergon/serve.css", "ergon/serve.js"]
 terms = ["board", "/review", "review page", "web", "serve", "chart", "colours"]
+introduced_by = "T-030"
 
 [[component]]
 id = "ui.stats"
 concern = "visibility"
 files = ["ergon/report.py", "ergon/metrics.py", "ergon/history.py", "ergon/serve.css"]
 terms = ["stats", "report", "metrics", "chart"]
+# introduced_by: 1bd9c47 added ergon stats; the suggested T-023 67d5131 only moved report code
+introduced_by = "T-007"
 
 [[component]]
 id = "ui.timeline"
@@ -245,6 +290,7 @@ concern = "visibility"
 files = ["ergon/timeline.py", "ergon/epic.js"]
 fns = ["build", "phases", "svg", "totals"]
 terms = ["timeline", "replay", "lane", "/e/", "phase"]
+introduced_by = "T-031"
 
 [[component]]
 id = "obs.transcripts"
@@ -252,15 +298,20 @@ concern = "visibility"
 files = ["ergon/transcripts.py"]
 fns = ["session_summary", "last_request", "read", "describe"]
 terms = ["transcript", "session", "spent", "tokens", "cache-read"]
+introduced_by = "T-025"
 
 [[component]]
 id = "obs.history"
 concern = "visibility"
 files = ["ergon/history.py", "ergon/gates.py"]
 terms = ["history.jsonl", "history table", "log "]
+# introduced_by: 24f7ece added history.py and runs/history.jsonl; the suggested T-023 67d5131 only moved gates.py
+introduced_by = "T-024"
 
 [[component]]
 id = "docs"
 concern = "model"
 files = ["README.md", "skills/ergon/SKILL.md", "docs/shared-state.md"]
 terms = ["readme", "skill.md", "shared-state.md", "document", "say how", "mention"]
+# introduced_by: README.md and skills/ergon/SKILL.md came with the initial import 1bbbb87; T-015 only added docs/shared-state.md
+introduced_by = "none"
