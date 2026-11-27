@@ -13,10 +13,14 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
                tier_why / touches, dead depends), and the quiz `ergon quiz` last wrote, minus questions whose task has changed since
   /live.json   tasks `doing`: elapsed time, round, spend so far; the board polls it
   /e/E-NNN     one epic's replay timeline: a lane per task, a bar per phase from the journal,
-               human waits hatched, a cost overlay, and a replay player (inline SVG, no libraries)
+               human waits hatched, a cost overlay, and a replay player (inline SVG, no libraries);
+               its planned architecture before and after (the newest `ergon arch` file, drawn
+               inline; the file itself is never served), as /review's per-epic sections show it too
   /t/T-NNN     one task: its brief, frontmatter, every run and review from the history
                journal, transcript usage, links to the raw logs, `claude --resume` commands,
-               and (with a concept map) the tasks it relates to, as `ergon related` lists them
+               and (with a concept map) the tasks it relates to, as `ergon related` lists them;
+               for a task that changes something visible, its planned result (the newest
+               `ergon mock` file, drawn escaped; /review's card folds it; the file is never served)
   /runs/NAME   one file directly inside <state>/runs/, as plain text
   /runs/breakdown/NAME   an epic breakdown's log (listed on the epic page)
   /runs/T-NNN-evidence/NAME   a worker's evidence file (images by type, the rest plain text)
@@ -714,6 +718,21 @@ def breakdown_block(eid, e=None):
     return f"<h2>Breakdown runs</h2><p>{len(rows)} run(s), {money(cost)}</p>{state}<ul>{items}</ul>"
 
 
+def epic_dep_map(eid, tasks):
+    """The epic's open tasks (not done, not dropped) on dep_map, each box with the components it
+    changes when the concept map loads; boxes link to /t/T-NNN. A muted line when none is open."""
+    open_ = sorted((t for t in tasks.values() if t.get("epic") == eid and t["status"] not in ("done", "dropped")),
+                   key=lambda t: t["id"])
+    if not open_:
+        return "<h2>Dependency map</h2><p class=muted>no open task in this epic</p>"
+    cmap = review_map()[0]
+    return (f'<h2>Dependency map</h2><div class=mapwrap>'
+            f'{dep_map(open_, tasks, {}, f"the open tasks of {eid}", cmap, anchor=False)}</div>'
+            '<p class=legend>The open tasks. An arrow points from a dependency to the task that waits on it; '
+            'a done or outside dependency is drawn too.' + (" A box's third line names the concept-map "
+                                                            "components its touches fall in." if cmap else "") + "</p>")
+
+
 def epic_page(eid, nonce, now=None):
     epics = _tasks.load(_config.EPICS)
     e = epics.get(eid)
@@ -729,7 +748,8 @@ def epic_page(eid, nonce, now=None):
 
     tl = _timeline.build(rows, tasks, eid, now or time.time(), tokens)
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
-         f'<h1>{esc(eid)} {esc(e.get("title"))}</h1>']
+         f'<h1>{esc(eid)} {esc(e.get("title"))}</h1>', epic_dep_map(eid, tasks),
+         f'<h2>Architecture</h2>{arch_block(eid, e, tasks)}']
     jb = journal_block(eid, tasks) + breakdown_block(eid, e)
     if not tl["lanes"]:
         b.append(jb)
@@ -938,6 +958,7 @@ def task_page(tid, nonce):
     # the brief
     b.append(f'<h2>Brief</h2><div class=brief>{markdown(no_options(t["_body"]), tasks)}</div>')
     b.append(options_html(t))
+    b.append(mock_block(t, page_open=True))
 
     # totals
     cost = 0.0
@@ -1181,9 +1202,20 @@ def dep_layers(nodes, deps):
     return col
 
 
-def dep_map(proposed, tasks, flagged, label="the proposed tasks"):
+MAP_COMP_CHARS = 22  # a box's components line, before it is cut with …
+
+
+def task_comps(t, cmap):
+    """The components t's touches: fall in (concepts.touch_components), in touches order, once each."""
+    return list(dict.fromkeys(c for _, cs in _concepts.touch_components(t, cmap)["entries"] for c in cs))
+
+
+def dep_map(proposed, tasks, flagged, label="the proposed tasks", cmap=None, anchor=True):
     """Proposed tasks and their depends: as inline SVG. A proposed task's box links to its card
-    below; a dependency that isn't proposed links to its task page (a missing one, nowhere)."""
+    below (with anchor, else to its task page); a dependency that isn't proposed links to its task
+    page (a missing one, nowhere). With a concept map each task's box gets a third line, the
+    components its touches fall in, cut to fit; the full list is in its <title>."""
+    bh = MAP_H + 14 if cmap else MAP_H
     ids = [t["id"] for t in proposed]
     deps = {t["id"]: [d for d in t.get("depends") or [] if isinstance(d, str)] for t in proposed}
     nodes = list(dict.fromkeys(ids + [d for i in ids for d in deps[i]]))
@@ -1191,17 +1223,17 @@ def dep_map(proposed, tasks, flagged, label="the proposed tasks"):
     rows = {}
     for n in sorted(nodes, key=lambda n: (col[n], n)):
         rows.setdefault(col[n], []).append(n)
-    pos = {n: (MAP_PAD + c * (MAP_W + MAP_GX), MAP_PAD + r * (MAP_H + MAP_GY))
+    pos = {n: (MAP_PAD + c * (MAP_W + MAP_GX), MAP_PAD + r * (bh + MAP_GY))
            for c, ns in rows.items() for r, n in enumerate(ns)}
     width = MAP_PAD * 2 + (max(rows) + 1) * (MAP_W + MAP_GX) - MAP_GX
-    height = MAP_PAD * 2 + max(len(ns) for ns in rows.values()) * (MAP_H + MAP_GY) - MAP_GY
+    height = MAP_PAD * 2 + max(len(ns) for ns in rows.values()) * (bh + MAP_GY) - MAP_GY
     o = [f'<svg class=depmap viewBox="0 0 {width} {height}" width="{width}" height="{height}" role=img '
          f'aria-label="dependency map of {esc(label)}">']
     for i in ids:
         x2, y2 = pos[i]
         for d in deps[i]:
             x1, y1 = pos[d]
-            sx, sy, ex, ey = x1 + MAP_W, y1 + MAP_H / 2, x2, y2 + MAP_H / 2
+            sx, sy, ex, ey = x1 + MAP_W, y1 + bh / 2, x2, y2 + bh / 2
             mx = (sx + ex) / 2
             o.append(f'<path class=edge d="M{sx} {sy:.0f}C{mx:.0f} {sy:.0f} {mx:.0f} {ey:.0f} {ex} {ey:.0f}" />')
             o.append(f'<path class=arrow d="M{ex} {ey:.0f}l-6 -4v8z" />')
@@ -1214,13 +1246,21 @@ def dep_map(proposed, tasks, flagged, label="the proposed tasks"):
             + (f" · {t.get('title') or ''}" if t else "") \
             + (f" · {len(flagged[n])} finding(s)" if n in flagged else "")
         label = f"{t.get('tier') or '?'} · {status}" if t else "no such task"
+        comp = ""
+        if cmap and t:
+            cs = task_comps(t, cmap)
+            line = ", ".join(cs) if cs else ("no component" if t.get("touches") else "no touches")
+            title += f" · changes: {line}"
+            if len(line) > MAP_COMP_CHARS:
+                line = line[:MAP_COMP_CHARS - 1] + "…"
+            comp = f'<text class=bcomp x={x + 8} y={y + 43}>{esc(line)}</text>'
         g = (f'<g class="{" ".join(cls)}"><title>{esc(title)}</title>'
-             f'<rect x={x} y={y} width={MAP_W} height={MAP_H} rx=6 />'
+             f'<rect x={x} y={y} width={MAP_W} height={bh} rx=6 />'
              f'<text class=bid x={x + 8} y={y + 15}>{esc(n)}</text>'
-             f'<text class=bsub x={x + 8} y={y + 29}>{esc(label)}</text>'
+             f'<text class=bsub x={x + 8} y={y + 29}>{esc(label)}</text>{comp}'
              + (f'<circle class=mark cx={x + MAP_W - 12} cy={y + 12} r=7 /><text class=marktext x={x + MAP_W - 12} '
                 f'y={y + 16} text-anchor=middle>!</text>' if n in flagged else "") + "</g>")
-        if status == "proposed":
+        if status == "proposed" and anchor:
             g = f'<a href="#{esc(n)}">{g}</a>'
         elif t:
             g = f'<a href="/t/{esc(n)}">{g}</a>'
@@ -1229,7 +1269,7 @@ def dep_map(proposed, tasks, flagged, label="the proposed tasks"):
     return "".join(o)
 
 
-def epic_maps(proposed, tasks, epics, flagged):
+def epic_maps(proposed, tasks, epics, flagged, cmap=None):
     """One dependency map per epic of the proposed tasks, in epic order, then the tasks with no epic.
     A dependency outside the epic still shows as a box in that epic's map."""
     groups = {}
@@ -1237,7 +1277,7 @@ def epic_maps(proposed, tasks, epics, flagged):
         groups.setdefault(str(t["epic"]) if t.get("epic") else None, []).append(t)
     keys = sorted(k for k in groups if k) + ([None] if None in groups else [])
     if keys == [None]:
-        return f"<div class=mapwrap>{dep_map(proposed, tasks, flagged)}</div>"
+        return f"<div class=mapwrap>{dep_map(proposed, tasks, flagged, cmap=cmap)}</div>"
     h = []
     for k in keys:
         ts, n = groups[k], len(groups[k])
@@ -1250,11 +1290,245 @@ def epic_maps(proposed, tasks, epics, flagged):
             h.append(f'<h3 class=mhead id="map-{esc(k)}"><a href="/e/{esc(k)}">{esc(k)}</a>'
                      + (f" {esc(title)}" if title else "") + f"{count}</h3>")
             label = f"the proposed tasks of {k}"
-        h.append(f"<div class=mapwrap>{dep_map(ts, tasks, flagged, label)}</div>")
+            if k in epics:
+                h.append(arch_block(k, epics[k], tasks))
+        h.append(f"<div class=mapwrap>{dep_map(ts, tasks, flagged, label, cmap)}</div>")
     return "".join(h)
 
 
-def review_card(t, tasks, found):
+TM_PAD, TM_LINE, TM_HEAD, TM_IN, TM_CH = 8, 16, 22, 10, 6.6  # touch map: padding, row, header, indent, char width
+
+
+def review_map():
+    """(map, None) for the /review cards' change pictures, or (None, muted note HTML) when there is no
+    `concepts` key or the map doesn't load. Read once per page."""
+    if not _config.CONCEPTS:
+        return None, (f'<span class=muted>no concept map: set <code>concepts = "&lt;path&gt;"</code> in '
+                      f'{esc(_config.CONFIG_FILE)} to see where the touches fall</span>')
+    cmap, errs = _concepts.read_map()
+    if errs:
+        return None, f'<span class=muted>the concept map does not load ({esc(errs[0])}); `ergon check` lists why</span>'
+    return cmap, None
+
+
+def touch_map(t, cmap):
+    """t's touches: as inline SVG (concepts.touch_components): component boxes grouped under their
+    concern, each touches: entry drawn inside every component it falls in, a dashed component for
+    a `concepts:` tag no entry reaches, and a "not in the map" box for the entries in no component."""
+    got = _concepts.touch_components(t, cmap)
+    inside = {}
+    for e, cs in got["entries"]:
+        for c in cs:
+            inside.setdefault(c, []).append(e)
+    shown = set(inside) | set(got["untouched"])
+    comps = [c for c in cmap["components"].values() if c["id"] in shown]
+    concerns = [k for k in cmap["concerns"] if any(c["concern"] == k for c in comps)]
+    texts = [e for e, _ in got["entries"]] + [c["id"] + "  (tagged; no touch falls in it)" for c in comps] \
+        + [f'{k} · {cmap["concerns"][k]["label"]}' for k in concerns] + ["not in the map"]
+    width = round(TM_PAD * 2 + TM_IN * 2 + 8 + max(len(s) for s in texts) * TM_CH)
+    o, y = [], TM_PAD
+
+    def lines(x, y, es):
+        return "".join(f'<text class=entry x={x + 8} y={y + TM_HEAD + n * TM_LINE + 11}>{esc(e)}</text>'
+                       for n, e in enumerate(es))
+
+    for k in concerns:
+        top = y
+        y += TM_HEAD
+        parts = []
+        for c in (c for c in comps if c["concern"] == k):
+            es = inside.get(c["id"], [])
+            unreached = c["id"] in got["untouched"]
+            h = TM_HEAD + TM_LINE * len(es) + 4
+            x, w = TM_PAD + TM_IN, width - 2 * (TM_PAD + TM_IN)
+            parts.append(f'<g class="comp{" untouched" if unreached else ""}">'
+                         f'<title>{esc(c["id"] + (" · " + c["label"] if c["label"] else ""))}'
+                         f'{" · tagged, but no touches: entry falls in it" if unreached else ""}</title>'
+                         f'<rect x={x} y={y} width={w} height={h} rx=5 />'
+                         f'<text class=cid x={x + 8} y={y + 15}>{esc(c["id"])}'
+                         + (' <tspan class=warn>(tagged; no touch falls in it)</tspan>' if unreached else "")
+                         + f'</text>{lines(x, y, es)}</g>')
+            y += h + 6
+        y += 2
+        label = cmap["concerns"][k]["label"]
+        o.append(f'<g class=concern><rect x={TM_PAD} y={top} width={width - 2 * TM_PAD} height={y - top} rx=7 />'
+                 f'<text class=chead x={TM_PAD + 8} y={top + 15}>{esc(k)}'
+                 + (f' <tspan class=clabel>· {esc(label)}</tspan>' if label else "") + "</text>" + "".join(parts) + "</g>")
+        y += 8
+    if got["outside"]:
+        h = TM_HEAD + TM_LINE * len(got["outside"]) + 4
+        o.append(f'<g class=outside><title>touches: entries no component\'s files match</title>'
+                 f'<rect x={TM_PAD} y={y} width={width - 2 * TM_PAD} height={h} rx=7 />'
+                 f'<text class=chead x={TM_PAD + 8} y={y + 15}>not in the map</text>{lines(TM_PAD, y, got["outside"])}</g>')
+        y += h + 8
+    height = y - 8 + TM_PAD
+    return (f'<svg class=touchmap viewBox="0 0 {width} {height}" width="{width}" height="{height}" role=img '
+            f'aria-label="where the touches of {esc(t["id"])} fall in the concept map">' + "".join(o) + "</svg>")
+
+
+AR_MARK = {"added": "+", "removed": "\u2212", "changed": "~"}
+
+
+def arch_svg(raw, marks, side, eid):
+    """One side (before or after) of an epic's planned architecture as inline SVG: the raw map
+    (concepts.toml shape) through concepts.check_map, so only well-formed entries are drawn;
+    component boxes under their concern. marks maps ("concern"|"component", id) to added,
+    removed or changed: a marked entry gets its sign and class, and a marked component lists its
+    files; an unmarked one is its id only, so the change stands out in a big map."""
+    cmap = _concepts.check_map(raw)[0]
+    comps = list(cmap["components"].values())
+    concerns = list(cmap["concerns"].values())
+
+    def sign(kind, i):
+        m = marks.get((kind, i))
+        return (m, f"{AR_MARK[m]} ") if m else (None, "")
+
+    texts = [f"~ {c['id']} \u00b7 {c['label']}" for c in comps] + ["   " + f for c in comps for f in c["files"]] \
+        + [f"~ {k['id']} \u00b7 {k['label']}" for k in concerns] + [f"{side} (no component)"]
+    width = round(TM_PAD * 2 + TM_IN * 2 + 8 + max(len(s) for s in texts) * TM_CH)
+    o, y = [], TM_PAD
+    for k in concerns:
+        top = y
+        y += TM_HEAD
+        parts = []
+        for c in (c for c in comps if c["concern"] == k["id"]):
+            m, mk = sign("component", c["id"])
+            files = c["files"] if m else []
+            h = 20 + TM_LINE * len(files) + (4 if files else 0)
+            x, w = TM_PAD + TM_IN, width - 2 * (TM_PAD + TM_IN)
+            title = " \u00b7 ".join([c["id"]] + ([c["label"]] if c["label"] else []) + ([m] if m else [])
+                                    + ([", ".join(c["files"])] if c["files"] else []))
+            parts.append(f'<g class="comp{" ch-" + m if m else ""}"><title>{esc(title)}</title>'
+                         f'<rect x={x} y={y} width={w} height={h} rx=5 />'
+                         f'<text class=cid x={x + 8} y={y + 14}>'
+                         + (f'<tspan class=mk>{esc(mk)}</tspan>' if mk else "") + esc(c["id"])
+                         + (f' <tspan class=clabel>\u00b7 {esc(c["label"])}</tspan>' if c["label"] else "") + "</text>"
+                         + "".join(f'<text class=entry x={x + 8} y={y + 20 + n * TM_LINE + 11}>{esc(f)}</text>'
+                                   for n, f in enumerate(files)) + "</g>")
+            y += h + 4
+        y += 4
+        m, mk = sign("concern", k["id"])
+        o.append(f'<g class="concern{" ch-" + m if m else ""}"><rect x={TM_PAD} y={top} width={width - 2 * TM_PAD} '
+                 f'height={y - top} rx=7 /><text class=chead x={TM_PAD + 8} y={top + 15}>'
+                 + (f'<tspan class=mk>{esc(mk)}</tspan>' if mk else "") + esc(k["id"])
+                 + (f' <tspan class=clabel>\u00b7 {esc(k["label"])}</tspan>' if k["label"] else "") + "</text>"
+                 + "".join(parts) + "</g>")
+        y += 8
+    if not concerns:
+        o.append(f'<text class=clabel x={TM_PAD} y={y + 12}>{esc(side)} (no component)</text>')
+        y += 24
+    height = y - 8 + TM_PAD
+    return (f'<svg class=archmap viewBox="0 0 {width} {height}" width="{width}" height="{height}" role=img '
+            f'aria-label="{esc(eid)} architecture {esc(side)}">' + "".join(o) + "</svg>")
+
+
+def arch_block(eid, e, tasks):
+    """Epic eid's planned architecture from the newest `ergon arch` file (concepts.latest_arch):
+    a before and an after picture with added, removed and changed components and concerns marked,
+    a muted stale line when the epic's brief or touches changed since, a muted line when it plans
+    no change, and one naming `ergon arch E-NNN` when there's no file. Serve runs nothing."""
+    _, d = _concepts.latest_arch(eid)
+    if not d:
+        return f'<p class="muted arch">no planned architecture yet: <code>ergon arch {esc(eid)}</code></p>'
+    when = f'planned {esc(d.get("generated"))} by {esc(d.get("model"))}'
+    stale = _concepts.arch_stale(dict(e, id=eid), tasks, d)
+    out = ([f'<p class="muted arch stale">stale: the epic\'s brief or its tasks\' touches changed since this was '
+            f'{when}; <code>ergon arch {esc(eid)}</code> plans it again</p>'] if stale else [])
+    diff = _concepts.map_diff(d.get("before"), d["after"])
+    if not diff:
+        out.append(f'<p class="muted arch">no architecture change planned <span class=muted>({when})</span></p>')
+        return "".join(out)
+    marks = {(kind, i): m for kind in ("concern", "component") for m, ids in diff.get(kind, {}).items() for i in ids}
+    before = {k: m for k, m in marks.items() if m != "added"}
+    after = {k: m for k, m in marks.items() if m != "removed"}
+    ign = diff.get("ignore")
+    out.append('<div class=archpair>'
+               f'<figure><figcaption>before</figcaption>{arch_svg(d.get("before"), before, "before", eid)}</figure>'
+               f'<figure><figcaption>after</figcaption>{arch_svg(d["after"], after, "after", eid)}</figure></div>'
+               '<p class=legend><b>+</b> added <b>\u2212</b> removed <b>~</b> changed; a marked component lists its '
+               'files, hover any for its label and files'
+               + (". [[ignore]] entries " + esc("; ".join(f"{m} {', '.join(ids)}" for m, ids in ign.items() if ids))
+                  if ign else "")
+               + (f". {when}" if not stale else "") + ".</p>")
+    return "".join(out)
+
+
+MOCK_TONES = ("neutral", "good", "warn", "bad")
+
+
+def mock_nodes(nodes):
+    """A mock body's layout nodes (mock.check_body's schema) as HTML. Every string is escaped and
+    only the known node types and tones are drawn, so a mock adds no markup of its own."""
+    o = []
+    for n in nodes if isinstance(nodes, list) else []:
+        kind = n.get("type") if isinstance(n, dict) else None
+        if kind == "heading":
+            lvl = n.get("level") if n.get("level") in (1, 2, 3) else 3
+            o.append(f'<p class="mh mh{lvl}">{esc(n.get("text"))}</p>')
+        elif kind == "text":
+            o.append(f'<pre class=mtext>{esc(n.get("text"))}</pre>' if n.get("mono") is True
+                     else f'<p class=mtext>{esc(n.get("text"))}</p>')
+        elif kind == "table":
+            cols = n.get("columns") if isinstance(n.get("columns"), list) else []
+            rows = n.get("rows") if isinstance(n.get("rows"), list) else []
+            o.append('<div class=table><table class=mtable><thead><tr>' + "".join(f"<th>{esc(c)}</th>" for c in cols)
+                     + "</tr></thead><tbody>"
+                     + "".join("<tr>" + "".join(f"<td>{esc(c)}</td>" for c in r) + "</tr>"
+                               for r in rows if isinstance(r, list))
+                     + "</tbody></table></div>")
+        elif kind == "list":
+            items = n.get("items") if isinstance(n.get("items"), list) else []
+            o.append("<ul class=mlist>" + "".join(f"<li>{esc(x)}</li>" for x in items) + "</ul>")
+        elif kind == "box":
+            title = f'<p class=mtitle>{esc(n["title"])}</p>' if n.get("title") else ""
+            o.append(f"<div class=mbox>{title}{mock_nodes(n.get('children'))}</div>")
+        elif kind == "badge":
+            tone = n.get("tone") if n.get("tone") in MOCK_TONES else "neutral"
+            o.append(f'<span class="mbadge tone-{tone}">{esc(n.get("text"))}</span>')
+    return "".join(o)
+
+
+def mock_block(t, page_open):
+    """Task t's planned result from the newest `ergon mock` file (mock.latest_mock), for a task whose
+    change someone can see (mock.visible); "" for any other. A `<details>` whose summary gives the
+    mock's format, where it appears, when it was generated and whether it is stale (the brief changed
+    since), open under a "Planned result" heading on the task page, closed with that label as its
+    summary on a /review card. With no file, a muted line naming
+    `ergon mock T-NNN`. Serve only reads the file; it never serves it or runs anything."""
+    from . import mock as _mock  # mock imports serve (brief_hash), so not at the top
+    if not _mock.visible(t):
+        return ""
+    tid = esc(t["id"])
+    head = "<h2>Planned result</h2>" if page_open else ""
+    _, d = _mock.latest_mock(t["id"])
+    if not d:
+        return (head + f'<p class="muted mock">{"" if page_open else "<b>Planned result</b>: "}no mock yet: '
+                f'<code>ergon mock {tid}</code></p>')
+    stale = _mock.mock_stale(t, d)
+    when = esc(d.get("generated"))
+    body = d.get("body") or {}
+    summary = (("mock" if page_open else "<b>Planned result</b>") + f' <span class=muted>· {esc(d.get("format"))} · in {esc(body.get("where"))}'
+               f' · generated {when}' + (f' by {esc(d.get("model"))}' if d.get("model") else "") + "</span>"
+               + (' <span class=mstale>stale</span>' if stale else ""))
+    note = (f'<p class="muted mstale-note">stale: the brief changed since this mock was generated {when}; '
+            f'<code>ergon mock {tid}</code> draws it again</p>' if stale else "")
+    return (head + f'<details class=mock{" open" if page_open else ""}><summary>{summary}</summary>{note}'
+            f'<div class=mockbody>{mock_nodes(body.get("nodes"))}</div></details>')
+
+
+def change_row(t, mapstate):
+    """The card's `change` row: touch_map, or the muted note review_map gave, or a note for no touches."""
+    cmap, note = mapstate
+    if note:
+        body = note
+    elif not t.get("touches"):
+        body = '<span class=muted>no touches: nothing to place on the map</span>'
+    else:
+        body = f"<div class=touchwrap>{touch_map(t, cmap)}</div>"
+    return f'<tr><th>change</th><td class=why>{body}</td></tr>'
+
+
+def review_card(t, tasks, found, mapstate=None):
     deps = t.get("depends") or []
     dep_html = ", ".join(f'{link_ids(esc(d), tasks)} <span class=muted>({esc(tasks.get(d, {}).get("status", "missing"))})</span>'
                          for d in deps) or '<span class=muted>none</span>'
@@ -1282,9 +1556,10 @@ def review_card(t, tasks, found):
             f'<tr><th>tier_why</th><td class=why>{link_ids(esc(t.get("tier_why") or ""), tasks) or "<span class=muted>empty</span>"}</td></tr>'
             f'<tr><th>depends</th><td class=why>{dep_html}</td></tr>'
             f'<tr><th>touches</th><td class=why>{touches}</td></tr>'
+            + change_row(t, mapstate or review_map())
             + (f'<tr><th>epic</th><td><a href="/e/{esc(t["epic"])}">{esc(t["epic"])}</a></td></tr>' if t.get("epic") else "")
             + (f'<tr><th>source</th><td class=why>{link_ids(esc(t["source"]), tasks)}</td></tr>' if t.get("source") else "")
-            + f'</tbody></table></div><div class=brief>{brief}</div>{options_html(t)}</section>')
+            + f'</tbody></table></div><div class=brief>{brief}</div>{options_html(t)}{mock_block(t, page_open=False)}</section>')
 
 
 def quiz_html(tasks):
@@ -1407,7 +1682,7 @@ def epic_cards(briefs):
     return b
 
 
-def epic_task_cards(proposed, tasks, epics, found):
+def epic_task_cards(proposed, tasks, epics, found, mapstate=None):
     """The /review task cards, one section per epic (in epic order, then the tasks with no epic), like
     epic_maps. Inside a section the depends-chain groups come first, then the independent tasks.
     With no epic anywhere there is one flat section, no epic headings."""
@@ -1415,7 +1690,7 @@ def epic_task_cards(proposed, tasks, epics, found):
     for t in proposed:
         by_epic.setdefault(str(t["epic"]) if t.get("epic") else None, []).append(t)
     keys = sorted(k for k in by_epic if k) + ([None] if None in by_epic else [])
-    h = []
+    h, mapstate = [], mapstate or review_map()
     for k in keys:
         ts = by_epic[k]
         if keys != [None]:
@@ -1430,11 +1705,11 @@ def epic_task_cards(proposed, tasks, epics, found):
         groups, alone = review_groups(ts, tasks)
         for g in groups:
             h.append(group_header(g, tasks))
-            h.extend(review_card(t, tasks, found[t["id"]]) for t in g)
+            h.extend(review_card(t, tasks, found[t["id"]], mapstate) for t in g)
         if alone:
             if groups:
                 h.append(f"<h3 class=ghead id=g-independent{'' if k is None else '-' + esc(k)}>Independent</h3>")
-            h.extend(review_card(t, tasks, found[t["id"]]) for t in alone)
+            h.extend(review_card(t, tasks, found[t["id"]], mapstate) for t in alone)
     return h
 
 
@@ -1470,13 +1745,16 @@ def review_page(nonce):
                  'approved: score = (cod + 60 × tasks it unblocks) ÷ tier size.</p>'
                  + priority_table(ranked, tasks, anchor=True) + grade_line())
 
-    b.append(f'<h2>Dependency map</h2>{epic_maps(proposed, tasks, epics, flagged)}'
+    mapstate = review_map()
+    cmap = mapstate[0]
+    b.append(f'<h2>Dependency map</h2>{epic_maps(proposed, tasks, epics, flagged, cmap)}'
              '<p class=legend>One map per epic. A box links to its card; <b>!</b> marks findings; an arrow '
              'points from a dependency to the task that waits on it; a dependency in another epic is drawn '
-             'in this one too.</p>')
+             'in this one too.' + (' A box\'s third line names the concept-map components its touches fall '
+                                   'in; hover it for the full list.' if cmap else "") + '</p>')
 
     b.append("<h2>Tasks</h2>")
-    b.extend(epic_task_cards(proposed, tasks, epics, found))
+    b.extend(epic_task_cards(proposed, tasks, epics, found, mapstate))
 
     b.append(f"<h2 id=findings>Findings ({sum(map(len, flagged.values()))})</h2>")
     if flagged:

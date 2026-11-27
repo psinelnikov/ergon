@@ -81,7 +81,7 @@ class TestJournalPage(JournalMixin, ServeFixture):
         self.assertIn("Went fine &lt;script&gt;alert(1)&lt;/script&gt; <strong>bold</strong>", page)
         self.assertNotIn("<script>alert(1)", page)
         self.assertRegex(page, r"journal generated \d{4}-\d\d-\d\dT[\d:+-]+ by sonnet · \$0\.07")
-        self.assertLess(page.index("Went fine"), page.index("<svg"))  # above the timeline
+        self.assertLess(page.index("Went fine"), page.index("<svg id=tl"))  # above the timeline
 
         # an epic with no task history still shows its entry
         self.ergon("journal", "E-002", env=env)

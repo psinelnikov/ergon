@@ -127,9 +127,21 @@ svg.depmap .box.st-missing rect, svg.depmap .box.st-dropped rect { stroke: var(-
 svg.depmap .box.flag rect { stroke: var(--bad); stroke-width: 2; }
 svg.depmap .bid { fill: var(--accent); font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
 svg.depmap .bsub { fill: var(--muted); }
+svg.depmap .bcomp { fill: var(--fg); font-size: 10px; }
 svg.depmap .mark { fill: var(--bad); }
 svg.depmap .marktext { fill: var(--bg); font-weight: 700; }
 svg.depmap a:hover rect { fill: var(--code); }
+.touchwrap { overflow-x: auto; }
+svg.touchmap { display: block; font: 11px -apple-system, BlinkMacSystemFont, sans-serif; margin-top: 2px; }
+svg.touchmap .concern > rect { fill: var(--code); stroke: var(--line); stroke-width: 1; }
+svg.touchmap .comp rect { fill: var(--bg); stroke: var(--line); stroke-width: 1.2; }
+svg.touchmap .comp.untouched rect { stroke: var(--warn); stroke-dasharray: 4 3; }
+svg.touchmap .outside rect { fill: var(--bg); stroke: var(--bad); stroke-width: 1.2; stroke-dasharray: 4 3; }
+svg.touchmap .chead { fill: var(--fg); font-weight: 600; }
+svg.touchmap .clabel { fill: var(--muted); font-weight: 400; }
+svg.touchmap .cid { fill: var(--accent); font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+svg.touchmap .warn { fill: var(--warn); font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 11px; }
+svg.touchmap .entry { fill: var(--fg); font-family: ui-monospace, Menlo, monospace; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 10px 0; scroll-margin-top: 8px; }
 .card .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin-bottom: 4px; }
 .card .id { font-family: ui-monospace, Menlo, monospace; }
@@ -156,3 +168,38 @@ table.prio .pin { font-size: 0.85em; color: var(--warn); }
 .options { list-style: decimal inside; padding: 0; margin: 6px 0; display: flex; flex-direction: column; gap: 6px; }
 .options li, p.option { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); overflow-wrap: anywhere; }
 .options li.chosen, p.option.chosen { border-color: var(--ok); color: var(--ok); }
+.archpair { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; overflow-x: auto; }
+.archpair figure { margin: 0; }
+.archpair figcaption { color: var(--muted); font-size: 0.85em; margin-bottom: 2px; }
+svg.archmap { display: block; font: 11px -apple-system, BlinkMacSystemFont, sans-serif; }
+svg.archmap .concern > rect { fill: var(--code); stroke: var(--line); stroke-width: 1; }
+svg.archmap .comp rect { fill: var(--bg); stroke: var(--line); stroke-width: 1.2; }
+svg.archmap .ch-added > rect { stroke: var(--ok); stroke-width: 2; }
+svg.archmap .ch-removed > rect { stroke: var(--bad); stroke-width: 2; stroke-dasharray: 4 3; }
+svg.archmap .ch-changed > rect { stroke: var(--warn); stroke-width: 2; }
+svg.archmap .chead { fill: var(--fg); font-weight: 600; }
+svg.archmap .clabel { fill: var(--muted); font-weight: 400; font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 11px; }
+svg.archmap .cid { fill: var(--accent); font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+svg.archmap .mk { font-weight: 700; }
+svg.archmap .ch-added > text .mk { fill: var(--ok); }
+svg.archmap .ch-removed > text .mk { fill: var(--bad); }
+svg.archmap .ch-changed > text .mk { fill: var(--warn); }
+svg.archmap .entry { fill: var(--fg); font-family: ui-monospace, Menlo, monospace; }
+p.arch.stale { color: var(--warn); }
+/* a task's planned result (`ergon mock`): closed on a /review card, open on /t/T-NNN */
+details.mock { margin: 8px 0; }
+details.mock > summary { cursor: pointer; overflow-wrap: anywhere; }
+.mstale { color: var(--warn); font-weight: 600; }
+p.mstale-note { color: var(--warn); }
+.mockbody { border: 1px dashed var(--line); border-radius: 8px; padding: 6px 12px; margin-top: 6px; overflow-x: auto; }
+.mockbody .mh { font-weight: 600; margin: 0.6em 0 0.2em; overflow-wrap: anywhere; }
+.mockbody .mh1 { font-size: 1.15em; }
+.mockbody .mh2 { font-size: 1.05em; }
+.mockbody p.mtext { margin: 0.3em 0; overflow-wrap: anywhere; }
+.mockbody pre.mtext { white-space: pre-wrap; overflow-wrap: anywhere; }
+.mockbody .mbox { border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; margin: 6px 0; background: var(--bg); }
+.mockbody .mtitle { font-weight: 600; margin: 2px 0; overflow-wrap: anywhere; }
+.mockbody .mbadge { display: inline-block; border: 1px solid var(--line); border-radius: 10px; padding: 0 8px; margin: 2px 4px 2px 0; font-size: 0.85em; }
+.mockbody .tone-good { color: var(--ok); border-color: var(--ok); }
+.mockbody .tone-warn { color: var(--warn); border-color: var(--warn); }
+.mockbody .tone-bad { color: var(--bad); border-color: var(--bad); }
