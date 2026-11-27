@@ -287,6 +287,18 @@ def clean_env(**extra):
     return env
 
 
+def today():
+    """The local date, as ergon stamps it."""
+    return time.strftime("%Y-%m-%d")
+
+
+def stamped(template, since):
+    """`template` with `{day}` filled in by each day from `since` (read before the command ran) to
+    now: one string, or two when the run crossed midnight. Check a date a command stamped against
+    these, never against the clock read a second time (T-313)."""
+    return [template.replace("{day}", d) for d in dict.fromkeys((since, today()))]
+
+
 def git_init(path):
     path.mkdir(parents=True, exist_ok=True)
     sh("git", "init", "-q", "-b", "main", cwd=path)
@@ -310,6 +322,7 @@ class Project(unittest.TestCase):
     journal = False  # finishing an epic would run `claude -p` for its journal entry; only tests of that turn it on
 
     def setUp(self):
+        self.since = today()  # what the test's commands stamp is this day or a later one: see stamped()
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve() / "proj"
         git_init(self.root)
@@ -2741,8 +2754,8 @@ class TestObsidian(Project):
         out = self.ergon("obsidian").stdout
         self.assertIn("2 line(s) ticked", out)
         new = note.read_bytes().decode()
-        today = __import__("datetime").date.today().isoformat()
-        self.assertRegex(new, rf"- \[x\] Compare plans #agent \U0001F4C5 2026-12-01 \u2705 {today} \(ergon T-001\) \^ergon-[0-9a-f]{{10}}\r\n")
+        days = "|".join(stamped("{day}", self.since))
+        self.assertRegex(new, rf"- \[x\] Compare plans #agent \U0001F4C5 2026-12-01 \u2705 (?:{days}) \(ergon T-001\) \^ergon-[0-9a-f]{{10}}\r\n")
         self.assertIn("- [ ] Call them #agent (ergon T-002 dropped) ^mine\r\n", new)
         self.assertEqual(len(new.split("\r\n")), len(text.split("\r\n")))
         self.assertTrue(new.endswith("\r\nplain\r\nlast"))
@@ -9702,8 +9715,8 @@ class TestGrade(Project):
         self.assertEqual(s["T-003"]["cod_why"], "users stay blocked " + "x" * 200)
         self.assertEqual(s["T-001"]["cod_why"], "why T-001")
         from ergon.tasks import brief_digest, parse
-        self.assertEqual(s["T-001"]["graded"],
-                         f"{time.strftime('%Y-%m-%d')} {brief_digest(parse(self.task_file('T-001')))[:12]}")
+        self.assertIn(s["T-001"]["graded"],
+                      stamped(f"{{day}} {brief_digest(parse(self.task_file('T-001')))[:12]}", self.since))
         self.assertIn("0 reply row(s) dropped", out)
         self.assertIn("left ungraded: T-005", out)
         [rec] = list((self.runs / "grade").glob("grade-*.json"))
@@ -9770,7 +9783,7 @@ class TestGrade(Project):
         for name in ("T-002", "T-003", "T-004"):
             f = [k for k in after if k.startswith(name)][0]
             self.assertEqual(after[f], changed[f], name)  # byte for byte
-        self.assertIn(f"{time.strftime('%Y-%m-%d')} ", self.fields("T-001")["graded"])
+        self.assertIn(self.fields("T-001")["graded"][:11], stamped("{day} ", self.since))
         from ergon.tasks import brief_digest, parse
         self.assertTrue(self.fields("T-001")["graded"].endswith(brief_digest(parse(self.task_file("T-001")))[:12]))
         self.assertEqual(self.fields("T-001")["cod"], "100")  # now beats the anchors
@@ -9863,6 +9876,7 @@ class TestGradeKeepsSignedApproval(unittest.TestCase):
 
     def test_graded_task_still_verifies(self):
         from ergon import tasks as T
+        since = today()
         self.ergon(self.a, "new", "task", "One", "--tier", "haiku")
         self.ergon(self.a, "new", "task", "Two", "--tier", "haiku")
         self.ergon(self.a, "sync", "--init", inp="y\n")
@@ -9874,7 +9888,7 @@ class TestGradeKeepsSignedApproval(unittest.TestCase):
         self.assertIn("graded 2 task(s)", out)
         text = f.read_text()
         self.assertIn("\ncod: 0\n", text)
-        self.assertIn(f"\ngraded: {time.strftime('%Y-%m-%d')} {digest[:12]}\n", text)
+        self.assertTrue(any(s in text for s in stamped(f"\ngraded: {{day}} {digest[:12]}\n", since)), text)
         self.assertEqual(T.brief_digest(T.parse_text(text)), digest)
         r = self.ergon(self.a, "check", check=False)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -10209,7 +10223,6 @@ class TestLearn(Project):
 
 class TestOptions(Project):
     """E-006 / T-190: a task's ## Options, `ergon choose`, and approve waiting on a choice."""
-    TODAY = time.strftime("%Y-%m-%d")
 
     def human(self, **extra):
         return dict(self.env, ERGON_ASK_STDIN="1", **extra)
@@ -10291,7 +10304,7 @@ class TestOptions(Project):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("choice: 2. a redis cache", r.stdout)
         self.assertIn("A choice steers only", r.stdout)
-        self.assertEqual(self.options_text("T-001").splitlines()[0], f"Chosen: 2 by Tester {self.TODAY}")
+        self.assertIn(self.options_text("T-001").splitlines()[0], stamped("Chosen: 2 by Tester {day}", self.since))
         rows = [x for x in history(self.root) if x["event"] == "chosen"]
         self.assertEqual([(x["task"], x["by"], x["option"], x["text"]) for x in rows],
                          [("T-001", "Tester", 2, "a redis cache")])
@@ -10305,7 +10318,7 @@ class TestOptions(Project):
         r = self.choose("T-001", "--own", "a file cache, keyed by path")
         self.assertEqual(r.returncode, 0, r.stderr)
         lines = self.options_text("T-001").splitlines()
-        self.assertEqual(lines[0], f"Chosen: own by Tester {self.TODAY} — a file cache, keyed by path")
+        self.assertIn(lines[0], stamped("Chosen: own by Tester {day} — a file cache, keyed by path", self.since))
         self.assertEqual(sum(l.startswith("Chosen:") for l in lines), 1)
         t = ergon.tasks.parse(f)
         self.assertEqual(ergon.tasks.options(t)[1]["text"], "a file cache, keyed by path")
@@ -10400,7 +10413,8 @@ class TestOptions(Project):
         self.assertIsNone(self.guard("Edit", {"file_path": p, "old_string": "2. b", "new_string": "2. b, but faster"}))
 
         self.assertEqual(self.choose("T-001", "1").returncode, 0)
-        line = f"Chosen: 1 by Tester {self.TODAY}"
+        line = self.options_text("T-001").splitlines()[0]
+        self.assertIn(line, stamped("Chosen: 1 by Tester {day}", self.since))
         self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": line,
                                                           "new_string": line.replace(": 1", ": 2")}))
         self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": line + "\n", "new_string": ""}))
@@ -10461,7 +10475,7 @@ class TestOptions(Project):
         self.assertIn("[c]hoose", r.stdout)
         self.assertIn("refused: T-001 has options and no choice", r.stdout)
         self.assertIn("chosen 1", r.stdout)
-        self.assertIn(f"Chosen: 2 by Tester {self.TODAY}", self.options_text("T-001"))
+        self.assertTrue(any(s in self.options_text("T-001") for s in stamped("Chosen: 2 by Tester {day}", self.since)))
         self.assertEqual(self.status("T-001"), "ready")
         self.assertEqual([x["option"] for x in history(self.root) if x["event"] == "chosen"], [2])
 
@@ -10617,7 +10631,6 @@ class TestLensOptions(Project):
 
 class TestLensChoose(Project):
     """E-009 / T-253: `ergon choose T-NNN <lens> [<lens> ...]` records one lens option or a combination."""
-    TODAY = time.strftime("%Y-%m-%d")
     human, agent, choose, approve, options_text = (TestOptions.human, TestOptions.agent, TestOptions.choose,
                                                    TestOptions.approve, TestOptions.options_text)
     OPERATOR = textwrap.dedent("""\
@@ -10651,7 +10664,7 @@ class TestLensChoose(Project):
         self.assertIn("choice: minimal + operator\n  minimal: an in-memory LRU", r.stdout)
         self.assertIn("a combination: the worker builds what these options share", r.stdout)
         self.assertIn("A choice steers only", r.stdout)
-        self.assertEqual(self.options_text("T-001").splitlines()[0], f"Chosen: minimal + operator by Tester {self.TODAY}")
+        self.assertIn(self.options_text("T-001").splitlines()[0], stamped("Chosen: minimal + operator by Tester {day}", self.since))
         self.assertEqual(fields(), before)  # never tier, touches:, accept: or approved:
         t = ergon.tasks.parse(f)
         _, chosen = ergon.tasks.options(t)
@@ -10672,7 +10685,7 @@ class TestLensChoose(Project):
         r = self.choose("T-001", "Durable")
         self.assertEqual(r.returncode, 0, r.stderr)
         lines = self.options_text("T-001").splitlines()
-        self.assertEqual(lines[0], f"Chosen: durable by Tester {self.TODAY}")
+        self.assertIn(lines[0], stamped("Chosen: durable by Tester {day}", self.since))
         self.assertEqual(sum(l.startswith("Chosen:") for l in lines), 1)
         self.assertEqual(self.rows()[-1]["options"], ["durable"])
         self.assertEqual(self.rows()[-1]["option"], "durable")
@@ -10763,7 +10776,8 @@ class TestLensChoose(Project):
         self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": "## Options\n",
                                                           "new_string": "## Options\n" + combo}))
         self.assertEqual(self.choose("T-001", "minimal", "operator").returncode, 0)
-        line = f"Chosen: minimal + operator by Tester {self.TODAY}"
+        line = self.options_text("T-001").splitlines()[0]
+        self.assertIn(line, stamped("Chosen: minimal + operator by Tester {day}", self.since))
         for new in (line.replace("operator", "durable"), line.replace(" + operator", ""),
                     line.replace("minimal + operator", "minimal + durable + operator")):
             self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": line, "new_string": new}), new)
@@ -10775,14 +10789,14 @@ class TestLensChoose(Project):
         r = self.choose("T-001", inp="operator, minimal\ny\n")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("choice (minimal, durable, operator, defer: one lens, or several to combine them", r.stdout)
-        self.assertEqual(self.options_text("T-001").splitlines()[0], f"Chosen: minimal + operator by Tester {self.TODAY}")
+        self.assertIn(self.options_text("T-001").splitlines()[0], stamped("Chosen: minimal + operator by Tester {day}", self.since))
         r = self.choose("T-001", inp="2\n")
         self.assertIn("chosen by name, not number", r.stderr)
         self.lens_task(tid="T-002")
         # T-001 (chosen) approves; T-002: c, two lens names, confirm, approve
         r = self.ergon("review", "-i", inp="a\nc\ndurable defer\ny\na\n", env=self.human(), check=False)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn(f"Chosen: durable + defer by Tester {self.TODAY}", self.options_text("T-002"))
+        self.assertTrue(any(s in self.options_text("T-002") for s in stamped("Chosen: durable + defer by Tester {day}", self.since)))
         self.assertEqual(self.rows()[-1]["options"], ["durable", "defer"])
 
     def test_help_describes_combinations(self):
