@@ -2183,6 +2183,62 @@ class TestEpicQuestions(Project):
             os.close(fd)
         self.assertEqual(self.brief(), ["Mike Shorter reviews for people who wait", ""])
 
+    def test_arrow_keys_edit_the_answer_and_never_reach_it(self):  # T-302
+        import pty
+        import select
+        try:
+            import readline  # noqa: F401
+        except ImportError:
+            self.skipTest("no readline here: the /dev/tty fallback strips escapes (unit test below)")
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.root)
+            os.execve(sys.executable, [sys.executable, str(ERGON), "new", "epic", "Shorter reviews"],
+                      dict(self.base, EPIC_OK="OKAY"))
+        seen = ""
+
+        def until(text):
+            nonlocal seen
+            end = time.monotonic() + 30
+            while text not in seen:
+                self.assertTrue(select.select([fd], [], [], max(0, end - time.monotonic()))[0], seen)
+                try:
+                    seen += os.read(fd, 4096).decode(errors="replace")
+                except OSError:
+                    self.fail(seen)
+            seen = seen.split(text, 1)[1]
+        try:
+            until("leave it empty]")
+            # Left, Left, Right, then the missing "to"; Home, then "OKAY"; End, then Left and Right back
+            os.write(fd, b"users can't find the export butn\x1b[D\x1b[D\x1b[Cto"
+                         b"\x1b[HOKAY \x1b[F\x1b[D\x1b[C\n")
+            until("leave it empty]")
+            os.write(fd, b"\n")
+            until("EPIC.md")
+            self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), 0)
+            pid = None
+        finally:
+            if pid:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+            os.close(fd)
+        self.assertEqual(self.brief(), ["OKAY users can't find the export button", ""])
+
+    def test_escape_sequences_read_without_line_editing_are_dropped(self):  # T-302
+        from ergon import gates
+        for raw, want in (("1 and 4 - diagrams with new additions\x1b[D\x1b[", "1 and 4 - diagrams with new additions"),
+                          ("ab\x1b[Dc\x1b[1;5C\x1bOH\x1b[3~d\x1b", "abcd"), ("plain words", "plain words")):
+            self.assertEqual(gates._no_escapes(raw), want)
+        # stdin redirected: the answer is read from /dev/tty without editing, and arrow keys are stripped
+        from unittest import mock
+        import io
+        tty = io.StringIO("New users\x1b[D\x1b[C can't find it\n")
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "AI_AGENT", "ERGON_ASK_STDIN")}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(gates, "_edits_lines", return_value=False), \
+                mock.patch("builtins.open", side_effect=lambda f, m="r", *a, **k: tty if "r" in m else io.StringIO()):
+            self.assertEqual(gates.ask("why? "), "New users can't find it")
+
 
 class TestEpicApproval(Project):
     """Epics start proposed; a human's `approve E-NNN` approves the brief and opens them (T-098)."""
