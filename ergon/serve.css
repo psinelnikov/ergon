@@ -168,3 +168,21 @@ table.prio .pin { font-size: 0.85em; color: var(--warn); }
 .options { list-style: decimal inside; padding: 0; margin: 6px 0; display: flex; flex-direction: column; gap: 6px; }
 .options li, p.option { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); overflow-wrap: anywhere; }
 .options li.chosen, p.option.chosen { border-color: var(--ok); color: var(--ok); }
+.archpair { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; overflow-x: auto; }
+.archpair figure { margin: 0; }
+.archpair figcaption { color: var(--muted); font-size: 0.85em; margin-bottom: 2px; }
+svg.archmap { display: block; font: 11px -apple-system, BlinkMacSystemFont, sans-serif; }
+svg.archmap .concern > rect { fill: var(--code); stroke: var(--line); stroke-width: 1; }
+svg.archmap .comp rect { fill: var(--bg); stroke: var(--line); stroke-width: 1.2; }
+svg.archmap .ch-added > rect { stroke: var(--ok); stroke-width: 2; }
+svg.archmap .ch-removed > rect { stroke: var(--bad); stroke-width: 2; stroke-dasharray: 4 3; }
+svg.archmap .ch-changed > rect { stroke: var(--warn); stroke-width: 2; }
+svg.archmap .chead { fill: var(--fg); font-weight: 600; }
+svg.archmap .clabel { fill: var(--muted); font-weight: 400; font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 11px; }
+svg.archmap .cid { fill: var(--accent); font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+svg.archmap .mk { font-weight: 700; }
+svg.archmap .ch-added > text .mk { fill: var(--ok); }
+svg.archmap .ch-removed > text .mk { fill: var(--bad); }
+svg.archmap .ch-changed > text .mk { fill: var(--warn); }
+svg.archmap .entry { fill: var(--fg); font-family: ui-monospace, Menlo, monospace; }
+p.arch.stale { color: var(--warn); }

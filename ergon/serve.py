@@ -13,7 +13,9 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
                tier_why / touches, dead depends), and the quiz `ergon quiz` last wrote, minus questions whose task has changed since
   /live.json   tasks `doing`: elapsed time, round, spend so far; the board polls it
   /e/E-NNN     one epic's replay timeline: a lane per task, a bar per phase from the journal,
-               human waits hatched, a cost overlay, and a replay player (inline SVG, no libraries)
+               human waits hatched, a cost overlay, and a replay player (inline SVG, no libraries);
+               its planned architecture before and after (the newest `ergon arch` file, drawn
+               inline; the file itself is never served), as /review's per-epic sections show it too
   /t/T-NNN     one task: its brief, frontmatter, every run and review from the history
                journal, transcript usage, links to the raw logs, `claude --resume` commands,
                and (with a concept map) the tasks it relates to, as `ergon related` lists them
@@ -719,7 +721,8 @@ def epic_page(eid, nonce, now=None):
 
     tl = _timeline.build(rows, tasks, eid, now or time.time(), tokens)
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
-         f'<h1>{esc(eid)} {esc(e.get("title"))}</h1>', epic_dep_map(eid, tasks)]
+         f'<h1>{esc(eid)} {esc(e.get("title"))}</h1>', epic_dep_map(eid, tasks),
+         f'<h2>Architecture</h2>{arch_block(eid, e, tasks)}']
     jb = journal_block(eid, tasks) + breakdown_block(eid)
     if not tl["lanes"]:
         b.append(jb)
@@ -1259,6 +1262,8 @@ def epic_maps(proposed, tasks, epics, flagged, cmap=None):
             h.append(f'<h3 class=mhead id="map-{esc(k)}"><a href="/e/{esc(k)}">{esc(k)}</a>'
                      + (f" {esc(title)}" if title else "") + f"{count}</h3>")
             label = f"the proposed tasks of {k}"
+            if k in epics:
+                h.append(arch_block(k, epics[k], tasks))
         h.append(f"<div class=mapwrap>{dep_map(ts, tasks, flagged, label, cmap)}</div>")
     return "".join(h)
 
@@ -1331,6 +1336,93 @@ def touch_map(t, cmap):
     height = y - 8 + TM_PAD
     return (f'<svg class=touchmap viewBox="0 0 {width} {height}" width="{width}" height="{height}" role=img '
             f'aria-label="where the touches of {esc(t["id"])} fall in the concept map">' + "".join(o) + "</svg>")
+
+
+AR_MARK = {"added": "+", "removed": "\u2212", "changed": "~"}
+
+
+def arch_svg(raw, marks, side, eid):
+    """One side (before or after) of an epic's planned architecture as inline SVG: the raw map
+    (concepts.toml shape) through concepts.check_map, so only well-formed entries are drawn;
+    component boxes under their concern. marks maps ("concern"|"component", id) to added,
+    removed or changed: a marked entry gets its sign and class, and a marked component lists its
+    files; an unmarked one is its id only, so the change stands out in a big map."""
+    cmap = _concepts.check_map(raw)[0]
+    comps = list(cmap["components"].values())
+    concerns = list(cmap["concerns"].values())
+
+    def sign(kind, i):
+        m = marks.get((kind, i))
+        return (m, f"{AR_MARK[m]} ") if m else (None, "")
+
+    texts = [f"~ {c['id']} \u00b7 {c['label']}" for c in comps] + ["   " + f for c in comps for f in c["files"]] \
+        + [f"~ {k['id']} \u00b7 {k['label']}" for k in concerns] + [f"{side} (no component)"]
+    width = round(TM_PAD * 2 + TM_IN * 2 + 8 + max(len(s) for s in texts) * TM_CH)
+    o, y = [], TM_PAD
+    for k in concerns:
+        top = y
+        y += TM_HEAD
+        parts = []
+        for c in (c for c in comps if c["concern"] == k["id"]):
+            m, mk = sign("component", c["id"])
+            files = c["files"] if m else []
+            h = 20 + TM_LINE * len(files) + (4 if files else 0)
+            x, w = TM_PAD + TM_IN, width - 2 * (TM_PAD + TM_IN)
+            title = " \u00b7 ".join([c["id"]] + ([c["label"]] if c["label"] else []) + ([m] if m else [])
+                                    + ([", ".join(c["files"])] if c["files"] else []))
+            parts.append(f'<g class="comp{" ch-" + m if m else ""}"><title>{esc(title)}</title>'
+                         f'<rect x={x} y={y} width={w} height={h} rx=5 />'
+                         f'<text class=cid x={x + 8} y={y + 14}>'
+                         + (f'<tspan class=mk>{esc(mk)}</tspan>' if mk else "") + esc(c["id"])
+                         + (f' <tspan class=clabel>\u00b7 {esc(c["label"])}</tspan>' if c["label"] else "") + "</text>"
+                         + "".join(f'<text class=entry x={x + 8} y={y + 20 + n * TM_LINE + 11}>{esc(f)}</text>'
+                                   for n, f in enumerate(files)) + "</g>")
+            y += h + 4
+        y += 4
+        m, mk = sign("concern", k["id"])
+        o.append(f'<g class="concern{" ch-" + m if m else ""}"><rect x={TM_PAD} y={top} width={width - 2 * TM_PAD} '
+                 f'height={y - top} rx=7 /><text class=chead x={TM_PAD + 8} y={top + 15}>'
+                 + (f'<tspan class=mk>{esc(mk)}</tspan>' if mk else "") + esc(k["id"])
+                 + (f' <tspan class=clabel>\u00b7 {esc(k["label"])}</tspan>' if k["label"] else "") + "</text>"
+                 + "".join(parts) + "</g>")
+        y += 8
+    if not concerns:
+        o.append(f'<text class=clabel x={TM_PAD} y={y + 12}>{esc(side)} (no component)</text>')
+        y += 24
+    height = y - 8 + TM_PAD
+    return (f'<svg class=archmap viewBox="0 0 {width} {height}" width="{width}" height="{height}" role=img '
+            f'aria-label="{esc(eid)} architecture {esc(side)}">' + "".join(o) + "</svg>")
+
+
+def arch_block(eid, e, tasks):
+    """Epic eid's planned architecture from the newest `ergon arch` file (concepts.latest_arch):
+    a before and an after picture with added, removed and changed components and concerns marked,
+    a muted stale line when the epic's brief or touches changed since, a muted line when it plans
+    no change, and one naming `ergon arch E-NNN` when there's no file. Serve runs nothing."""
+    _, d = _concepts.latest_arch(eid)
+    if not d:
+        return f'<p class="muted arch">no planned architecture yet: <code>ergon arch {esc(eid)}</code></p>'
+    when = f'planned {esc(d.get("generated"))} by {esc(d.get("model"))}'
+    stale = _concepts.arch_stale(dict(e, id=eid), tasks, d)
+    out = ([f'<p class="muted arch stale">stale: the epic\'s brief or its tasks\' touches changed since this was '
+            f'{when}; <code>ergon arch {esc(eid)}</code> plans it again</p>'] if stale else [])
+    diff = _concepts.map_diff(d.get("before"), d["after"])
+    if not diff:
+        out.append(f'<p class="muted arch">no architecture change planned <span class=muted>({when})</span></p>')
+        return "".join(out)
+    marks = {(kind, i): m for kind in ("concern", "component") for m, ids in diff.get(kind, {}).items() for i in ids}
+    before = {k: m for k, m in marks.items() if m != "added"}
+    after = {k: m for k, m in marks.items() if m != "removed"}
+    ign = diff.get("ignore")
+    out.append('<div class=archpair>'
+               f'<figure><figcaption>before</figcaption>{arch_svg(d.get("before"), before, "before", eid)}</figure>'
+               f'<figure><figcaption>after</figcaption>{arch_svg(d["after"], after, "after", eid)}</figure></div>'
+               '<p class=legend><b>+</b> added <b>\u2212</b> removed <b>~</b> changed; a marked component lists its '
+               'files, hover any for its label and files'
+               + (". [[ignore]] entries " + esc("; ".join(f"{m} {', '.join(ids)}" for m, ids in ign.items() if ids))
+                  if ign else "")
+               + (f". {when}" if not stale else "") + ".</p>")
+    return "".join(out)
 
 
 def change_row(t, mapstate):

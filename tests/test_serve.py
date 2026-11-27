@@ -263,6 +263,27 @@ class TestServe(ServeFixture):
         self.assertNotIn("<svg class=depmap", page)
         self.assertIn("<p class=muted>no open task in this epic</p>", page)
 
+    def test_epic_page_and_review_architecture(self):
+        # T-307: the newest arch file drawn before and after on /e/E-001 and in /review's E-001 section
+        from ergon import concepts as K
+        from ergon import tasks as T
+        page = self.req("GET", "/e/E-001")[2]
+        self.assertIn("no planned architecture yet: <code>ergon arch E-001</code>", page)
+        e = T.parse(next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md")))
+        tasks = {t["id"]: t for t in (T.parse(p) for p in (self.root / "tasks").rglob("T-*.md"))}
+        write_arch(self.runs / "arch", "E-001", K.arch_hash(e, tasks), ARCH_BEFORE, ARCH_AFTER)
+        page = self.req("GET", "/e/E-001")[2]
+        sec = page.split("<h2>Architecture</h2>")[1].split("<h2")[0]
+        self.assertEqual(len(re.findall(r"<svg class=archmap", sec)), 2)
+        self.assertIn('<g class="comp ch-added">', sec)
+        self.assertNotIn("stale", sec)
+        review = self.req("GET", "/review")[2]
+        self.assertEqual(len(re.findall(r"<svg class=archmap", review)), 2)
+        self.assertLess(review.index("<svg class=archmap"), review.index("<svg class=depmap"))
+        # the file itself is never served
+        self.assertEqual(self.req("GET", "/runs/arch/E-001-20261127-120000.json")[0], 404)
+        self.assertNotIn("/runs/arch", page + review)
+
     def test_epic_page_breakdown_runs(self):
         d = self.runs / "breakdown"
         d.mkdir()
@@ -924,6 +945,9 @@ class TestTouchMap(unittest.TestCase):
         p = mock.patch.object(C, "CONCEPTS", self.map, create=True)
         p.start()
         self.addCleanup(p.stop)
+        p = mock.patch.object(C, "RUNS", Path(self.tmp.name) / "runs", create=True)  # no arch file
+        p.start()
+        self.addCleanup(p.stop)
         self.task = {"id": "T-009", "tier": "sonnet", "title": "x", "status": "proposed",
                      "touches": ["ergon/serve.py/::task_page", "ergon/serve.css", "README.md",
                                  'docs/<script>alert("x")</script>.md'],
@@ -1032,6 +1056,128 @@ class TestTouchMap(unittest.TestCase):
         h = S.epic_dep_map("E-001", tasks)
         self.assertNotIn("<svg", h)
         self.assertIn("<p class=muted>no open task in this epic</p>", h)
+
+
+ARCH_BEFORE = {
+    "concern": [{"id": "ui", "label": "Seeing"}, {"id": "plan", "label": "Deciding"}],
+    "component": [
+        {"id": "ui.board", "concern": "ui", "files": ["ergon/serve.py"], "terms": ["board"]},
+        {"id": "ui.old", "concern": "ui", "files": ["ergon/old.py"], "terms": ["old"]},
+        {"id": "plan.tags", "concern": "plan", "files": ["ergon/concepts.py"], "terms": ["tag"]},
+    ]}
+ARCH_AFTER = {
+    "concern": [{"id": "ui", "label": "Seeing"}, {"id": "plan", "label": "Deciding"}],
+    "component": [
+        {"id": "ui.board", "concern": "ui", "files": ["ergon/serve.py", "ergon/serve.css"], "terms": ["board"]},
+        {"id": "ui.arch", "concern": "ui", "files": ["ergon/arch.py"], "terms": ["arch"], "label": "the picture"},
+        {"id": "plan.tags", "concern": "plan", "files": ["ergon/concepts.py"], "terms": ["tag"]},
+    ]}
+
+
+def write_arch(folder, eid, digest, before, after, stamp="20261127-120000"):
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{eid}-{stamp}.json").write_text(json.dumps(
+        {"epic": eid, "hash": digest, "generated": "2026-11-27T12:00:00+00:00", "model": "opus",
+         "cost": 0.5, "changed": before != after, "before": before, "after": after}))
+
+
+class TestArch(unittest.TestCase):
+    """T-307: the epic's planned architecture, before and after, from <state>/runs/arch/."""
+
+    def setUp(self):
+        from ergon import config as C
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        p = mock.patch.object(C, "RUNS", Path(self.tmp.name) / "runs", create=True)
+        p.start()
+        self.addCleanup(p.stop)
+        self.dir = C.RUNS / "arch"
+        self.epic = {"id": "E-001", "title": "x", "_body": "the brief\n"}
+        self.tasks = {"T-001": {"id": "T-001", "epic": "E-001", "status": "ready", "touches": ["ergon/serve.py"]}}
+
+    def block(self):
+        return S.arch_block("E-001", self.epic, self.tasks)
+
+    def write(self, before, after, digest=None):
+        from ergon import concepts as K
+        write_arch(self.dir, "E-001", digest or K.arch_hash(self.epic, self.tasks), before, after)
+
+    def test_before_and_after_with_changes_marked(self):
+        self.write(ARCH_BEFORE, ARCH_AFTER)
+        h = self.block()
+        self.assertNotIn("stale", h)
+        before, after = re.findall(r"<svg class=archmap.*?</svg>", h, re.S)
+        self.assertIn('aria-label="E-001 architecture before"', before)
+        self.assertIn('aria-label="E-001 architecture after"', after)
+        self.assertLess(h.index("<figcaption>before"), h.index("<figcaption>after"))
+        # removed only before, added only after, changed on both sides with its files
+        self.assertRegex(before, r'<g class="comp ch-removed">.*?<tspan class=mk>\u2212 </tspan>ui\.old')
+        self.assertNotIn("ui.arch", before)
+        self.assertRegex(after, r'<g class="comp ch-added">.*?<tspan class=mk>\+ </tspan>ui\.arch')
+        self.assertNotIn("ui.old", after)
+        for side in (before, after):
+            self.assertRegex(side, r'<g class="comp ch-changed">.*?<tspan class=mk>~ </tspan>ui\.board')
+            # unchanged: unmarked, its id only (its files only in the hover title)
+            self.assertRegex(side, r'<g class="comp"><title>plan\.tags · ergon/concepts\.py</title><rect [^>]*/>'
+                                   r'<text class=cid [^>]*>plan\.tags</text></g>')
+            self.assertNotIn(">ergon/concepts.py</text>", side)
+            self.assertEqual(len(re.findall(r"<g class=\"?concern", side)), 2)  # grouped by concern
+        self.assertIn(">ergon/serve.css</text>", after)
+        self.assertNotIn(">ergon/serve.css</text>", before)
+        self.assertNotIn("<a ", h)
+        self.assertNotIn(".svg", h)
+
+    def test_hostile_ids_labels_files_escaped(self):
+        bad = '<script>"x'
+        after = json.loads(json.dumps(ARCH_AFTER))
+        after["concern"][0]["label"] = bad
+        after["component"][1].update(label=bad, files=[f'ergon/{bad}.py'])
+        after["component"].append({"id": 'ok.id', "concern": "plan", "files": [bad], "terms": ["t"]})
+        before = json.loads(json.dumps(ARCH_BEFORE))
+        before["component"].append({"id": bad, "concern": "ui", "files": ["a"], "terms": ["t"]})  # malformed id
+        self.write(before, after)
+        h = self.block()
+        self.assertNotIn("<script>", h)
+        self.assertNotIn('"x', h)
+        self.assertIn("&lt;script&gt;&quot;x", h)
+        self.assertIn("ergon/&lt;script&gt;&quot;x.py", h)
+        # a hostile id in an svg is escaped too
+        svg = S.arch_svg({"concern": [{"id": "c", "label": "l"}],
+                          "component": [{"id": "a", "concern": "c", "files": [bad], "terms": ["t"]}]},
+                         {("component", "a"): "changed"}, "after", 'E-<b>"1')
+        self.assertIn('aria-label="E-&lt;b&gt;&quot;1 architecture after"', svg)
+        self.assertNotIn("<script>", svg)
+
+    def test_missing_file(self):
+        h = self.block()
+        self.assertNotIn("<svg", h)
+        self.assertIn("<p class=\"muted arch\">no planned architecture yet: <code>ergon arch E-001</code></p>", h)
+
+    def test_no_change(self):
+        self.write(ARCH_BEFORE, ARCH_BEFORE)
+        h = self.block()
+        self.assertNotIn("<svg", h)
+        self.assertIn('<p class="muted arch">no architecture change planned', h)
+        self.assertNotIn("stale", h)
+
+    def test_stale(self):
+        self.write(ARCH_BEFORE, ARCH_AFTER)
+        self.tasks["T-001"]["touches"] = ["ergon/other.py"]  # a touch changed since the plan
+        h = self.block()
+        self.assertIn('<p class="muted arch stale">stale: ', h)
+        self.assertIn("<code>ergon arch E-001</code> plans it again", h)
+        self.assertEqual(len(re.findall(r"<svg class=archmap", h)), 2)  # still drawn, labelled stale
+        self.write(ARCH_BEFORE, ARCH_BEFORE, digest="0" * 64)
+        h = self.block()
+        self.assertIn("stale: ", h)
+        self.assertIn("no architecture change planned", h)
+
+    def test_review_section_above_its_map(self):
+        self.write(ARCH_BEFORE, ARCH_AFTER)
+        t = dict(self.tasks["T-001"], status="proposed", tier="sonnet", title="t")
+        h = S.epic_maps([t], {"T-001": t}, {"E-001": self.epic}, {})
+        self.assertLess(h.index('<h3 class=mhead id="map-E-001">'), h.index("<svg class=archmap"))
+        self.assertLess(h.rindex("<svg class=archmap"), h.index("<svg class=depmap"))
 
 
 class TestTwoProjects(ServeFixture):
