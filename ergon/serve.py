@@ -1499,7 +1499,7 @@ def review_page(nonce):
              + (f"<code class=cmd>{esc('ergon approve ' + ' '.join(ids))}</code>" if ids
                 else "<p class=muted>nothing to approve yet</p>"))
     if first:
-        b.append("<p class=muted>Choose first, then approve: " + link_ids(esc(", ".join(first)), tasks) + "</p>")
+        b.append("<p class=muted>Choose first (choosing approves): " + link_ids(esc(", ".join(first)), tasks) + "</p>")
     if flagged and clean:
         b.append(f"<p class=muted>Only those without findings:</p><code class=cmd>{esc('ergon approve ' + ' '.join(clean))}</code>")
     return page("ergon · review", "".join(b), nonce, script=True)

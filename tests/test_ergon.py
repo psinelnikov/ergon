@@ -10098,8 +10098,7 @@ class TestLearn(Project):
         self.assertIn("has options and no choice", r.stderr)
         r = self.ergon("choose", "T-004", "durable", inp="y\n", check=False, env=self.human())
         self.assertEqual(r.returncode, 0, r.stderr)
-        r = self.ergon("approve", "T-004", inp="y\n", check=False, env=self.human())
-        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.status("T-004"), "ready")  # the confirmed choice approved it
 
     def test_prompt_asks_for_a_crux_and_lens_options_with_no_ranking(self):
         self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C)))
@@ -10141,7 +10140,10 @@ class TestLearn(Project):
     def test_a_class_joining_an_open_task_leaves_its_options_alone(self):
         self.ergon("learn", env=self.reply(self.bare_except(self.A, self.B, self.C, crux=self.CRUX,
                                                             options=self.LENS_OPTS)))
-        self.ergon("choose", "T-004", "minimal", inp="y\n", env=self.human())
+        # a proposed task that already has a choice (e.g. awaiting a second approver): the join
+        # leaves its options alone — `ergon choose` would approve it and take it out of the joinable set
+        f = self.task_file("T-004")
+        f.write_text(f.read_text().replace("## Options\n", "## Options\nChosen: minimal by Tester 2026-01-01\n"))
         before = self.task_file("T-004").read_text()
         self.incident(self.D, "runtime", "test_parse fails: ValueError swallowed")
         self.ergon("learn", env=self.reply(self.bare_except(self.D, task="T-004", crux="c", options=self.LENS_OPTS[:2])))
@@ -10300,6 +10302,7 @@ class TestOptions(Project):
         self.assertIn("ergon choose T-001", r.stderr)
         self.assertEqual(self.status("T-001"), "proposed")
 
+        # a confirmed choice also approves: no `ergon approve` step after it
         r = self.choose("T-001", "2")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("choice: 2. a redis cache", r.stdout)
@@ -10312,30 +10315,35 @@ class TestOptions(Project):
         self.assertEqual(ergon.tasks.options(t)[1]["option"], 2)
         self.assertEqual(ergon.tasks.options(t)[1]["text"], "a redis cache")
         self.assertIn("(chosen)", self.ergon("show", "T-001").stdout)
+        self.assertEqual(self.status("T-001"), "ready")
+        r = self.approve("T-001")
+        self.assertNotEqual(r.returncode, 0)  # nothing left to approve
 
-        # choosing again replaces the line; --own writes the human's own text
-        before = ergon.tasks.brief_digest(t)
-        r = self.choose("T-001", "--own", "a file cache, keyed by path")
+        # on a still-proposed task that already has a choice (a first approver's of two, or one
+        # written by hand), choosing again replaces the line; --own writes the human's own text
+        self.new_feature("a", "b")  # T-002
+        g = self.task_file("T-002")
+        g.write_text(g.read_text().replace("## Options\n", f"## Options\nChosen: 1 by Tester {today()}\n"))
+        before = ergon.tasks.brief_digest(ergon.tasks.parse(g))
+        r = self.choose("T-002", "--own", "a file cache, keyed by path")
         self.assertEqual(r.returncode, 0, r.stderr)
-        lines = self.options_text("T-001").splitlines()
+        lines = self.options_text("T-002").splitlines()
         self.assertIn(lines[0], stamped("Chosen: own by Tester {day} — a file cache, keyed by path", self.since))
         self.assertEqual(sum(l.startswith("Chosen:") for l in lines), 1)
-        t = ergon.tasks.parse(f)
+        t = ergon.tasks.parse(g)
         self.assertEqual(ergon.tasks.options(t)[1]["text"], "a file cache, keyed by path")
         self.assertNotEqual(ergon.tasks.brief_digest(t), before)  # the choice is in what approval approves
         self.assertEqual([x["option"] for x in history(self.root) if x["event"] == "chosen"], [2, "own"])
+        self.assertEqual(self.status("T-002"), "ready")
 
-        # not confirmed: nothing written
-        r = self.choose("T-001", "1", inp="n\n")
+        # not confirmed: nothing written, nothing approved
+        self.new_feature("a", "b")  # T-003
+        r = self.choose("T-003", "1", inp="n\n")
         self.assertIn("aborted", r.stderr)
-        self.assertIn("Chosen: own", self.options_text("T-001"))
-        r = self.choose("T-001", "3")
+        self.assertNotIn("Chosen:", self.options_text("T-003"))
+        self.assertEqual(self.status("T-003"), "proposed")
+        r = self.choose("T-003", "3")
         self.assertIn("from 1 to 2", r.stderr)
-
-        r = self.approve("T-001")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("chosen own: a file cache", r.stdout)
-        self.assertEqual(self.status("T-001"), "ready")
         self.ergon("check")
 
     def test_choose_refusals(self):
@@ -10348,9 +10356,9 @@ class TestOptions(Project):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("no ## Options", r.stderr)
         self.assertEqual(self.choose("T-404", "1").returncode, 1)
-        # a task that isn't proposed
+        # a task that isn't proposed (choosing it approved it already)
         self.assertEqual(self.choose("T-001", "1").returncode, 0)
-        self.assertEqual(self.approve("T-001").returncode, 0)
+        self.assertEqual(self.status("T-001"), "ready")
         r = self.choose("T-001", "2")
         self.assertIn("is ready: a choice is made on a proposed task only", r.stderr)
         self.assertIn("Chosen: 1 by", self.options_text("T-001"))
@@ -10665,7 +10673,6 @@ class TestLensChoose(Project):
         self.assertIn("a combination: the worker builds what these options share", r.stdout)
         self.assertIn("A choice steers only", r.stdout)
         self.assertIn(self.options_text("T-001").splitlines()[0], stamped("Chosen: minimal + operator by Tester {day}", self.since))
-        self.assertEqual(fields(), before)  # never tier, touches:, accept: or approved:
         t = ergon.tasks.parse(f)
         _, chosen = ergon.tasks.options(t)
         self.assertEqual((chosen["option"], chosen["lenses"]), ("minimal + operator", ["minimal", "operator"]))
@@ -10681,26 +10688,33 @@ class TestLensChoose(Project):
         self.assertIn("4. defer: build nothing now", out)
         self.assertNotIn("4. defer: build nothing now and look again when the table passes a million rows  (chosen)", out)
 
-        # one lens: the row has options too, and it replaces the combination
-        r = self.choose("T-001", "Durable")
+        # choosing approved it: status and approved: change, tier, touches: and accept: do not
+        after = fields()
+        self.assertEqual((after["status"], bool(after["approved"])), ("ready", True))
+        self.assertEqual({k: after[k] for k in ("tier", "touches", "accept")},
+                         {k: before[k] for k in ("tier", "touches", "accept")})
+        self.assertNotEqual(self.approve("T-001").returncode, 0)  # nothing left to approve
+
+        # `c` in review -i writes the choice but does not approve: T-002 stays proposed, and the
+        # CLI's choose then replaces the combination and approves it
+        self.lens_task(tid="T-002")
+        r = self.ergon("review", "-i", inp="c\nminimal operator\ny\ns\n", env=self.human(), check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.status("T-002"), "proposed")
+        self.assertTrue(any(s in self.options_text("T-002") for s in stamped("Chosen: minimal + operator by Tester {day}", self.since)))
+        r = self.choose("T-002", "Durable")
         self.assertEqual(r.returncode, 0, r.stderr)
-        lines = self.options_text("T-001").splitlines()
+        lines = self.options_text("T-002").splitlines()
         self.assertIn(lines[0], stamped("Chosen: durable by Tester {day}", self.since))
         self.assertEqual(sum(l.startswith("Chosen:") for l in lines), 1)
         self.assertEqual(self.rows()[-1]["options"], ["durable"])
         self.assertEqual(self.rows()[-1]["option"], "durable")
+        self.assertEqual(self.status("T-002"), "ready")
         # --own on a lens section: as before, no options
-        self.assertEqual(self.choose("T-001", "--own", "a file cache").returncode, 0)
+        self.lens_task(tid="T-003")
+        self.assertEqual(self.choose("T-003", "--own", "a file cache").returncode, 0)
         self.assertNotIn("options", self.rows()[-1])
-        self.assertEqual(fields(), before)
 
-        self.assertEqual(self.choose("T-001", "minimal", "defer").returncode, 0)
-        r = self.approve("T-001")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("chosen minimal: an in-memory LRU", r.stdout)
-        after = fields()
-        self.assertEqual({k: after[k] for k in ("tier", "touches", "accept")},
-                         {k: before[k] for k in ("tier", "touches", "accept")})
         self.ergon("check")
 
     def test_choose_refusals(self):
@@ -10725,9 +10739,9 @@ class TestLensChoose(Project):
                 self.assertIn(want, r.stderr)
         self.assertEqual({tid: self.task_file(tid).read_text() for tid in ("T-001", "T-002")}, text)
         self.assertEqual(self.rows(), [])
-        # a task that isn't proposed
+        # a task that isn't proposed (choosing it approved it already)
         self.assertEqual(self.choose("T-001", "minimal").returncode, 0)
-        self.assertEqual(self.approve("T-001").returncode, 0)
+        self.assertEqual(self.status("T-001"), "ready")
         r = self.choose("T-001", "durable")
         self.assertIn("is ready: a choice is made on a proposed task only", r.stderr)
         self.assertIn("Chosen: minimal by", self.options_text("T-001"))
@@ -10786,18 +10800,20 @@ class TestLensChoose(Project):
 
     def test_prompt_and_review_interactive_take_lens_names(self):
         self.lens_task()
+        r = self.choose("T-001", inp="2\n")
+        self.assertIn("chosen by name, not number", r.stderr)
         r = self.choose("T-001", inp="operator, minimal\ny\n")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("choice (minimal, durable, operator, defer: one lens, or several to combine them", r.stdout)
         self.assertIn(self.options_text("T-001").splitlines()[0], stamped("Chosen: minimal + operator by Tester {day}", self.since))
-        r = self.choose("T-001", inp="2\n")
-        self.assertIn("chosen by name, not number", r.stderr)
+        self.assertEqual(self.status("T-001"), "ready")  # choosing approved it
         self.lens_task(tid="T-002")
-        # T-001 (chosen) approves; T-002: c, two lens names, confirm, approve
+        # T-002: a refused (no choice yet); c, two lens names, confirm; a approves
         r = self.ergon("review", "-i", inp="a\nc\ndurable defer\ny\na\n", env=self.human(), check=False)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertTrue(any(s in self.options_text("T-002") for s in stamped("Chosen: durable + defer by Tester {day}", self.since)))
         self.assertEqual(self.rows()[-1]["options"], ["durable", "defer"])
+        self.assertEqual(self.status("T-002"), "ready")
 
     def test_help_describes_combinations(self):
         h = self.ergon("choose", "-h").stdout

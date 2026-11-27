@@ -598,8 +598,9 @@ def review_interactive(args):
     `brief_due`, comes before its tasks, offering `a`: approve the brief alone, as approving the
     epic's ID does), then tasks waiting on an answer to their worker's question (offering `a`:
     answer it, as `ergon answer` does), then tasks whose review vetoed them (offering `p`: save
-    the finding as a policy). A proposed task with options offers `c`: choose one, as `ergon choose`
-    does; approving it is refused until it has a choice. Every answer lands immediately."""
+    the finding as a policy). A proposed task with options offers `c`: choose one (the choice
+    alone; `a` still approves, and is refused until it has a choice). Every answer lands
+    immediately."""
     tasks, epics = _tasks.load(_config.ITEMS), _tasks.load(_config.EPICS)
     held = _shared.unpublished([t["id"] for t in tasks.values() if t["status"] == "proposed"]
                                + [t["epic"] for t in tasks.values() if t["status"] == "proposed" and t.get("epic")]
@@ -1067,7 +1068,7 @@ def answer_task(t, text=""):
     print(f"{tid} is ready: the next `ergon dispatch` resumes its worker with your answer")
 
 
-CHOICE_STEERS = ("A choice steers only: it never changes tier, touches:, accept: or approved:. If the chosen "
+CHOICE_STEERS = ("A choice steers only: it never changes tier, touches: or accept:. If the chosen "
                  "option needs a different tier or touches:, edit those before approving.")
 
 
@@ -1075,25 +1076,40 @@ def choose(args):
     """HUMAN ONLY: pick a proposed task's option: one or more lenses on a lens section
     (`ergon choose ID minimal operator`, several combine them), one number on a numbered one
     (`ergon choose ID N`), or say how it is built in your own words (`--own "<text>"`). With none,
-    offers the options to pick from."""
+    offers the options to pick from. A confirmed choice approves the task: `approve`'s checks run
+    before asking, and its stamp lands with the choice."""
     if in_agent_shell():
         raise SystemExit("refused: running inside an agent shell. A human chooses from their own terminal.")
+    if args.picks and args.own is not None:
+        raise SystemExit("give the option's lens(es) or number, or --own \"<text>\", not both")
     t = _tasks.load(_config.ITEMS).get(args.id)
     if not t:
         raise SystemExit(f"no such task: {args.id}")
-    if args.picks and args.own is not None:
-        raise SystemExit("give the option's lens(es) or number, or --own \"<text>\", not both")
-    choose_task(t, args.picks, args.own)
+    # choosing approves: what `approve` checks before its prompt, checked before asking anything
+    approve_ready()
+    count = bool(_config.SHARED and _config.TWO_PERSON)
+    if count:
+        sync_for_count([args.id])
+    _shared.ensure_published([args.id])  # an unpublished ID can still be renumbered by a sync
+    t = _tasks.load(_config.ITEMS).get(args.id)
+    if not t:
+        raise SystemExit(f"no such task: {args.id}")
+    choose_task(t, args.picks, args.own, approves=True)
+    if count:  # publish, so the other approvers see this approval
+        sync_for_count([args.id], after=True)
 
 
-def choose_task(t, picks=None, own=None):
+def choose_task(t, picks=None, own=None, approves=False):
     """HUMAN ONLY, the one path for `ergon choose` and `c` in the interactive review: check that t
     is proposed and has a well-formed `## Options` section, take the choice (one or more lens names
     on a lens section, exactly one number on a numbered one, or the human's own text; with none,
     ask), print it and confirm; then write or replace the section's `Chosen:` line (lenses in LENSES
     order, joined by ` + `) and record a `chosen` row (`option` and `text`, plus `options`, the
-    lenses, for a lens choice). Never touches tier, touches:, accept: or approved:. Raises
-    SystemExit, writing nothing, if any of that fails or isn't confirmed."""
+    lenses, for a lens choice). With `approves` (`ergon choose`) the confirmation covers the
+    approval too, and once the choice is written the task is stamped as `approve` would stamp it;
+    returns stamp_approved's waiting list, and a stamping failure leaves the choice written.
+    Never touches tier, touches: or accept:. Raises SystemExit, writing nothing, if any of that
+    fails or isn't confirmed."""
     picks = [str(x).strip() for x in ([picks] if isinstance(picks, (str, int)) else picks or []) if str(x).strip()]
     tid = t["id"]
     if t["status"] != "proposed":
@@ -1149,7 +1165,7 @@ def choose_task(t, picks=None, own=None):
         option, text = int(picks[0]), opts[int(picks[0]) - 1]
         what = f"{option}. {text}"
     print(f"\nchoice: {what}\n\n{CHOICE_STEERS}")
-    if not human_gate(f"Choose this for {tid} as {approver()}?"):
+    if not human_gate(f"Choose this{' and approve ' if approves else ' for '}{tid} as {approver()}?"):
         raise SystemExit("aborted")
     with _gitops.state_lock():  # shared mode: the write is a state commit, like a `set`
         t = _tasks.load(_config.ITEMS).get(tid)
@@ -1162,7 +1178,18 @@ def choose_task(t, picks=None, own=None):
         _tasks.dump(t, _tasks.TASK_KEYS)
         _history.record("chosen", t, by=approver(), option=option, text=text,
                         **({"options": lenses} if lenses else {}))
-    print(f"{tid}: chose {option if lenses else what}. Approve it from your own terminal: ergon approve {tid}")
+    if not approves:
+        print(f"{tid}: chose {option if lenses else what} — approve it with `ergon approve {tid}` "
+              "or [a] in `review -i`")
+        return None
+    try:
+        waiting = stamp_approved([t])
+    except SystemExit as err:
+        raise SystemExit(f"{err}\n{tid}: the choice is written; approve it from your own terminal: "
+                         f"ergon approve {tid}")
+    print(f"{tid}: chose {option if lenses else what}"
+          + ("; your approval is in — it waits for another approver" if waiting else ", approved"))
+    return waiting
 
 
 def pin(args):
