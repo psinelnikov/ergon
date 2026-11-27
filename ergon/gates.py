@@ -155,11 +155,41 @@ def ask(prompt):
         return sys.stdin.readline().strip()
     try:
         with open("/dev/tty", "r") as tin, open("/dev/tty", "w") as tout:
+            if _edits_lines():  # stdin and stdout are the terminal: input() edits the line (T-302)
+                head, _, last = prompt.rpartition("\n")
+                if head:  # readline redraws only the prompt's last line
+                    sys.stdout.write(head + "\n")
+                    sys.stdout.flush()
+                try:
+                    return _no_escapes(input(last)).strip()
+                except EOFError:
+                    return ""
             tout.write(prompt)
             tout.flush()
-            return tin.readline().strip()
+            return _no_escapes(tin.readline()).strip()
     except OSError:
         raise SystemExit("refused: no terminal to confirm on.")
+
+
+_ESCAPES = re.compile(r"\x1b(\[[0-?]*[ -/]*[@-~]?|O.?|.?)")  # CSI (arrow, Home, End...), SS3, or a lone ESC
+
+
+def _no_escapes(text):
+    """text without terminal escape sequences: an arrow key read without line editing arrives as
+    ESC [ D, and none of it belongs in an answer."""
+    return _ESCAPES.sub("", text)
+
+
+def _edits_lines():
+    """Whether input() reads with line editing: stdin and stdout are a terminal and readline loads
+    (it doesn't on Windows). Otherwise ask() reads /dev/tty itself and strips what arrow keys send."""
+    try:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return False
+        import readline  # noqa: F401  (importing it is what gives input() editing and history)
+    except (ImportError, AttributeError, ValueError):
+        return False
+    return True
 
 
 def can_ask():
