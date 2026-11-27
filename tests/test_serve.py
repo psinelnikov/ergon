@@ -444,12 +444,13 @@ class TestServe(ServeFixture):
         self.assertIn("Awaiting choice (1)", board)
         self.assertRegex(board, r'id="count-choice">1<')
         self.ergon("choose", "T-004", "2", inp="y\n", env=dict(self.env, ERGON_ASK_STDIN="1"))
-        for path in ("/review", "/t/T-004"):
-            _, _, page = self.req("GET", path)
-            self.assertIn("chosen by", page)
-            self.assertNotIn("ergon choose T-004", page)
+        # choose approves the task, so it has left /review; its page shows the chosen mark
+        _, _, page = self.req("GET", "/t/T-004")
+        self.assertIn("chosen by", page)
+        self.assertNotIn("ergon choose T-004", page)
         _, _, review = self.req("GET", "/review")
-        self.assertIn("ergon approve T-004", review.split("<h2>Approve</h2>")[1])
+        self.assertNotIn("ergon choose T-004", review)
+        self.assertNotIn("Choose first", review)
         _, _, board = self.req("GET", "/")
         self.assertNotIn("Awaiting choice", board)
 
