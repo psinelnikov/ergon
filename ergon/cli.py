@@ -215,6 +215,15 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                nothing is written and it exits non-zero. Writes <state>/runs/arch/
                                E-NNN-<time>.json with both maps (before, after) and a hash of the brief
                                and touches, so a breakdown or an edit makes it stale. Never run by serve
+  ergon mock [T-ID ...] [--model sonnet] [--budget USD]
+                               one `claude -p` (no tools) per task draws a mock of its planned result
+                               from the brief: a layout tree of heading, text, table, list, box and
+                               badge nodes holding plain text only, checked against a fixed schema
+                               (no markup, no script). A reply that doesn't hold writes nothing and
+                               it exits non-zero. Writes <state>/runs/mock/T-NNN-<time>.json with
+                               the brief's hash, so an edited brief makes it stale. No IDs: every
+                               proposed task touching ui.serve or ui.stats (concept map) or
+                               ergon/cli.py. Never run by serve
   ergon sync [--init | --join] HUMAN ONLY, with [shared] in .ergon.toml (docs/shared-state.md):
                                commit pending state edits, fetch, merge and push the state branch.
                                --init creates it from local state (first person), --join checks
@@ -254,6 +263,7 @@ from . import gitops as _gitops
 from . import grade as _grade
 from . import history as _history
 from . import learn as _learn
+from . import mock as _mock
 from . import obsidian as _obsidian
 from . import report as _report
 from . import serve as _serve
@@ -565,6 +575,10 @@ def main():
     ar.add_argument("id", help="the epic, E-NNN")
     ar.add_argument("--model", default="sonnet", help="default sonnet")
     ar.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
+    mk = sub.add_parser("mock", help="write a script-free mock of proposed UI tasks' planned result (runs claude -p)")
+    mk.add_argument("ids", nargs="*", metavar="T-ID", help="tasks to mock (default: proposed tasks that change something visible)")
+    mk.add_argument("--model", default="sonnet", help="default sonnet")
+    mk.add_argument("--budget", type=float, help="max USD per task (--max-budget-usd)")
     sub.add_parser("check")
     sub.add_parser("tidy")
     sy = sub.add_parser("sync", help="HUMAN ONLY: commit, fetch, merge and push the shared state branch")
@@ -663,7 +677,7 @@ def run(args):
         # (and tag) around their writes only, not the minutes claude takes to answer
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "choose": _gates.choose, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "breakdown": _dispatch.breakdown, "rules": rules,
-         "import": _tasks.import_issue, "obsidian": _obsidian.obsidian, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "learn": _learn.learn, "journal": journal, "arch": _concepts.arch, "sync": _shared.sync}[args.cmd](args)
+         "import": _tasks.import_issue, "obsidian": _obsidian.obsidian, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "learn": _learn.learn, "journal": journal, "arch": _concepts.arch, "mock": _mock.mock, "sync": _shared.sync}[args.cmd](args)
 
 
 if __name__ == "__main__":
