@@ -127,6 +127,7 @@ svg.depmap .box.st-missing rect, svg.depmap .box.st-dropped rect { stroke: var(-
 svg.depmap .box.flag rect { stroke: var(--bad); stroke-width: 2; }
 svg.depmap .bid { fill: var(--accent); font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
 svg.depmap .bsub { fill: var(--muted); }
+svg.depmap .bcomp { fill: var(--fg); font-size: 10px; }
 svg.depmap .mark { fill: var(--bad); }
 svg.depmap .marktext { fill: var(--bg); font-weight: 700; }
 svg.depmap a:hover rect { fill: var(--code); }

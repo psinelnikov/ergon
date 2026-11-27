@@ -245,6 +245,24 @@ class TestServe(ServeFixture):
         self.assertEqual(self.req("GET", "/runs/T-001-evidence/..%2fsecret.txt")[0], 404)
         self.assertEqual(self.req("GET", "/runs/T-001-evidence/missing.png")[0], 404)
 
+    def test_epic_page_dep_map(self):
+        # T-305: the open tasks' map sits above the journal and timeline; an epic with none, a muted line
+        self.ergon("new", "epic", "Empty")
+        f = self.task_file("T-005")
+        f.write_text(re.sub(r"^depends:.*$", "depends: [T-004]", f.read_text(), flags=re.M))
+        page = self.req("GET", "/e/E-001")[2]
+        sec = page.split("<h2>Dependency map</h2>")[1]
+        self.assertLess(page.index("<h2>Dependency map</h2>"), page.index("no journal entry yet"))
+        svg = re.search(r"<svg class=depmap.*?</svg>", sec, re.S)[0]
+        self.assertEqual(sorted(re.findall(r"<text class=bid [^>]*>(T-\d+)</text>", svg)),
+                         ["T-002", "T-003", "T-004", "T-005"])  # T-001 is done
+        self.assertEqual(svg.count("class=edge"), 1)
+        self.assertIn('<a href="/t/T-004"><g class="box st-proposed">', svg)
+        self.assertNotIn(HOSTILE, page)
+        page = self.req("GET", "/e/E-002")[2]
+        self.assertNotIn("<svg class=depmap", page)
+        self.assertIn("<p class=muted>no open task in this epic</p>", page)
+
     def test_epic_page_breakdown_runs(self):
         d = self.runs / "breakdown"
         d.mkdir()
@@ -965,6 +983,55 @@ class TestTouchMap(unittest.TestCase):
         card = self.card(dict(self.task, touches=[]))
         self.assertNotIn("<svg", card)
         self.assertIn("<span class=muted>no touches: nothing to place on the map</span>", card)
+
+
+    def dep_tasks(self):
+        # T-009 changes three components, T-010 (hostile title) waits on it and on done T-001
+        a = dict(self.task, epic="E-001", touches=["ergon/serve.py", "ergon/serve.css", "ergon/concepts.py"])
+        b = {"id": "T-010", "tier": "haiku", "title": HOSTILE, "status": "ready", "epic": "E-001",
+             "depends": ["T-009", "T-001"], "touches": ["README.md"]}
+        c = {"id": "T-001", "tier": "haiku", "title": "old", "status": "done", "epic": "E-001", "touches": ["ergon/serve.py"]}
+        return {t["id"]: t for t in (a, b, c)}
+
+    def test_dep_map_shows_components(self):
+        # T-305: each box's third line names the components its touches fall in; the full list in <title>
+        from ergon import concepts as K
+        cmap, errs = K.read_map()
+        self.assertEqual(errs, [])
+        tasks = self.dep_tasks()
+        svg = S.epic_maps([tasks["T-009"]], tasks, {"E-001": {"title": "t"}}, {}, cmap)
+        self.assertRegex(svg, r"<title>T-009 · proposed · E-001 · x · changes: ui\.board, ui\.css, plan\.tags</title>")
+        line = re.search(r"<text class=bcomp [^>]*>([^<]*)</text>", svg)[1]
+        self.assertEqual(line, "ui.board, ui.css, pla…")
+        self.assertLessEqual(len(line), S.MAP_COMP_CHARS)
+        self.assertIn('<a href="#T-009">', svg)  # /review: a proposed box links to its card
+        # no concept map: the boxes keep their two lines
+        self.assertNotIn("bcomp", S.epic_maps([tasks["T-009"]], tasks, {}, {}))
+        # names and titles escaped
+        cmap["components"]["ui.board"]["id"] = '<b>"comp'
+        svg = S.dep_map(list(tasks.values()), tasks, {}, "x", cmap)
+        self.assertNotIn("<b>", svg)
+        self.assertNotIn("<script>", svg)
+        self.assertIn("changes: &lt;b&gt;&quot;comp, ui.css, plan.tags", svg)
+        self.assertIn("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;", svg)
+        self.assertIn("changes: no component", svg)  # T-010's README.md falls in none
+
+    def test_epic_dep_map(self):
+        # /e/E-NNN: the open tasks with their depends arrows and components, boxes linking to /t/
+        tasks = self.dep_tasks()
+        h = S.epic_dep_map("E-001", tasks)
+        svg = re.search(r"<svg class=depmap.*?</svg>", h, re.S)[0]
+        self.assertEqual(sorted(re.findall(r"<text class=bid [^>]*>(T-\d+)</text>", svg)), ["T-001", "T-009", "T-010"])
+        self.assertEqual(svg.count("class=edge"), 2)
+        self.assertIn('<a href="/t/T-009">', svg)
+        self.assertNotIn('href="#', svg)
+        self.assertEqual(len(re.findall(r"<text class=bcomp ", svg)), 3)
+        self.assertNotIn("<script>", h)
+        for t in tasks.values():
+            t["status"] = "done"
+        h = S.epic_dep_map("E-001", tasks)
+        self.assertNotIn("<svg", h)
+        self.assertIn("<p class=muted>no open task in this epic</p>", h)
 
 
 class TestTwoProjects(ServeFixture):

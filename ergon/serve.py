@@ -689,6 +689,21 @@ def breakdown_block(eid):
     return f"<h2>Breakdown runs</h2><p>{len(rows)} run(s), {money(cost)}</p><ul>{items}</ul>"
 
 
+def epic_dep_map(eid, tasks):
+    """The epic's open tasks (not done, not dropped) on dep_map, each box with the components it
+    changes when the concept map loads; boxes link to /t/T-NNN. A muted line when none is open."""
+    open_ = sorted((t for t in tasks.values() if t.get("epic") == eid and t["status"] not in ("done", "dropped")),
+                   key=lambda t: t["id"])
+    if not open_:
+        return "<h2>Dependency map</h2><p class=muted>no open task in this epic</p>"
+    cmap = review_map()[0]
+    return (f'<h2>Dependency map</h2><div class=mapwrap>'
+            f'{dep_map(open_, tasks, {}, f"the open tasks of {eid}", cmap, anchor=False)}</div>'
+            '<p class=legend>The open tasks. An arrow points from a dependency to the task that waits on it; '
+            'a done or outside dependency is drawn too.' + (" A box's third line names the concept-map "
+                                                            "components its touches fall in." if cmap else "") + "</p>")
+
+
 def epic_page(eid, nonce, now=None):
     epics = _tasks.load(_config.EPICS)
     e = epics.get(eid)
@@ -704,7 +719,7 @@ def epic_page(eid, nonce, now=None):
 
     tl = _timeline.build(rows, tasks, eid, now or time.time(), tokens)
     b = [f'<div class=top><a href="/">← board</a><span class=crumb>{esc(_config.HOME.name)}</span></div>',
-         f'<h1>{esc(eid)} {esc(e.get("title"))}</h1>']
+         f'<h1>{esc(eid)} {esc(e.get("title"))}</h1>', epic_dep_map(eid, tasks)]
     jb = journal_block(eid, tasks) + breakdown_block(eid)
     if not tl["lanes"]:
         b.append(jb)
@@ -1156,9 +1171,20 @@ def dep_layers(nodes, deps):
     return col
 
 
-def dep_map(proposed, tasks, flagged, label="the proposed tasks"):
+MAP_COMP_CHARS = 22  # a box's components line, before it is cut with …
+
+
+def task_comps(t, cmap):
+    """The components t's touches: fall in (concepts.touch_components), in touches order, once each."""
+    return list(dict.fromkeys(c for _, cs in _concepts.touch_components(t, cmap)["entries"] for c in cs))
+
+
+def dep_map(proposed, tasks, flagged, label="the proposed tasks", cmap=None, anchor=True):
     """Proposed tasks and their depends: as inline SVG. A proposed task's box links to its card
-    below; a dependency that isn't proposed links to its task page (a missing one, nowhere)."""
+    below (with anchor, else to its task page); a dependency that isn't proposed links to its task
+    page (a missing one, nowhere). With a concept map each task's box gets a third line, the
+    components its touches fall in, cut to fit; the full list is in its <title>."""
+    bh = MAP_H + 14 if cmap else MAP_H
     ids = [t["id"] for t in proposed]
     deps = {t["id"]: [d for d in t.get("depends") or [] if isinstance(d, str)] for t in proposed}
     nodes = list(dict.fromkeys(ids + [d for i in ids for d in deps[i]]))
@@ -1166,17 +1192,17 @@ def dep_map(proposed, tasks, flagged, label="the proposed tasks"):
     rows = {}
     for n in sorted(nodes, key=lambda n: (col[n], n)):
         rows.setdefault(col[n], []).append(n)
-    pos = {n: (MAP_PAD + c * (MAP_W + MAP_GX), MAP_PAD + r * (MAP_H + MAP_GY))
+    pos = {n: (MAP_PAD + c * (MAP_W + MAP_GX), MAP_PAD + r * (bh + MAP_GY))
            for c, ns in rows.items() for r, n in enumerate(ns)}
     width = MAP_PAD * 2 + (max(rows) + 1) * (MAP_W + MAP_GX) - MAP_GX
-    height = MAP_PAD * 2 + max(len(ns) for ns in rows.values()) * (MAP_H + MAP_GY) - MAP_GY
+    height = MAP_PAD * 2 + max(len(ns) for ns in rows.values()) * (bh + MAP_GY) - MAP_GY
     o = [f'<svg class=depmap viewBox="0 0 {width} {height}" width="{width}" height="{height}" role=img '
          f'aria-label="dependency map of {esc(label)}">']
     for i in ids:
         x2, y2 = pos[i]
         for d in deps[i]:
             x1, y1 = pos[d]
-            sx, sy, ex, ey = x1 + MAP_W, y1 + MAP_H / 2, x2, y2 + MAP_H / 2
+            sx, sy, ex, ey = x1 + MAP_W, y1 + bh / 2, x2, y2 + bh / 2
             mx = (sx + ex) / 2
             o.append(f'<path class=edge d="M{sx} {sy:.0f}C{mx:.0f} {sy:.0f} {mx:.0f} {ey:.0f} {ex} {ey:.0f}" />')
             o.append(f'<path class=arrow d="M{ex} {ey:.0f}l-6 -4v8z" />')
@@ -1189,13 +1215,21 @@ def dep_map(proposed, tasks, flagged, label="the proposed tasks"):
             + (f" · {t.get('title') or ''}" if t else "") \
             + (f" · {len(flagged[n])} finding(s)" if n in flagged else "")
         label = f"{t.get('tier') or '?'} · {status}" if t else "no such task"
+        comp = ""
+        if cmap and t:
+            cs = task_comps(t, cmap)
+            line = ", ".join(cs) if cs else ("no component" if t.get("touches") else "no touches")
+            title += f" · changes: {line}"
+            if len(line) > MAP_COMP_CHARS:
+                line = line[:MAP_COMP_CHARS - 1] + "…"
+            comp = f'<text class=bcomp x={x + 8} y={y + 43}>{esc(line)}</text>'
         g = (f'<g class="{" ".join(cls)}"><title>{esc(title)}</title>'
-             f'<rect x={x} y={y} width={MAP_W} height={MAP_H} rx=6 />'
+             f'<rect x={x} y={y} width={MAP_W} height={bh} rx=6 />'
              f'<text class=bid x={x + 8} y={y + 15}>{esc(n)}</text>'
-             f'<text class=bsub x={x + 8} y={y + 29}>{esc(label)}</text>'
+             f'<text class=bsub x={x + 8} y={y + 29}>{esc(label)}</text>{comp}'
              + (f'<circle class=mark cx={x + MAP_W - 12} cy={y + 12} r=7 /><text class=marktext x={x + MAP_W - 12} '
                 f'y={y + 16} text-anchor=middle>!</text>' if n in flagged else "") + "</g>")
-        if status == "proposed":
+        if status == "proposed" and anchor:
             g = f'<a href="#{esc(n)}">{g}</a>'
         elif t:
             g = f'<a href="/t/{esc(n)}">{g}</a>'
@@ -1204,7 +1238,7 @@ def dep_map(proposed, tasks, flagged, label="the proposed tasks"):
     return "".join(o)
 
 
-def epic_maps(proposed, tasks, epics, flagged):
+def epic_maps(proposed, tasks, epics, flagged, cmap=None):
     """One dependency map per epic of the proposed tasks, in epic order, then the tasks with no epic.
     A dependency outside the epic still shows as a box in that epic's map."""
     groups = {}
@@ -1212,7 +1246,7 @@ def epic_maps(proposed, tasks, epics, flagged):
         groups.setdefault(str(t["epic"]) if t.get("epic") else None, []).append(t)
     keys = sorted(k for k in groups if k) + ([None] if None in groups else [])
     if keys == [None]:
-        return f"<div class=mapwrap>{dep_map(proposed, tasks, flagged)}</div>"
+        return f"<div class=mapwrap>{dep_map(proposed, tasks, flagged, cmap=cmap)}</div>"
     h = []
     for k in keys:
         ts, n = groups[k], len(groups[k])
@@ -1225,7 +1259,7 @@ def epic_maps(proposed, tasks, epics, flagged):
             h.append(f'<h3 class=mhead id="map-{esc(k)}"><a href="/e/{esc(k)}">{esc(k)}</a>'
                      + (f" {esc(title)}" if title else "") + f"{count}</h3>")
             label = f"the proposed tasks of {k}"
-        h.append(f"<div class=mapwrap>{dep_map(ts, tasks, flagged, label)}</div>")
+        h.append(f"<div class=mapwrap>{dep_map(ts, tasks, flagged, label, cmap)}</div>")
     return "".join(h)
 
 
@@ -1465,7 +1499,7 @@ def epic_cards(briefs):
     return b
 
 
-def epic_task_cards(proposed, tasks, epics, found):
+def epic_task_cards(proposed, tasks, epics, found, mapstate=None):
     """The /review task cards, one section per epic (in epic order, then the tasks with no epic), like
     epic_maps. Inside a section the depends-chain groups come first, then the independent tasks.
     With no epic anywhere there is one flat section, no epic headings."""
@@ -1473,7 +1507,7 @@ def epic_task_cards(proposed, tasks, epics, found):
     for t in proposed:
         by_epic.setdefault(str(t["epic"]) if t.get("epic") else None, []).append(t)
     keys = sorted(k for k in by_epic if k) + ([None] if None in by_epic else [])
-    h, mapstate = [], review_map()
+    h, mapstate = [], mapstate or review_map()
     for k in keys:
         ts = by_epic[k]
         if keys != [None]:
@@ -1528,13 +1562,16 @@ def review_page(nonce):
                  'approved: score = (cod + 60 × tasks it unblocks) ÷ tier size.</p>'
                  + priority_table(ranked, tasks, anchor=True) + grade_line())
 
-    b.append(f'<h2>Dependency map</h2>{epic_maps(proposed, tasks, epics, flagged)}'
+    mapstate = review_map()
+    cmap = mapstate[0]
+    b.append(f'<h2>Dependency map</h2>{epic_maps(proposed, tasks, epics, flagged, cmap)}'
              '<p class=legend>One map per epic. A box links to its card; <b>!</b> marks findings; an arrow '
              'points from a dependency to the task that waits on it; a dependency in another epic is drawn '
-             'in this one too.</p>')
+             'in this one too.' + (' A box\'s third line names the concept-map components its touches fall '
+                                   'in; hover it for the full list.' if cmap else "") + '</p>')
 
     b.append("<h2>Tasks</h2>")
-    b.extend(epic_task_cards(proposed, tasks, epics, found))
+    b.extend(epic_task_cards(proposed, tasks, epics, found, mapstate))
 
     b.append(f"<h2 id=findings>Findings ({sum(map(len, flagged.values()))})</h2>")
     if flagged:
