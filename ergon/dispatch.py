@@ -3124,6 +3124,7 @@ BLOCK_END = re.compile(r"^\W*END TASK\W*$")
 BLOCK_FIELDS = ("tier", "tier_why", "category", "touches", "depends")  # category may be left out (a feature)
 BLOCK_SECTIONS = ("what", "done when", "options", "notes")
 BLOCK_OPTIONS = (2, 4)  # a feature block's number of options, at least and at most
+BLOCK_TITLE_MAX = 120  # a TASK block's title, in characters; agents/task-breakdown.md states it (T-308)
 
 BREAKDOWN_PROMPT = """Break down epic {eid} into tasks.
 
@@ -3179,9 +3180,13 @@ risk, defer. The lenses are peers: the crux names no option, no option is marked
 that favours one option in its wording is refused. No option may be under half the median option's length. Every
 option stays within the epic's Goal and Constraints. A feature block needs it; a bugfix, refactor or
 chore block may leave it out. An old numbered list is refused. Blocks are numbered 1, 2, 3, … in the order you write them, and `depends` may name only an earlier
-block. Each block is checked as `ergon check` would check it. A block with an unknown field, a tier
-below a `[[protect]]` minimum for a path it touches, an unknown category, a feature with no options or an `## Options` section that breaks the lens rules, an empty What or
-Done when, or a missing END TASK line is refused and never repaired. So is a block that depends on a refused one. At most
+block. Each block is checked as `ergon check` would check it. A block with a title over {title_max} characters
+(or one holding ` #` or starting with `[`), an unknown, missing or repeated field, an empty tier_why (or one holding ` #`
+or wrapped in `[...]`), a tier below a `[[protect]]` minimum for a path it touches, an unknown category, a touches:
+entry holding `[`, `]` or `#`, a depends: entry that isn't an earlier block or an existing undropped T-NNN, a feature
+with no options or an `## Options` section that breaks the lens rules (or has a `Chosen:` line), an unknown or
+repeated `## ` section, a single-`#` heading, an empty What or Done when, or a missing END TASK line is refused and
+never repaired. So is a block that depends on a refused one. At most
 {max} blocks are filed.
 """
 
@@ -3260,7 +3265,7 @@ def breakdown_prompt(e, tasks):
         policies=REVIEW_POLICIES.format(policies=pol).replace("Do not raise a finding one of them settles",
                                                                 "Don't propose a task one of them rules out") if pol else "",
         protect=protect_text(), companions=f"\nCompanion repos:\n{comps}" if comps else "",
-        existing=existing_text(e["id"], tasks), max=BREAKDOWN_MAX)
+        existing=existing_text(e["id"], tasks), max=BREAKDOWN_MAX, title_max=BLOCK_TITLE_MAX)
 
 
 def split_list(val):
@@ -3341,8 +3346,8 @@ def check_block(n, f, tasks, ids, refused):
     title = f.get("title") or ""
     if not title:
         return "no title on the TASK: line"
-    if len(title) > 120:
-        return f"title is {len(title)} characters (at most 120)"
+    if len(title) > BLOCK_TITLE_MAX:
+        return f"title is {len(title)} characters (at most {BLOCK_TITLE_MAX})"
     if re.search(r"(?:^|\s)#", title) or title.startswith("["):
         return "title would not survive frontmatter (a ` #` starts a comment, a leading `[` a list)"
     for k in BLOCK_FIELDS:

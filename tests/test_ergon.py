@@ -6436,6 +6436,103 @@ class TestBreakdown(DispatchProject):
             self.assertIn(word, why[i] or "", i)
         self.assertIsNone(why[8])  # a chore may leave it out
 
+    def test_breakdown_agent_is_told_every_block_refusal_rule(self):
+        """T-308: each reason a TASK block can be refused for is named in the breakdown agent's
+        instructions, so blocks pass the first time. A new refusal reason fails this test until
+        it is mapped here to the words that state it in agents/task-breakdown.md."""
+        import ast, inspect
+        from ergon import dispatch as D, tasks as T
+        md = (ERGON.parent / "agents" / "task-breakdown.md").read_text()
+        self.assertIn(f"at most {D.BLOCK_TITLE_MAX} characters", md)
+        self.assertIn(f"At most {D.BREAKDOWN_MAX} blocks", md)
+        self.assertIn(f"title over {D.BLOCK_TITLE_MAX} characters", D.BREAKDOWN_PROMPT.format_map(
+            {k: "" for k in ("eid", "home", "again", "path", "brief", "rules", "policies", "protect", "companions",
+                             "existing", "max")} | {"title_max": D.BLOCK_TITLE_MAX}))
+        # leading text of a refusal reason -> words in the instructions that state the rule
+        rules = {
+            "no END TASK line": "`END TASK` line",
+            "past the first": "At most 30 blocks",
+            "a `# ` heading": "single-`#` heading",
+            "unknown section": "only `## What`, `## Done when`, `## Options` and `## Notes`",
+            "two `## ": "each at most once",
+            "a line before `## What`": "No other text sits before `## What`",
+            "unknown field": "only `tier:`, `tier_why:`, `category:`, `touches:` and `depends:`",
+            "`{}:` given twice": "each once",
+            "no title": "has a title",
+            "title is": "at most 120 characters",
+            "title would not survive": "holds no ` #` and doesn't start with `[`",
+            "no `{}:` line": "Every one but `category:` must be there",
+            "tier {} not in": "one of `haiku`, `sonnet`, `opus`, `human`",
+            "empty tier_why": "`tier_why:` is not empty",
+            "tier_why would not survive": "isn't wrapped in `[...]`",
+            "empty or missing `## What`": "both there and not empty",
+            "empty or missing `## Done when`": "both there and not empty",
+            "category {} not in": "one of `feature`, `bugfix`, `refactor`, `chore`",
+            "`## Options` has a `Chosen:`": "no `Chosen:` line",
+            "`## Options` is not in lens format": "no numbered list",
+            "`## Options`: {}": "`## Options` (rule 6)",
+            "a feature block needs": "A feature block has one",
+            "a touches: entry": "entries hold no `[`, `]` or `#`",
+            "<protect>": "not below a `[[protect]]` minimum",
+            "depends on block {}, which isn't an earlier": "earlier block numbers",
+            "depends on block {}, which was refused": "every block that depends on it",
+            "depends on block {}, which doesn't exist": "no block that doesn't exist",
+            "depends on {}, which doesn't exist": "existing T-NNN IDs",
+            "depends on {}, which is dropped": "that aren't dropped",
+            "depends: {} is neither": "nothing else",
+            # lens_problems (require_defer is never set for a breakdown)
+            "no `Crux:` line": "a non-empty `Crux:` line",
+            "{} option(s)": "2 to 4 options",
+            "unknown lens": "each a known lens used once",
+            "the {} lens more than once": "each a known lens used once",
+            "the {} option has no": "non-empty `Optimizes for:`, `Gives up:` and `Regret if:` lines",
+            "no `defer` option": None,
+            "the {} option is under half": "under half the median option's length",
+            "{} uses recommendation wording": "no wording that marks one as the pick",
+        }
+
+        def lead(node):
+            """The leading text of each reason node may give ({} for an interpolated value)."""
+            if isinstance(node, ast.IfExp):
+                return lead(node.body) + lead(node.orelse)
+            if isinstance(node, ast.Tuple):
+                node = node.elts[-1]
+            while isinstance(node, ast.BinOp):
+                node = node.left
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return [node.value]
+            if isinstance(node, ast.JoinedStr):
+                return ["".join(v.value if isinstance(v, ast.Constant) else "{}" for v in node.values)]
+            if isinstance(node, ast.Subscript):
+                return ["<protect>"]  # check_block's `return why[0]` from protect_problems
+            return []
+
+        def names(t):
+            return [x for e in t.elts for x in names(e)] if isinstance(t, ast.Tuple) else [getattr(t, "id", "")]
+
+        reasons = set()
+        for fn in (D.parse_blocks, D.parse_block, D.check_block, D.file_blocks, T.lens_problems):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            for node in ast.walk(tree):
+                val = None
+                if isinstance(node, ast.Return) and node.value is not None:
+                    val = node.value
+                elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                      and node.func.attr == "append" and getattr(node.func.value, "id", "") == "out" and node.args):
+                    val = node.args[0]
+                elif isinstance(node, ast.Assign) and any("why" in names(t) for t in node.targets):
+                    val = node.value
+                if val is not None:
+                    reasons.update(lead(val))
+        reasons = {r for r in reasons if r.strip()}
+        for r in sorted(reasons):
+            key = next((k for k in rules if r.startswith(k)), None)
+            self.assertIsNotNone(key, f"refusal reason {r!r} isn't mapped to a rule in agents/task-breakdown.md")
+            if rules[key]:
+                self.assertIn(rules[key], md, r)
+        for k in ("title is", "no END TASK line", "past the first", "<protect>", "{} uses recommendation wording"):
+            self.assertTrue(any(r.startswith(k) for r in reasons), k)  # the extraction still finds them
+
     def test_breakdown_refuses_a_one_option_feature_and_files_the_rest(self):
         self.new_epic()
         approve_epic(self)
