@@ -1,6 +1,6 @@
 """End-to-end tests: each one builds a throwaway git repo and drives the real CLI.
 
-Run: python3 -m unittest discover -s tests
+Run: python3 tests/run_parallel.py (in parallel), or python3 -m unittest discover -s tests
 """
 import json
 import os

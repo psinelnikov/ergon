@@ -1,7 +1,7 @@
 """`ergon journal`, the entry `ergon finish` writes, and /e/E-NNN showing it. A fake `claude` on
 PATH stands in for the model.
 
-Run: python3 -m unittest discover -s tests
+Run: python3 tests/run_parallel.py (in parallel), or python3 -m unittest discover -s tests
 """
 import json
 import os
