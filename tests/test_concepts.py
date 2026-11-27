@@ -778,6 +778,29 @@ class TestFunctionTouches(unittest.TestCase):
         self.assertEqual(parts("ergon/gates.py::hook"), ["ergon", "gates.py"])  # malformed: the whole file
         self.assertEqual(parts("ergon/gates.py/::hook", None), ["ergon", "gates.py"])  # no map: the whole file
 
+    def test_touch_components(self):
+        # T-304: each touches: entry and the components it falls in, for the /review card's picture
+        got = lambda touches, tags=None: C.touch_components(  # noqa: E731
+            {"touches": touches, "concepts": tags or []}, self.cmap)
+        # a file entry: every component whose files match it, and a directory's files under it
+        self.assertEqual(got(["ergon/gates.py"])["entries"], [("ergon/gates.py", ["approval.guard", "approval.stamp"])])
+        self.assertEqual(got(["hooks/hooks.json"])["entries"], [("hooks/hooks.json", ["approval.guard"])])
+        # a /::fn entry: only the components that list fn for that file
+        self.assertEqual(got(["ergon/gates.py/::guard_reason"])["entries"],
+                         [("ergon/gates.py/::guard_reason", ["approval.guard"])])
+        self.assertEqual(got(["ergon/serve.py/::task_page"])["entries"], [("ergon/serve.py/::task_page", ["ui.board"])])
+        # a function the map doesn't list there counts as its whole file
+        self.assertEqual(got(["ergon/gates.py/::nope"])["entries"],
+                         [("ergon/gates.py/::nope", ["approval.guard", "approval.stamp"])])
+        # outside every component
+        out = got(["README.md", "ergon/serve.py", "tests/x.py/::f"])
+        self.assertEqual(out["outside"], ["README.md", "tests/x.py/::f"])
+        self.assertEqual(out["entries"][1], ("ergon/serve.py", ["ui.board"]))
+        # a concepts: tag no entry reaches; tags not in the map are left out
+        out = got(["ergon/serve.py"], ["ui.board", "approval.stamp", "no.such"])
+        self.assertEqual(out["untouched"], ["approval.stamp"])
+        self.assertEqual(got([]), {"entries": [], "outside": [], "untouched": []})
+
 
 class FnDispatch(DispatchProject):
     config = DispatchProject.config.replace('trunk = "main"\n', 'trunk = "main"\n'

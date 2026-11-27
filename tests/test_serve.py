@@ -591,6 +591,9 @@ class TestReview(ServeFixture):
         self.assertIn("<h3>Done when</h3><ul><li>the board shows it</li></ul>", c4)
         self.assertIn('<a href="/t/T-001">T-001</a> <span class=muted>(done)</span>', c4)
         self.assertIsNone(self.card(page, "T-001"))  # only a box on the map
+        # no `concepts` key: a muted note where the change picture would be (T-304)
+        self.assertIn("<th>change</th><td class=why><span class=muted>no concept map", c4)
+        self.assertNotIn("<svg class=touchmap", page)
         # it never approves: a command to copy, nothing to submit
         self.assertIn(f"<code class=cmd>{APPROVE} T-004 T-005</code>", page)
         self.assertNotIn("<form", page)
@@ -858,6 +861,109 @@ class TestServeUnits(unittest.TestCase):
         self.assertNotRegex(out, r"<(?!/?(h2|pre|code|ul|ol|li|p|strong|br)\b)")
         self.assertIn("&lt;script&gt;", out)
         self.assertIn("<strong>&lt;i&gt;z&lt;/i&gt;</strong>", out)
+
+
+TOUCH_MAP = """\
+[[concern]]
+id = "ui"
+label = "Seeing <b>what</b> happened"
+
+[[concern]]
+id = "plan"
+label = "Deciding"
+
+[[component]]
+id = "ui.board"
+concern = "ui"
+files = ["ergon/serve.py"]
+fns = ["task_page"]
+terms = ["board"]
+
+[[component]]
+id = "ui.css"
+concern = "ui"
+files = ["ergon/*.css"]
+terms = ["css"]
+
+[[component]]
+id = "plan.tags"
+concern = "plan"
+files = ["ergon/concepts.py"]
+terms = ["tag"]
+"""
+
+
+class TestTouchMap(unittest.TestCase):
+    """T-304: the /review card's change picture, in-process against a map file in a temp dir."""
+
+    def setUp(self):
+        from ergon import config as C
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.map = Path(self.tmp.name) / "concepts.toml"
+        self.map.write_text(TOUCH_MAP)
+        p = mock.patch.object(C, "CONCEPTS", self.map, create=True)
+        p.start()
+        self.addCleanup(p.stop)
+        self.task = {"id": "T-009", "tier": "sonnet", "title": "x", "status": "proposed",
+                     "touches": ["ergon/serve.py/::task_page", "ergon/serve.css", "README.md",
+                                 'docs/<script>alert("x")</script>.md'],
+                     "concepts": ["ui.board", "plan.tags"], "_body": "## What\nx\n\n## Done when\ny\n"}
+
+    def card(self, t=None):
+        t = t or self.task
+        return S.review_card(t, {t["id"]: t}, [])
+
+    def test_draws_touches_by_concern_and_component(self):
+        card = self.card()
+        svg = re.search(r"<svg class=touchmap.*?</svg>", card, re.S)[0]
+        self.assertLess(card.index("<th>touches</th>"), card.index("<th>change</th>"))
+        groups = re.findall(r"<g class=concern>.*?</g></g>", svg, re.S)
+        self.assertEqual(len(groups), 2)
+        ui, plan = groups
+        self.assertIn("Seeing &lt;b&gt;what&lt;/b&gt; happened", ui)  # concern label escaped
+        self.assertRegex(ui, r"<text class=cid [^>]*>ui\.board</text><text class=entry [^>]*>ergon/serve\.py/::task_page</text>")
+        self.assertRegex(ui, r"<text class=cid [^>]*>ui\.css</text><text class=entry [^>]*>ergon/serve\.css</text>")
+        # a concepts: tag no touches: entry reaches is drawn and marked
+        self.assertIn('<g class="comp untouched">', plan)
+        self.assertIn("plan.tags <tspan class=warn>(tagged; no touch falls in it)</tspan>", plan)
+        out = re.search(r"<g class=outside>.*?</g>", svg, re.S)[0]
+        self.assertIn("not in the map", out)
+        self.assertIn(">README.md</text>", out)
+        # every entry shows somewhere in the picture
+        for e in self.task["touches"]:
+            self.assertIn(S.esc(e), svg)
+
+    def test_hostile_entry_escaped(self):
+        svg = re.search(r"<svg class=touchmap.*?</svg>", self.card(), re.S)[0]
+        self.assertNotIn("<script>", svg)
+        self.assertNotIn('"x")', svg)
+        self.assertIn("docs/&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;.md", svg)
+        t = dict(self.task, id='T-<i>"9', touches=['a"b<script>.py'])
+        svg = re.search(r"<svg class=touchmap.*?</svg>", self.card(t), re.S)[0]
+        self.assertIn('aria-label="where the touches of T-&lt;i&gt;&quot;9 fall', svg)
+        self.assertIn("a&quot;b&lt;script&gt;.py", svg)
+        self.assertNotIn("<script>", svg)
+
+    def test_no_map_or_broken_map_is_a_muted_note(self):
+        from ergon import config as C
+        with mock.patch.object(C, "CONCEPTS", None):
+            card = self.card()
+        self.assertNotIn("<svg", card)
+        self.assertIn("<th>change</th><td class=why><span class=muted>no concept map", card)
+        self.map.write_text("[[component]]\nid = \"x\"\n")  # no concern: the map doesn't hold
+        card = self.card()
+        self.assertNotIn("<svg", card)
+        self.assertIn("<span class=muted>the concept map does not load (", card)
+        self.map.unlink()
+        card = self.card()
+        self.assertNotIn("<svg", card)
+        self.assertIn("<span class=muted>the concept map does not load (concepts.toml: no such file", card)
+
+    def test_no_touches(self):
+        card = self.card(dict(self.task, touches=[]))
+        self.assertNotIn("<svg", card)
+        self.assertIn("<span class=muted>no touches: nothing to place on the map</span>", card)
 
 
 class TestTwoProjects(ServeFixture):

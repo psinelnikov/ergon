@@ -1229,7 +1229,89 @@ def epic_maps(proposed, tasks, epics, flagged):
     return "".join(h)
 
 
-def review_card(t, tasks, found):
+TM_PAD, TM_LINE, TM_HEAD, TM_IN, TM_CH = 8, 16, 22, 10, 6.6  # touch map: padding, row, header, indent, char width
+
+
+def review_map():
+    """(map, None) for the /review cards' change pictures, or (None, muted note HTML) when there is no
+    `concepts` key or the map doesn't load. Read once per page."""
+    if not _config.CONCEPTS:
+        return None, (f'<span class=muted>no concept map: set <code>concepts = "&lt;path&gt;"</code> in '
+                      f'{esc(_config.CONFIG_FILE)} to see where the touches fall</span>')
+    cmap, errs = _concepts.read_map()
+    if errs:
+        return None, f'<span class=muted>the concept map does not load ({esc(errs[0])}); `ergon check` lists why</span>'
+    return cmap, None
+
+
+def touch_map(t, cmap):
+    """t's touches: as inline SVG (concepts.touch_components): component boxes grouped under their
+    concern, each touches: entry drawn inside every component it falls in, a dashed component for
+    a `concepts:` tag no entry reaches, and a "not in the map" box for the entries in no component."""
+    got = _concepts.touch_components(t, cmap)
+    inside = {}
+    for e, cs in got["entries"]:
+        for c in cs:
+            inside.setdefault(c, []).append(e)
+    shown = set(inside) | set(got["untouched"])
+    comps = [c for c in cmap["components"].values() if c["id"] in shown]
+    concerns = [k for k in cmap["concerns"] if any(c["concern"] == k for c in comps)]
+    texts = [e for e, _ in got["entries"]] + [c["id"] + "  (tagged; no touch falls in it)" for c in comps] \
+        + [f'{k} · {cmap["concerns"][k]["label"]}' for k in concerns] + ["not in the map"]
+    width = round(TM_PAD * 2 + TM_IN * 2 + 8 + max(len(s) for s in texts) * TM_CH)
+    o, y = [], TM_PAD
+
+    def lines(x, y, es):
+        return "".join(f'<text class=entry x={x + 8} y={y + TM_HEAD + n * TM_LINE + 11}>{esc(e)}</text>'
+                       for n, e in enumerate(es))
+
+    for k in concerns:
+        top = y
+        y += TM_HEAD
+        parts = []
+        for c in (c for c in comps if c["concern"] == k):
+            es = inside.get(c["id"], [])
+            unreached = c["id"] in got["untouched"]
+            h = TM_HEAD + TM_LINE * len(es) + 4
+            x, w = TM_PAD + TM_IN, width - 2 * (TM_PAD + TM_IN)
+            parts.append(f'<g class="comp{" untouched" if unreached else ""}">'
+                         f'<title>{esc(c["id"] + (" · " + c["label"] if c["label"] else ""))}'
+                         f'{" · tagged, but no touches: entry falls in it" if unreached else ""}</title>'
+                         f'<rect x={x} y={y} width={w} height={h} rx=5 />'
+                         f'<text class=cid x={x + 8} y={y + 15}>{esc(c["id"])}'
+                         + (' <tspan class=warn>(tagged; no touch falls in it)</tspan>' if unreached else "")
+                         + f'</text>{lines(x, y, es)}</g>')
+            y += h + 6
+        y += 2
+        label = cmap["concerns"][k]["label"]
+        o.append(f'<g class=concern><rect x={TM_PAD} y={top} width={width - 2 * TM_PAD} height={y - top} rx=7 />'
+                 f'<text class=chead x={TM_PAD + 8} y={top + 15}>{esc(k)}'
+                 + (f' <tspan class=clabel>· {esc(label)}</tspan>' if label else "") + "</text>" + "".join(parts) + "</g>")
+        y += 8
+    if got["outside"]:
+        h = TM_HEAD + TM_LINE * len(got["outside"]) + 4
+        o.append(f'<g class=outside><title>touches: entries no component\'s files match</title>'
+                 f'<rect x={TM_PAD} y={y} width={width - 2 * TM_PAD} height={h} rx=7 />'
+                 f'<text class=chead x={TM_PAD + 8} y={y + 15}>not in the map</text>{lines(TM_PAD, y, got["outside"])}</g>')
+        y += h + 8
+    height = y - 8 + TM_PAD
+    return (f'<svg class=touchmap viewBox="0 0 {width} {height}" width="{width}" height="{height}" role=img '
+            f'aria-label="where the touches of {esc(t["id"])} fall in the concept map">' + "".join(o) + "</svg>")
+
+
+def change_row(t, mapstate):
+    """The card's `change` row: touch_map, or the muted note review_map gave, or a note for no touches."""
+    cmap, note = mapstate
+    if note:
+        body = note
+    elif not t.get("touches"):
+        body = '<span class=muted>no touches: nothing to place on the map</span>'
+    else:
+        body = f"<div class=touchwrap>{touch_map(t, cmap)}</div>"
+    return f'<tr><th>change</th><td class=why>{body}</td></tr>'
+
+
+def review_card(t, tasks, found, mapstate=None):
     deps = t.get("depends") or []
     dep_html = ", ".join(f'{link_ids(esc(d), tasks)} <span class=muted>({esc(tasks.get(d, {}).get("status", "missing"))})</span>'
                          for d in deps) or '<span class=muted>none</span>'
@@ -1257,6 +1339,7 @@ def review_card(t, tasks, found):
             f'<tr><th>tier_why</th><td class=why>{link_ids(esc(t.get("tier_why") or ""), tasks) or "<span class=muted>empty</span>"}</td></tr>'
             f'<tr><th>depends</th><td class=why>{dep_html}</td></tr>'
             f'<tr><th>touches</th><td class=why>{touches}</td></tr>'
+            + change_row(t, mapstate or review_map())
             + (f'<tr><th>epic</th><td><a href="/e/{esc(t["epic"])}">{esc(t["epic"])}</a></td></tr>' if t.get("epic") else "")
             + (f'<tr><th>source</th><td class=why>{link_ids(esc(t["source"]), tasks)}</td></tr>' if t.get("source") else "")
             + f'</tbody></table></div><div class=brief>{brief}</div>{options_html(t)}</section>')
@@ -1390,7 +1473,7 @@ def epic_task_cards(proposed, tasks, epics, found):
     for t in proposed:
         by_epic.setdefault(str(t["epic"]) if t.get("epic") else None, []).append(t)
     keys = sorted(k for k in by_epic if k) + ([None] if None in by_epic else [])
-    h = []
+    h, mapstate = [], review_map()
     for k in keys:
         ts = by_epic[k]
         if keys != [None]:
@@ -1405,11 +1488,11 @@ def epic_task_cards(proposed, tasks, epics, found):
         groups, alone = review_groups(ts, tasks)
         for g in groups:
             h.append(group_header(g, tasks))
-            h.extend(review_card(t, tasks, found[t["id"]]) for t in g)
+            h.extend(review_card(t, tasks, found[t["id"]], mapstate) for t in g)
         if alone:
             if groups:
                 h.append(f"<h3 class=ghead id=g-independent{'' if k is None else '-' + esc(k)}>Independent</h3>")
-            h.extend(review_card(t, tasks, found[t["id"]]) for t in alone)
+            h.extend(review_card(t, tasks, found[t["id"]], mapstate) for t in alone)
     return h
 
 

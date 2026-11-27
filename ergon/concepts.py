@@ -655,6 +655,25 @@ def touch_parts(entry, cmap):
     return parts + ["::" + fn] if fn and not why and known_fn(path, fn, cmap) else parts
 
 
+def touch_components(t, cmap):
+    """Where t's touches: fall in the map, for the /review card's change picture (T-304):
+    {"entries": [(entry, [component ids])], "outside": [entries in no component],
+     "untouched": [t's tag ids no entry falls in]}. A file entry falls in each component whose
+    `files` match it (config.protect_hit, as for uncovered); a `/::fn` entry in the components
+    that list fn for its file (known_fn), else, as dispatch counts it, in those of its whole file."""
+    entries, reached = [], set()
+    for x in t.get("touches") or []:
+        path, fn, _ = parse_touch(x)
+        comps = known_fn(path, fn, cmap) if fn else []
+        if not comps:
+            comps = [c["id"] for c in cmap["components"].values()
+                     if any(_config.protect_hit(path, p) for p in c["files"])]
+        entries.append((str(x).strip(), comps))
+        reached.update(comps)
+    return {"entries": entries, "outside": [e for e, cs in entries if not cs],
+            "untouched": [c for c in tags(t, cmap) if c not in reached]}
+
+
 def fn_notes(t, cmap, short=False):
     """The function-level entries of t that count as their whole file, one line each: fn_problem's
     message, or fn_reason's with short."""

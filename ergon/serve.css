@@ -130,6 +130,17 @@ svg.depmap .bsub { fill: var(--muted); }
 svg.depmap .mark { fill: var(--bad); }
 svg.depmap .marktext { fill: var(--bg); font-weight: 700; }
 svg.depmap a:hover rect { fill: var(--code); }
+.touchwrap { overflow-x: auto; }
+svg.touchmap { display: block; font: 11px -apple-system, BlinkMacSystemFont, sans-serif; margin-top: 2px; }
+svg.touchmap .concern > rect { fill: var(--code); stroke: var(--line); stroke-width: 1; }
+svg.touchmap .comp rect { fill: var(--bg); stroke: var(--line); stroke-width: 1.2; }
+svg.touchmap .comp.untouched rect { stroke: var(--warn); stroke-dasharray: 4 3; }
+svg.touchmap .outside rect { fill: var(--bg); stroke: var(--bad); stroke-width: 1.2; stroke-dasharray: 4 3; }
+svg.touchmap .chead { fill: var(--fg); font-weight: 600; }
+svg.touchmap .clabel { fill: var(--muted); font-weight: 400; }
+svg.touchmap .cid { fill: var(--accent); font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+svg.touchmap .warn { fill: var(--warn); font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 11px; }
+svg.touchmap .entry { fill: var(--fg); font-family: ui-monospace, Menlo, monospace; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 10px 0; scroll-margin-top: 8px; }
 .card .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin-bottom: 4px; }
 .card .id { font-family: ui-monospace, Menlo, monospace; }
