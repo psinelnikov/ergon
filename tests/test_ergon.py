@@ -6049,11 +6049,16 @@ class TestAccept(DispatchProject):
         dry = self.ergon("dispatch", "--dry-run").stdout
         self.assertIn("held for your accept", [l for l in dry.splitlines() if "T-001" in l][0])
         self.assertNotIn("held for your accept", [l for l in dry.splitlines() if "T-002" in l][0])
-        out = self.ergon("dispatch").stdout
-        self.assertEqual(self.status("T-002"), "done", out)
+        # T-001 first and alone, so it is held at review before T-002 moves the epic branch;
+        # dispatching both at once races them and T-002 can land before T-001 is held (T-318).
+        out = self.ergon("dispatch", "--ids", "T-001").stdout
         self.assertEqual(self.status("T-001"), "review", out)
+        self.assertEqual(self.status("T-002"), "ready", out)
         self.assertIn("1 awaiting your accept", out)
         self.assertIn("AWAITING YOUR ACCEPT (1)", out)
+        out = self.ergon("dispatch").stdout  # only T-002 is ready: T-001 waits for a human
+        self.assertEqual(self.status("T-002"), "done", out)
+        self.assertEqual(self.status("T-001"), "review", out)
         epic = next((self.root / "tasks/epics").glob("E-001-*"))
         self.assertIn("status: open", (epic / "EPIC.md").read_text())  # not complete: T-001 isn't done
         branch = f"epic/{epic.name}"
