@@ -3124,6 +3124,7 @@ BLOCK_END = re.compile(r"^\W*END TASK\W*$")
 BLOCK_FIELDS = ("tier", "tier_why", "category", "touches", "depends")  # category may be left out (a feature)
 BLOCK_SECTIONS = ("what", "done when", "options", "notes")
 BLOCK_OPTIONS = (2, 4)  # a feature block's number of options, at least and at most
+BLOCK_TITLE_MAX = 120  # a TASK block's title, in characters; agents/task-breakdown.md states it (T-308)
 
 BREAKDOWN_PROMPT = """Break down epic {eid} into tasks.
 
@@ -3136,9 +3137,17 @@ The epic's brief ({path}):
 {rules}{policies}{protect}{companions}
 {existing}
 
-Write one block per task, in the order they should land, and end with `RESULT: done` as your last line.
-If the brief can't be broken down as it stands, write no blocks and end with
-`RESULT: blocked — <what a human must settle>`. Each block is exactly this:
+First check the brief's `## Why` and `## When it's done`. If either is empty (no heading, or nothing but
+blank lines under it), write no TASK blocks: ask the human instead. Write one `QUESTION: <the question>`
+line per question, each followed by one `OPTIONS: <a> | <b> | …` line of at most 4 peer suggestions drawn
+from the brief and the code, none marked or ranked above another (the human may answer in their own words
+instead), and end with `RESULT: asking — <one line: which sections are empty>` as your last line. With
+either section empty nothing is filed, whatever you reply.
+
+Otherwise plan tasks that together make every "When it's done" item true. Write one block per task, in the
+order they should land, and end with `RESULT: done` as your last line. If the brief can't be broken down as
+it stands, write no blocks and end with `RESULT: blocked — <what a human must settle>` (with QUESTION: /
+OPTIONS: lines before it, as above, when a human's answer would settle it). Each block is exactly this:
 
 TASK: <title: what changes, one line>
 tier: <haiku | sonnet | opus | human>
@@ -3171,9 +3180,13 @@ risk, defer. The lenses are peers: the crux names no option, no option is marked
 that favours one option in its wording is refused. No option may be under half the median option's length. Every
 option stays within the epic's Goal and Constraints. A feature block needs it; a bugfix, refactor or
 chore block may leave it out. An old numbered list is refused. Blocks are numbered 1, 2, 3, … in the order you write them, and `depends` may name only an earlier
-block. Each block is checked as `ergon check` would check it. A block with an unknown field, a tier
-below a `[[protect]]` minimum for a path it touches, an unknown category, a feature with no options or an `## Options` section that breaks the lens rules, an empty What or
-Done when, or a missing END TASK line is refused and never repaired. So is a block that depends on a refused one. At most
+block. Each block is checked as `ergon check` would check it. A block with a title over {title_max} characters
+(or one holding ` #` or starting with `[`), an unknown, missing or repeated field, an empty tier_why (or one holding ` #`
+or wrapped in `[...]`), a tier below a `[[protect]]` minimum for a path it touches, an unknown category, a touches:
+entry holding `[`, `]` or `#`, a depends: entry that isn't an earlier block or an existing undropped T-NNN, a feature
+with no options or an `## Options` section that breaks the lens rules (or has a `Chosen:` line), an unknown or
+repeated `## ` section, a single-`#` heading, an empty What or Done when, or a missing END TASK line is refused and
+never repaired. So is a block that depends on a refused one. At most
 {max} blocks are filed.
 """
 
@@ -3195,11 +3208,28 @@ def breakdown_rows(eid=None):
 
 def breakdown_candidates(tasks, epics, apr=None):
     """Epics dispatch breaks down: open, approved (or from before approvals: epic_problem), with
-    no task at all (a dropped one counts: someone looked), never broken down before."""
-    done = {r.get("epic") for r in breakdown_rows()}
+    no task at all (a dropped one counts: someone looked), and either never broken down before or
+    answered since a breakdown asked (rebreak)."""
+    rows = {}
+    for r in breakdown_rows():
+        rows.setdefault(r.get("epic"), []).append(r)
     have = {t.get("epic") for t in tasks.values()}
     return [e for _, e in sorted(epics.items()) if e.get("status") == "open" and e["id"] not in have
-            and e["id"] not in done and not _tasks.epic_problem(e, apr)]
+            and (e["id"] not in rows or rebreak(e, rows[e["id"]])) and not _tasks.epic_problem(e, apr)]
+
+
+def rebreak(e, rows):
+    """Is epic e, broken down before (its history `breakdown` rows, oldest first), to be broken down
+    again? Only once a run asked (a row with `asked`: the brief's Why or When it's done was empty),
+    both sections are now filled, and the brief's digest differs from every asked row's: one
+    automatic re-run per answered brief (T-289). An epic with no asked row stays as it was (never
+    again by itself). A non-asked row after the first asked one doesn't rule the epic out by being
+    non-asked, but a run of this same brief since then did read the answers, so it isn't re-run."""
+    first = next((n for n, r in enumerate(rows) if r.get("asked")), None)
+    if first is None or _tasks.empty_answers(e):
+        return False
+    digest = _tasks.brief_digest(e)
+    return all(r.get("digest") != digest for r in rows[first:])
 
 
 def protect_text():
@@ -3235,7 +3265,7 @@ def breakdown_prompt(e, tasks):
         policies=REVIEW_POLICIES.format(policies=pol).replace("Do not raise a finding one of them settles",
                                                                 "Don't propose a task one of them rules out") if pol else "",
         protect=protect_text(), companions=f"\nCompanion repos:\n{comps}" if comps else "",
-        existing=existing_text(e["id"], tasks), max=BREAKDOWN_MAX)
+        existing=existing_text(e["id"], tasks), max=BREAKDOWN_MAX, title_max=BLOCK_TITLE_MAX)
 
 
 def split_list(val):
@@ -3316,8 +3346,8 @@ def check_block(n, f, tasks, ids, refused):
     title = f.get("title") or ""
     if not title:
         return "no title on the TASK: line"
-    if len(title) > 120:
-        return f"title is {len(title)} characters (at most 120)"
+    if len(title) > BLOCK_TITLE_MAX:
+        return f"title is {len(title)} characters (at most {BLOCK_TITLE_MAX})"
     if re.search(r"(?:^|\s)#", title) or title.startswith("["):
         return "title would not survive frontmatter (a ` #` starts a comment, a leading `[` a list)"
     for k in BLOCK_FIELDS:
@@ -3414,14 +3444,27 @@ def run_breakdown(e, args, by="breakdown", gate=None, sync=None):
     except Exception as err:  # noqa: BLE001 - a breakdown never takes dispatch down
         verdict, why = "blocked", f"breakdown crashed: {err}"
     info.update(verdict=verdict, reason=why, seconds=round(time.monotonic() - start, 1))
+    extra = {}
+    try:  # the brief this run read: an answered epic is broken down again once per new brief (T-289)
+        extra["digest"] = _tasks.brief_digest(e)
+    except Exception:  # noqa: BLE001 - a row without it only means no automatic re-run
+        pass
+    if info.get("asked"):
+        extra["asked"] = info["asked"]
+    if info.get("questions"):
+        extra["questions"] = [{"text": q, "options": opts} for q, opts in info["questions"]]
     _history.record("breakdown", e, by=by, verdict=verdict, reason=why or None, cost=info["cost"],
                     seconds=info["seconds"], log=info["log"], session=info.get("session"),
-                    filed=[i for i, _ in info["filed"]], refused=[f"block {n}: {w}" for n, _, w in info["refused"]])
+                    filed=[i for i, _ in info["filed"]], refused=[f"block {n}: {w}" for n, _, w in info["refused"]],
+                    **extra)
     return info
 
 
 def _run_breakdown(e, args, log, info, gate, sync):
     tasks = _tasks.load(_config.ITEMS)
+    missing = _tasks.empty_answers(e)
+    if missing:
+        info["asked"] = missing
     agent = breakdown_agent()
     cmd = ["claude", "-p", "--agents", json.dumps({BREAKDOWN_AGENT: agent}), "--agent", BREAKDOWN_AGENT,
            "--permission-mode", "dontAsk", "--allowedTools", ",".join(BREAKDOWN_ALLOW),
@@ -3452,11 +3495,18 @@ def _run_breakdown(e, args, log, info, gate, sync):
         return "blocked", f"couldn't check the checkout after the breakdown: {err}"
     if changed:
         return "blocked", f"the checkout's `git status` changed during the breakdown (it must stay read-only); nothing filed"
-    found = re.findall(r"^\W*RESULT:\s*(done|blocked)\b[\s—:–-]*(.*)$", text, re.M)
+    found = re.findall(r"^\W*RESULT:\s*(done|blocked|asking)\b[\s—:–-]*(.*)$", text, re.M)
     if not found:
         return "blocked", "breakdown ended without a RESULT line; nothing filed"
-    if found[-1][0] == "blocked":
-        return "blocked", md_trim(found[-1][1].strip(" *`")) or "(no reason given)"
+    if found[-1][0] != "done" or missing:
+        info["questions"] = parse_questions(text)
+    if found[-1][0] != "done":
+        n = len(info["questions"])
+        return "blocked", (md_trim(found[-1][1].strip(" *`"))
+                           or (f"{n} question(s) for a human" if n else "(no reason given)"))
+    if missing:
+        return "blocked", (f"the brief's {' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} empty; "
+                           f"nothing filed until a human fills {'it' if len(missing) == 1 else 'them'}")
     blocks = parse_blocks(text)
     if not blocks:
         return "blocked", "breakdown ended `RESULT: done` with no TASK block"
@@ -3517,6 +3567,14 @@ def print_breakdown(info, indent="  "):
     print(f"{indent}breakdown {eid}  {info['verdict']}: {len(info['filed'])} proposed, {len(info['refused'])} refused, "
           f"${info['cost']:.2f}" + (f"; {info['reason']}" if info.get("reason") else "") + f" (log {info['log']})",
           flush=True)
+    if info.get("asked"):
+        print(f"{indent}  empty in the brief: {', '.join(info['asked'])}. Fill them in {eid}'s brief (and approve it "
+              f"again where approvals are signed): dispatch then breaks it down again by itself, or run "
+              f"`ergon breakdown {eid}`")
+    for q, opts in info.get("questions") or []:
+        print(f"{indent}  question: {q}")
+        for o in opts:
+            print(f"{indent}    - {o}")
 
 
 def breakdown(args):
@@ -4986,8 +5044,13 @@ def dispatch(args):
               + ". `ergon review` lists them for your approval")
         for b in breaks:
             if b["verdict"] != "done":
-                print(f"  breakdown {b['epic']} {b['verdict']}: {b['reason']}. Dispatch won't run it again; "
-                      f"`ergon breakdown {b['epic']}` does")
+                if b.get("asked"):
+                    print(f"  breakdown {b['epic']} {b['verdict']}: {b['reason']}. Dispatch runs it again once "
+                          f"{' and '.join(b['asked'])} {'is' if len(b['asked']) == 1 else 'are'} filled in the brief; "
+                          f"`ergon breakdown {b['epic']}` does now")
+                else:
+                    print(f"  breakdown {b['epic']} {b['verdict']}: {b['reason']}. Dispatch won't run it again; "
+                          f"`ergon breakdown {b['epic']}` does")
     if stopped:
         print("\ninterrupted: stopped launching" + ("; killed running workers" if KILL_ALL.is_set() else ""))
     held_back = sorted(i for i, t in _tasks.load(_config.ITEMS).items() if _tasks.limited(t)) if paused else []

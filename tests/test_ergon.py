@@ -271,7 +271,9 @@ print(json.dumps({"result": "did it\n" + found + evidence + os.environ.get("FAKE
 
 
 def sh(*cmd, cwd, check=True, env=None, inp=None):
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env, input=inp)
+    # no input: never the terminal the tests run in, where `ergon new epic` would stop to ask
+    stdin = {"stdin": subprocess.DEVNULL} if inp is None else {"input": inp}
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env, **stdin)
     if check and r.returncode:
         raise AssertionError(f"{cmd} failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
     return r
@@ -283,6 +285,18 @@ def clean_env(**extra):
                GIT_COMMITTER_NAME="Tester", GIT_COMMITTER_EMAIL="t@example.com")
     env.update(extra)
     return env
+
+
+def today():
+    """The local date, as ergon stamps it."""
+    return time.strftime("%Y-%m-%d")
+
+
+def stamped(template, since):
+    """`template` with `{day}` filled in by each day from `since` (read before the command ran) to
+    now: one string, or two when the run crossed midnight. Check a date a command stamped against
+    these, never against the clock read a second time (T-313)."""
+    return [template.replace("{day}", d) for d in dict.fromkeys((since, today()))]
 
 
 def git_init(path):
@@ -308,6 +322,7 @@ class Project(unittest.TestCase):
     journal = False  # finishing an epic would run `claude -p` for its journal entry; only tests of that turn it on
 
     def setUp(self):
+        self.since = today()  # what the test's commands stamp is this day or a later one: see stamped()
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve() / "proj"
         git_init(self.root)
@@ -1949,11 +1964,375 @@ def approve_epic(test, eid="E-001"):
     return r
 
 
+FAKE_EPIC_CLAUDE = r"""#!PYTHON
+'''Stands in for `claude -p` under `ergon new epic`. Logs what it was told per call to $EPIC_TMP/calls.
+Judges an answer concrete when it contains $EPIC_OK, and otherwise follows up on its words. Every
+reply has more suggestions than may be shown, one of them ranked. $EPIC_RAW replies that instead;
+$EPIC_EXIT exits with that status.'''
+import json, os, sys
+prompt = sys.stdin.read()
+known = json.loads(next(l for l in prompt.splitlines() if l.startswith("{")))
+with open(os.path.join(os.environ["EPIC_TMP"], "calls"), "a") as f:
+    f.write(json.dumps({"argv": sys.argv[1:], "known": known, "cwd": os.listdir(".")}) + "\n")
+if os.environ.get("EPIC_EXIT"):
+    sys.exit(int(os.environ["EPIC_EXIT"]))
+about = known.get("answer", known["epic"])
+reply = {"concrete": os.environ.get("EPIC_OK", "\0") in about, "question": f"Who needs {about}?",
+         "suggestions": [f"{n} {about} for people \x1b[31mwho wait" for n in ("Zulu", "Yankee")]
+         + [f"Alpha {about} (Recommended)", "Nothing to do with it at all", 7]
+         + [f"{n} {about} for people who wait" for n in ("Mike", "Lima", "Kilo")]}
+if "answer" not in known:
+    del reply["concrete"], reply["question"]
+print(json.dumps({"type": "result", "is_error": False, "total_cost_usd": 0.001,
+                  "result": os.environ.get("EPIC_RAW") or "Here:\n```json\n" + json.dumps(reply) + "\n```"}))
+"""
+
+
+class TestEpicQuestions(Project):
+    """`ergon new epic` in a person's terminal asks why and when it's done (T-286)."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = Path(self.tmp.name) / "bin"
+        self.bin.mkdir()
+        (self.bin / "claude").write_text(FAKE_EPIC_CLAUDE.replace("#!PYTHON", f"#!{sys.executable}"))
+        (self.bin / "claude").chmod(0o755)
+        self.base = clean_env(PATH=f"{self.bin}:{os.environ['PATH']}", EPIC_TMP=self.tmp.name)
+        self.base.pop("ERGON_ASK_STDIN", None)
+
+    def ask(self, *flags, answers=(), **env):
+        r = self.ergon("new", "epic", "Shorter reviews", *flags, inp="".join(a + "\n" for a in answers),
+                       env=dict(self.base, ERGON_ASK_STDIN="1", **env))
+        for prompt in self.prompts(r):
+            self.assertLessEqual(len(self.listed(prompt)), 4, prompt)
+            self.assertIn("or your own words", prompt)
+            self.assertNotIn("recommend", prompt.lower())
+            self.assertNotIn("\x1b", prompt)
+        return r
+
+    def prompts(self, r):
+        return re.findall(r"(?s)\n(.*?leave it empty\])", r.stdout)
+
+    def listed(self, prompt):
+        return re.findall(r"^  \d\. (.*)$", prompt, re.M)
+
+    def calls(self):
+        f = Path(self.tmp.name) / "calls"
+        return [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
+
+    def brief(self):
+        text = next((self.root / "tasks" / "epics").glob("E-*/EPIC.md")).read_text()
+        self.ergon("check")
+        return [x.strip() for x in re.search(r"(?s)## Why\n(.*?)## When it's done\n(.*?)## Goal\n", text).groups()]
+
+    def test_a_vague_why_is_followed_up_and_a_concrete_answer_is_written_word_for_word(self):
+        why, done = "My  reviewers wait *two* days — and OKAY nobody knows why", "`ergon stats` prints OKAY hours per review"
+        r = self.ask(answers=["faster reviewing", "quick", why, done], EPIC_OK="OKAY")
+        self.assertEqual(self.brief(), [why, done])
+        ps = self.prompts(r)
+        self.assertEqual(len(ps), 4, r.stdout)
+        self.assertIn("What problem does someone have today?", ps[0])
+        self.assertIn("Who needs faster reviewing?", ps[1])
+        self.assertEqual(self.listed(ps[1]), sorted(self.listed(ps[1])))  # the order says nothing
+        self.assertEqual(len(self.listed(ps[1])), 4)
+        for x in self.listed(ps[1]):  # the one that has nothing to do with the answer isn't shown
+            self.assertIn("faster reviewing", x)
+        for x in self.listed(ps[2]):
+            self.assertIn("quick", x)
+        self.assertIn("How could someone check?", ps[3])
+        known = [c["known"] for c in self.calls()]
+        self.assertEqual(known, [
+            {"epic": "Shorter reviews"},
+            {"epic": "Shorter reviews", "earlier_vague_answers": [], "answer": "faster reviewing"},
+            {"epic": "Shorter reviews", "earlier_vague_answers": ["faster reviewing"], "answer": "quick"},
+            {"epic": "Shorter reviews", "earlier_vague_answers": ["faster reviewing", "quick"], "answer": why},
+            {"epic": "Shorter reviews", "why": why},
+            {"epic": "Shorter reviews", "why": why, "earlier_vague_answers": [], "answer": done}])
+        for c in self.calls():  # a cheap call with no tools, in an empty folder
+            self.assertEqual(c["argv"], ["-p", "--model", "haiku", "--tools", "", "--strict-mcp-config",
+                                         "--output-format", "json"])
+            self.assertEqual(c["cwd"], [])
+
+    def test_a_picked_suggestion_is_written_as_shown_and_not_judged(self):
+        r = self.ask(answers=["9", "2", "vague", "1."])
+        ps = self.prompts(r)
+        self.assertIn("There is no 9 in the list", ps[1])
+        self.assertEqual(self.listed(ps[0]), self.listed(ps[1]))
+        self.assertEqual(self.brief(), [self.listed(ps[1])[1], self.listed(ps[3])[0]])
+        self.assertIn("vague", self.brief()[1])
+        self.assertEqual([c["known"].get("answer") for c in self.calls()], [None, None, "vague"])
+
+    def test_several_picked_numbers_combine_their_texts_with_no_clarifying_round(self):  # T-303
+        r = self.ask(answers=["1 and 4", "2 and 3 - if no UI work, show diagrams"])
+        ps = self.prompts(r)
+        self.assertEqual(len(ps), 2, r.stdout)
+        why, done = self.listed(ps[0]), self.listed(ps[1])
+        dot = lambda t: t if t.endswith((".", "!", "?", "…")) else t + "."
+        self.assertEqual(self.brief(), [f"{dot(why[0])} {dot(why[3])}",
+                                        f"{dot(done[1])} {dot(done[2])} if no UI work, show diagrams"])
+        self.assertEqual([c["known"].get("answer") for c in self.calls()], [None, None])  # nothing judged
+
+    def test_a_number_off_the_list_inside_a_longer_answer_is_judged_with_the_options_shown(self):  # T-303
+        r = self.ask(answers=["1 and 9 more", "", ""])
+        ps = self.prompts(r)
+        self.assertEqual(len(ps), 3, r.stdout)
+        judged = self.calls()[1]["known"]
+        self.assertEqual(judged["answer"], "1 and 9 more")
+        self.assertEqual(judged["options_shown"], self.listed(ps[0]))
+        self.assertEqual(self.brief(), ["", ""])
+
+    def test_resolving_picks(self):  # T-303
+        from ergon import tasks
+        shown = ["Alpha", "Bravo.", "Charlie", "Delta"]
+        for got, want in (("1 and 4", "Alpha. Delta."), ("2, 3", "Bravo. Charlie."), ("4+1", "Delta. Alpha."),
+                          ("2 & 2", "Bravo."), ("2 and 3 — also X, Y", "Bravo. Charlie. also X, Y"),
+                          ("3: only for admins", "Charlie. only for admins"),
+                          ("1 and 9 more", None), ("9 and 1 - also X", None), ("1, 2 people wait", None),
+                          ("2 days of waiting", None), ("people wait", None)):
+            self.assertEqual(tasks.resolve_picks(got, shown), want, got)
+        for answer, want in (("1 and 9 more", True), ("reviewers wait 2 days", True), ("wait 12 days", False),
+                             ("v1.2 is slow", False), ("nothing numbered", False)):
+            self.assertEqual(tasks._names_a_pick(answer, shown), want, answer)
+
+    def test_an_empty_answer_leaves_the_section_empty_and_says_breakdown_will_ask(self):
+        r = self.ask(answers=["vague", "", "", "unread"])
+        self.assertEqual(self.brief(), ["", ""])
+        self.assertIn("Why is left empty: breakdown will ask for it later", r.stderr)
+        self.assertIn("When it's done is left empty: breakdown will ask for it later", r.stderr)
+
+    def test_the_answers_run_out(self):  # end of input is an empty answer, and no model call is spent on it
+        r = self.ask()
+        self.assertEqual((self.brief(), self.prompts(r), self.calls()), (["", ""], [], []))
+
+    def test_a_flag_skips_its_question_and_both_skip_all(self):
+        r = self.ask("--why", "Reviews stall", answers=["1"])
+        self.assertEqual(len(self.prompts(r)), 1)
+        self.assertNotIn("Why do you want", r.stdout)
+        self.assertEqual(self.brief(), ["Reviews stall", self.listed(self.prompts(r)[0])[0]])
+        self.assertEqual([c["known"] for c in self.calls()], [{"epic": "Shorter reviews", "why": "Reviews stall"}])
+
+    def test_the_other_flag_skips_its_question(self):
+        r = self.ask("--when-done", "It prints 1", answers=["1"])
+        self.assertEqual(len(self.prompts(r)), 1)
+        self.assertNotIn("How could someone check", r.stdout)
+        self.assertEqual(self.brief()[1], "It prints 1")
+
+    def test_both_flags_skip_all_prompting(self):
+        r = self.ask("--why", "Reviews stall", "--when-done", "", answers=["1", "1"])
+        self.assertEqual(self.brief(), ["Reviews stall", ""])
+        self.assertEqual((self.prompts(r), self.calls(), r.stderr), ([], [], ""))
+
+    def test_nothing_is_read_in_an_agent_shell_or_without_a_terminal(self):
+        # stdin is a pipe nobody writes to or closes: reading it would hang
+        for env in ({"CLAUDECODE": "1"}, {"AI_AGENT": "1"}, {"CLAUDECODE": "1", "ERGON_ASK_STDIN": "1"}, {}):
+            p = subprocess.Popen([sys.executable, str(ERGON), "new", "epic", "Big thing"], cwd=self.root,
+                                 env=dict(self.base, **env), stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(p.wait(timeout=30), 0, env)
+                self.assertRegex(p.stdout.read(), r"\A\S+/EPIC\.md\n\Z")
+            finally:
+                p.kill()
+                for f in (p.stdin, p.stdout, p.stderr):
+                    f.close()
+        self.assertEqual(self.brief(), ["", ""])
+        self.assertEqual(self.calls(), [])
+
+    def test_without_claude_the_fixed_suggestions_and_checks_do_it(self):
+        why, done = "Our reviewers wait two days for a build", "The board page shows how long each one waited"
+        for n, env in enumerate(({"EPIC_EXIT": "1"}, {"EPIC_RAW": "sure, happy to help"}, {"EPIC_RAW": "{nope}"}), 1):
+            r = self.ask(answers=["faster deploys.", why, "deploys are nicer", done], **env)
+            ps = self.prompts(r)
+            self.assertEqual(len(ps), 4, r.stdout)
+            self.assertIn("“faster deploys”", ps[1])
+            for p, said in ((ps[1], "faster deploys"), (ps[3], "deploys are nicer")):
+                self.assertEqual(len(self.listed(p)), 4)
+                for x in self.listed(p):
+                    self.assertIn(said, x)
+            self.assertEqual(self.brief(), [why, done])
+            self.assertEqual(len(self.calls()), n)  # one failure, and it isn't called again
+            self.assertEqual(r.stderr.count("no answer from claude"), 1)
+            sh("rm", "-r", str(next((self.root / "tasks" / "epics").glob("E-*"))), cwd=self.root)
+
+    def test_a_suggestion_unlike_the_answer_gives_way_to_ones_built_from_it(self):
+        raw = json.dumps({"concrete": False, "question": "We recommend what?", "suggestions": ["One thing", "Two things"]})
+        r = self.ask(answers=["faster deploys", "1"], EPIC_RAW=raw)
+        p = self.prompts(r)[1]
+        self.assertTrue(all("faster deploys" in x for x in self.listed(p)), p)
+        self.assertIn("Who runs into “faster deploys”", p)
+
+    def test_the_fixed_check(self):
+        from ergon import tasks
+        for key, q in tasks.EPIC_QUESTIONS.items():  # what it offers passes it, and stays within the limit
+            self.assertEqual(len(q["fixed"]), 4)
+            self.assertEqual(len(q["built"]), 4)
+            for x in q["fixed"] + [b.format(said="deploys") for b in q["built"]]:
+                self.assertTrue(tasks.concrete(key, x), x)
+        for key, text, want in (
+                ("why", "make it better", False), ("why", "I want the app to be nicer", False),
+                ("why", "Users are great and happy", False), ("why", "it's too slow", False),
+                ("why", "New users can't find the export button", True),
+                ("why", "I re-type every invoice by hand on Fridays", True),
+                ("when_done", "it works well for everyone", False), ("when_done", "users are happy", False),
+                ("when_done", "the whole product feels modern", False),
+                ("when_done", "`ergon board` prints the wait next to each task", True),
+                ("when_done", "A user can download their invoices as CSV", True)):
+            self.assertEqual(tasks.concrete(key, text), want, text)
+
+    def test_a_slow_or_missing_claude_is_given_up_on(self):
+        from unittest import mock
+        from ergon import tasks
+        (self.bin / "claude").write_text("#!/bin/sh\nsleep 60 &\nsleep 60\n")  # with a child holding its output open
+        with mock.patch.dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}"), \
+                mock.patch.object(tasks, "EPIC_ASK_TIMEOUT", 1):
+            start = time.monotonic()
+            self.assertIsNone(tasks._claude_json("hi"))
+            self.assertLess(time.monotonic() - start, 20)
+        with mock.patch.object(tasks.shutil, "which", return_value=None), \
+                mock.patch.object(tasks.subprocess, "Popen", side_effect=AssertionError("ran")):
+            self.assertIsNone(tasks._claude_json("hi"))
+
+    def test_in_a_real_terminal_it_asks_and_holds_no_lock_meanwhile(self):
+        import pty
+        import select
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.root)
+            os.execve(sys.executable, [sys.executable, str(ERGON), "new", "epic", "Shorter reviews"], self.base)
+        seen = ""
+
+        def until(text):
+            nonlocal seen
+            end = time.monotonic() + 30
+            while text not in seen:
+                self.assertTrue(select.select([fd], [], [], max(0, end - time.monotonic()))[0], seen)
+                try:
+                    seen += os.read(fd, 4096).decode(errors="replace")
+                except OSError:  # the other end closed
+                    self.fail(seen)
+            seen = seen.split(text, 1)[1]
+        try:
+            until("leave it empty]")
+            self.ergon("new", "task", "Meanwhile", "--tier", "haiku")  # would wait for a held lock
+            os.write(fd, b"1\n")
+            until("leave it empty]")
+            os.write(fd, b"\n")
+            until("breakdown will ask for it later")
+            until("EPIC.md")
+            self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), 0)
+            pid = None
+        finally:
+            if pid:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+            os.close(fd)
+        self.assertEqual(self.brief(), ["Mike Shorter reviews for people who wait", ""])
+
+    def test_arrow_keys_edit_the_answer_and_never_reach_it(self):  # T-302
+        import pty
+        import select
+        try:
+            import readline  # noqa: F401
+        except ImportError:
+            self.skipTest("no readline here: the /dev/tty fallback strips escapes (unit test below)")
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.root)
+            os.execve(sys.executable, [sys.executable, str(ERGON), "new", "epic", "Shorter reviews"],
+                      dict(self.base, EPIC_OK="OKAY"))
+        seen = ""
+
+        def until(text):
+            nonlocal seen
+            end = time.monotonic() + 30
+            while text not in seen:
+                self.assertTrue(select.select([fd], [], [], max(0, end - time.monotonic()))[0], seen)
+                try:
+                    seen += os.read(fd, 4096).decode(errors="replace")
+                except OSError:
+                    self.fail(seen)
+            seen = seen.split(text, 1)[1]
+        try:
+            until("leave it empty]")
+            # Left, Left, Right, then the missing "to"; Home, then "OKAY"; End, then Left and Right back
+            os.write(fd, b"users can't find the export butn\x1b[D\x1b[D\x1b[Cto"
+                         b"\x1b[HOKAY \x1b[F\x1b[D\x1b[C\n")
+            until("leave it empty]")
+            os.write(fd, b"\n")
+            until("EPIC.md")
+            self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), 0)
+            pid = None
+        finally:
+            if pid:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+            os.close(fd)
+        self.assertEqual(self.brief(), ["OKAY users can't find the export button", ""])
+
+    def test_escape_sequences_read_without_line_editing_are_dropped(self):  # T-302
+        from ergon import gates
+        for raw, want in (("1 and 4 - diagrams with new additions\x1b[D\x1b[", "1 and 4 - diagrams with new additions"),
+                          ("ab\x1b[Dc\x1b[1;5C\x1bOH\x1b[3~d\x1b", "abcd"), ("plain words", "plain words")):
+            self.assertEqual(gates._no_escapes(raw), want)
+        # stdin redirected: the answer is read from /dev/tty without editing, and arrow keys are stripped
+        from unittest import mock
+        import io
+        tty = io.StringIO("New users\x1b[D\x1b[C can't find it\n")
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "AI_AGENT", "ERGON_ASK_STDIN")}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(gates, "_edits_lines", return_value=False), \
+                mock.patch("builtins.open", side_effect=lambda f, m="r", *a, **k: tty if "r" in m else io.StringIO()):
+            self.assertEqual(gates.ask("why? "), "New users can't find it")
+
+
 class TestEpicApproval(Project):
     """Epics start proposed; a human's `approve E-NNN` approves the brief and opens them (T-098)."""
 
     def epic_file(self, eid="E-001"):
         return next((self.root / "tasks" / "epics").glob(f"{eid}-*/EPIC.md"))
+
+    def test_new_epic_writes_why_and_when_done_word_for_word(self):
+        why = "Reviewers  keep asking: *why* this?  — twice"
+        done = "Every brief says why; and `check` is green."
+        self.ergon("new", "epic", "Big thing", "--why", why, "--when-done", done)
+        text = self.epic_file().read_text()
+        self.assertIn(f"## Why\n\n{why}\n\n## When it's done\n\n{done}\n\n## Goal\n", text)
+        self.ergon("check")
+
+    def test_new_epic_without_flags_leaves_both_empty_and_never_reads_stdin(self):
+        # an agent shell with stdin a pipe nobody writes to or closes: reading it would hang
+        p = subprocess.Popen([sys.executable, str(ERGON), "new", "epic", "Big thing"], cwd=self.root,
+                             env=clean_env(CLAUDECODE="1"), stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(p.wait(timeout=30), 0, p.stderr.read())
+        finally:
+            if p.poll() is None:
+                p.kill()
+            p.stdin.close()
+            p.stdout.close()
+            p.stderr.close()
+        text = self.epic_file().read_text()
+        self.assertIn("## Why\n\n## When it's done\n\n## Goal\n", text)
+
+    def test_new_task_refuses_why_and_when_done(self):
+        for flag in ("--why", "--when-done"):
+            r = self.ergon("new", "task", "Part", "--tier", "haiku", flag, "x", check=False)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("for `ergon new epic` only", r.stderr)
+        self.assertEqual(list((self.root / "tasks" / "items").glob("T-*.md")), [])
+
+    def test_skill_tells_agents_to_ask_why_and_when_done_before_new_epic(self):  # T-287
+        skill = (ERGON.parent / "skills" / "ergon" / "SKILL.md").read_text()
+        start = skill.index("### Before `ergon new epic`: ask why, and what done looks like")
+        section = skill[start:skill.index("\n## Epics → tasks", start)]
+        for want in ("--why", "--when-done", "at most 4 suggestions", "own words", "ask again",
+                     "in the person's words", "goes in Goal", "A dispatched agent",
+                     "with both sections empty", "says so in its final report"):
+            self.assertIn(want, section)
+        self.assertIsNone(re.search(r"(?i)recommend", section))
+        # the worked exchange ends in a real `new epic` command with both flags
+        self.assertRegex(section, r'ergon new epic "[^"]+" \\\n  --why "[^"]+" \\\n  --when-done "')
 
     def test_an_agents_epic_is_proposed_and_its_tasks_wait_until_a_human_approves_it(self):
         agent = clean_env(CLAUDECODE="1")
@@ -2375,8 +2754,8 @@ class TestObsidian(Project):
         out = self.ergon("obsidian").stdout
         self.assertIn("2 line(s) ticked", out)
         new = note.read_bytes().decode()
-        today = __import__("datetime").date.today().isoformat()
-        self.assertRegex(new, rf"- \[x\] Compare plans #agent \U0001F4C5 2026-12-01 \u2705 {today} \(ergon T-001\) \^ergon-[0-9a-f]{{10}}\r\n")
+        days = "|".join(stamped("{day}", self.since))
+        self.assertRegex(new, rf"- \[x\] Compare plans #agent \U0001F4C5 2026-12-01 \u2705 (?:{days}) \(ergon T-001\) \^ergon-[0-9a-f]{{10}}\r\n")
         self.assertIn("- [ ] Call them #agent (ergon T-002 dropped) ^mine\r\n", new)
         self.assertEqual(len(new.split("\r\n")), len(text.split("\r\n")))
         self.assertTrue(new.endswith("\r\nplain\r\nlast"))
@@ -6024,8 +6403,10 @@ class TestBreakdown(DispatchProject):
         self.env["FAKE_BREAKDOWN_SEEN"] = str(self.seen)
         self.env["FAKE_BREAKDOWN"] = BREAKDOWN_REPLY
 
-    def new_epic(self, goal="Ship widgets end to end."):
-        self.ergon("new", "epic", "Widgets")
+    def new_epic(self, goal="Ship widgets end to end.", why="Customers can't see their widgets today",
+                 when_done="- GET /widgets lists a customer's widgets"):
+        flags = (["--why", why] if why else []) + (["--when-done", when_done] if when_done else [])
+        self.ergon("new", "epic", "Widgets", *flags)
         f = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
         f.write_text(f.read_text().replace("## Goal\n", f"## Goal\n{goal}\n"))
         return f
@@ -6156,6 +6537,103 @@ class TestBreakdown(DispatchProject):
             self.assertIn(word, why[i] or "", i)
         self.assertIsNone(why[8])  # a chore may leave it out
 
+    def test_breakdown_agent_is_told_every_block_refusal_rule(self):
+        """T-308: each reason a TASK block can be refused for is named in the breakdown agent's
+        instructions, so blocks pass the first time. A new refusal reason fails this test until
+        it is mapped here to the words that state it in agents/task-breakdown.md."""
+        import ast, inspect
+        from ergon import dispatch as D, tasks as T
+        md = (ERGON.parent / "agents" / "task-breakdown.md").read_text()
+        self.assertIn(f"at most {D.BLOCK_TITLE_MAX} characters", md)
+        self.assertIn(f"At most {D.BREAKDOWN_MAX} blocks", md)
+        self.assertIn(f"title over {D.BLOCK_TITLE_MAX} characters", D.BREAKDOWN_PROMPT.format_map(
+            {k: "" for k in ("eid", "home", "again", "path", "brief", "rules", "policies", "protect", "companions",
+                             "existing", "max")} | {"title_max": D.BLOCK_TITLE_MAX}))
+        # leading text of a refusal reason -> words in the instructions that state the rule
+        rules = {
+            "no END TASK line": "`END TASK` line",
+            "past the first": "At most 30 blocks",
+            "a `# ` heading": "single-`#` heading",
+            "unknown section": "only `## What`, `## Done when`, `## Options` and `## Notes`",
+            "two `## ": "each at most once",
+            "a line before `## What`": "No other text sits before `## What`",
+            "unknown field": "only `tier:`, `tier_why:`, `category:`, `touches:` and `depends:`",
+            "`{}:` given twice": "each once",
+            "no title": "has a title",
+            "title is": "at most 120 characters",
+            "title would not survive": "holds no ` #` and doesn't start with `[`",
+            "no `{}:` line": "Every one but `category:` must be there",
+            "tier {} not in": "one of `haiku`, `sonnet`, `opus`, `human`",
+            "empty tier_why": "`tier_why:` is not empty",
+            "tier_why would not survive": "isn't wrapped in `[...]`",
+            "empty or missing `## What`": "both there and not empty",
+            "empty or missing `## Done when`": "both there and not empty",
+            "category {} not in": "one of `feature`, `bugfix`, `refactor`, `chore`",
+            "`## Options` has a `Chosen:`": "no `Chosen:` line",
+            "`## Options` is not in lens format": "no numbered list",
+            "`## Options`: {}": "`## Options` (rule 6)",
+            "a feature block needs": "A feature block has one",
+            "a touches: entry": "entries hold no `[`, `]` or `#`",
+            "<protect>": "not below a `[[protect]]` minimum",
+            "depends on block {}, which isn't an earlier": "earlier block numbers",
+            "depends on block {}, which was refused": "every block that depends on it",
+            "depends on block {}, which doesn't exist": "no block that doesn't exist",
+            "depends on {}, which doesn't exist": "existing T-NNN IDs",
+            "depends on {}, which is dropped": "that aren't dropped",
+            "depends: {} is neither": "nothing else",
+            # lens_problems (require_defer is never set for a breakdown)
+            "no `Crux:` line": "a non-empty `Crux:` line",
+            "{} option(s)": "2 to 4 options",
+            "unknown lens": "each a known lens used once",
+            "the {} lens more than once": "each a known lens used once",
+            "the {} option has no": "non-empty `Optimizes for:`, `Gives up:` and `Regret if:` lines",
+            "no `defer` option": None,
+            "the {} option is under half": "under half the median option's length",
+            "{} uses recommendation wording": "no wording that marks one as the pick",
+        }
+
+        def lead(node):
+            """The leading text of each reason node may give ({} for an interpolated value)."""
+            if isinstance(node, ast.IfExp):
+                return lead(node.body) + lead(node.orelse)
+            if isinstance(node, ast.Tuple):
+                node = node.elts[-1]
+            while isinstance(node, ast.BinOp):
+                node = node.left
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return [node.value]
+            if isinstance(node, ast.JoinedStr):
+                return ["".join(v.value if isinstance(v, ast.Constant) else "{}" for v in node.values)]
+            if isinstance(node, ast.Subscript):
+                return ["<protect>"]  # check_block's `return why[0]` from protect_problems
+            return []
+
+        def names(t):
+            return [x for e in t.elts for x in names(e)] if isinstance(t, ast.Tuple) else [getattr(t, "id", "")]
+
+        reasons = set()
+        for fn in (D.parse_blocks, D.parse_block, D.check_block, D.file_blocks, T.lens_problems):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            for node in ast.walk(tree):
+                val = None
+                if isinstance(node, ast.Return) and node.value is not None:
+                    val = node.value
+                elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                      and node.func.attr == "append" and getattr(node.func.value, "id", "") == "out" and node.args):
+                    val = node.args[0]
+                elif isinstance(node, ast.Assign) and any("why" in names(t) for t in node.targets):
+                    val = node.value
+                if val is not None:
+                    reasons.update(lead(val))
+        reasons = {r for r in reasons if r.strip()}
+        for r in sorted(reasons):
+            key = next((k for k in rules if r.startswith(k)), None)
+            self.assertIsNotNone(key, f"refusal reason {r!r} isn't mapped to a rule in agents/task-breakdown.md")
+            if rules[key]:
+                self.assertIn(rules[key], md, r)
+        for k in ("title is", "no END TASK line", "past the first", "<protect>", "{} uses recommendation wording"):
+            self.assertTrue(any(r.startswith(k) for r in reasons), k)  # the extraction still finds them
+
     def test_breakdown_refuses_a_one_option_feature_and_files_the_rest(self):
         self.new_epic()
         approve_epic(self)
@@ -6193,6 +6671,147 @@ class TestBreakdown(DispatchProject):
         self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run", "--tier", "haiku").stdout)
         self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run", "--epic", "E-009").stdout)
 
+    def test_empty_why_files_nothing_even_on_done(self):
+        """T-288: an epic with an empty Why gets no tasks from a reply full of TASK blocks; the
+        verdict is blocked, the reason names Why, and the history row records what was asked."""
+        self.new_epic(why=None)
+        approve_epic(self)
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        self.assertIn("breakdown E-001 blocked: the brief's Why is empty; nothing filed", out)
+        row = [r for r in history(self.root) if r["event"] == "breakdown"][-1]
+        self.assertEqual(row["verdict"], "blocked")
+        self.assertIn("Why", row["reason"])
+        self.assertNotIn("When it's done", row["reason"])
+        self.assertEqual(row["asked"], ["Why"])
+        self.assertEqual(row["filed"], [])
+        prompt = self.calls()[0]["prompt"]
+        self.assertIn("If either is empty", prompt)
+        self.assertIn('make every "When it\'s done" item true', prompt)
+
+    def test_asking_breakdown_shows_each_question_with_its_suggestions(self):
+        """T-288: a blocked reply's QUESTION: / OPTIONS: lines reach `ergon breakdown`'s output, the
+        history row (whole, with their suggestions) and the epic's serve page."""
+        f = self.new_epic(why=None, when_done=None)
+        f.write_text(f.read_text().replace("## Why\n", "## Why\n   \n\n"))  # whitespace only is empty
+        approve_epic(self)
+        self.env["FAKE_BREAKDOWN"] = (
+            "The brief has no Why and no When it's done.\n\n"
+            "QUESTION: Why do you want widgets?\n"
+            "OPTIONS: Customers can't find their widgets | Support answers widget questions by hand\n"
+            "QUESTION: What will be true when it's done?\n"
+            "OPTIONS: GET /widgets lists a customer's widgets | the widgets page loads in under a second | "
+            "support gets no widget tickets for a week\n"
+            "RESULT: blocked — the brief's Why and When it's done are empty\n")
+        r = self.ergon("breakdown", "E-001", check=False)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        out = r.stdout
+        self.assertIn("breakdown E-001  blocked: 0 proposed, 0 refused", out)
+        self.assertIn("the brief's Why and When it's done are empty", out)
+        self.assertIn("empty in the brief: Why, When it's done", out)
+        self.assertIn("question: Why do you want widgets?\n    - Customers can't find their widgets\n"
+                      "    - Support answers widget questions by hand\n", out)
+        self.assertIn("question: What will be true when it's done?\n    - GET /widgets lists a customer's widgets\n"
+                      "    - the widgets page loads in under a second\n    - support gets no widget tickets for a week\n",
+                      out)
+        row = [r for r in history(self.root) if r["event"] == "breakdown"][-1]
+        self.assertEqual(row["verdict"], "blocked")
+        self.assertEqual(row["reason"], "the brief's Why and When it's done are empty")
+        self.assertEqual(row["asked"], ["Why", "When it's done"])
+        self.assertEqual(row["questions"], [
+            {"text": "Why do you want widgets?",
+             "options": ["Customers can't find their widgets", "Support answers widget questions by hand"]},
+            {"text": "What will be true when it's done?",
+             "options": ["GET /widgets lists a customer's widgets", "the widgets page loads in under a second",
+                         "support gets no widget tickets for a week"]}])
+        self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
+        page = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); from ergon import config, serve; "
+             "config.configure(); print(serve.breakdown_block('E-001'))", str(ERGON.parent)],
+            cwd=self.root, env=self.env, capture_output=True, text=True, check=True).stdout
+        self.assertIn("Why do you want widgets?", page)
+        self.assertIn("<li>support gets no widget tickets for a week</li>", page)
+        self.assertIn("empty in the brief:</span> Why, When it&#x27;s done", page)
+
+    def test_asking_with_no_reason_counts_the_questions(self):
+        self.new_epic(when_done=None)
+        approve_epic(self)
+        self.env["FAKE_BREAKDOWN"] = "QUESTION: What should be true?\nOPTIONS: a | b\nRESULT: asking\n"
+        r = self.ergon("breakdown", "E-001", check=False)
+        self.assertIn("blocked: 0 proposed, 0 refused, $0.05; 1 question(s) for a human", r.stdout)
+        row = [r for r in history(self.root) if r["event"] == "breakdown"][-1]
+        self.assertEqual((row["asked"], row["questions"]), (["When it's done"], [{"text": "What should be true?",
+                                                                                  "options": ["a", "b"]}]))
+
+    def fill(self, f, section, text):
+        """Write text under the brief's `## <section>` heading (which `ergon new epic` always writes)."""
+        f.write_text(f.read_text().replace(f"## {section}\n", f"## {section}\n{text}\n", 1))
+
+    def test_answered_epic_is_broken_down_again_once_per_brief(self):
+        """T-289 (durable): an epic whose only breakdown row is `asked` waits while its sections are
+        empty, is broken down again once they are filled, not again for the same brief, and once
+        more after the brief changes."""
+        from ergon import tasks as T
+        f = self.new_epic(why=None)
+        approve_epic(self)
+        self.env["FAKE_BREAKDOWN"] = "QUESTION: Why do you want widgets?\nOPTIONS: a | b\nRESULT: asking\n"
+        out = self.ergon("dispatch").stdout
+        self.assertIn("Dispatch runs it again once Why is filled in the brief", out)
+        row = [r for r in history(self.root) if r["event"] == "breakdown"][-1]
+        self.assertEqual(row["asked"], ["Why"])
+        self.assertEqual(row["digest"], T.brief_digest(T.parse_text(f.read_text())))
+        # empty still: not a candidate, and the board says what it waits on
+        self.ergon("dispatch")
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertEqual(len(self.calls()), 1)
+        board = self.ergon("board").stdout
+        self.assertIn("E-001  open     0/0 done  <- breakdown waiting on Why (fill in the brief)", board)
+        self.assertNotIn("needs breakdown", board)
+        self.fill(f, "Why", "   ")  # whitespace only is still empty
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        # answered: a candidate again; this run blocks again (a non-asked row with this brief's digest)
+        f.write_text(f.read_text().replace("## Why\n   \n", "## Why\nCustomers can't see their widgets today\n"))
+        self.assertIn("would run  breakdown E-001", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertIn("<- needs breakdown", self.ergon("board").stdout)
+        page = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); from ergon import config, serve, tasks; "
+             "config.configure(); print(serve.breakdown_block('E-001', tasks.load(config.EPICS)['E-001']))",
+             str(ERGON.parent)], cwd=self.root, env=self.env, capture_output=True, text=True, check=True).stdout
+        self.assertIn("answered: dispatch breaks it down again on its next scan", page)
+        self.env["FAKE_BREAKDOWN"] = "QUESTION: Which repo?\nOPTIONS: this one | the API\nRESULT: blocked — say which repo\n"
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(len(self.calls()), 2)
+        self.assertIn("Dispatch won't run it again", out)
+        self.assertNotIn("asked", [r for r in history(self.root) if r["event"] == "breakdown"][-1])
+        # the same brief is never broken down twice by dispatch: no loop
+        self.ergon("dispatch")
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertEqual(len(self.calls()), 2)
+        # a changed brief earns one more run; the non-asked row in between doesn't rule the epic out
+        self.fill(f, "Goal", "The widgets live in this repo.")
+        self.env["FAKE_BREAKDOWN"] = BREAKDOWN_REPLY
+        out = self.ergon("dispatch").stdout
+        self.assertEqual(len(self.calls()), 3)
+        self.assertIn("proposed T-001  (breakdown E-001)", out)
+        # with tasks it is done with, whatever the brief does next
+        self.fill(f, "Goal", "More.")
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+
+    def test_a_non_asked_row_after_an_asked_one_does_not_rule_the_epic_out(self):
+        """T-289: only the asked rows' digests matter; a later run that didn't ask (here a crash
+        recorded while the Why was still empty, with no digest) doesn't stop the re-run once the
+        Why is filled."""
+        f = self.new_epic(why=None)
+        approve_epic(self)
+        self.env["FAKE_BREAKDOWN"] = "QUESTION: Why?\nOPTIONS: a | b\nRESULT: asking\n"
+        self.ergon("dispatch")
+        with (self.root / "tasks" / "runs" / "history.jsonl").open("a") as h:
+            h.write(json.dumps({"at": "2026-11-26T10:00:00+00:00", "event": "breakdown", "epic": "E-001",
+                                "verdict": "blocked", "reason": "breakdown crashed: boom"}) + "\n")
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.fill(f, "Why", "Customers can't see their widgets today")
+        self.assertIn("would run  breakdown E-001", self.ergon("dispatch", "--dry-run").stdout)
+
     def test_blocked_breakdown_runs_once_and_by_hand_only_adds(self):
         self.new_epic()
         approve_epic(self)
@@ -6202,6 +6821,11 @@ class TestBreakdown(DispatchProject):
         self.assertEqual(list((self.root / "tasks").rglob("T-*.md")), [])
         self.ergon("dispatch")
         self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertEqual(len(self.calls()), 1)
+        # T-289: a non-asked blocked row behaves as before: editing the brief doesn't bring it back
+        self.fill(next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md")), "Goal", "The widgets live here.")
+        self.assertNotIn("breakdown", self.ergon("dispatch", "--dry-run").stdout)
+        self.assertIn("E-001  open     0/0 done  <- needs breakdown", self.ergon("board").stdout)
         self.assertEqual(len(self.calls()), 1)
         # by hand it runs again, and again only adds
         one = "TASK: First\ntier: haiku\ntier_why: w\ncategory: chore\ntouches: a.md\ndepends:\n## What\nx\n## Done when\n- y\nEND TASK\nRESULT: done\n"
@@ -9091,8 +9715,8 @@ class TestGrade(Project):
         self.assertEqual(s["T-003"]["cod_why"], "users stay blocked " + "x" * 200)
         self.assertEqual(s["T-001"]["cod_why"], "why T-001")
         from ergon.tasks import brief_digest, parse
-        self.assertEqual(s["T-001"]["graded"],
-                         f"{time.strftime('%Y-%m-%d')} {brief_digest(parse(self.task_file('T-001')))[:12]}")
+        self.assertIn(s["T-001"]["graded"],
+                      stamped(f"{{day}} {brief_digest(parse(self.task_file('T-001')))[:12]}", self.since))
         self.assertIn("0 reply row(s) dropped", out)
         self.assertIn("left ungraded: T-005", out)
         [rec] = list((self.runs / "grade").glob("grade-*.json"))
@@ -9159,7 +9783,7 @@ class TestGrade(Project):
         for name in ("T-002", "T-003", "T-004"):
             f = [k for k in after if k.startswith(name)][0]
             self.assertEqual(after[f], changed[f], name)  # byte for byte
-        self.assertIn(f"{time.strftime('%Y-%m-%d')} ", self.fields("T-001")["graded"])
+        self.assertIn(self.fields("T-001")["graded"][:11], stamped("{day} ", self.since))
         from ergon.tasks import brief_digest, parse
         self.assertTrue(self.fields("T-001")["graded"].endswith(brief_digest(parse(self.task_file("T-001")))[:12]))
         self.assertEqual(self.fields("T-001")["cod"], "100")  # now beats the anchors
@@ -9252,6 +9876,7 @@ class TestGradeKeepsSignedApproval(unittest.TestCase):
 
     def test_graded_task_still_verifies(self):
         from ergon import tasks as T
+        since = today()
         self.ergon(self.a, "new", "task", "One", "--tier", "haiku")
         self.ergon(self.a, "new", "task", "Two", "--tier", "haiku")
         self.ergon(self.a, "sync", "--init", inp="y\n")
@@ -9263,7 +9888,7 @@ class TestGradeKeepsSignedApproval(unittest.TestCase):
         self.assertIn("graded 2 task(s)", out)
         text = f.read_text()
         self.assertIn("\ncod: 0\n", text)
-        self.assertIn(f"\ngraded: {time.strftime('%Y-%m-%d')} {digest[:12]}\n", text)
+        self.assertTrue(any(s in text for s in stamped(f"\ngraded: {{day}} {digest[:12]}\n", since)), text)
         self.assertEqual(T.brief_digest(T.parse_text(text)), digest)
         r = self.ergon(self.a, "check", check=False)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -9274,6 +9899,55 @@ class TestGradeKeepsSignedApproval(unittest.TestCase):
         changed = [l for l in show.splitlines() if re.match(r"^[+-](?![+-])", l)]
         self.assertTrue(changed)
         self.assertTrue(all(re.match(r"^\+(cod|cod_why|graded): ", l) for l in changed), changed)
+
+
+class TestAnsweredBreakdownShared(unittest.TestCase):
+    """Shared mode (T-289): filling an asked epic's Why un-approves its brief, so dispatch breaks it
+    down again only after a human approves it again. Borrows test_shared's breakdown fixture,
+    imported here since test_shared imports this module."""
+
+    def __getattr__(self, name):
+        from test_shared import TestBreakdownClaims
+        attr = getattr(TestBreakdownClaims, name)
+        return attr.__get__(self) if callable(attr) else attr
+
+    def setUp(self):
+        import test_shared
+        test_shared.Shared.setUp(self)
+        bindir = Path(self.tmp.name) / "bin"
+        bindir.mkdir()
+        (bindir / "claude").write_text(test_shared.FAKE_CLAUDE.replace("#!/usr/bin/env python3", f"#!{sys.executable}"))
+        (bindir / "claude").chmod(0o755)
+        self.calls = Path(self.tmp.name) / "breakdowns.jsonl"
+        self.env_a = clean_env(USER="ann", LOGNAME="ann", ERGON_ASK_STDIN="1", PATH=f"{bindir}:{os.environ['PATH']}",
+                               FAKE_BREAKDOWN=test_shared.BREAKDOWN_ONE, FAKE_BREAKDOWN_SEEN=str(self.calls))
+
+    def tearDown(self):
+        from test_shared import Shared
+        Shared.tearDown(self)
+
+    def test_answered_epic_waits_for_approval_then_is_broken_down_again(self):
+        why = "Shop staff can't sell widgets, so orders go elsewhere"
+        self.ergon(self.a, "new", "epic", "Widgets", "--why", why,
+                   "--when-done", "A widget can be ordered and shows up on the orders page", env=self.env_a)
+        f = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        f.write_text(f.read_text().replace("## Goal\n", "## Goal\nShip widgets end to end.\n").replace(why, ""))
+        self.ergon(self.a, "sync", "--init", inp="y\n", env=self.env_a)
+        self.assertIn("approved 1", self.ergon(self.a, "approve", "E-001", inp="y\n", env=self.env_a).stdout)
+        asking = dict(self.env_a, FAKE_BREAKDOWN="QUESTION: Why widgets?\nOPTIONS: a | b\nRESULT: asking\n")
+        self.ergon(self.a, "dispatch", env=asking)
+        self.assertEqual(len(self.breakdowns()), 1)
+        self.assertNotIn("breakdown E-001", self.ergon(self.a, "dispatch", "--dry-run", env=self.env_a).stdout)
+        # filled: the brief's approval no longer verifies, so no breakdown yet
+        f = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        f.write_text(f.read_text().replace("## Why\n", f"## Why\n{why}\n", 1))
+        self.assertNotIn("breakdown E-001", self.ergon(self.a, "dispatch", "--dry-run", env=self.env_a).stdout)
+        # approved again: dispatch breaks it down again by itself, once
+        self.assertIn("approved 1", self.ergon(self.a, "approve", "E-001", inp="y\n", env=self.env_a).stdout)
+        self.assertIn("would run  breakdown E-001", self.ergon(self.a, "dispatch", "--dry-run", env=self.env_a).stdout)
+        out = self.ergon(self.a, "dispatch", env=self.env_a).stdout
+        self.assertIn("proposed T-001  (breakdown E-001)  Add the schema", out)
+        self.assertEqual(len(self.breakdowns()), 2)
 
 
 FAKE_LEARN_CLAUDE = r'''#!PYTHON
@@ -9551,7 +10225,6 @@ class TestLearn(Project):
 
 class TestOptions(Project):
     """E-006 / T-190: a task's ## Options, `ergon choose`, and approve waiting on a choice."""
-    TODAY = time.strftime("%Y-%m-%d")
 
     def human(self, **extra):
         return dict(self.env, ERGON_ASK_STDIN="1", **extra)
@@ -9634,7 +10307,7 @@ class TestOptions(Project):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("choice: 2. a redis cache", r.stdout)
         self.assertIn("A choice steers only", r.stdout)
-        self.assertEqual(self.options_text("T-001").splitlines()[0], f"Chosen: 2 by Tester {self.TODAY}")
+        self.assertIn(self.options_text("T-001").splitlines()[0], stamped("Chosen: 2 by Tester {day}", self.since))
         rows = [x for x in history(self.root) if x["event"] == "chosen"]
         self.assertEqual([(x["task"], x["by"], x["option"], x["text"]) for x in rows],
                          [("T-001", "Tester", 2, "a redis cache")])
@@ -9650,12 +10323,12 @@ class TestOptions(Project):
         # written by hand), choosing again replaces the line; --own writes the human's own text
         self.new_feature("a", "b")  # T-002
         g = self.task_file("T-002")
-        g.write_text(g.read_text().replace("## Options\n", f"## Options\nChosen: 1 by Tester {self.TODAY}\n"))
+        g.write_text(g.read_text().replace("## Options\n", f"## Options\nChosen: 1 by Tester {today()}\n"))
         before = ergon.tasks.brief_digest(ergon.tasks.parse(g))
         r = self.choose("T-002", "--own", "a file cache, keyed by path")
         self.assertEqual(r.returncode, 0, r.stderr)
         lines = self.options_text("T-002").splitlines()
-        self.assertEqual(lines[0], f"Chosen: own by Tester {self.TODAY} — a file cache, keyed by path")
+        self.assertIn(lines[0], stamped("Chosen: own by Tester {day} — a file cache, keyed by path", self.since))
         self.assertEqual(sum(l.startswith("Chosen:") for l in lines), 1)
         t = ergon.tasks.parse(g)
         self.assertEqual(ergon.tasks.options(t)[1]["text"], "a file cache, keyed by path")
@@ -9748,7 +10421,8 @@ class TestOptions(Project):
         self.assertIsNone(self.guard("Edit", {"file_path": p, "old_string": "2. b", "new_string": "2. b, but faster"}))
 
         self.assertEqual(self.choose("T-001", "1").returncode, 0)
-        line = f"Chosen: 1 by Tester {self.TODAY}"
+        line = self.options_text("T-001").splitlines()[0]
+        self.assertIn(line, stamped("Chosen: 1 by Tester {day}", self.since))
         self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": line,
                                                           "new_string": line.replace(": 1", ": 2")}))
         self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": line + "\n", "new_string": ""}))
@@ -9809,7 +10483,7 @@ class TestOptions(Project):
         self.assertIn("[c]hoose", r.stdout)
         self.assertIn("refused: T-001 has options and no choice", r.stdout)
         self.assertIn("chosen 1", r.stdout)
-        self.assertIn(f"Chosen: 2 by Tester {self.TODAY}", self.options_text("T-001"))
+        self.assertTrue(any(s in self.options_text("T-001") for s in stamped("Chosen: 2 by Tester {day}", self.since)))
         self.assertEqual(self.status("T-001"), "ready")
         self.assertEqual([x["option"] for x in history(self.root) if x["event"] == "chosen"], [2])
 
@@ -9965,7 +10639,6 @@ class TestLensOptions(Project):
 
 class TestLensChoose(Project):
     """E-009 / T-253: `ergon choose T-NNN <lens> [<lens> ...]` records one lens option or a combination."""
-    TODAY = time.strftime("%Y-%m-%d")
     human, agent, choose, approve, options_text = (TestOptions.human, TestOptions.agent, TestOptions.choose,
                                                    TestOptions.approve, TestOptions.options_text)
     OPERATOR = textwrap.dedent("""\
@@ -9999,7 +10672,7 @@ class TestLensChoose(Project):
         self.assertIn("choice: minimal + operator\n  minimal: an in-memory LRU", r.stdout)
         self.assertIn("a combination: the worker builds what these options share", r.stdout)
         self.assertIn("A choice steers only", r.stdout)
-        self.assertEqual(self.options_text("T-001").splitlines()[0], f"Chosen: minimal + operator by Tester {self.TODAY}")
+        self.assertIn(self.options_text("T-001").splitlines()[0], stamped("Chosen: minimal + operator by Tester {day}", self.since))
         t = ergon.tasks.parse(f)
         _, chosen = ergon.tasks.options(t)
         self.assertEqual((chosen["option"], chosen["lenses"]), ("minimal + operator", ["minimal", "operator"]))
@@ -10028,11 +10701,11 @@ class TestLensChoose(Project):
         r = self.ergon("review", "-i", inp="c\nminimal operator\ny\ns\n", env=self.human(), check=False)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.status("T-002"), "proposed")
-        self.assertIn(f"Chosen: minimal + operator by Tester {self.TODAY}", self.options_text("T-002"))
+        self.assertTrue(any(s in self.options_text("T-002") for s in stamped("Chosen: minimal + operator by Tester {day}", self.since)))
         r = self.choose("T-002", "Durable")
         self.assertEqual(r.returncode, 0, r.stderr)
         lines = self.options_text("T-002").splitlines()
-        self.assertEqual(lines[0], f"Chosen: durable by Tester {self.TODAY}")
+        self.assertIn(lines[0], stamped("Chosen: durable by Tester {day}", self.since))
         self.assertEqual(sum(l.startswith("Chosen:") for l in lines), 1)
         self.assertEqual(self.rows()[-1]["options"], ["durable"])
         self.assertEqual(self.rows()[-1]["option"], "durable")
@@ -10117,7 +10790,8 @@ class TestLensChoose(Project):
         self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": "## Options\n",
                                                           "new_string": "## Options\n" + combo}))
         self.assertEqual(self.choose("T-001", "minimal", "operator").returncode, 0)
-        line = f"Chosen: minimal + operator by Tester {self.TODAY}"
+        line = self.options_text("T-001").splitlines()[0]
+        self.assertIn(line, stamped("Chosen: minimal + operator by Tester {day}", self.since))
         for new in (line.replace("operator", "durable"), line.replace(" + operator", ""),
                     line.replace("minimal + operator", "minimal + durable + operator")):
             self.assertIn("ergon choose", self.guard("Edit", {"file_path": p, "old_string": line, "new_string": new}), new)
@@ -10131,13 +10805,13 @@ class TestLensChoose(Project):
         r = self.choose("T-001", inp="operator, minimal\ny\n")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("choice (minimal, durable, operator, defer: one lens, or several to combine them", r.stdout)
-        self.assertEqual(self.options_text("T-001").splitlines()[0], f"Chosen: minimal + operator by Tester {self.TODAY}")
+        self.assertIn(self.options_text("T-001").splitlines()[0], stamped("Chosen: minimal + operator by Tester {day}", self.since))
         self.assertEqual(self.status("T-001"), "ready")  # choosing approved it
         self.lens_task(tid="T-002")
         # T-002: a refused (no choice yet); c, two lens names, confirm; a approves
         r = self.ergon("review", "-i", inp="a\nc\ndurable defer\ny\na\n", env=self.human(), check=False)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn(f"Chosen: durable + defer by Tester {self.TODAY}", self.options_text("T-002"))
+        self.assertTrue(any(s in self.options_text("T-002") for s in stamped("Chosen: durable + defer by Tester {day}", self.since)))
         self.assertEqual(self.rows()[-1]["options"], ["durable", "defer"])
         self.assertEqual(self.status("T-002"), "ready")
 
@@ -10146,6 +10820,165 @@ class TestLensChoose(Project):
         self.assertIn("LENS|N", h)
         self.assertIn("combine", h)
         self.assertIn("Chosen: minimal +", self.ergon("-h").stdout)
+
+
+class TestEpicAnswers(Project):
+    """An epic's `## Why` and `## When it's done` (E-011, T-284): in the brief, in its digest only
+    when non-empty, and in every view of the brief."""
+    REST = ("## Goal\nShip the big thing.\n\n## Out of scope\n- Rewriting old epics.\n\n## Constraints\n"
+            "- Standard library only.\n\n## Notes\n- scratch\n")
+    OLD = "e6d725be55d5a45f819d4cd528886e34125f1b177527918562629eda1c7b9bac"  # taken before the sections existed
+
+    def epic(self, head="", **extra):
+        return {"id": "E-042", "title": "Big thing", "status": "open", "_body": "\n" + head + self.REST, **extra}
+
+    def digest(self, head=""):
+        return ergon.tasks.brief_digest(self.epic(head))
+
+    def epic_file(self, eid="E-001"):
+        return next((self.root / "tasks" / "epics").glob(f"{eid}-*/EPIC.md"))
+
+    def fill(self, why="Planning takes a day.", done="- A plan takes an hour."):
+        f = self.epic_file()
+        f.write_text(f.read_text().replace("## Why\n", f"## Why\n{why}\n", 1)
+                     .replace("## When it's done\n", f"## When it's done\n{done}\n", 1)
+                     .replace("## Goal\n", "## Goal\nShip the big thing.\n", 1))
+
+    def test_new_epic_writes_the_sections_in_order_and_empty(self):
+        self.ergon("new", "epic", "X")
+        text = self.epic_file().read_text()
+        self.assertEqual(re.findall(r"^## (.*)$", text, re.M),
+                         ["Why", "When it's done", "Goal", "Out of scope", "Constraints"])
+        body = ergon.tasks.parse(self.epic_file())["_body"]
+        for name in ("why", "when it's done"):
+            self.assertEqual(ergon.tasks.normalised(ergon.tasks.sections(body, name)), "", name)
+
+    def test_digest_of_an_epic_signed_before_the_sections_is_unchanged(self):
+        self.assertEqual(self.digest(), self.OLD)
+        for head in ("## Why\n\n## When it's done\n\n", "## Why\n## When it's done\n", "## Why\n \n\n\t\n",
+                     "## When it's done\n\n"):
+            self.assertEqual(self.digest(head), self.OLD, repr(head))
+
+    def test_digest_covers_each_answer_when_non_empty(self):
+        heads = ("## Why\nPlanning takes a day.\n\n", "## Why\nPlanning takes a week.\n\n",
+                 "## When it's done\nPlanning takes a day.\n\n",
+                 "## Why\nPlanning takes a day.\n\n## When it's done\n- A plan takes an hour.\n\n")
+        self.assertEqual(len({self.OLD, *map(self.digest, heads)}), 5)
+        # spacing and an empty sibling don't count
+        self.assertEqual(self.digest("## Why\n\nPlanning takes a day.  \n\n\n## When it's done\n\n"), self.digest(heads[0]))
+
+    def test_an_approval_stops_verifying_when_an_answer_changes(self):
+        from ergon import gitops
+        who = [("a@example.com", "Tester", "2026-11-25")]
+        head = "## Why\nPlanning takes a day.\n\n## When it's done\n- A plan takes an hour.\n\n"
+        apr = gitops.Approvals(good={"E-042": {self.digest(head): who}})
+        self.assertIsNone(apr.problem(self.epic(head)))
+        for changed in (head.replace("a day", "a week"), head.replace("an hour", "a minute"), head.replace("- A plan takes an hour.\n", ""), ""):
+            self.assertIn("brief changed after approval", apr.problem(self.epic(changed)) or "", changed)
+        # an approval from before the sections existed verifies, until one is filled
+        apr = gitops.Approvals(good={"E-042": {self.OLD: who}})
+        self.assertIsNone(apr.problem(self.epic()))
+        self.assertIsNone(apr.problem(self.epic("## Why\n\n## When it's done\n\n")))
+        self.assertIn("brief changed after approval", apr.problem(self.epic("## Why\nNew.\n\n")) or "")
+
+    def test_approve_and_review_show_the_answers(self):
+        self.ergon("new", "epic", "Big thing")
+        human = clean_env(ERGON_ASK_STDIN="1")
+        self.assertIn("(Why, When it's done, Goal, Out of scope, Constraints)", self.ergon("review").stdout)
+        empty = "      Why: (empty)\n      When it's done: (empty)\n      Goal: (empty)\n"
+        self.assertIn(empty, self.ergon("review", "-i", inp="q\n", env=human).stdout)
+        f = self.epic_file()
+        text = f.read_text()
+        f.write_text(text.replace("## Why\n\n## When it's done\n\n", ""))  # an old brief, no such headings
+        self.assertIn(empty, self.ergon("review", "-i", inp="q\n", env=human).stdout)
+        self.assertIn(empty, self.ergon("approve", "E-001", inp="n\n", env=human, check=False).stdout)
+        f.write_text(text)
+        self.fill(done="- A plan takes an hour.\n- Nobody asks twice.")
+        want = ("      Why: Planning takes a day.\n      When it's done: - A plan takes an hour.\n"
+                "        - Nobody asks twice.\n      Goal: Ship the big thing.\n")
+        self.assertIn(want, self.ergon("review", "-i", inp="q\n", env=human).stdout)
+        out = approve_epic(self).stdout
+        self.assertIn("(its brief: Why, When it's done, Goal, Out of scope, Constraints)", out)
+        self.assertIn(want, out)
+        self.ergon("check")
+
+    def test_merge_message_and_journal_inputs_include_the_answers_when_non_empty(self):
+        from ergon import gitops
+        merge = lambda head: gitops.merge_message(self.epic(head), {}, [])
+        journal = lambda head: gitops.journal_inputs("E-042", {}, {"E-042": self.epic(head)}, [])
+        for head in ("", "## Why\n\n## When it's done\n\n", "## Why\n## When it's done\n"):
+            self.assertEqual(merge(head), "Merge E-042: Big thing\n\nShip the big thing.\n", head)
+            self.assertNotIn("## Why", journal(head))
+            self.assertNotIn("## When it's done", journal(head))
+        one, both = "## Why\nPlanning takes a day.\n\n", "## Why\nPlanning takes a day.\n\n## When it's done\n- An hour.\n\n"
+        self.assertEqual(merge(one), "Merge E-042: Big thing\n\nWhy:\nPlanning takes a day.\n\n"
+                                     "Goal:\nShip the big thing.\n")
+        self.assertEqual(merge(both), "Merge E-042: Big thing\n\nWhy:\nPlanning takes a day.\n\n"
+                                      "When it's done:\n- An hour.\n\nGoal:\nShip the big thing.\n")
+        self.assertNotIn("## When it's done", journal(one))
+        self.assertIn("## Why\nPlanning takes a day.\n## When it's done\n- An hour.\n## Goal\nShip the big thing.\n", journal(both))
+
+    def test_an_empty_section_right_above_the_next_heading_reads_as_empty(self):
+        """A `## Goal` with `## Out of scope` on the very next line is an empty Goal, not the
+        Out of scope text, in the merge message and the journal inputs alike (T-293)."""
+        from ergon import gitops
+        e = self.epic(_body="\n## Goal\n## Out of scope\n- Rewriting old epics.\n## Constraints\n"
+                            "## Notes\n- scratch\n")
+        self.assertEqual(gitops.merge_message(e, {}, []), "Merge E-042: Big thing\n")
+        self.assertEqual(gitops.epic_section(e, "Goal"), "")
+        self.assertEqual(gitops.epic_section(e, "Constraints"), "")
+        self.assertIn("## Goal\n(none)\n## Out of scope\n- Rewriting old epics.\n## Constraints\n(none)\n",
+                      gitops.journal_inputs("E-042", {}, {"E-042": e}, []))
+        last = self.epic(_body="\n## Goal\nShip it.")  # no newline at the end of the body
+        self.assertEqual(gitops.merge_message(last, {}, []), "Merge E-042: Big thing\n\nShip it.\n")
+
+
+class TestEpicAnswersSigned(unittest.TestCase):
+    """Shared mode: editing an approved epic's Why or When it's done un-approves it, as with Goal
+    (T-284). Borrows test_shared's fixture, as TestGateWeakeningFieldsSigned does."""
+
+    def __getattr__(self, name):
+        from test_shared import TestSignedApprovals
+        attr = getattr(TestSignedApprovals, name)
+        return attr.__get__(self) if callable(attr) else attr
+
+    def setUp(self):
+        from test_shared import Shared
+        Shared.setUp(self)
+
+    def tearDown(self):
+        from test_shared import Shared
+        Shared.tearDown(self)
+
+    def test_changing_an_approved_epics_answers_unapproves_it(self):
+        self.start()
+        self.ergon(self.a, "new", "epic", "Big")
+        self.ergon(self.a, "new", "task", "Part", "--tier", "haiku", "--epic", "E-001")
+        epic = next((self.a / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        # approved as a brief with no such headings, like one signed before they existed
+        epic.write_text(epic.read_text().replace("## Why\n\n## When it's done\n\n", "")
+                        .replace("## Goal\n", "## Goal\nShip the big thing.\n"))
+        self.ergon(self.a, "approve", "E-001", inp="y\n")
+        self.ergon(self.a, "approve", "T-002", inp="y\n")
+        self.counts(self.a, "T-002")
+        why = "epic E-001's approval doesn't verify: brief changed after approval"
+        text = epic.read_text()
+        epic.write_text(text.replace("## Goal\n", "## Why\n\n## When it's done\n\n## Goal\n"))
+        self.counts(self.a, "T-002")  # empty headings change nothing
+        epic.write_text(text.replace("## Goal\n", "## Why\nIt hurts.\n\n## When it's done\nIt doesn't.\n\n## Goal\n"))
+        self.assertIn(why, self.ergon(self.a, "next").stdout)
+        self.assertIn(why, self.ergon(self.a, "dispatch", "--dry-run").stdout)
+        self.ergon(self.a, "approve", "E-001", inp="y\n")  # approving it again makes it count
+        self.counts(self.a, "T-002")
+        text = epic.read_text()
+        for old, new in (("It hurts.", "Drop the database."), ("It doesn't.", "Nothing is left."), ("It doesn't.\n", "")):
+            epic.write_text(text.replace(old, new, 1))
+            self.assertIn(why, self.ergon(self.a, "next").stdout)
+            r = self.ergon(self.a, "check", check=False)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("E-001: open, but its approval doesn't verify: brief changed after approval", r.stdout)
+            epic.write_text(text)
+            self.counts(self.a, "T-002")
 
 
 if __name__ == "__main__":

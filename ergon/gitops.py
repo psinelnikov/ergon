@@ -266,9 +266,11 @@ def cites(commit, tid):
 def merge_message(e, tasks, commits):
     """The epic's permanent record. Task files are local, so this is what history keeps."""
     lines = [f"Merge {e['id']}: {e['title']}", ""]
-    goal = re.search(r"## Goal\n(.*?)(?=\n## |\Z)", e["_body"], re.S)
-    if goal and goal.group(1).strip():
-        lines += [goal.group(1).strip(), ""]
+    answers = [(name, text) for name in ("Why", "When it's done") if (text := epic_answer(e, name))]
+    for name, text in answers:
+        lines += [f"{name}:", text, ""]
+    if goal := epic_section(e, "Goal"):
+        lines += [*(["Goal:"] if answers else []), goal, ""]
     for t in sorted((t for t in tasks.values() if t.get("epic") == e["id"]), key=lambda t: t["id"]):
         lines.append(f"{t['id']} {t['title']}" + (" (dropped)" if t["status"] == "dropped" else ""))
         lines += [f"  {c[0]} {c[1]}" for c in commits if cites(c, t["id"])]
@@ -391,14 +393,21 @@ def journal_stale(eid, rows, entry):
 
 
 def epic_section(e, name):
-    m = re.search(rf"## {name}\n(.*?)(?=\n## |\Z)", e["_body"], re.S)
-    return m[1].strip() if m else ""
+    """The text under a brief's `## <name>`, read as its digest reads it ("" when empty): an empty
+    section stays empty even with the next heading right under it (T-293)."""
+    return _tasks.normalised(_tasks.sections(e["_body"], name.lower()))
+
+
+epic_answer = epic_section  # the epic's Why or When it's done
 
 
 def journal_inputs(eid, tasks, epics, rows):
     e = epics[eid]
     kids = sorted((t for t in tasks.values() if t.get("epic") == eid), key=lambda t: t["id"])
     out = [f"=== epic {eid}: {e['title']} (status {e.get('status')}) ==="]
+    for name in ("Why", "When it's done"):
+        if text := epic_answer(e, name):
+            out.append(f"## {name}\n{text}")
     for name in ("Goal", "Out of scope", "Constraints"):
         out.append(f"## {name}\n{epic_section(e, name) or '(none)'}")
     out.append("=== tasks ===")
