@@ -679,10 +679,18 @@ def main():
     _config.ITEMS.mkdir(parents=True, exist_ok=True)
     _config.EPICS.mkdir(parents=True, exist_ok=True)
     _shared.COMMAND = args.cmd
+    interrupted = False
     try:
         run(args)
+    except KeyboardInterrupt:  # Ctrl-C, e.g. while a `claude -p` call runs: one line, not a traceback
+        interrupted = True
+        raise SystemExit(f"\nergon {args.cmd or 'board'}: interrupted") from None
     finally:  # no lock is held here: epics this command finished get their journal entry now
-        _gitops.flush_journals()
+        if not interrupted:  # after a Ctrl-C, no new claude call; `ergon journal` writes stale entries later
+            try:
+                _gitops.flush_journals()
+            except KeyboardInterrupt:
+                raise SystemExit(f"\nergon {args.cmd or 'board'}: interrupted while writing journal entries") from None
 
 
 def run(args):

@@ -5,6 +5,7 @@ Run: python3 tests/run_parallel.py (in parallel), or python3 -m unittest discove
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -6424,6 +6425,36 @@ class TestBreakdown(DispatchProject):
 
     def field(self, tid, key):
         return re.search(rf"^{key}:[ \t]*(.*)$", self.task_file(tid).read_text(), re.M).group(1)
+
+    def test_ctrl_c_during_the_call_exits_on_one_line_and_kills_claude(self):
+        """T-309: Ctrl-C while `claude -p` runs prints no traceback, exits non-zero with one
+        `interrupted` line, and kills the call (it runs in its own session, so Ctrl-C can't reach
+        it). Nothing is left half-done: no run log, no history row, no task filed."""
+        from ergon import history
+        self.new_epic()
+        approve_epic(self)
+        pidfile = Path(self.tmp.name) / "claude.pid"
+        fake = Path(self.tmp.name) / "bin" / "claude"
+        fake.write_text(f"#!{sys.executable}\nimport os, time\n"
+                        f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n")
+        p = subprocess.Popen([sys.executable, str(ERGON), "breakdown", "E-001"], cwd=self.root, env=self.env,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 20
+        while not (pidfile.exists() and pidfile.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(pidfile.exists(), "the fake claude never started")
+        child = int(pidfile.read_text())
+        p.send_signal(signal.SIGINT)
+        out, err = p.communicate(timeout=20)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(err.strip(), "ergon breakdown: interrupted", err)
+        with self.assertRaises(OSError):  # killed and reaped by ergon, not left running on its own
+            os.kill(child, 0)
+        state = self.root / "tasks" / "runs"
+        self.assertFalse([r for r in history.read(state / "history.jsonl") if r["event"] == "breakdown"])
+        self.assertFalse(list((state / "breakdown").glob("*")))
+        self.assertFalse(list((self.root / "tasks" / "items").rglob("T-*.md")))
 
     def test_approved_empty_epic_gets_proposed_tasks_once(self):
         self.new_epic()

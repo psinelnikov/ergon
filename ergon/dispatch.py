@@ -715,7 +715,9 @@ def kill_workers():
 def run_proc(cmd, cwd, timeout):
     """Run a worker in its own session (a terminal Ctrl-C doesn't reach it) so the dispatcher
     decides what an interrupt means. Returns (stdout, stderr); stderr starts with KILLED if
-    kill_workers() ended it."""
+    kill_workers() ended it. A KeyboardInterrupt (Ctrl-C outside dispatch's own SIGINT handler:
+    breakdown, finish --resolve) kills the worker's process group, so the call stops spending,
+    and is raised again for the caller (cli.main turns it into one line)."""
     with PROCS_LOCK:
         if KILL_ALL.is_set():
             return "", KILLED
@@ -731,6 +733,13 @@ def run_proc(cmd, cwd, timeout):
             pass
         out, err = p.communicate()
         err = f"timed out after {timeout // 60} min\n{err or ''}"
+    except KeyboardInterrupt:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        p.wait()
+        raise
     finally:
         with PROCS_LOCK:
             PROCS.discard(p)
