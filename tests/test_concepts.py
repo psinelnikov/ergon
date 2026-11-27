@@ -1,5 +1,6 @@
 """The concept map (T-141): the map file, `ergon tag`, `ergon related`, `check` and /t/T-NNN."""
 import json
+import math
 import os
 import re
 import sys
@@ -219,6 +220,90 @@ class TestRelated(ConceptProject):
         r = self.ergon("related", "T-999", check=False)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("no such task: T-999", r.stderr)
+
+
+class TestRelatedFiles(ConceptProject):
+    """T-282: the files a task's commits on main changed, and done tasks ranked by file overlap
+    weighted by each file's rarity. T-001 and T-004 (done) share a rare file, T-006 (done) shares
+    only a common one, T-002 (open) shares only README.md, which every citing task changed."""
+
+    def commit(self, files, msg, force=False):
+        for f in files:
+            (self.root / f).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / f).write_text(msg + "\n")
+        sh("git", "add", *(["-f"] if force else []), *files, cwd=self.root)
+        sh("git", "commit", "-qm", msg, cwd=self.root)
+
+    def setUp(self):
+        super().setUp()
+        self.commit(["src/guard.py", "src/common.py", "README.md"], "Guard heredocs\n\nPart of T-001.")
+        self.commit(["src/guard.py", "src/common.py", "README.md"], "Signed stamps (T-004)")
+        self.commit(["src/common.py", "README.md"], "Board colours (T-006)")
+        self.commit(["README.md", "src/other.py"], "Guard aliases (T-002)")
+        self.commit(["uncited.py"], "tidy without a task")
+        self.commit(["landed.py"], "Merge T-001: a landing subject")
+        self.commit(["tasks/T-001-state.txt"], "T-001: state commit", force=True)
+        sh("git", "checkout", "-qb", "side", cwd=self.root)
+        self.commit(["side.py"], "side work")
+        sh("git", "checkout", "-qb", "unlanded", cwd=self.root)
+        self.commit(["unlanded.py"], "not on main yet (T-001)")
+        sh("git", "checkout", "-q", "main", cwd=self.root)
+        sh("git", "merge", "-q", "--no-ff", "--no-commit", "side", cwd=self.root)
+        (self.root / "merged.py").write_text("m\n")
+        sh("git", "add", "merged.py", cwd=self.root)
+        sh("git", "commit", "-qm", "Merge T-001 side", cwd=self.root)
+
+    @staticmethod
+    def section(out, head):
+        return out.split(head)[1].split("\n\n")[0].splitlines()[1:]
+
+    def test_files_and_overlap(self):
+        out = self.ergon("related", "T-001").stdout
+        files = self.section(out, "FILES CHANGED (commits on main citing T-001)")
+        self.assertEqual(files, ["  README.md", "  src/common.py", "  src/guard.py"])
+        overlap = self.section(out, "DONE, SHARING FILES")
+        self.assertEqual(len(overlap), 2, out)
+        self.assertEqual(overlap[0], "  T-004  0.98  Signed stamps  [src/guard.py, src/common.py, README.md]")
+        self.assertEqual(overlap[1], "  T-006  0.29  Board colours  [src/common.py, README.md]")
+        # the order: component BUILDS ON, then the two file sections, then MISSING DEPENDS
+        self.assertLess(out.index("BUILDS ON (done"), out.index("FILES CHANGED"))
+        self.assertLess(out.index("DONE, SHARING FILES"), out.index("MISSING DEPENDS"))
+        self.assertIn("rarer files weigh more", " ".join(self.ergon("related", "-h").stdout.split()))
+
+    def test_a_task_with_no_citing_commits_shows_none(self):
+        out = self.ergon("related", "T-005").stdout
+        self.assertEqual(self.section(out, "FILES CHANGED"), ["  none"])
+        self.assertEqual(self.section(out, "DONE, SHARING FILES"), ["  none"])
+
+    def test_untagged_still_prints_both_sections(self):
+        set_field(self.task_file("T-002"), "concepts", "[]")
+        out = self.ergon("related", "T-002").stdout
+        self.assertIn("no concepts: untagged; run `ergon tag T-002`", out)
+        self.assertEqual(self.section(out, "FILES CHANGED"), ["  README.md", "  src/other.py"])
+        self.assertEqual(self.section(out, "DONE, SHARING FILES"),
+                         ["  T-004  0.00  Signed stamps  [README.md]", "  T-006  0.00  Board colours  [README.md]"])
+        self.assertNotIn("MISSING DEPENDS", out)
+
+    def test_rarity_and_ties(self):
+        index = {"T-001": {"a", "r"}, "T-002": {"a", "r"}, "T-003": {"a"}, "T-004": {"a", "b", "r"}}
+        w = C.rarity(index)
+        self.assertEqual(w["a"], 0.0)
+        self.assertAlmostEqual(w["r"], math.log(4 / 3))
+        tasks = {i: {"id": i, "status": "done"} for i in index}
+        got = [(o["id"], shared) for o, _, shared in C.file_overlap("T-001", tasks, index)]
+        # T-002 and T-004 tie on score and shared count: ID order; T-003 shares only "a"
+        self.assertEqual(got, [("T-002", ["r", "a"]), ("T-004", ["r", "a"]), ("T-003", ["a"])])
+        self.assertEqual(C.file_overlap("T-009", tasks, index), [])
+        # a one-task history: every file weighs 0, nothing divides by zero
+        self.assertEqual(C.rarity({"T-001": {"a"}}), {"a": 0.0})
+        self.assertEqual(C.rarity({}), {})
+
+    def test_no_git_reads_nothing(self):
+        _config.configure(self.root)
+        with mock.patch.object(C.subprocess, "run", side_effect=FileNotFoundError("git")):
+            self.assertIsNone(C.task_files())
+            t = {"id": "T-001"}
+            self.assertIn("could not be read", "\n".join(C.file_lines(t, {"T-001": t})))
 
 
 class TestCheck(ConceptProject):
