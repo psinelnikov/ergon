@@ -1270,12 +1270,12 @@ EPIC_ASK_JUDGE = """Judge only `answer`, read by itself. It is concrete when {co
 If `options_shown` is given, those are the suggestions the person saw, numbered from 1: a number in `answer` may stand for that option's text, so read it with the text in its place.
 If it isn't concrete, write one short, friendly follow-up question asking for what is missing, and 4 new suggested answers built from what the person said. Every suggestion must contain at least one of the words of `answer`."""
 
-PICKS = re.compile(r"""(?P<nums>[0-9]{1,2}(?:\s*(?:,|\+|&|\band\b)\s*[0-9]{1,2})*)[.)]?
+PICKS = re.compile(r"""(?P<nums>[0-9]{1,2}(?:(?:\s*(?:,|\+|&|\band\b)\s*|\s+)[0-9]{1,2})*)[.)]?
     (?:\s*[-–—:;,]\s*(?P<rest>(?![0-9])\S.*))?""", re.X | re.I | re.S)
 
 
 def resolve_picks(got, picks):
-    """The answer `got` makes of the numbered `picks`: "1 and 4", "2, 3" or "2 + 3 - also X" is
+    """The answer `got` makes of the numbered `picks`: "1 and 4", "1 4", "2, 3" or "2 + 3 - also X" is
     option 2's text, option 3's, then the person's own "also X". None when it isn't that shape or a
     number in it isn't on the list (then it's free text). A lone number is handled by the caller."""
     m = PICKS.fullmatch(got.strip())
@@ -1402,7 +1402,7 @@ class EpicAsker:
                 _suggestions(d.get("suggestions"), answer) or [x.format(said=said) for x in q["built"]])
 
     def ask(self, key, other):
-        """Ask one question until its answer is concrete, a suggestion is picked, or it is left empty
+        """Ask one question until its answer is concrete, one or more suggestions are picked, or it is left empty
         (""). The answer is returned as it was typed or shown."""
         question, picks, vague, note = EPIC_QUESTIONS[key]["ask"], None, [], ""
 
@@ -1412,7 +1412,7 @@ class EpicAsker:
                 picks = self.draft(key, other)
             return (f"\n{note}{question}\n" + "".join(f"  {n}. {x}\n" for n, x in enumerate(picks, 1))
                     + "  or your own words" + (" (the whole answer: it replaces the last one)" if vague else "")
-                    + f"\n[1-{len(picks)}, your own words, or Enter to leave it empty] ")
+                    + f"\n[1-{len(picks)} (several combine: 1 3), your own words, or Enter to leave it empty] ")
         while True:
             got = _gates.ask_made(prompt)
             if not got:

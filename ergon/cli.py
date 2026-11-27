@@ -29,7 +29,7 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon new epic "Title" [--why "<text>"] [--when-done "<text>"]
                                writes each answer word for word under ## Why / ## When it's done
                                of the brief. In a person's terminal it asks for each one not given:
-                               suggestions to pick from or your own words, and follow-ups until the
+                               suggestions to pick one or several of, or your own words, and follow-ups until the
                                answer is concrete (Enter leaves it empty; claude haiku drafts the
                                suggestions, fixed ones without it). In an agent shell, or when stdin
                                isn't a terminal, it never prompts and leaves the section empty
@@ -483,7 +483,7 @@ def main():
                          "feature (category feature or empty) needs --crux and well-formed options")
     nw.add_argument("--why", metavar="TEXT",
                     help="epic: why the person wants it, written word for word under ## Why (refused for a task). Not given: "
-                         "asked for in a person's terminal, with up to 4 suggestions or your own words, until it names "
+                         "asked for in a person's terminal, with up to 4 suggestions (pick one or several) or your own words, until it names "
                          "a problem someone has today; left empty in an agent shell or when stdin isn't a terminal")
     nw.add_argument("--when-done", metavar="TEXT",
                     help="epic: what they expect to be true once it's done, written word for word under "

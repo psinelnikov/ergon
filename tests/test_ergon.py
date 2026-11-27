@@ -2006,6 +2006,7 @@ class TestEpicQuestions(Project):
         for prompt in self.prompts(r):
             self.assertLessEqual(len(self.listed(prompt)), 4, prompt)
             self.assertIn("or your own words", prompt)
+            self.assertIn("several combine", prompt)
             self.assertNotIn("recommend", prompt.lower())
             self.assertNotIn("\x1b", prompt)
         return r
@@ -2063,7 +2064,7 @@ class TestEpicQuestions(Project):
         self.assertEqual([c["known"].get("answer") for c in self.calls()], [None, None, "vague"])
 
     def test_several_picked_numbers_combine_their_texts_with_no_clarifying_round(self):  # T-303
-        r = self.ask(answers=["1 and 4", "2 and 3 - if no UI work, show diagrams"])
+        r = self.ask(answers=["1 4", "2 and 3 - if no UI work, show diagrams"])
         ps = self.prompts(r)
         self.assertEqual(len(ps), 2, r.stdout)
         why, done = self.listed(ps[0]), self.listed(ps[1])
@@ -2085,6 +2086,8 @@ class TestEpicQuestions(Project):
         from ergon import tasks
         shown = ["Alpha", "Bravo.", "Charlie", "Delta"]
         for got, want in (("1 and 4", "Alpha. Delta."), ("2, 3", "Bravo. Charlie."), ("4+1", "Delta. Alpha."),
+                          ("1 4", "Alpha. Delta."), ("3  1 2", "Charlie. Alpha. Bravo."), ("1 3 - also X", "Alpha. Charlie. also X"),
+                          ("1 2 people wait", None), ("1 9", None),
                           ("2 & 2", "Bravo."), ("2 and 3 — also X, Y", "Bravo. Charlie. also X, Y"),
                           ("3: only for admins", "Charlie. only for admins"),
                           ("1 and 9 more", None), ("9 and 1 - also X", None), ("1, 2 people wait", None),

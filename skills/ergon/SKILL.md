@@ -229,15 +229,15 @@ An agent in chat with a person asks two questions before it files an epic, one a
 - **Why do you want this?** The answer is concrete when it names a problem someone has today (who is stuck, slowed or wrong, and how).
 - **What do you expect once it's done?** The answer is concrete when it names something a person could check (a command that works, a page that shows, a number that changes).
 
-Give each question at most 4 suggestions built from the title and what the person has said so far, as peers: unordered, none marked or ranked above the rest. Always add a line inviting them to answer in their own words instead. If an answer fails its test ("make it better", "cleaner code", "it works"), ask again with new suggestions built from what they said, and keep going until both answers pass or the person says to leave a section empty.
+Give each question at most 4 suggestions built from the title and what the person has said so far, as peers: unordered, none marked or ranked above the rest. Let the person pick more than one: several picks combine, and their texts go in together, in the order picked, each ending in a full stop (with a question tool, allow multiple selections). Always add a line inviting them to answer in their own words instead, or to add their own words to what they picked. If an answer fails its test ("make it better", "cleaner code", "it works"), ask again with new suggestions built from what they said, and keep going until both answers pass or the person says to leave a section empty.
 
-Write the answers with `--why` and `--when-done` in the person's words, as they gave them or picked them, not reworded. Your own reading of the work (what you'll change, how you see the scope) goes in Goal, Out of scope and Constraints, never in Why or When it's done.
+Write the answers with `--why` and `--when-done` in the person's words, as they gave them or picked them (several picks joined as above, any words of their own after them), not reworded. Your own reading of the work (what you'll change, how you see the scope) goes in Goal, Out of scope and Constraints, never in Why or When it's done.
 
 A dispatched agent (headless, `claude -p`, no person to ask) never invents the answers: it files the epic with both sections empty (no `--why`, no `--when-done`; they show as `(empty)`) and says so in its final report, so the human can fill them in before approving the brief.
 
 An example exchange:
 
-> **Agent:** Why do you want this? Pick one or say it in your own words:
+> **Agent:** Why do you want this? Pick one or more, or say it in your own words:
 > 1. Reviewers can't tell which tasks are waiting on them
 > 2. Approving a long queue takes too many commands
 > 3. Stale tasks pile up and nobody notices
@@ -245,21 +245,21 @@ An example exchange:
 >
 > **Person:** It's just messy.
 >
-> **Agent:** Messy for whom, and when does it bite? Pick one or say it in your own words:
+> **Agent:** Messy for whom, and when does it bite? Pick one or more, or say it in your own words:
 > 1. I scroll past done tasks every morning to find open ones
 > 2. Proposed tasks get lost among ready ones
 > 3. I can't see which epic a task belongs to
 > 4. The list is too long to read on a phone
 >
-> **Person:** 2, I approve things late because I miss them.
+> **Person:** 2 and 4. Also, I approve things late because I miss them.
 >
-> **Agent:** What do you expect to be true once it's done? Pick one or say it in your own words: …
+> **Agent:** What do you expect to be true once it's done? Pick one or more, or say it in your own words: …
 >
 > **Person:** `ergon review` shows proposed tasks first, and I can approve the lot in one go.
 
 ```bash
 ergon new epic "Surface proposed tasks" \
-  --why "Proposed tasks get lost among ready ones. I approve things late because I miss them." \
+  --why "Proposed tasks get lost among ready ones. The list is too long to read on a phone. Also, I approve things late because I miss them." \
   --when-done "\`ergon review\` shows proposed tasks first, and I can approve the lot in one go."
 ```
 
