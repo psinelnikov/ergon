@@ -1457,3 +1457,109 @@ class TestReviewGroups(ServeFixture):
         self.assertIn(f"<code class=cmd>{APPROVE} T-004 T-006 T-007</code>", self.region(page, "T-004") or self.region(page, "T-006"))
         self.assertNotIn("<img", page)
         self.assertIn("&lt;script&gt;alert(&quot;x&quot;)", page)
+
+
+MOCK_BODY = {"where": "/review", "nodes": [
+    {"type": "heading", "level": 2, "text": 'Planned "card" <b>bold</b>'},
+    {"type": "text", "text": "T-042 ready <img src=x>", "mono": True},
+    {"type": "table", "columns": ["id", "state"], "rows": [["T-042", "fresh & \"quoted\""]]},
+    {"type": "list", "items": ["one <i>x</i>"]},
+    {"type": "box", "title": "panel '1'", "children": [{"type": "badge", "text": "stale", "tone": "warn"}]},
+]}
+
+
+class TestMockSection(ServeFixture):
+    """T-312: a visible task's newest `ergon mock` file on its /review card (folded) and on /t/T-NNN
+    (open), escaped, labelled stale when the brief changed and named as missing when there's none."""
+
+    def setUp(self):
+        super().setUp()
+        # T-004 (proposed) changes the CLI, so it is visible even with no concept map; T-005 isn't
+        f = self.task_file("T-004")
+        f.write_text(re.sub(r"(?m)^touches:.*$", "touches: [ergon/cli.py]", f.read_text()))
+        self.dir = self.runs / "mock"
+
+    def write_mock(self, digest, body=MOCK_BODY, stamp_="20261127-120000"):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        (self.dir / f"T-004-{stamp_}.json").write_text(json.dumps(
+            {"task": "T-004", "hash": digest, "generated": "2026-11-27T12:00:00+00:00", "model": "sonnet",
+             "cost": 0.1, "format": "layout/1", "body": body}))
+
+    def current_hash(self):
+        from ergon import tasks as T
+        return S.brief_hash(T.parse(self.task_file("T-004")))
+
+    def card(self, page, tid):
+        return page.split(f'<section class=card id="{tid}">')[1].split("</section>")[0]
+
+    def test_current_mock_on_review_card_and_task_page(self):
+        self.write_mock(self.current_hash())
+        code, headers, review = self.req("GET", "/review")
+        self.assertEqual(code, 200)
+        card = self.card(review, "T-004")
+        self.assertIn("<details class=mock><summary><b>Planned result</b>", card)  # closed on /review
+        self.assertIn("layout/1 · in /review · generated 2026-11-27T12:00:00+00:00 by sonnet", card)
+        self.assertIn('<p class="mh mh2">Planned &quot;card&quot; &lt;b&gt;bold&lt;/b&gt;</p>', card)
+        self.assertIn("<pre class=mtext>T-042 ready &lt;img src=x&gt;</pre>", card)
+        self.assertIn("<td>fresh &amp; &quot;quoted&quot;</td>", card)
+        self.assertIn('<span class="mbadge tone-warn">stale</span>', card)
+        self.assertNotIn("class=mstale", card)
+        self.assertNotIn("Planned result", self.card(review, "T-005"))  # not visible: no section
+        code, _, page = self.req("GET", "/t/T-004")
+        self.assertEqual(code, 200)
+        sec = page.split("<h2>Planned result</h2>")[1].split("<h2")[0]
+        self.assertTrue(sec.startswith("<details class=mock open><summary>mock "))
+        self.assertIn("<li>one &lt;i&gt;x&lt;/i&gt;</li>", sec)
+        self.assertIn("<p class=mtitle>panel &#x27;1&#x27;</p>", sec)
+        for p in (review, page):
+            self.assertNotIn("<img src=x", p)
+            self.assertNotIn("<b>bold", p)
+        self.assertNotIn("Planned result", self.req("GET", "/t/T-005")[2])
+
+    def test_stale_and_missing(self):
+        code, _, review = self.req("GET", "/review")
+        self.assertIn('<p class="muted mock"><b>Planned result</b>: no mock yet: <code>ergon mock T-004</code></p>',
+                      self.card(review, "T-004"))
+        page = self.req("GET", "/t/T-004")[2]
+        self.assertIn('<h2>Planned result</h2><p class="muted mock">no mock yet: <code>ergon mock T-004</code></p>', page)
+        self.write_mock("0" * 16)  # made from a brief that has since changed
+        for p in (self.card(self.req("GET", "/review")[2], "T-004"), self.req("GET", "/t/T-004")[2]):
+            self.assertIn("<span class=mstale>stale</span>", p)
+            self.assertIn("stale: the brief changed since this mock was generated 2026-11-27T12:00:00+00:00; "
+                          "<code>ergon mock T-004</code> draws it again", p)
+            self.assertIn('class="mh mh2"', p)  # still drawn
+
+    def test_mock_file_is_never_served_and_csp_unchanged(self):
+        self.write_mock(self.current_hash())
+        name = "T-004-20261127-120000.json"
+        for path in (f"/runs/mock/{name}", f"/runs/{name}", f"/runs/mock%2f{name}", f"/runs/..%2fruns%2fmock%2f{name}",
+                     "/runs/mock", "/runs/mock/"):
+            self.assertEqual(self.req("GET", path)[0], 404, path)
+        for path in ("/review", "/t/T-004"):
+            code, headers, page = self.req("GET", path)
+            self.assertNotIn("/runs/mock", page)
+            nonce = re.search(r"script-src 'nonce-([\w-]+)'", headers["Content-Security-Policy"])[1]
+            self.assertEqual(headers["Content-Security-Policy"], S.csp(nonce))
+            self.assertEqual(S.csp(nonce), f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+                             "connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; "
+                             "frame-ancestors 'none'")
+            self.assertEqual(re.findall(r"<script[^>]*>", page), [f'<script nonce="{nonce}">'] if path == "/review" else [])
+
+
+class TestMockNodes(unittest.TestCase):
+    """T-312: mock_nodes escapes every string, even ones mock.check_body would have refused."""
+
+    def test_hostile_text_is_escaped(self):
+        bad = ['<script>alert("x")</script>', '<svg onload=alert(1)>', '"><img src=x onerror=alert(1)>']
+        h = S.mock_nodes([{"type": "heading", "level": 9, "text": bad[0]}, {"type": "text", "text": bad[1]},
+                          {"type": "text", "text": bad[2], "mono": True},
+                          {"type": "table", "columns": bad, "rows": [bad]}, {"type": "list", "items": bad},
+                          {"type": "box", "title": bad[1], "children": [{"type": "badge", "text": bad[0],
+                                                                         "tone": '"><script>'}]},
+                          {"type": "<script>", "text": bad[0]}, "<script>"])
+        for tag in ("<script", "<svg", "<img", 'tone-"'):
+            self.assertNotIn(tag, h)
+        self.assertIn("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;", h)
+        self.assertIn("&lt;svg onload=alert(1)&gt;", h)
+        self.assertIn('class="mh mh3"', h)  # an unknown level falls back to 3
+        self.assertIn('class="mbadge tone-neutral"', h)  # an unknown tone too

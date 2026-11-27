@@ -18,7 +18,9 @@ Standard library only: a ThreadingHTTPServer that renders HTML with its CSS and 
                inline; the file itself is never served), as /review's per-epic sections show it too
   /t/T-NNN     one task: its brief, frontmatter, every run and review from the history
                journal, transcript usage, links to the raw logs, `claude --resume` commands,
-               and (with a concept map) the tasks it relates to, as `ergon related` lists them
+               and (with a concept map) the tasks it relates to, as `ergon related` lists them;
+               for a task that changes something visible, its planned result (the newest
+               `ergon mock` file, drawn escaped; /review's card folds it; the file is never served)
   /runs/NAME   one file directly inside <state>/runs/, as plain text
   /runs/breakdown/NAME   an epic breakdown's log (listed on the epic page)
   /runs/T-NNN-evidence/NAME   a worker's evidence file (images by type, the rest plain text)
@@ -931,6 +933,7 @@ def task_page(tid, nonce):
     # the brief
     b.append(f'<h2>Brief</h2><div class=brief>{markdown(no_options(t["_body"]), tasks)}</div>')
     b.append(options_html(t))
+    b.append(mock_block(t, page_open=True))
 
     # totals
     cost = 0.0
@@ -1425,6 +1428,69 @@ def arch_block(eid, e, tasks):
     return "".join(out)
 
 
+MOCK_TONES = ("neutral", "good", "warn", "bad")
+
+
+def mock_nodes(nodes):
+    """A mock body's layout nodes (mock.check_body's schema) as HTML. Every string is escaped and
+    only the known node types and tones are drawn, so a mock adds no markup of its own."""
+    o = []
+    for n in nodes if isinstance(nodes, list) else []:
+        kind = n.get("type") if isinstance(n, dict) else None
+        if kind == "heading":
+            lvl = n.get("level") if n.get("level") in (1, 2, 3) else 3
+            o.append(f'<p class="mh mh{lvl}">{esc(n.get("text"))}</p>')
+        elif kind == "text":
+            o.append(f'<pre class=mtext>{esc(n.get("text"))}</pre>' if n.get("mono") is True
+                     else f'<p class=mtext>{esc(n.get("text"))}</p>')
+        elif kind == "table":
+            cols = n.get("columns") if isinstance(n.get("columns"), list) else []
+            rows = n.get("rows") if isinstance(n.get("rows"), list) else []
+            o.append('<div class=table><table class=mtable><thead><tr>' + "".join(f"<th>{esc(c)}</th>" for c in cols)
+                     + "</tr></thead><tbody>"
+                     + "".join("<tr>" + "".join(f"<td>{esc(c)}</td>" for c in r) + "</tr>"
+                               for r in rows if isinstance(r, list))
+                     + "</tbody></table></div>")
+        elif kind == "list":
+            items = n.get("items") if isinstance(n.get("items"), list) else []
+            o.append("<ul class=mlist>" + "".join(f"<li>{esc(x)}</li>" for x in items) + "</ul>")
+        elif kind == "box":
+            title = f'<p class=mtitle>{esc(n["title"])}</p>' if n.get("title") else ""
+            o.append(f"<div class=mbox>{title}{mock_nodes(n.get('children'))}</div>")
+        elif kind == "badge":
+            tone = n.get("tone") if n.get("tone") in MOCK_TONES else "neutral"
+            o.append(f'<span class="mbadge tone-{tone}">{esc(n.get("text"))}</span>')
+    return "".join(o)
+
+
+def mock_block(t, page_open):
+    """Task t's planned result from the newest `ergon mock` file (mock.latest_mock), for a task whose
+    change someone can see (mock.visible); "" for any other. A `<details>` whose summary gives the
+    mock's format, where it appears, when it was generated and whether it is stale (the brief changed
+    since), open under a "Planned result" heading on the task page, closed with that label as its
+    summary on a /review card. With no file, a muted line naming
+    `ergon mock T-NNN`. Serve only reads the file; it never serves it or runs anything."""
+    from . import mock as _mock  # mock imports serve (brief_hash), so not at the top
+    if not _mock.visible(t):
+        return ""
+    tid = esc(t["id"])
+    head = "<h2>Planned result</h2>" if page_open else ""
+    _, d = _mock.latest_mock(t["id"])
+    if not d:
+        return (head + f'<p class="muted mock">{"" if page_open else "<b>Planned result</b>: "}no mock yet: '
+                f'<code>ergon mock {tid}</code></p>')
+    stale = _mock.mock_stale(t, d)
+    when = esc(d.get("generated"))
+    body = d.get("body") or {}
+    summary = (("mock" if page_open else "<b>Planned result</b>") + f' <span class=muted>· {esc(d.get("format"))} · in {esc(body.get("where"))}'
+               f' · generated {when}' + (f' by {esc(d.get("model"))}' if d.get("model") else "") + "</span>"
+               + (' <span class=mstale>stale</span>' if stale else ""))
+    note = (f'<p class="muted mstale-note">stale: the brief changed since this mock was generated {when}; '
+            f'<code>ergon mock {tid}</code> draws it again</p>' if stale else "")
+    return (head + f'<details class=mock{" open" if page_open else ""}><summary>{summary}</summary>{note}'
+            f'<div class=mockbody>{mock_nodes(body.get("nodes"))}</div></details>')
+
+
 def change_row(t, mapstate):
     """The card's `change` row: touch_map, or the muted note review_map gave, or a note for no touches."""
     cmap, note = mapstate
@@ -1468,7 +1534,7 @@ def review_card(t, tasks, found, mapstate=None):
             + change_row(t, mapstate or review_map())
             + (f'<tr><th>epic</th><td><a href="/e/{esc(t["epic"])}">{esc(t["epic"])}</a></td></tr>' if t.get("epic") else "")
             + (f'<tr><th>source</th><td class=why>{link_ids(esc(t["source"]), tasks)}</td></tr>' if t.get("source") else "")
-            + f'</tbody></table></div><div class=brief>{brief}</div>{options_html(t)}</section>')
+            + f'</tbody></table></div><div class=brief>{brief}</div>{options_html(t)}{mock_block(t, page_open=False)}</section>')
 
 
 def quiz_html(tasks):

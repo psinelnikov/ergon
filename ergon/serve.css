@@ -186,3 +186,20 @@ svg.archmap .ch-removed > text .mk { fill: var(--bad); }
 svg.archmap .ch-changed > text .mk { fill: var(--warn); }
 svg.archmap .entry { fill: var(--fg); font-family: ui-monospace, Menlo, monospace; }
 p.arch.stale { color: var(--warn); }
+/* a task's planned result (`ergon mock`): closed on a /review card, open on /t/T-NNN */
+details.mock { margin: 8px 0; }
+details.mock > summary { cursor: pointer; overflow-wrap: anywhere; }
+.mstale { color: var(--warn); font-weight: 600; }
+p.mstale-note { color: var(--warn); }
+.mockbody { border: 1px dashed var(--line); border-radius: 8px; padding: 6px 12px; margin-top: 6px; overflow-x: auto; }
+.mockbody .mh { font-weight: 600; margin: 0.6em 0 0.2em; overflow-wrap: anywhere; }
+.mockbody .mh1 { font-size: 1.15em; }
+.mockbody .mh2 { font-size: 1.05em; }
+.mockbody p.mtext { margin: 0.3em 0; overflow-wrap: anywhere; }
+.mockbody pre.mtext { white-space: pre-wrap; overflow-wrap: anywhere; }
+.mockbody .mbox { border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; margin: 6px 0; background: var(--bg); }
+.mockbody .mtitle { font-weight: 600; margin: 2px 0; overflow-wrap: anywhere; }
+.mockbody .mbadge { display: inline-block; border: 1px solid var(--line); border-radius: 10px; padding: 0 8px; margin: 2px 4px 2px 0; font-size: 0.85em; }
+.mockbody .tone-good { color: var(--ok); border-color: var(--ok); }
+.mockbody .tone-warn { color: var(--warn); border-color: var(--warn); }
+.mockbody .tone-bad { color: var(--bad); border-color: var(--bad); }
