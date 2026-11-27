@@ -602,6 +602,142 @@ class TestTag(ConceptProject):
         self.assertIn("skip E-404: no tasks in that epic", out)
 
 
+FAKE_ARCH_CLAUDE = r'''#!PYTHON
+"""Stands in for `claude -p` under `ergon arch`: replies with $ARCH_REPLY as the result text and
+saves its prompt in $ARCH_TMP."""
+import json, os, sys
+open(os.path.join(os.environ["ARCH_TMP"], "arch-prompt.txt"), "w").write(sys.stdin.read())
+print(json.dumps({"type": "result", "is_error": False, "total_cost_usd": 0.03, "result": os.environ["ARCH_REPLY"]}))
+'''
+
+
+class TestArch(ConceptProject):
+    """`ergon arch E-NNN` (T-306): the epic's planned concept map, checked by check_map."""
+
+    def setUp(self):
+        super().setUp()
+        bindir = Path(self.tmp.name) / "archbin"
+        bindir.mkdir()
+        (bindir / "claude").write_text(FAKE_ARCH_CLAUDE.replace("#!PYTHON", f"#!{sys.executable}"))
+        (bindir / "claude").chmod(0o755)
+        self.env = clean_env(PATH=f"{bindir}:{os.environ['PATH']}", ARCH_TMP=self.tmp.name)
+        self.ergon("new", "epic", "Planned pictures")
+        self.ergon("new", "task", "Picture module", "--tier", "sonnet", "--epic", "E-001",
+                   "--touches", "ergon/picture.py,ergon/serve.py")
+        self.ergon("new", "task", "x", "--tier", "sonnet", "--epic", "E-001",
+                   "--touches", "ergon/x.py")  # a second task, dropped below
+        f = self.task_file("T-008")
+        f.write_text(f.read_text().replace("status: proposed", "status: dropped"))
+        self.arch_dir = self.root / "tasks" / "runs" / "arch"
+        self.before = _config.mini_toml(MAP)
+
+    def epic_file(self):
+        return next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+
+    def planned(self):
+        after = json.loads(json.dumps(self.before))
+        after["component"].append({"id": "ui.picture", "concern": "ui", "label": "Planned pictures",
+                                   "files": ["ergon/picture.py"], "terms": ["picture"], "introduced_by": "T-007"})
+        return after
+
+    def arch(self, reply, *extra, check=True):
+        return self.ergon("arch", "E-001", *extra, check=check, env=dict(self.env, ARCH_REPLY=reply))
+
+    def files(self):
+        return sorted(self.arch_dir.glob("*.json")) if self.arch_dir.exists() else []
+
+    def test_writes_one_file_whose_after_holds(self):
+        reply = "Here you go:\n```json\n" + json.dumps({"change": True, "map": self.planned()}) + "\n```"
+        out = self.arch(reply).stdout
+        [p] = self.files()
+        self.assertRegex(p.name, r"^E-001-\d{8}-\d{6}\.json$")
+        self.assertIn("components added ui.picture", out)
+        d = json.loads(p.read_text())
+        self.assertEqual(set(d), {"epic", "hash", "generated", "model", "cost", "changed", "before", "after"})
+        self.assertEqual((d["epic"], d["model"], d["cost"], d["changed"]), ("E-001", "sonnet", 0.03, True))
+        self.assertEqual(d["before"], self.before)
+        self.assertEqual(C.check_map(d["after"])[1], [])
+        self.assertIn("ui.picture", C.check_map(d["after"])[0]["components"])
+        self.assertEqual(C.map_diff(d["before"], d["after"]),
+                         {"component": {"added": ["ui.picture"], "removed": [], "changed": []}})
+        prompt = (Path(self.tmp.name) / "arch-prompt.txt").read_text()
+        fence = re.search(r"<<<epic (\w+)>>>", prompt)[1]
+        epic = prompt.split(f"<<<epic {fence}>>>\n")[1].split(f"<<<end {fence}>>>")[0]
+        self.assertIn("T-007 Picture module", epic)
+        self.assertIn("touches: ergon/picture.py, ergon/serve.py", epic)
+        self.assertNotIn("T-008", epic)  # dropped
+        self.assertIn("- approval.guard (approval): terms: guard, heredoc", prompt)
+        _config.configure(self.root)
+        self.assertEqual(C.latest_arch("E-001"), (p.name, d))
+
+    def test_a_map_that_does_not_hold_writes_nothing(self):
+        bad = self.planned()
+        bad["component"][-1]["concern"] = "nope"
+        r = self.arch(json.dumps({"change": True, "map": bad}), check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("the planned map doesn't hold; nothing written", r.stderr)
+        self.assertIn("concern 'nope' isn't a [[concern]] id", r.stderr)
+        self.assertEqual(self.files(), [])
+        for reply in ("no JSON here", json.dumps({"change": True})):
+            r = self.arch(reply, check=False)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("nothing written", r.stderr)
+        self.assertEqual(self.files(), [])
+        self.assertNotEqual(self.ergon("arch", "E-404", check=False).returncode, 0)
+
+    def test_no_change_gets_a_file_saying_so(self):
+        out = self.arch(json.dumps({"change": False})).stdout
+        self.assertIn("the epic plans no architecture change", out)
+        [p] = self.files()
+        d = json.loads(p.read_text())
+        self.assertFalse(d["changed"])
+        self.assertEqual(d["after"], d["before"])
+
+    def test_latest_arch_takes_the_newest_valid_file(self):
+        self.arch_dir.mkdir(parents=True)
+        good = {"epic": "E-001", "hash": "h", "after": self.planned(), "before": self.before}
+        (self.arch_dir / "E-001-20260101-000000.json").write_text(json.dumps(good))
+        (self.arch_dir / "E-001-20260102-000000.json").write_text("{not json")
+        bad = dict(good, after={"component": [{"id": "x"}]})
+        (self.arch_dir / "E-001-20260103-000000.json").write_text(json.dumps(bad))
+        (self.arch_dir / "E-001-20260104-000000.json").write_text(json.dumps(dict(good, epic="E-002")))
+        elsewhere = Path(self.tmp.name) / "elsewhere.json"
+        elsewhere.write_text(json.dumps(dict(good, hash="evil")))
+        (self.arch_dir / "E-001-20260105-000000.json").symlink_to(elsewhere)
+        (self.arch_dir / "E-0001-20260106-000000.json").write_text(json.dumps(good))  # other epic's name
+        _config.configure(self.root)
+        self.assertEqual(C.latest_arch("E-001"), ("E-001-20260101-000000.json", good))
+        self.assertEqual(C.latest_arch("E-002"), (None, None))
+        (self.arch_dir / "E-001-20260101-000000.json").unlink()
+        self.assertEqual(C.latest_arch("E-001"), (None, None))
+
+    def test_editing_the_brief_or_touches_makes_it_stale(self):
+        self.arch(json.dumps({"change": True, "map": self.planned()}))
+
+        def stale():
+            _config.configure(self.root)
+            epics, tasks = T.load(_config.EPICS), T.load(_config.ITEMS)
+            return C.arch_stale(epics["E-001"], tasks, C.latest_arch("E-001")[1])
+
+        self.assertFalse(stale())
+        tf = self.task_file("T-007")
+        orig = tf.read_text()
+        tf.write_text(orig.replace("title: Picture module", "title: Picture modules"))
+        self.assertFalse(stale())  # a title isn't what the plan is made from
+        tf.write_text(orig.replace("ergon/serve.py", "ergon/serve.py, ergon/other.py"))
+        self.assertTrue(stale())
+        tf.write_text(orig)
+        self.assertFalse(stale())
+        ef = self.epic_file()
+        ef.write_text(ef.read_text() + "\nAlso draw the epics.\n")
+        self.assertTrue(stale())
+        self.assertTrue(C.arch_stale(T.load(_config.EPICS)["E-001"], {}, None))
+
+    def test_in_help(self):
+        out = self.ergon("--help").stdout
+        self.assertIn("ergon arch E-ID", out)
+
+
 class TestHoldByComponent(DispatchProject):
     """hold_by = "component" (T-144): touches that overlap hold two tasks apart only when they share
     a component, or when either one's tags aren't known (stale, hand-written or empty)."""

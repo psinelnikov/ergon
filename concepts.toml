@@ -209,7 +209,7 @@ terms = [".ergon.toml", "[shared]", "two_person", "remote's url"]
 [[component]]
 id = "ui.serve"
 concern = "visibility"
-files = ["ergon/serve.py", "ergon/serve.css", "ergon/serve.js"]
+files = ["ergon/serve.py", "ergon/serve.css", "ergon/serve.js", "ergon/mock.py"]
 terms = ["board", "/review", "review page", "web", "serve", "chart", "colours"]
 
 [[component]]
