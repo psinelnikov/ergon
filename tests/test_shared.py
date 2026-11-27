@@ -1,6 +1,6 @@
 """Shared task state (T-016): two clones of one project and a bare remote for the state branch.
 
-Run: python3 -m unittest discover -s tests
+Run: python3 tests/run_parallel.py (in parallel), or python3 -m unittest discover -s tests
 """
 import json
 import os

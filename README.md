@@ -290,6 +290,16 @@ It is read-only by construction:
 ## Tests
 
 ```bash
+python3 tests/run_parallel.py                  # every test, one worker process per core
+python3 tests/run_parallel.py -j 4             # four workers
+python3 tests/run_parallel.py test_ergon.TestAccept test_serve   # only these
+```
+
+The runner needs only the standard library. It finds the same tests as `unittest discover`, runs each one in a pool of worker processes, and prints a unittest-style report. It exits 1 if any test fails or errors. Running the tests in parallel takes the suite from about 16 minutes to under 3 on a 12-core Mac. `-v` prints each test with its time.
+
+The serial run still works, and gives the same results:
+
+```bash
 python3 -m unittest discover -s tests
 ```
 

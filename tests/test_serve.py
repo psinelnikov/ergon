@@ -1,6 +1,6 @@
 """`ergon serve`: the read-only board and task pages, driven over HTTP against a fixture state dir.
 
-Run: python3 -m unittest discover -s tests
+Run: python3 tests/run_parallel.py (in parallel), or python3 -m unittest discover -s tests
 """
 import contextlib
 import http.client
