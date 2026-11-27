@@ -208,6 +208,13 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                /e/E-NNN. No IDs: epics with no entry or newer history rows; --all:
                                every epic; IDs always rewrite. An epic that finishes gets one too,
                                unless `journal = false` in .ergon.toml
+  ergon arch E-ID [--model sonnet] [--budget USD]
+                               with `concepts`: one `claude -p` (no tools) plans the concept map as
+                               it will be once the epic lands, from the current map, the epic's brief
+                               and its tasks' touches. The planned map must pass the map's checks, else
+                               nothing is written and it exits non-zero. Writes <state>/runs/arch/
+                               E-NNN-<time>.json with both maps (before, after) and a hash of the brief
+                               and touches, so a breakdown or an edit makes it stale. Never run by serve
   ergon sync [--init | --join] HUMAN ONLY, with [shared] in .ergon.toml (docs/shared-state.md):
                                commit pending state edits, fetch, merge and push the state branch.
                                --init creates it from local state (first person), --join checks
@@ -554,6 +561,10 @@ def main():
     jn.add_argument("--all", action="store_true", help="every epic, not only those with a missing or stale entry")
     jn.add_argument("--model", default="sonnet", help="default sonnet")
     jn.add_argument("--budget", type=float, help="max USD per epic (--max-budget-usd)")
+    ar = sub.add_parser("arch", help="write an epic's planned concept map next to the current one (runs claude -p)")
+    ar.add_argument("id", help="the epic, E-NNN")
+    ar.add_argument("--model", default="sonnet", help="default sonnet")
+    ar.add_argument("--budget", type=float, help="max USD for the call (--max-budget-usd)")
     sub.add_parser("check")
     sub.add_parser("tidy")
     sy = sub.add_parser("sync", help="HUMAN ONLY: commit, fetch, merge and push the shared state branch")
@@ -652,7 +663,7 @@ def run(args):
         # (and tag) around their writes only, not the minutes claude takes to answer
         {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "choose": _gates.choose, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "breakdown": _dispatch.breakdown, "rules": rules,
-         "import": _tasks.import_issue, "obsidian": _obsidian.obsidian, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "learn": _learn.learn, "journal": journal, "sync": _shared.sync}[args.cmd](args)
+         "import": _tasks.import_issue, "obsidian": _obsidian.obsidian, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "learn": _learn.learn, "journal": journal, "arch": _concepts.arch, "sync": _shared.sync}[args.cmd](args)
 
 
 if __name__ == "__main__":
