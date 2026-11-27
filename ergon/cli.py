@@ -15,8 +15,9 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
   ergon review [-i]            everything waiting on human approval, and tasks AWAITING A CHOICE
                                of their options (-i: HUMAN ONLY, walk it item by item: tasks to
                                approve / choose (c) / reject / retier / edit / skip;
-                               epic briefs (Goal, Out of scope, Constraints) to approve, which
-                               opens the epic and leaves its tasks proposed / edit / skip)
+                               epic briefs (Why, When it's done, Goal, Out of scope, Constraints)
+                               to approve, which opens the epic and leaves its tasks proposed /
+                               edit / skip)
   ergon show ID
   ergon new task "Title" --tier sonnet [--epic E-001] [--touches a,b] [--source LOG.md:42]
                       [--category C] [--crux "<text>"] [--option "<lens>: <approach> | <optimizes for> | <gives up> | <regret if>" ...]
@@ -25,7 +26,13 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                `ergon choose`. In an agent shell a feature (category feature or empty)
                                is refused without a crux and well-formed options; elsewhere plain
                                --option text writes a numbered list
-  ergon new epic "Title"
+  ergon new epic "Title" [--why "<text>"] [--when-done "<text>"]
+                               writes each answer word for word under ## Why / ## When it's done
+                               of the brief. In a person's terminal it asks for each one not given:
+                               suggestions to pick from or your own words, and follow-ups until the
+                               answer is concrete (Enter leaves it empty; claude haiku drafts the
+                               suggestions, fixed ones without it). In an agent shell, or when stdin
+                               isn't a terminal, it never prompts and leaves the section empty
   ergon import gh#123 [--tier T] [--epic E] [--touches a,b]
                                a GitHub issue (or gh:OWNER/REPO#123) as a proposed task, via the
                                `gh` CLI: title, quoted body as What, source: gh#123. Tier is
@@ -185,8 +192,12 @@ repo's main checkout (`ergon init` writes one). No dependencies beyond the stand
                                --all: every one. Not in the brief digest. Record in <state>/runs/tag/
   ergon related T-ID           read-only, with `concepts`: open tasks sharing a component, then only
                                a concern; done tasks it builds on (Jaccard overlap of components);
-                               missing depends (a component an open task introduces, not in its
-                               depends: closure). /t/T-ID shows the same
+                               the files changed by commits on main citing it (one git log; no
+                               merges, no state files) and done tasks ranked by shared files, each
+                               weighted by rarity (log of tasks / tasks changing it); missing
+                               depends (a component an open task introduces, not in its depends:
+                               closure). The two file lists show for untagged tasks too. /t/T-ID
+                               shows the same, without the file lists
   ergon related --origins      read-only: for each component with no introduced_by, the task cited by
                                the commit that first added its files, with the evidence (file ->
                                commit -> task). A guess (a move or package split adds files too):
@@ -470,6 +481,14 @@ def main():
                          "<regret if>\"; give it 2 to 4 times, one per lens (minimal, durable, operator, risk, defer). "
                          "Writes an ## Options section a human picks from with `ergon choose`. In an agent shell a "
                          "feature (category feature or empty) needs --crux and well-formed options")
+    nw.add_argument("--why", metavar="TEXT",
+                    help="epic: why the person wants it, written word for word under ## Why (refused for a task). Not given: "
+                         "asked for in a person's terminal, with up to 4 suggestions or your own words, until it names "
+                         "a problem someone has today; left empty in an agent shell or when stdin isn't a terminal")
+    nw.add_argument("--when-done", metavar="TEXT",
+                    help="epic: what they expect to be true once it's done, written word for word under "
+                         "## When it's done (refused for a task). Not given: asked for the same way, until it names "
+                         "something a person could check; with both flags given nothing is asked")
     im = sub.add_parser("import", help="a GitHub issue as a proposed task: gh#123 or gh:OWNER/REPO#123")
     im.add_argument("ref", metavar="gh#N")
     im.add_argument("--tier", help="default: human, until someone sizes it")
@@ -556,7 +575,12 @@ def main():
     tg.add_argument("--model", default="sonnet", help="default sonnet")
     tg.add_argument("--budget", type=float, help="max USD per call (--max-budget-usd)")
     tg.add_argument("--dry-run", action="store_true", help="list the tasks; ask nothing, write nothing")
-    rl = sub.add_parser("related", help="tasks related to this one through the concept map")
+    rl_help = ("tasks related to this one through the concept map, the files its commits on main changed and "
+               "done tasks ranked by shared files (rarer files weigh more)")
+    rl = sub.add_parser("related", help=rl_help, description=rl_help[0].upper() + rl_help[1:] + (
+        ". The file lists come from one `git log --no-merges --name-only` on main each run (nothing is "
+        "cached); `Merge T-/E-` subjects and files under the state dir don't count. They show for "
+        "untagged tasks too."))
     rl.add_argument("id", nargs="?", help="the task")
     rl.add_argument("--origins", action="store_true", help=(
         "instead of a task: suggest each component's introduced_by from the commit that first added its "
@@ -669,13 +693,14 @@ def run(args):
         _tasks.board(args)
     elif args.cmd == "finish" and args.resolve:  # the resolver runs for minutes: it takes the lock only to merge
         _dispatch.finish_resolve(args)
-    elif args.cmd in ("new", "set", "start", "finish", "tidy"):  # read, then write state: one at a time
+    elif args.cmd in ("set", "start", "finish", "tidy"):  # read, then write state: one at a time
         with _gitops.state_lock():
-            {"new": _tasks.new, "set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish,
+            {"set": _gates.setf, "start": _gitops.start, "finish": _gitops.finish,
              "tidy": _tasks.tidy}[args.cmd](args)
     else:  # dispatch takes the lock itself, around each step (it runs for hours); grade around its
-        # (and tag) around their writes only, not the minutes claude takes to answer
-        {"next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "choose": _gates.choose, "pin": _gates.pin,
+        # (and tag) around their writes only, not the minutes claude takes to answer; new around its
+        # write, not the questions it asks a person
+        {"new": _tasks.new, "next": _tasks.nxt, "review": _tasks.review, "show": _tasks.show, "approve": _gates.approve, "reject": _gates.reject, "close": _gates.close, "accept": _gates.accept, "answer": _gates.answer, "choose": _gates.choose, "pin": _gates.pin,
          "audit": _tasks.audit, "stats": _report.stats, "report": _report.report, "check": _tasks.check, "dispatch": _dispatch.dispatch, "breakdown": _dispatch.breakdown, "rules": rules,
          "import": _tasks.import_issue, "obsidian": _obsidian.obsidian, "serve": _serve.serve, "quiz": quiz, "grade": _grade.grade, "fill": _fill.fill, "tag": _concepts.tag, "related": _concepts.related, "learn": _learn.learn, "journal": journal, "arch": _concepts.arch, "mock": _mock.mock, "sync": _shared.sync}[args.cmd](args)
 

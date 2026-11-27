@@ -305,6 +305,32 @@ class TestServe(ServeFixture):
                     "/runs/breakdown/.hidden", "/runs/breakdown/%2e%2e/x"):
             self.assertEqual(self.req("GET", bad)[0], 404, bad)
 
+    def test_epic_page_lists_a_blocked_breakdowns_questions(self):
+        """T-289: /e/E-NNN shows a blocked run's reason, the brief's empty sections and each question
+        with its suggestions, and says the breakdown waits on those sections while they are empty."""
+        journal = self.runs / ("history" + ".jsonl")
+        with journal.open("a") as f:
+            f.write(json.dumps(row("2026-11-16T10:00:00+00:00", None, "breakdown", verdict="blocked", cost=0.5,
+                                   seconds=20, reason="the brief's Why and When it's done are empty",
+                                   asked=["Why", "When it's done"], digest="abc",
+                                   questions=[{"text": "Why ship <it>?", "options": ["users wait", "ops asked"]},
+                                              {"text": "What is true when it's done?", "options": []}])) + "\n")
+        code, _, page = self.req("GET", "/e/E-001")
+        self.assertEqual(code, 200)
+        sec = page.split("<h2>Breakdown runs</h2>")[1].split("<h2")[0]
+        self.assertIn("the brief&#x27;s Why and When it&#x27;s done are empty", sec)
+        self.assertIn("<li>Why ship &lt;it&gt;?<ul><li>users wait</li><li>ops asked</li></ul></li>", sec)
+        self.assertIn("<li>What is true when it&#x27;s done?</li>", sec)
+        self.assertIn("<p>waiting on Why / When it&#x27;s done: fill them in the brief</p>", sec)
+        # filled: no longer waiting; E-001 has tasks, so dispatch won't break it down again either
+        f = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        f.write_text(f.read_text().replace("## Why\n", "## Why\nUsers wait.\n")
+                     .replace("## When it's done\n", "## When it's done\n- it ships\n"))
+        sec = self.req("GET", "/e/E-001")[2].split("<h2>Breakdown runs</h2>")[1].split("<h2")[0]
+        self.assertNotIn("<p>waiting on", sec)
+        self.assertNotIn("answered:", sec)
+        self.assertIn("Why ship &lt;it&gt;?", sec)  # the run's questions stay listed
+
     def test_follow_ups_open_on_board_and_task_page(self):
         f = self.task_file("T-004")
         f.write_text(re.sub(r"(?m)^source:.*$", "source: T-001", f.read_text()))
@@ -353,6 +379,22 @@ class TestServe(ServeFixture):
         self.assertNotIn("<img src=x", sec)
         self.assertIn("ergon approve E-001 E-002", sec)
         self.assertNotIn("Nothing is waiting", review)
+
+    def test_review_shows_an_epics_why_and_when_its_done(self):
+        f = next((self.root / "tasks" / "epics").glob("E-001-*/EPIC.md"))
+        text = f.read_text()
+        card = lambda: re.search(r'<section class=card id="E-001">(.*?)</section>', self.req("GET", "/review")[2], re.S)[1]
+        empty = "<h4>Why</h4><p class=muted>empty</p><h4>When it's done</h4><p class=muted>empty</p><h4>Goal</h4>"
+        self.assertIn(empty, card())
+        f.write_text(text.replace("## Why\n\n## When it's done\n\n", ""))  # a brief from before the sections
+        self.assertNotIn("## Why", f.read_text())
+        self.assertIn(empty, card())
+        f.write_text(text.replace("## Why\n", f"## Why\nIt hurts {HOSTILE}\n", 1)
+                     .replace("## When it's done\n", "## When it's done\n- It stops.\n", 1))
+        c = card()
+        self.assertRegex(c, r"<h4>Why</h4><pre>It hurts &lt;script&gt;")
+        self.assertIn("<h4>When it's done</h4><pre>- It stops.</pre><h4>Goal</h4>", c)
+        self.assertNotIn("<script>alert", c)
 
     def test_priority_on_board_and_task_page(self):
         f = self.task_file("T-004")

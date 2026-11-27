@@ -80,6 +80,7 @@ function-level touch never exempts its file.
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -865,6 +866,97 @@ def fn_notes(t, cmap, short=False):
     return out
 
 
+# ---------- files a task's commits changed (T-282) ----------
+
+FILE_OVERLAP = 5  # done tasks `related` lists by file overlap
+SHARED_SHOWN = 4  # shared files a file-overlap row names before "+N more"
+
+
+def task_files(tasks=None):
+    """{task ID: set of paths} changed by the non-merge commits on main that cite each task (one
+    `git log --no-merges --name-only`). A `Merge T-/E-` landing subject cites nothing (as for
+    origins), and paths under the state dir are dropped: shared-mode state commits cite task IDs
+    and change only task files. Given tasks, only IDs the tracker has. None when git can't be run
+    or main can't be read. Stores nothing: each call reads the log again."""
+    try:
+        r = subprocess.run(["git", "-C", str(_config.REPO), "-c", "core.quotePath=false", "log", "--no-merges",
+                            "--name-only", "--format=%x1e%h%x1f%s%x1f%B%x1d", _config.MAIN, "--"],
+                           capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode:
+        return None
+    try:
+        state = _config.STATE.relative_to(_config.HOME).as_posix().strip("/") + "/"
+    except ValueError:
+        state = None  # the state dir is outside the repo: no commit can change it
+    out = {}
+    for chunk in r.stdout.split("\x1e"):
+        head, sep, names = chunk.partition("\x1d")
+        if not sep:
+            continue
+        commit = tuple(head.split("\x1f", 2))
+        if len(commit) != 3:
+            continue
+        files = {f for f in names.splitlines() if f.strip() and not (state and f.startswith(state))}
+        if not files:
+            continue
+        for i in commit_cites(commit, tasks):
+            out.setdefault(i, set()).update(files)
+    return out
+
+
+def rarity(index):
+    """{path: weight}: log(tasks in index / tasks whose commits changed the path). A file every
+    task changes weighs 0, one only a single task changed weighs the most."""
+    n = len(index)
+    seen = {}
+    for files in index.values():
+        for f in files:
+            seen[f] = seen.get(f, 0) + 1
+    return {f: math.log(n / k) for f, k in seen.items()}
+
+
+def file_overlap(tid, tasks, index):
+    """[(task, score, [shared paths, rarest first])] for each done task whose commits changed a file
+    tid's commits changed, best first, the top FILE_OVERLAP. score is the sum of the shared files'
+    rarity, so files most tasks touch (README, docs, shared tests) count for almost nothing. Ties go
+    to more shared files, then to ID order. [] when tid has no citing commits."""
+    mine = index.get(tid) or set()
+    if not mine:
+        return []
+    w = rarity(index)
+    out = []
+    for i, o in sorted(tasks.items()):
+        if i == tid or o.get("status") != "done":
+            continue
+        both = mine & (index.get(i) or set())
+        if both:
+            shared = sorted(both, key=lambda f: (-w[f], f))
+            out.append((o, sum(w[f] for f in both), shared))
+    out.sort(key=lambda x: (-round(x[1], 9), -len(x[2])))  # stable: ties stay in ID order
+    return out[:FILE_OVERLAP]
+
+
+def file_lines(t, tasks):
+    """`related`'s two git sections for t: the files its citing commits changed, then the done tasks
+    ranked by file overlap. Read from git on every call; nothing is stored."""
+    index = task_files(tasks)
+    lines = [f"\nFILES CHANGED (commits on {_config.MAIN} citing {t['id']})"]
+    if index is None:
+        return lines + [f"  git log on {_config.MAIN} could not be read"]
+    mine = sorted(index.get(t["id"]) or ())
+    lines += [f"  {f}" for f in mine] or ["  none"]
+    lines.append("\nDONE, SHARING FILES (ranked by how rare the shared files are)")
+    rows = file_overlap(t["id"], tasks, index)
+    for o, score, shared in rows:
+        more = f", +{len(shared) - SHARED_SHOWN} more" if len(shared) > SHARED_SHOWN else ""
+        lines.append(f"  {o['id']}  {score:.2f}  {o.get('title', '')}  [{', '.join(shared[:SHARED_SHOWN])}{more}]")
+    if not rows:
+        lines.append("  none")
+    return lines
+
+
 # ---------- links ----------
 
 def closure(tid, tasks):
@@ -954,6 +1046,7 @@ def related(args):
     if not ls["components"]:
         print("no concepts: " + (note if note and t.get("tagged") else "untagged")
               + f"; run `ergon tag {t['id']}`")
+        print("\n".join(file_lines(t, tasks)))
         return
     print(f"concepts: {', '.join(ls['components'])}" + (f"  (stale: {note}; `ergon tag {t['id']}`)" if note else ""))
     comps = cmap["components"]
@@ -976,6 +1069,7 @@ def related(args):
         print(f"  {o['id']}  {j:.2f}  {o.get('title', '')}  [{', '.join(shared)}]")
     if not ls["builds_on"]:
         print("  none")
+    print("\n".join(file_lines(t, tasks)))
     print("\nMISSING DEPENDS")
     for c, intro in ls["missing"]:
         print(f"  {intro} ({tasks[intro].get('status')}) introduces {c}, which {t['id']} uses, "

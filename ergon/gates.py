@@ -155,11 +155,67 @@ def ask(prompt):
         return sys.stdin.readline().strip()
     try:
         with open("/dev/tty", "r") as tin, open("/dev/tty", "w") as tout:
+            if _edits_lines():  # stdin and stdout are the terminal: input() edits the line (T-302)
+                head, _, last = prompt.rpartition("\n")
+                if head:  # readline redraws only the prompt's last line
+                    sys.stdout.write(head + "\n")
+                    sys.stdout.flush()
+                try:
+                    return _no_escapes(input(last)).strip()
+                except EOFError:
+                    return ""
             tout.write(prompt)
             tout.flush()
-            return tin.readline().strip()
+            return _no_escapes(tin.readline()).strip()
     except OSError:
         raise SystemExit("refused: no terminal to confirm on.")
+
+
+_ESCAPES = re.compile(r"\x1b(\[[0-?]*[ -/]*[@-~]?|O.?|.?)")  # CSI (arrow, Home, End...), SS3, or a lone ESC
+
+
+def _no_escapes(text):
+    """text without terminal escape sequences: an arrow key read without line editing arrives as
+    ESC [ D, and none of it belongs in an answer."""
+    return _ESCAPES.sub("", text)
+
+
+def _edits_lines():
+    """Whether input() reads with line editing: stdin and stdout are a terminal and readline loads
+    (it doesn't on Windows). Otherwise ask() reads /dev/tty itself and strips what arrow keys send."""
+    try:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return False
+        import readline  # noqa: F401  (importing it is what gives input() editing and history)
+    except (ImportError, AttributeError, ValueError):
+        return False
+    return True
+
+
+def can_ask():
+    """Whether a person is there to answer questions: stdin is a TTY with a terminal behind it for
+    ask() to use (or ERGON_ASK_STDIN scripts the answers), and this isn't an agent shell. Reads nothing."""
+    if in_agent_shell():
+        return False
+    if os.environ.get("ERGON_ASK_STDIN"):
+        return True
+    try:
+        with open("/dev/tty", "r"):
+            return sys.stdin.isatty()
+    except (OSError, AttributeError, ValueError):  # no terminal; no stdin, or a closed one
+        return False
+
+
+def ask_made(make_prompt):
+    """ask() for a prompt that costs something to make (a model call). A scripted answer is read
+    first, so once the script has run out nothing is made or shown and the answer is ""."""
+    if not os.environ.get("ERGON_ASK_STDIN") or in_agent_shell():
+        return ask(make_prompt())
+    line = sys.stdin.readline()
+    if line:
+        sys.stdout.write(make_prompt() + "\n")
+        sys.stdout.flush()
+    return line.strip()
 
 
 def human_gate(prompt):
@@ -320,8 +376,9 @@ def brief_due(e, apr):
 
 
 def print_brief(e):
-    """Print what approving epic e approves: its Goal, Out of scope and Constraints sections."""
-    for name in _tasks.EPIC_DIGEST_SECTIONS:
+    """Print what approving epic e approves: its Why, When it's done, Goal, Out of scope and
+    Constraints sections."""
+    for name in _tasks.EPIC_ANSWER_SECTIONS + _tasks.EPIC_DIGEST_SECTIONS:
         text = _tasks.normalised(_tasks.sections(e.get("_body") or "", name))
         print(f"      {name.capitalize()}: " + ("\n        ".join(text.split("\n")) if text else "(empty)"))
 
@@ -384,7 +441,7 @@ def approve(args):
     apr = _gitops.approvals() if count else apr
     for t in todo:
         if _tasks.is_epic(t):
-            print(f"  {t['id']}  epic    {t['title']}  (its brief: Goal, Out of scope, Constraints)"
+            print(f"  {t['id']}  epic    {t['title']}  (its brief: Why, When it's done, Goal, Out of scope, Constraints)"
                   + (f"  (approve again: {again[t['id']]})" if t["id"] in again else ""))
             print_brief(t)
             continue
@@ -469,10 +526,10 @@ def write_policy(t):
 
 def review_brief(e, at, tasks, apr, tally):
     """One epic brief in the interactive review, while its approval is due (`brief_due`): show
-    its Goal, Out of scope and Constraints and offer to approve it, which approves the brief
-    alone as `ergon approve E-NNN` does (signed in shared mode; its tasks stay proposed), reject
-    it (a proposed brief only: drops it as `ergon reject E-NNN` does), edit it, or skip it.
-    Returns False on quit."""
+    its Why, When it's done, Goal, Out of scope and Constraints and offer to approve it, which
+    approves the brief alone as `ergon approve E-NNN` does (signed in shared mode; its tasks stay
+    proposed), reject it (a proposed brief only: drops it as `ergon reject E-NNN` does), edit it,
+    or skip it. Returns False on quit."""
     while brief_due(e, apr):
         why = apr.problem(e) if e["status"] == "open" else ""
         print(f"\n{'=' * 78}\n{at}  {e['id']}  {e['title']}  (epic brief, {e['status']})"
