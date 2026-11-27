@@ -31,7 +31,8 @@ answer yet commits, then ends with $FAKE_ASK (QUESTION lines) and RESULT: asking
 without --agent it is dispatch's 5-hour-window probe: it counts itself in $FAKE_PROBES and, with
 $FAKE_FIVE_HOUR set (|-separated utilizations, the nth probe the nth, the last repeating), streams
 a rate_limit_event; without it, no window, as on an API key. With $FAKE_PROBE_LIMIT the probe
-itself ends the way a still-limited login does ($FAKE_LIMIT_TEXT). A worker writes its task ID over
+itself ends the way a still-limited login does ($FAKE_LIMIT_TEXT), until the epoch reset that text
+ends with (if any) has passed. A worker writes its task ID over
 $FAKE_SHARED (and $FAKE_PUB_SHARED in the companion) too, so two tasks conflict, and sleeps
 $FAKE_SLEEP_<TIER> first. Handed a conflict round, it merges each base named and keeps both sides
 of each conflicted file, then ends $FAKE_CONFLICT_RESULT (default RESULT: done), and so does an
@@ -64,8 +65,9 @@ if "--agent" not in sys.argv:
     if os.environ.get("FAKE_PROBES"):
         n = len(open(os.environ["FAKE_PROBES"]).read()) if os.path.exists(os.environ["FAKE_PROBES"]) else 0
         open(os.environ["FAKE_PROBES"], "a").write("p")
-    if os.environ.get("FAKE_PROBE_LIMIT"):
-        limit_stop()
+    reset = os.environ.get("FAKE_LIMIT_TEXT", "").rpartition("|")[2]
+    if os.environ.get("FAKE_PROBE_LIMIT") and not (reset.isdigit() and int(reset) <= time.time()):
+        limit_stop()  # as a real login: once the message's epoch reset has passed, the probe goes through
     seq = [x for x in os.environ.get("FAKE_FIVE_HOUR", "").split("|") if x]
     if seq:
         u, resets = float(seq[min(n, len(seq) - 1)]), int(os.environ.get("FAKE_RESETS_" + str(n), "1794935400"))
