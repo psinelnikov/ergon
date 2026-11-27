@@ -1267,7 +1267,31 @@ Reply with one JSON object and nothing else: {reply}
 """
 EPIC_ASK_DRAFT = "Write 4 suggested answers to the question that fit this epic."
 EPIC_ASK_JUDGE = """Judge only `answer`, read by itself. It is concrete when {concrete}. Don't grade its style, size or ambition.
+If `options_shown` is given, those are the suggestions the person saw, numbered from 1: a number in `answer` may stand for that option's text, so read it with the text in its place.
 If it isn't concrete, write one short, friendly follow-up question asking for what is missing, and 4 new suggested answers built from what the person said. Every suggestion must contain at least one of the words of `answer`."""
+
+PICKS = re.compile(r"""(?P<nums>[0-9]{1,2}(?:\s*(?:,|\+|&|\band\b)\s*[0-9]{1,2})*)[.)]?
+    (?:\s*[-–—:;,]\s*(?P<rest>(?![0-9])\S.*))?""", re.X | re.I | re.S)
+
+
+def resolve_picks(got, picks):
+    """The answer `got` makes of the numbered `picks`: "1 and 4", "2, 3" or "2 + 3 - also X" is
+    option 2's text, option 3's, then the person's own "also X". None when it isn't that shape or a
+    number in it isn't on the list (then it's free text). A lone number is handled by the caller."""
+    m = PICKS.fullmatch(got.strip())
+    if not m:
+        return None
+    nums = [int(n) for n in re.findall(r"[0-9]+", m["nums"])]
+    if not all(1 <= n <= len(picks) for n in nums):
+        return None
+    texts = [picks[n - 1].rstrip() for n in dict.fromkeys(nums)]
+    texts = [t if t.endswith((".", "!", "?", "…")) else t + "." for t in texts]
+    return " ".join(texts + ([m["rest"].strip()] if m["rest"] else []))
+
+
+def _names_a_pick(answer, picks):
+    """Whether `answer` has a bare number that could be one of the shown options."""
+    return any(1 <= int(n) <= len(picks) for n in re.findall(r"(?<![\w.])([0-9]{1,2})(?![\w.][0-9]|[0-9])", answer))
 
 RANKED = re.compile(r"recommend|[(\[](?:best|default|preferred|suggested|top)\b", re.I)
 FILLER = frozenset("""the and for that this with from are was were has have had not but you your our its it's they them
@@ -1358,13 +1382,15 @@ class EpicAsker:
         d = self._call(key, EPIC_ASK_DRAFT, '{"suggestions": ["...", "...", "...", "..."]}', **other)
         return _suggestions((d or {}).get("suggestions")) or EPIC_QUESTIONS[key]["fixed"]
 
-    def judge(self, key, answer, vague, other):
+    def judge(self, key, answer, vague, other, shown=()):
         """None when `answer` is concrete, else the (question, suggestions) to follow up with, built
-        from the answer. `vague`: the answers before it."""
+        from the answer. `vague`: the answers before it. `shown`: the suggestions the person saw,
+        passed on when the answer has a number that could stand for one of them."""
         q = EPIC_QUESTIONS[key]
+        seen = {"options_shown": list(shown)} if shown and _names_a_pick(answer, shown) else {}
         d = self._call(key, EPIC_ASK_JUDGE, '{"concrete": true or false, "question": "...", '
                        '"suggestions": ["...", "...", "...", "..."]}',
-                       **other, earlier_vague_answers=vague, answer=answer) or {}
+                       **other, earlier_vague_answers=vague, **seen, answer=answer) or {}
         verdict = d.get("concrete")
         if not isinstance(verdict, bool):
             verdict = concrete(key, answer)
@@ -1399,7 +1425,10 @@ class EpicAsker:
             if m:
                 note = f"There is no {m[1]} in the list.\n"
                 continue
-            follow = self.judge(key, got, list(vague), other)
+            both = resolve_picks(got, picks)
+            if both:
+                return both
+            follow = self.judge(key, got, list(vague), other, picks)
             if not follow:
                 return got
             vague.append(got)

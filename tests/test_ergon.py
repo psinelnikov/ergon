@@ -2049,6 +2049,38 @@ class TestEpicQuestions(Project):
         self.assertIn("vague", self.brief()[1])
         self.assertEqual([c["known"].get("answer") for c in self.calls()], [None, None, "vague"])
 
+    def test_several_picked_numbers_combine_their_texts_with_no_clarifying_round(self):  # T-303
+        r = self.ask(answers=["1 and 4", "2 and 3 - if no UI work, show diagrams"])
+        ps = self.prompts(r)
+        self.assertEqual(len(ps), 2, r.stdout)
+        why, done = self.listed(ps[0]), self.listed(ps[1])
+        dot = lambda t: t if t.endswith((".", "!", "?", "…")) else t + "."
+        self.assertEqual(self.brief(), [f"{dot(why[0])} {dot(why[3])}",
+                                        f"{dot(done[1])} {dot(done[2])} if no UI work, show diagrams"])
+        self.assertEqual([c["known"].get("answer") for c in self.calls()], [None, None])  # nothing judged
+
+    def test_a_number_off_the_list_inside_a_longer_answer_is_judged_with_the_options_shown(self):  # T-303
+        r = self.ask(answers=["1 and 9 more", "", ""])
+        ps = self.prompts(r)
+        self.assertEqual(len(ps), 3, r.stdout)
+        judged = self.calls()[1]["known"]
+        self.assertEqual(judged["answer"], "1 and 9 more")
+        self.assertEqual(judged["options_shown"], self.listed(ps[0]))
+        self.assertEqual(self.brief(), ["", ""])
+
+    def test_resolving_picks(self):  # T-303
+        from ergon import tasks
+        shown = ["Alpha", "Bravo.", "Charlie", "Delta"]
+        for got, want in (("1 and 4", "Alpha. Delta."), ("2, 3", "Bravo. Charlie."), ("4+1", "Delta. Alpha."),
+                          ("2 & 2", "Bravo."), ("2 and 3 — also X, Y", "Bravo. Charlie. also X, Y"),
+                          ("3: only for admins", "Charlie. only for admins"),
+                          ("1 and 9 more", None), ("9 and 1 - also X", None), ("1, 2 people wait", None),
+                          ("2 days of waiting", None), ("people wait", None)):
+            self.assertEqual(tasks.resolve_picks(got, shown), want, got)
+        for answer, want in (("1 and 9 more", True), ("reviewers wait 2 days", True), ("wait 12 days", False),
+                             ("v1.2 is slow", False), ("nothing numbered", False)):
+            self.assertEqual(tasks._names_a_pick(answer, shown), want, answer)
+
     def test_an_empty_answer_leaves_the_section_empty_and_says_breakdown_will_ask(self):
         r = self.ask(answers=["vague", "", "", "unread"])
         self.assertEqual(self.brief(), ["", ""])
