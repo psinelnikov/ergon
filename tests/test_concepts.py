@@ -528,11 +528,11 @@ class TestIgnoreMap(unittest.TestCase):
         self.assertEqual(C.uncovered(cmap, files), ["ergon/fill.py", "hooks/run.sh"])
 
     def test_no_git_or_no_repo_lists_nothing(self):
-        with mock.patch.object(C, "subprocess") as sp:
+        with mock.patch.object(C, "subprocess") as sp, mock.patch.object(_config, "REPO", Path("."), create=True):
             sp.run.side_effect = FileNotFoundError("git")
             self.assertIsNone(C.tracked_files())
         import tempfile
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(_config, "REPO", Path(d)):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(_config, "REPO", Path(d), create=True):
             self.assertIsNone(C.tracked_files())
 
 
